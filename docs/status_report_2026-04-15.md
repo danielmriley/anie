@@ -18,7 +18,7 @@ There are a small number of open items from the implementation plans that have n
 
 ### 1. Architecture follows the design documents
 
-The original implementation order (`docs/IMPLEMENTATION_ORDER.md`) defined five global guardrails. The codebase adheres to all five:
+The original implementation order (`docs/completed/IMPLEMENTATION_ORDER.md`) defined five global guardrails. The codebase adheres to all five:
 
 | Guardrail | Status |
 |---|---|
@@ -54,7 +54,7 @@ The controller (`anie-cli`) is the only integration point that wires all layers 
 
 ### 3. The v1.0.1 local-reasoning work landed cleanly
 
-The v1.0.1 phased plan defined 9 steps (Step -1 through Step 7). Based on the existing review (`docs/v1-0-1_review.md`) and code inspection:
+The v1.0.1 phased plan defined 9 steps (Step -1 through Step 7). Based on the existing review (`docs/completed/v1-0-1_review.md`) and code inspection:
 
 | Step | Status |
 |---|---|
@@ -73,7 +73,7 @@ Reasoning behavior lives entirely in the provider layer, as the plan required. T
 
 ### 4. The v1.0.1 review fixes were addressed
 
-The three issues raised in `docs/v1-0-1_review.md` have all been addressed:
+The three issues raised in `docs/completed/v1-0-1_review.md` have all been addressed:
 
 - **Fix 1 — Empty-stop protection:** `finish_stream()` now returns a `ProviderError::Stream("empty assistant response")` when no meaningful content was accumulated. Test: `truly_empty_successful_stop_becomes_stream_error`.
 - **Fix 2 — Token headroom direction:** `effective_max_tokens()` implements the "shrink within budget" strategy. The existing test covers the behavior.
@@ -113,19 +113,19 @@ The codebase is structured for future extension:
 
 #### 1a. `anie-extensions` is a placeholder
 
-The crate contains only a constant. The design documents (`docs/IMPLEMENTATION_ORDER.md`, phase 5 plan) call for an `Extension` trait with hooks for `before_agent_start`, `session_start`, and `before/after_tool_call`. The agent loop already has `BeforeToolCallHook` and `AfterToolCallHook` traits in `anie-agent/src/hooks.rs`, but there is no extension runner, no extension loading, and no integration in `anie-extensions`.
+The crate contains only a constant. The design documents (`docs/completed/IMPLEMENTATION_ORDER.md`, phase 5 plan) call for an `Extension` trait with hooks for `before_agent_start`, `session_start`, and `before/after_tool_call`. The agent loop already has `BeforeToolCallHook` and `AfterToolCallHook` traits in `anie-agent/src/hooks.rs`, but there is no extension runner, no extension loading, and no integration in `anie-extensions`.
 
 **Impact:** Low risk today — the hook traits exist and work — but the empty crate signals unfinished work to anyone reading the workspace.
 
 **Recommendation:** Either implement a minimal extension surface or explicitly document that `anie-extensions` is reserved for post-v1.0 and update the README accordingly.
 
-#### 1b. Doc naming alignment (`docs/local_model_thinking_plan.md`)
+#### 1b. Doc naming alignment (`docs/completed/local_model_thinking_plan.md`)
 
 The design reference doc still uses the old planned enum names (`NativeOpenAiReasoning`, `PromptOnly`, `PromptWithTags`, `NativeDeltas`, `TaggedText`). The implementation uses cleaner names (`Native`, `Prompt`, `Separated`, `Tagged`). This was called out in the v1.0.1 review as Fix 3 but the doc has not been updated.
 
 **Impact:** Causes confusion when reading the design doc alongside the code.
 
-**Recommendation:** Update `docs/local_model_thinking_plan.md` to match the implemented types.
+**Recommendation:** Update `docs/completed/local_model_thinking_plan.md` to match the implemented types.
 
 #### 1c. `effective_max_tokens` lacks a doc comment
 
@@ -178,13 +178,11 @@ The TUI tests come closest by exercising `App` with `AgentEvent` sequences, but 
 
 #### 4a. v1.0 milestone checklist is unchecked
 
-`docs/v1_0_milestone_checklist.md` contains the release-blocker checklist, but no items are checked off despite the implementation being substantially complete. This makes it hard to assess completion status at a glance.
-
-**Recommendation:** Walk through the checklist and mark completed items.
+~~`docs/v1_0_milestone_checklist.md` contained unchecked items~~ — **Resolved:** checklist has been updated and moved to `docs/completed/v1_0_milestone_checklist.md`.
 
 #### 4b. Phase detail plans reference older patterns
 
-Some of the original phase plans in `docs/phase_detail_plans/` contain code snippets and type names that have evolved during implementation (e.g., `ThinkingLevel` as enum variants vs. the actual implementation). These are historical reference docs, but new contributors could be confused.
+Some of the original phase plans in `docs/completed/phase_detail_plans/` contain code snippets and type names that have evolved during implementation (e.g., `ThinkingLevel` as enum variants vs. the actual implementation). These are historical reference docs, but new contributors could be confused.
 
 **Recommendation:** Add a note at the top of each phase plan indicating it is a historical planning document and directing readers to the actual code.
 
@@ -206,8 +204,8 @@ Some of the original phase plans in `docs/phase_detail_plans/` contain code snip
 
 ## Recommended next actions (in priority order)
 
-1. **Update the v1.0 milestone checklist** — check off completed items to get a clear picture of remaining work
-2. **Update `docs/local_model_thinking_plan.md`** — align enum names with the implementation
+1. ~~**Update the v1.0 milestone checklist**~~ — Done
+2. **Update `docs/completed/local_model_thinking_plan.md`** — align enum names with the implementation
 3. **Add a doc comment to `effective_max_tokens()`** — clarify the shrink-within-budget policy
 4. **Decide on `anie-extensions`** — implement a minimal surface or explicitly defer and document
 5. **Split `controller.rs`** — break into focused modules for readability

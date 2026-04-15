@@ -229,9 +229,9 @@ The workspace is split into focused crates:
 
 For more detail, see:
 
-- `docs/anie-rs_architecture.md`
-- `docs/anie-rs_build_doc.md`
-- `docs/phased_plan_v1-0-1/README.md`
+- `docs/arch/anie-rs_architecture.md`
+- `docs/arch/anie-rs_build_doc.md`
+- `docs/completed/phased_plan_v1-0-1/README.md`
 
 ## Development
 
