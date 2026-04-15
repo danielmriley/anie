@@ -1,0 +1,18 @@
+title = "anie gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Benign placeholder values and env-var names used in tests and docs"
+stopwords = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "LOCAL_LLM_KEY",
+  "ANIE_TEST_OPENAI_KEY",
+  "sk-test",
+  "auth-key",
+  "env-key",
+  "cli-key",
+]
