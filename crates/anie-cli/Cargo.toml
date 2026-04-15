@@ -1,0 +1,39 @@
+[package]
+name = "anie-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "anie"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+rpassword.workspace = true
+anie-agent.workspace = true
+anie-auth.workspace = true
+anie-config.workspace = true
+anie-extensions.workspace = true
+anie-provider.workspace = true
+anie-protocol.workspace = true
+anie-providers-builtin.workspace = true
+anie-session.workspace = true
+anie-tools.workspace = true
+anie-tui.workspace = true

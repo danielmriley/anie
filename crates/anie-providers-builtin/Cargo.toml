@@ -1,0 +1,27 @@
+[package]
+name = "anie-providers-builtin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+eventsource-stream.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+anie-provider.workspace = true
+anie-protocol.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true

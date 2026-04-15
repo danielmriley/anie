@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/anie-protocol",
+    "crates/anie-provider",
+    "crates/anie-providers-builtin",
+    "crates/anie-agent",
+    "crates/anie-tools",
+    "crates/anie-session",
+    "crates/anie-config",
+    "crates/anie-auth",
+    "crates/anie-tui",
+    "crates/anie-cli",
+    "crates/anie-extensions",
+]
+default-members = ["crates/anie-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://example.com/anie-rs"
+
+[workspace.dependencies]
+# External
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+dashmap = "6"
+dirs = "6"
+eventsource-stream = "0.2"
+futures = "0.3"
+jsonschema = "0.30"
+nix = { version = "0.30", features = ["signal", "process"] }
+rand = "0.9"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["serde", "v4"] }
+which = "8"
+
+# Internal
+anie-agent = { path = "crates/anie-agent" }
+anie-auth = { path = "crates/anie-auth" }
+anie-cli = { path = "crates/anie-cli" }
+anie-config = { path = "crates/anie-config" }
+anie-extensions = { path = "crates/anie-extensions" }
+anie-provider = { path = "crates/anie-provider" }
+anie-protocol = { path = "crates/anie-protocol" }
+anie-providers-builtin = { path = "crates/anie-providers-builtin" }
+anie-session = { path = "crates/anie-session" }
+anie-tools = { path = "crates/anie-tools" }
+anie-tui = { path = "crates/anie-tui" }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+needless_borrow = "deny"
+redundant_clone = "deny"
+uninlined_format_args = "deny"
+manual_let_else = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+opt-level = "z"
+panic = "abort"

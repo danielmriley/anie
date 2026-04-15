@@ -1,0 +1,29 @@
+# Rust build output
+/target/
+
+# Local runtime data and secrets
+/.anie/
+.env
+.env.*
+!.env.example
+auth.json
+state.json
+sessions/
+logs/
+
+# Editor and OS clutter
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files and reports
+*.log
+*.tmp
+*.bak
+coverage/
+dist/
+*.profraw
+*.profdata
