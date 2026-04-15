@@ -99,27 +99,34 @@ async fn compacted_session_context_drives_agent_run() {
     let (dir, mut session) = create_temp_session();
     let _ = dir;
 
-    // Persist several exchanges.
+    // Persist 4 question/answer exchanges with incrementing timestamps.
+    let exchanges = 4;
     let mut entry_ids = Vec::new();
-    for i in 0..4 {
+    for i in 0..exchanges {
+        let ts = (i as u64 + 1) * 100;
         let id = session
-            .append_message(&user_prompt(&format!("question {i}")))
+            .append_message(&user_prompt_at(&format!("question {i}"), ts))
             .expect("persist prompt");
         entry_ids.push(id);
         let ids = session
-            .append_messages(&[Message::Assistant(final_assistant(&format!("answer {i}")))])
+            .append_messages(&[Message::Assistant(final_assistant_at(
+                &format!("answer {i}"),
+                ts + 50,
+            ))])
             .expect("persist assistant");
         entry_ids.extend(ids);
     }
 
-    // Add a compaction entry marking the 4th exchange's first entry as the keep point.
-    let first_kept_id = entry_ids[6].clone(); // keep from question 3 onward
+    // Each exchange produces 2 entry IDs (question + answer).  We want to
+    // keep from the last exchange onward (exchange index 3, i.e. "question 3").
+    let kept_exchange = 3;
+    let first_kept_id = entry_ids[kept_exchange * 2].clone();
     session
         .add_entries(vec![SessionEntry::Compaction {
             base: EntryBase {
                 id: format!("compact-{}", entry_ids.len()),
                 parent_id: session.leaf_id().map(str::to_string),
-                timestamp: "2".into(),
+                timestamp: "500".into(),
             },
             summary: "Prior discussion covered questions 0 through 2.".into(),
             first_kept_entry_id: first_kept_id,

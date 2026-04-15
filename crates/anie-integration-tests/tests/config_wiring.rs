@@ -66,31 +66,24 @@ async fn auth_resolver_with_config_env_var_resolves_key() {
     use anie_provider::RequestOptionsResolver;
 
     let env_var = "ANIE_INTEGRATION_TEST_AUTH_KEY";
-    // SAFETY: test-only env var with a unique name; no concurrent test uses it.
-    unsafe {
-        std::env::set_var(env_var, "test-key-value");
-    }
 
-    let mut config = AnieConfig::default();
-    config.providers.insert(
-        "openai".into(),
-        ProviderConfig {
-            api_key_env: Some(env_var.into()),
-            ..Default::default()
-        },
-    );
+    temp_env::async_with_vars([(env_var, Some("test-key-value"))], async {
+        let mut config = AnieConfig::default();
+        config.providers.insert(
+            "openai".into(),
+            ProviderConfig {
+                api_key_env: Some(env_var.into()),
+                ..Default::default()
+            },
+        );
 
-    let resolver = AuthResolver::new(None, config)
-        .with_auth_path(Some(std::path::PathBuf::from("/tmp/nonexistent-auth.json")));
-    let model = anie_integration_tests::helpers::sample_model();
-    let mut openai_model = model;
-    openai_model.provider = "openai".into();
+        let resolver = AuthResolver::new(None, config)
+            .with_auth_path(Some(std::path::PathBuf::from("/tmp/nonexistent-auth.json")));
+        let mut openai_model = anie_integration_tests::helpers::sample_model();
+        openai_model.provider = "openai".into();
 
-    let resolved = resolver.resolve(&openai_model, &[]).await.expect("resolve");
-    assert_eq!(resolved.api_key.as_deref(), Some("test-key-value"));
-
-    // Cleanup
-    unsafe {
-        std::env::remove_var(env_var);
-    }
+        let resolved = resolver.resolve(&openai_model, &[]).await.expect("resolve");
+        assert_eq!(resolved.api_key.as_deref(), Some("test-key-value"));
+    })
+    .await;
 }

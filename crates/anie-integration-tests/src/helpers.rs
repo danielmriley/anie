@@ -14,6 +14,7 @@ use anie_provider::{
     ApiKind, CostPerMillion, Model, ProviderError, ProviderRegistry, RequestOptionsResolver,
     ResolvedRequestOptions, ThinkingLevel, mock::MockProvider,
 };
+use anie_session::{SessionContext, SessionManager};
 use anie_tools::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
 
 /// A minimal mock model for integration tests.
@@ -96,11 +97,32 @@ pub async fn run_agent_collecting_events(
 }
 
 /// Create a fresh session backed by a temp directory.
-pub fn create_temp_session() -> (tempfile::TempDir, anie_session::SessionManager) {
+pub fn create_temp_session() -> (tempfile::TempDir, SessionManager) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cwd = dir.path().to_path_buf();
-    let session = anie_session::SessionManager::new_session(dir.path(), &cwd).expect("new session");
+    let session = SessionManager::new_session(dir.path(), &cwd).expect("new session");
     (dir, session)
+}
+
+/// Persist a prompt and agent result into a new session, then reopen and
+/// return the deserialized context. This is the standard
+/// "persist → close → reopen → build_context" roundtrip used by many tests.
+pub fn persist_and_reopen(cwd: &Path, prompt: &Message, result: &AgentRunResult) -> SessionContext {
+    let sessions_dir = cwd.join("sessions");
+    let mut session = SessionManager::new_session(&sessions_dir, cwd).expect("new session");
+    session.append_message(prompt).expect("persist prompt");
+    session
+        .append_messages(&result.generated_messages)
+        .expect("persist result");
+
+    let session_path = std::fs::read_dir(&sessions_dir)
+        .expect("read sessions dir")
+        .filter_map(Result::ok)
+        .next()
+        .expect("session file")
+        .path();
+    let reopened = SessionManager::open_session(&session_path).expect("reopen");
+    reopened.build_context()
 }
 
 /// Create a tool registry with all four real tools rooted at the given directory.
@@ -122,6 +144,14 @@ pub fn user_prompt(text: &str) -> Message {
     })
 }
 
+/// Create a user prompt with a specific timestamp.
+pub fn user_prompt_at(text: &str, timestamp: u64) -> Message {
+    Message::User(UserMessage {
+        content: vec![ContentBlock::Text { text: text.into() }],
+        timestamp,
+    })
+}
+
 /// Create a final assistant message with text-only content.
 pub fn final_assistant(text: &str) -> AssistantMessage {
     AssistantMessage {
@@ -132,6 +162,19 @@ pub fn final_assistant(text: &str) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+    }
+}
+
+/// Create a final assistant message with a specific timestamp.
+pub fn final_assistant_at(text: &str, timestamp: u64) -> AssistantMessage {
+    AssistantMessage {
+        content: vec![ContentBlock::Text { text: text.into() }],
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        provider: "mock".into(),
+        model: "mock-model".into(),
+        timestamp,
     }
 }
 
@@ -156,29 +199,4 @@ pub fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
         name: name.into(),
         arguments: args,
     }
-}
-
-/// Extract event type names for sequence assertions.
-pub fn event_kinds(events: &[AgentEvent]) -> Vec<&'static str> {
-    events
-        .iter()
-        .map(|event| match event {
-            AgentEvent::AgentStart => "AgentStart",
-            AgentEvent::AgentEnd { .. } => "AgentEnd",
-            AgentEvent::TurnStart => "TurnStart",
-            AgentEvent::TurnEnd { .. } => "TurnEnd",
-            AgentEvent::MessageStart { .. } => "MessageStart",
-            AgentEvent::MessageDelta { .. } => "MessageDelta",
-            AgentEvent::MessageEnd { .. } => "MessageEnd",
-            AgentEvent::ToolExecStart { .. } => "ToolExecStart",
-            AgentEvent::ToolExecUpdate { .. } => "ToolExecUpdate",
-            AgentEvent::ToolExecEnd { .. } => "ToolExecEnd",
-            AgentEvent::TranscriptReplace { .. } => "TranscriptReplace",
-            AgentEvent::SystemMessage { .. } => "SystemMessage",
-            AgentEvent::StatusUpdate { .. } => "StatusUpdate",
-            AgentEvent::CompactionStart => "CompactionStart",
-            AgentEvent::CompactionEnd { .. } => "CompactionEnd",
-            AgentEvent::RetryScheduled { .. } => "RetryScheduled",
-        })
-        .collect()
 }

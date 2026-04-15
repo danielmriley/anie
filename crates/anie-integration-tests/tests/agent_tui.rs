@@ -9,6 +9,8 @@ use anie_provider::{ProviderError, ProviderEvent, mock::MockStreamScript};
 use anie_tui::App;
 
 fn replay_events_and_render(events: &[AgentEvent], width: u16, height: u16) -> String {
+    // App::new requires channel endpoints for construction; we feed events
+    // directly via handle_agent_event so neither channel is actually used.
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
     let mut app = App::new(event_rx, action_tx);
