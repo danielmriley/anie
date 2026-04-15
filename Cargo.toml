@@ -12,6 +12,7 @@ members = [
     "crates/anie-tui",
     "crates/anie-cli",
     "crates/anie-extensions",
+    "crates/anie-integration-tests",
 ]
 default-members = ["crates/anie-cli"]
 

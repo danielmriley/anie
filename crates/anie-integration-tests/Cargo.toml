@@ -1,0 +1,24 @@
+[package]
+name = "anie-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anie-agent.workspace = true
+anie-auth.workspace = true
+anie-config.workspace = true
+anie-protocol.workspace = true
+anie-provider = { workspace = true, features = ["mock"] }
+anie-providers-builtin.workspace = true
+anie-session.workspace = true
+anie-tools.workspace = true
+anie-tui.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

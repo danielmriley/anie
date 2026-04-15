@@ -119,6 +119,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "anie-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "anie-agent",
+ "anie-auth",
+ "anie-config",
+ "anie-protocol",
+ "anie-provider",
+ "anie-providers-builtin",
+ "anie-session",
+ "anie-tools",
+ "anie-tui",
+ "anyhow",
+ "async-trait",
+ "ratatui",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "anie-protocol"
 version = "0.1.0"
 dependencies = [
