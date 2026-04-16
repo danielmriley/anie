@@ -7,7 +7,8 @@ mod runtime_state;
 use std::{path::PathBuf, sync::OnceLock};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -17,8 +18,16 @@ static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 /// Main CLI arguments.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "anie", version, about = "A coding agent harness")]
+#[command(
+    name = "anie",
+    version,
+    about = "A coding agent harness",
+    subcommand_precedence_over_arg = true
+)]
 pub struct Cli {
+    /// Optional command entry point.
+    #[command(subcommand)]
+    pub command: Option<Command>,
     /// Run in interactive TUI mode.
     #[arg(short, long)]
     pub interactive: bool,
@@ -54,6 +63,13 @@ pub struct Cli {
     pub cwd: Option<PathBuf>,
 }
 
+/// Supported top-level subcommands.
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum Command {
+    /// Launch the interactive onboarding flow.
+    Onboard,
+}
+
 /// Run the CLI entry point.
 pub async fn run(cli: Cli) -> Result<()> {
     init_tracing();
@@ -61,6 +77,19 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(cwd) = &cli.cwd {
         std::env::set_current_dir(cwd)
             .with_context(|| format!("failed to change directory to {}", cwd.display()))?;
+    }
+
+    if matches!(cli.command, Some(Command::Onboard)) {
+        return onboarding::run_onboarding().await;
+    }
+
+    let credential_store = anie_auth::CredentialStore::new();
+    if credential_store.should_migrate() {
+        match credential_store.migrate_from_json() {
+            Ok(0) => {}
+            Ok(count) => info!(count, "migrated credentials into native keyring"),
+            Err(error) => warn!(%error, "credential migration skipped"),
+        }
     }
 
     if onboarding::check_first_run() && !cli.rpc {
@@ -99,4 +128,32 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_onboard_subcommand() {
+        let cli = Cli::parse_from(["anie", "onboard"]);
+        assert_eq!(cli.command, Some(Command::Onboard));
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn positional_prompt_still_parses_without_subcommand() {
+        let cli = Cli::parse_from(["anie", "hello world"]);
+        assert_eq!(cli.command, None);
+        assert_eq!(cli.prompt, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn prompt_and_model_flags_still_parse() {
+        let cli = Cli::parse_from(["anie", "--model", "gpt-4o", "hello"]);
+        assert_eq!(cli.command, None);
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(cli.prompt, vec!["hello".to_string()]);
+    }
 }

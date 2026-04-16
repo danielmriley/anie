@@ -2,12 +2,21 @@
 
 mod app;
 mod input;
+mod onboarding;
 mod output;
+mod providers;
 mod terminal;
 
 pub use app::{AgentUiState, App, Spinner, StatusBarState, ToolCallResult, UiAction, run_tui};
 pub use input::InputPane;
+pub use onboarding::{
+    ConfiguredProvider, ConfiguredProviderKind, OnboardingAction, OnboardingCompletion,
+    OnboardingScreen, write_configured_providers,
+};
 pub use output::{OutputPane, RenderedBlock};
+pub use providers::{
+    ProviderEntry, ProviderManagementAction, ProviderManagementScreen, ProviderType, TestResult,
+};
 pub use terminal::{install_panic_hook, restore_terminal, setup_terminal};
 
 #[cfg(test)]

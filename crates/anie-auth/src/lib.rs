@@ -1,5 +1,7 @@
 //! API-key storage and async request-option resolution.
 
+mod store;
+
 use std::{
     collections::HashMap,
     fs,
@@ -14,6 +16,8 @@ use tracing::warn;
 use anie_config::AnieConfig;
 use anie_protocol::Message;
 use anie_provider::{Model, ProviderError, RequestOptionsResolver, ResolvedRequestOptions};
+
+pub use store::CredentialStore;
 
 /// Credential storage keyed by provider name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -32,30 +36,41 @@ pub enum AuthCredential {
     ApiKey { key: String },
 }
 
-/// Resolve per-request auth from CLI, auth.json, and environment variables.
+/// Resolve per-request auth from CLI, persisted credentials, and environment variables.
 pub struct AuthResolver {
     /// Optional CLI API key override.
     pub cli_api_key: Option<String>,
     /// Loaded application configuration.
     pub config: AnieConfig,
-    auth_path: Option<PathBuf>,
+    credential_store: CredentialStore,
 }
 
 impl AuthResolver {
-    /// Create a resolver using the default auth file path.
+    /// Create a resolver using the default credential store.
     #[must_use]
     pub fn new(cli_api_key: Option<String>, config: AnieConfig) -> Self {
+        Self::with_credential_store(cli_api_key, config, CredentialStore::new())
+    }
+
+    /// Create a resolver with an explicit credential store, primarily for tests.
+    #[must_use]
+    pub fn with_credential_store(
+        cli_api_key: Option<String>,
+        config: AnieConfig,
+        credential_store: CredentialStore,
+    ) -> Self {
         Self {
             cli_api_key,
             config,
-            auth_path: auth_file_path(),
+            credential_store,
         }
     }
 
-    /// Override the auth file path, primarily for tests.
+    /// Override the auth file path, primarily for legacy tests.
     #[must_use]
+    #[deprecated(note = "use AuthResolver::with_credential_store instead")]
     pub fn with_auth_path(mut self, auth_path: Option<PathBuf>) -> Self {
-        self.auth_path = auth_path;
+        self.credential_store = CredentialStore::with_config("anie", auth_path);
         self
     }
 }
@@ -75,24 +90,16 @@ impl RequestOptionsResolver for AuthResolver {
             });
         }
 
-        let api_key = self
-            .auth_path
-            .as_deref()
-            .and_then(|path| load_auth_store_from(path).ok())
-            .and_then(|store| match store.providers.get(&model.provider) {
-                Some(AuthCredential::ApiKey { key }) => Some(key.clone()),
-                None => None,
-            })
-            .or_else(|| {
-                let configured_env = self
-                    .config
-                    .providers
-                    .get(&model.provider)
-                    .and_then(|provider| provider.api_key_env.as_deref())
-                    .map(str::to_owned)
-                    .or_else(|| builtin_api_key_env(&model.provider).map(str::to_owned))?;
-                std::env::var(&configured_env).ok()
-            });
+        let api_key = self.credential_store.get(&model.provider).or_else(|| {
+            let configured_env = self
+                .config
+                .providers
+                .get(&model.provider)
+                .and_then(|provider| provider.api_key_env.as_deref())
+                .map(str::to_owned)
+                .or_else(|| builtin_api_key_env(&model.provider).map(str::to_owned))?;
+            std::env::var(&configured_env).ok()
+        });
 
         Ok(ResolvedRequestOptions {
             api_key,
@@ -102,20 +109,11 @@ impl RequestOptionsResolver for AuthResolver {
     }
 }
 
-/// Return the default auth.json path.
-#[must_use]
-pub fn auth_file_path() -> Option<PathBuf> {
+pub(crate) fn default_auth_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".anie/auth.json"))
 }
 
-/// Load credentials from the default auth file.
-pub fn load_auth_store() -> Result<AuthStore> {
-    let path = auth_file_path().context("home directory is not available")?;
-    load_auth_store_from(&path)
-}
-
-/// Load credentials from an explicit auth file path.
-pub fn load_auth_store_from(path: &Path) -> Result<AuthStore> {
+pub(crate) fn load_auth_store_at(path: &Path) -> Result<AuthStore> {
     if !path.exists() {
         return Ok(AuthStore::default());
     }
@@ -142,15 +140,8 @@ pub fn load_auth_store_from(path: &Path) -> Result<AuthStore> {
         .with_context(|| format!("failed to parse auth file {}", path.display()))
 }
 
-/// Save an API key to the default auth file.
-pub fn save_api_key(provider: &str, key: &str) -> Result<()> {
-    let path = auth_file_path().context("home directory is not available")?;
-    save_api_key_to(&path, provider, key)
-}
-
-/// Save an API key to an explicit auth file path.
-pub fn save_api_key_to(path: &Path, provider: &str, key: &str) -> Result<()> {
-    let mut store = load_auth_store_from(path).unwrap_or_default();
+pub(crate) fn save_api_key_at(path: &Path, provider: &str, key: &str) -> Result<()> {
+    let mut store = load_auth_store_at(path).unwrap_or_default();
     store.providers.insert(
         provider.to_string(),
         AuthCredential::ApiKey {
@@ -176,6 +167,39 @@ pub fn save_api_key_to(path: &Path, provider: &str, key: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Return the default auth.json path.
+#[must_use]
+#[deprecated(note = "use CredentialStore::new instead")]
+pub fn auth_file_path() -> Option<PathBuf> {
+    default_auth_file_path()
+}
+
+/// Load credentials from the default auth file.
+#[deprecated(note = "use CredentialStore::get instead")]
+pub fn load_auth_store() -> Result<AuthStore> {
+    let path = default_auth_file_path().context("home directory is not available")?;
+    load_auth_store_at(&path)
+}
+
+/// Load credentials from an explicit auth file path.
+#[deprecated(note = "use CredentialStore::with_config(...).get instead")]
+pub fn load_auth_store_from(path: &Path) -> Result<AuthStore> {
+    load_auth_store_at(path)
+}
+
+/// Save an API key to the default auth file.
+#[deprecated(note = "use CredentialStore::set instead")]
+pub fn save_api_key(provider: &str, key: &str) -> Result<()> {
+    let path = default_auth_file_path().context("home directory is not available")?;
+    save_api_key_at(&path, provider, key)
+}
+
+/// Save an API key to an explicit auth file path.
+#[deprecated(note = "use CredentialStore::with_config(...).set instead")]
+pub fn save_api_key_to(path: &Path, provider: &str, key: &str) -> Result<()> {
+    save_api_key_at(path, provider, key)
 }
 
 fn builtin_api_key_env(provider: &str) -> Option<&'static str> {
@@ -214,8 +238,8 @@ mod tests {
     fn saves_and_loads_api_keys() {
         let tempdir = tempdir().expect("tempdir");
         let auth_path = tempdir.path().join("auth.json");
-        save_api_key_to(&auth_path, "openai", "sk-test").expect("save api key");
-        let store = load_auth_store_from(&auth_path).expect("load auth store");
+        save_api_key_at(&auth_path, "openai", "sk-test").expect("save api key");
+        let store = load_auth_store_at(&auth_path).expect("load auth store");
         assert_eq!(
             store.providers.get("openai"),
             Some(&AuthCredential::ApiKey {
@@ -225,10 +249,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_prioritizes_cli_then_auth_file_then_env() {
+    async fn resolver_prioritizes_cli_then_credential_store_then_env() {
         let tempdir = tempdir().expect("tempdir");
         let auth_path = tempdir.path().join("auth.json");
-        save_api_key_to(&auth_path, "openai", "auth-key").expect("save auth key");
+        let credential_store = CredentialStore::with_config("anie-test", Some(auth_path.clone()))
+            .without_native_keyring();
+        credential_store
+            .set("openai", "auth-key")
+            .expect("save auth key");
         // SAFETY: this test uses a process-unique temporary variable name and cleans it up before exit.
         unsafe {
             std::env::set_var("ANIE_TEST_OPENAI_KEY", "env-key");
@@ -243,12 +271,19 @@ mod tests {
             },
         );
 
-        let cli_resolver = AuthResolver::new(Some("cli-key".into()), config.clone())
-            .with_auth_path(Some(auth_path.clone()));
+        let cli_resolver = AuthResolver::with_credential_store(
+            Some("cli-key".into()),
+            config.clone(),
+            credential_store.clone(),
+        );
         let auth_resolver =
-            AuthResolver::new(None, config.clone()).with_auth_path(Some(auth_path.clone()));
-        let env_resolver = AuthResolver::new(None, config)
-            .with_auth_path(Some(tempdir.path().join("missing.json")));
+            AuthResolver::with_credential_store(None, config.clone(), credential_store);
+        let env_resolver = AuthResolver::with_credential_store(
+            None,
+            config,
+            CredentialStore::with_config("anie-test", Some(tempdir.path().join("missing.json")))
+                .without_native_keyring(),
+        );
 
         let cli = cli_resolver
             .resolve(&sample_model("openai"), &[])
@@ -275,7 +310,11 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_allows_local_models_without_api_keys() {
-        let resolver = AuthResolver::new(None, AnieConfig::default()).with_auth_path(None);
+        let resolver = AuthResolver::with_credential_store(
+            None,
+            AnieConfig::default(),
+            CredentialStore::with_config("anie-test", None).without_native_keyring(),
+        );
         let resolved = resolver
             .resolve(&sample_model("ollama"), &[])
             .await
@@ -290,7 +329,7 @@ mod tests {
 
         let tempdir = tempdir().expect("tempdir");
         let auth_path = tempdir.path().join("auth.json");
-        save_api_key_to(&auth_path, "openai", "sk-test").expect("save api key");
+        save_api_key_at(&auth_path, "openai", "sk-test").expect("save api key");
         let mode = fs::metadata(&auth_path)
             .expect("metadata")
             .permissions()

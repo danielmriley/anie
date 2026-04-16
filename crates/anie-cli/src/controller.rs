@@ -562,6 +562,18 @@ impl InteractiveController {
                 self.send_system_message("Use /model <id> to switch models.")
                     .await;
             }
+            UiAction::ReloadConfig { provider, model } => {
+                if self.current_run.is_some() {
+                    self.send_system_message("Cannot reload config while a run is active.")
+                        .await;
+                } else {
+                    self.state
+                        .reload_config(provider.as_deref(), model.as_deref())
+                        .await?;
+                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    self.send_system_message("Configuration reloaded.").await;
+                }
+            }
             UiAction::ClearOutput => {}
         }
         Ok(())
@@ -643,6 +655,7 @@ impl InteractiveController {
 
 struct ControllerState {
     config: AnieConfig,
+    cli_api_key: Option<String>,
     current_cwd: PathBuf,
     session_dir: PathBuf,
     session: SessionManager,
@@ -1014,6 +1027,43 @@ impl ControllerState {
             warn!(%error, "failed to persist runtime state");
         }
     }
+
+    async fn reload_config(
+        &mut self,
+        requested_provider: Option<&str>,
+        requested_model: Option<&str>,
+    ) -> Result<()> {
+        let config = load_config(CliOverrides::default())?;
+        let (model_catalog, local_models_available) = build_model_catalog(&config).await;
+        let current_provider = requested_provider.unwrap_or(&self.current_model.provider);
+        let current_model = requested_model.unwrap_or(&self.current_model.id);
+        let selected_model = resolve_model(
+            Some(current_provider),
+            Some(current_model),
+            &model_catalog,
+            local_models_available,
+        )
+        .or_else(|_| {
+            resolve_model(
+                Some(&config.model.provider),
+                Some(&config.model.id),
+                &model_catalog,
+                local_models_available,
+            )
+        })?;
+
+        self.config = config;
+        self.model_catalog = model_catalog;
+        self.current_model = selected_model;
+        self.request_options_resolver = Arc::new(AuthResolver::new(
+            self.cli_api_key.clone(),
+            self.config.clone(),
+        ));
+        self.system_prompt =
+            build_system_prompt(&self.current_cwd, &self.tool_registry, &self.config)?;
+        self.persist_runtime_state();
+        Ok(())
+    }
 }
 
 async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
@@ -1025,15 +1075,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
     register_builtin_providers(&mut provider_registry);
     let provider_registry = Arc::new(provider_registry);
 
-    let local_servers = detect_local_servers().await;
-    let local_models = local_servers
-        .iter()
-        .flat_map(|server| server.models.clone())
-        .collect::<Vec<_>>();
-    let mut model_catalog = builtin_models();
-    model_catalog.extend(configured_models(&config));
-    model_catalog.extend(local_models);
-    dedupe_models(&mut model_catalog);
+    let (model_catalog, local_models_available) = build_model_catalog(&config).await;
 
     let sessions_dir = dirs::home_dir()
         .context("home directory is not available")?
@@ -1056,7 +1098,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
         &runtime_state,
         &session_context,
         &model_catalog,
-        !local_servers.is_empty(),
+        local_models_available,
     )?;
 
     let tool_registry = build_tool_registry(&cwd, cli.no_tools);
@@ -1066,6 +1108,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
 
     let mut state = ControllerState {
         config,
+        cli_api_key: cli.api_key.clone(),
         current_cwd: cwd,
         session_dir: sessions_dir,
         session,
@@ -1084,6 +1127,19 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
     runtime_state = state.runtime_state.clone();
     let _ = runtime_state;
     Ok(state)
+}
+
+async fn build_model_catalog(config: &AnieConfig) -> (Vec<Model>, bool) {
+    let local_servers = detect_local_servers().await;
+    let local_models = local_servers
+        .iter()
+        .flat_map(|server| server.models.clone())
+        .collect::<Vec<_>>();
+    let mut model_catalog = builtin_models();
+    model_catalog.extend(configured_models(config));
+    model_catalog.extend(local_models);
+    dedupe_models(&mut model_catalog);
+    (model_catalog, !local_servers.is_empty())
 }
 
 struct InitialSelection {
@@ -1726,6 +1782,7 @@ mod tests {
     #[test]
     fn resolve_initial_selection_prefers_provider_only_override() {
         let cli = Cli {
+            command: None,
             interactive: false,
             print: true,
             rpc: false,

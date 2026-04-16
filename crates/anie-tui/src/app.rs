@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
@@ -18,11 +18,17 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
+use anie_auth::CredentialStore;
+use anie_config::global_config_path;
 use anie_protocol::{
     AgentEvent, ContentBlock, Message, StreamDelta, ToolResult, ToolResultMessage,
 };
 
-use crate::{InputPane, OutputPane, input::InputAction, output::RenderedBlock};
+use crate::{
+    InputPane, OnboardingAction, OnboardingCompletion, OnboardingScreen, OutputPane,
+    ProviderManagementAction, ProviderManagementScreen, input::InputAction,
+    onboarding::write_configured_providers, output::RenderedBlock,
+};
 
 /// Rendered tool result details re-exported for consumers.
 pub use crate::output::ToolCallResult;
@@ -38,6 +44,12 @@ pub struct App {
     should_quit: bool,
     spinner: Spinner,
     last_ctrl_c: Option<Instant>,
+    overlay: Option<OverlayState>,
+}
+
+enum OverlayState {
+    Onboarding(OnboardingScreen),
+    Providers(ProviderManagementScreen),
 }
 
 /// The current UI-level agent state.
@@ -82,6 +94,11 @@ pub enum UiAction {
     ForkSession,
     /// Show a summary of file changes made in this session.
     ShowDiff,
+    /// Reload config after a local onboarding/provider-management change.
+    ReloadConfig {
+        provider: Option<String>,
+        model: Option<String>,
+    },
 }
 
 /// Status-bar display state.
@@ -167,6 +184,7 @@ impl App {
             should_quit: false,
             spinner: Spinner::new(),
             last_ctrl_c: None,
+            overlay: None,
         }
     }
 
@@ -199,10 +217,26 @@ impl App {
         );
         let cursor = self.input_pane.render(input_area, frame.buffer_mut());
         frame.set_cursor_position(cursor);
+
+        if let Some(overlay) = &mut self.overlay {
+            match overlay {
+                OverlayState::Onboarding(screen) => screen.render(frame, frame.area()),
+                OverlayState::Providers(screen) => screen.render(frame, frame.area()),
+            }
+        }
     }
 
     /// Handle an incoming terminal event.
     pub fn handle_terminal_event(&mut self, event: Event) -> Result<()> {
+        if self.overlay.is_some() {
+            match event {
+                Event::Key(key) => self.handle_overlay_key_event(key)?,
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match event {
             Event::Key(key) => self.handle_key_event(key),
             Event::Mouse(mouse) => self.handle_mouse_event(mouse),
@@ -342,6 +376,23 @@ impl App {
                 self.last_ctrl_c = None;
             }
             AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Poll overlay state that depends on background workers.
+    pub fn handle_tick(&mut self) -> Result<()> {
+        if let Some(overlay) = &mut self.overlay {
+            match overlay {
+                OverlayState::Onboarding(screen) => {
+                    let action = screen.handle_tick();
+                    self.apply_onboarding_action(action)?;
+                }
+                OverlayState::Providers(screen) => {
+                    let action = screen.handle_tick();
+                    self.apply_provider_management_action(action);
+                }
+            }
         }
         Ok(())
     }
@@ -503,6 +554,8 @@ impl App {
             "/tools" => {
                 let _ = self.action_tx.try_send(UiAction::ShowTools);
             }
+            "/onboard" => self.open_onboarding_overlay(),
+            "/providers" => self.open_provider_management_overlay(),
             "/help" => self.show_help(),
             "/quit" | "/exit" => {
                 self.should_quit = true;
@@ -516,9 +569,120 @@ impl App {
 
     fn show_help(&mut self) {
         self.output_pane.add_system_message(
-            "Available commands:\n  /model [id]       — Show or switch the active model\n  /thinking [level] — Show or change thinking (off, low, medium, high)\n  /compact          — Force context compaction\n  /fork             — Fork into a new child session\n  /diff             — Show file changes made in this session\n  /clear            — Clear the output pane\n  /session list     — List known sessions\n  /session <id>     — Switch to another session\n  /tools            — Show registered tools\n  /help             — Show this help\n  /quit             — Exit anie"
+            "Available commands:\n  /model [id]       — Show or switch the active model\n  /thinking [level] — Show or change thinking (off, low, medium, high)\n  /compact          — Force context compaction\n  /fork             — Fork into a new child session\n  /diff             — Show file changes made in this session\n  /clear            — Clear the output pane\n  /session list     — List known sessions\n  /session <id>     — Switch to another session\n  /tools            — Show registered tools\n  /onboard          — Launch the onboarding flow\n  /providers        — Manage configured providers\n  /help             — Show this help\n  /quit             — Exit anie"
                 .to_string(),
         );
+    }
+
+    fn open_onboarding_overlay(&mut self) {
+        self.overlay = Some(OverlayState::Onboarding(OnboardingScreen::new(
+            CredentialStore::new(),
+        )));
+    }
+
+    fn open_provider_management_overlay(&mut self) {
+        match ProviderManagementScreen::new() {
+            Ok(screen) => {
+                self.overlay = Some(OverlayState::Providers(screen));
+            }
+            Err(error) => self
+                .output_pane
+                .add_system_message(format!("Could not open provider management: {error}")),
+        }
+    }
+
+    fn handle_overlay_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        match &mut self.overlay {
+            Some(OverlayState::Onboarding(screen)) => {
+                let action = screen.handle_key(key);
+                self.apply_onboarding_action(action)
+            }
+            Some(OverlayState::Providers(screen)) => {
+                let action = screen.handle_key(key);
+                self.apply_provider_management_action(action);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn apply_onboarding_action(&mut self, action: OnboardingAction) -> Result<()> {
+        match action {
+            OnboardingAction::Continue => {}
+            OnboardingAction::Cancelled => {
+                self.overlay = None;
+                self.output_pane
+                    .add_system_message("Onboarding cancelled.".to_string());
+            }
+            OnboardingAction::Complete(OnboardingCompletion {
+                providers,
+                reload_target,
+            }) => {
+                self.overlay = None;
+                if providers.is_empty() {
+                    match reload_target {
+                        Some((provider, model)) => {
+                            self.output_pane.add_system_message(
+                                "Onboarding applied provider-management changes.".to_string(),
+                            );
+                            let _ = self
+                                .action_tx
+                                .try_send(UiAction::ReloadConfig { provider, model });
+                        }
+                        None => {
+                            self.output_pane.add_system_message(
+                                "Onboarding finished with no configuration changes.".to_string(),
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+
+                let config_path =
+                    global_config_path().context("home directory is not available")?;
+                match write_configured_providers(&config_path, &providers) {
+                    Ok(Some((provider, model))) => {
+                        self.output_pane.add_system_message(format!(
+                            "Onboarding saved configuration for {provider}:{model}."
+                        ));
+                        let _ = self.action_tx.try_send(UiAction::ReloadConfig {
+                            provider: Some(provider),
+                            model: Some(model),
+                        });
+                    }
+                    Ok(None) => {
+                        self.output_pane.add_system_message(
+                            "Onboarding finished with no configuration changes.".to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        self.output_pane.add_system_message(format!(
+                            "Onboarding could not save configuration: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_provider_management_action(&mut self, action: ProviderManagementAction) {
+        match action {
+            ProviderManagementAction::Continue => {}
+            ProviderManagementAction::Close => {
+                self.overlay = None;
+            }
+            ProviderManagementAction::ConfigChanged {
+                provider,
+                model,
+                message,
+            } => {
+                self.output_pane.add_system_message(message);
+                let _ = self
+                    .action_tx
+                    .try_send(UiAction::ReloadConfig { provider, model });
+            }
+        }
     }
 
     fn load_message(&mut self, message: &Message) {
@@ -571,7 +735,9 @@ pub async fn run_tui(
             Some(event) = app.event_rx.recv() => {
                 app.handle_agent_event(event)?;
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                app.handle_tick()?;
+            }
         }
 
         if app.should_quit() {

@@ -861,7 +861,78 @@ fn slash_commands_route_actions_and_render_help() {
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
-    assert!(screen.contains("Force context compaction") || screen.contains("/quit"));
+    assert!(screen.contains("/onboard"), "screen was:\n{screen}");
+    assert!(screen.contains("/providers"), "screen was:\n{screen}");
+}
+
+#[test]
+fn onboarding_slash_command_opens_overlay_locally() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx);
+
+    for ch in "/onboard".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type onboard command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit onboard command");
+
+    assert!(
+        action_rx.try_recv().is_err(),
+        "overlay should not emit a controller action on open"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+    assert!(
+        screen.contains("Welcome to Anie — First Run"),
+        "screen was:\n{screen}"
+    );
+}
+
+#[test]
+fn providers_slash_command_opens_provider_management_overlay() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx);
+
+    for ch in "/providers".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type providers command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit providers command");
+
+    assert!(
+        action_rx.try_recv().is_err(),
+        "overlay should not emit a controller action on open"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+    assert!(
+        screen.contains("Configured Providers"),
+        "screen was:\n{screen}"
+    );
 }
 
 #[test]

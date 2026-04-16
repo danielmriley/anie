@@ -13,8 +13,8 @@ The workspace is split into focused crates for protocol types, provider abstract
 - **Automatic context compaction** when token budgets get tight
 - **Provider support** for Anthropic, OpenAI-compatible backends, and local servers such as Ollama and LM Studio
 - **Layered configuration** via `~/.anie/config.toml`, project `.anie/config.toml`, and CLI overrides
-- **Credential resolution** from CLI args, `~/.anie/auth.json`, configured env vars, or built-in provider env vars
-- **First-run onboarding** with local-server detection and guided config setup
+- **Credential resolution** from CLI args, the OS keyring, JSON fallback files, configured env vars, or built-in provider env vars
+- **First-run onboarding** with a full-screen TUI, local-server detection, provider presets, and provider management overlays
 - **CI coverage** for build/test and secret scanning
 
 ## Status and safety
@@ -59,11 +59,14 @@ or, if installed:
 anie
 ```
 
-On first run, when `~/.anie/config.toml` and `~/.anie/auth.json` do not exist, `anie` will try to:
+On first run, `anie` launches a full-screen onboarding UI when no provider config or saved credentials are available.
 
-- detect a local model server
-- detect common provider API key environment variables
-- otherwise walk you through initial setup
+The onboarding flow can:
+
+- detect a local model server such as Ollama or LM Studio
+- let you add an API-key-backed provider from a preset list
+- let you add a custom OpenAI-compatible endpoint
+- reopen later with `anie onboard` or `/onboard`
 
 ### Run a one-shot prompt
 
@@ -90,6 +93,13 @@ cargo run -p anie-cli -- --rpc
 ```
 
 ### Helpful CLI options
+
+You can rerun the onboarding flow anytime with:
+
+```bash
+anie onboard
+```
+
 
 - `--resume <session-id>` — reopen a previous session
 - `-C, --cwd <dir>` — run against a different working directory
@@ -138,11 +148,12 @@ Discovery walks upward from the current working directory and is controlled by t
 
 ## Authentication
 
-Credentials can come from:
+Credentials resolve in this order:
 
 1. `--api-key`
-2. `~/.anie/auth.json`
-3. provider-specific environment variables
+2. OS-native keyring storage via `CredentialStore`
+3. JSON compatibility files (`~/.anie/auth.json`, then `~/.anie/auth.json.migrated`)
+4. provider-specific environment variables
 
 Custom providers can set `api_key_env` in config. Unauthenticated local servers can omit auth entirely.
 
@@ -151,11 +162,13 @@ Common built-in env var names include:
 - `ANTHROPIC_API_KEY`
 - `OPENAI_API_KEY`
 
-Saved credentials live in:
+Saved credentials are written to your operating system's credential store when native keyring support is available:
 
-- `~/.anie/auth.json`
+- macOS: Keychain
+- Windows: Credential Manager
+- Linux: kernel keyring backend in the current build
 
-On Unix, `anie` writes that file with `0600` permissions.
+The current implementation also mirrors credentials into `~/.anie/auth.json` as a compatibility store so provider enumeration, headless fallback, and older flows continue to work. Legacy plaintext credentials are migrated to the keyring on startup and preserved as `~/.anie/auth.json.migrated`.
 
 ## Usage modes
 
@@ -173,6 +186,8 @@ Useful TUI slash commands include:
 - `/session list`
 - `/session <id>`
 - `/tools`
+- `/onboard`
+- `/providers`
 - `/clear`
 - `/help`
 - `/quit`
@@ -204,7 +219,8 @@ The core toolset is intentionally small and focused:
 Common files and directories include:
 
 - `~/.anie/config.toml` — global config
-- `~/.anie/auth.json` — saved API keys
+- `~/.anie/auth.json` — JSON credential fallback when native keyring storage is unavailable
+- `~/.anie/auth.json.migrated` — preserved backup after legacy credential migration
 - `~/.anie/state.json` — last-used non-secret runtime state
 - `~/.anie/sessions/*.jsonl` — append-only session transcripts
 - `~/.anie/logs/anie.log` — tracing output
@@ -231,6 +247,8 @@ For more detail, see:
 
 - `docs/arch/anie-rs_architecture.md`
 - `docs/arch/anie-rs_build_doc.md`
+- `docs/arch/credential_resolution.md`
+- `docs/arch/onboarding_flow.md`
 - `docs/completed/phased_plan_v1-0-1/README.md`
 
 ## Development

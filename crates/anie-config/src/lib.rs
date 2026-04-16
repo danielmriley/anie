@@ -9,10 +9,14 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod mutation;
+
 use anie_provider::{
     ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
     ReasoningOutputMode, ReasoningTags, ThinkingLevel,
 };
+
+pub use mutation::ConfigMutator;
 
 /// Fully-resolved application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

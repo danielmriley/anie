@@ -1,0 +1,1771 @@
+use std::{path::Path, time::Duration};
+
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
+};
+use tokio::sync::mpsc;
+
+use anie_auth::CredentialStore;
+use anie_config::{ConfigMutator, global_config_path};
+use anie_provider::{ApiKind, CostPerMillion, Model};
+use anie_providers_builtin::{LocalServer, builtin_models, detect_local_servers};
+
+use crate::{ProviderManagementAction, ProviderManagementScreen, Spinner};
+
+/// A provider configured during onboarding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfiguredProvider {
+    /// The model selected as the default for this provider.
+    pub model: Model,
+    /// How this provider should be persisted into config.
+    pub kind: ConfiguredProviderKind,
+    /// Whether this provider should become the active default selection.
+    pub is_default: bool,
+}
+
+/// How a configured provider should be written into config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfiguredProviderKind {
+    /// Built-in hosted provider; do not write custom model metadata.
+    BuiltinHosted,
+    /// Config-backed provider; persist base URL, API kind, and model metadata.
+    ConfigBacked,
+}
+
+/// Data returned when onboarding finishes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnboardingCompletion {
+    /// Providers that still need to be written into config by the caller.
+    pub providers: Vec<ConfiguredProvider>,
+    /// A config reload target for changes that were already persisted during onboarding.
+    pub reload_target: Option<(Option<String>, Option<String>)>,
+}
+
+/// Actions emitted by the onboarding screen.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnboardingAction {
+    /// Keep running the onboarding screen.
+    Continue,
+    /// Onboarding completed successfully.
+    Complete(OnboardingCompletion),
+    /// User cancelled onboarding.
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+enum OnboardingState {
+    MainMenu {
+        selected: usize,
+    },
+    ManagingProviders,
+    LocalServerWaiting,
+    LocalServerSelect {
+        selected: usize,
+    },
+    NoLocalServers,
+    ProviderPresetList {
+        selected: usize,
+    },
+    ApiKeyInput {
+        preset_index: usize,
+        input: TextField,
+    },
+    CustomEndpoint {
+        form: CustomEndpointForm,
+    },
+    Busy {
+        title: String,
+        message: String,
+        return_to: Box<OnboardingState>,
+    },
+    Success {
+        message: String,
+    },
+    Error {
+        message: String,
+        return_to: Box<OnboardingState>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum LocalDetectionState {
+    Pending,
+    Ready(Vec<LocalServer>),
+}
+
+#[derive(Debug)]
+enum WorkerEvent {
+    LocalServersDetected(Vec<LocalServer>),
+    Progress(String),
+    ProviderConfigured(Result<ConfiguredProvider, String>),
+}
+
+#[derive(Debug, Clone)]
+struct ProviderPreset {
+    display_name: &'static str,
+    provider_name: &'static str,
+    kind: ConfiguredProviderKind,
+    model: Model,
+}
+
+#[derive(Debug, Clone)]
+struct CustomEndpointForm {
+    base_url: TextField,
+    provider_name: TextField,
+    model_id: TextField,
+    api_key: TextField,
+    selected_field: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TextField {
+    value: String,
+    cursor: usize,
+    masked: bool,
+}
+
+/// Full-screen onboarding widget.
+pub struct OnboardingScreen {
+    state: OnboardingState,
+    credential_store: CredentialStore,
+    configured_providers: Vec<ConfiguredProvider>,
+    local_detection: LocalDetectionState,
+    worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+    worker_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+    spinner: Spinner,
+    provider_management: Option<ProviderManagementScreen>,
+    persisted_reload_target: Option<(Option<String>, Option<String>)>,
+}
+
+impl OnboardingScreen {
+    /// Create a new onboarding screen.
+    #[must_use]
+    pub fn new(credential_store: CredentialStore) -> Self {
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let mut screen = Self {
+            state: OnboardingState::MainMenu { selected: 0 },
+            credential_store,
+            configured_providers: Vec::new(),
+            local_detection: LocalDetectionState::Pending,
+            worker_tx,
+            worker_rx,
+            spinner: Spinner::new(),
+            provider_management: None,
+            persisted_reload_target: None,
+        };
+        screen.start_local_detection();
+        screen
+    }
+
+    /// Return providers configured so far.
+    #[must_use]
+    pub fn configured_providers(&self) -> &[ConfiguredProvider] {
+        &self.configured_providers
+    }
+
+    /// Handle a key press.
+    pub fn handle_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        match &mut self.state {
+            OnboardingState::MainMenu { .. } => self.handle_main_menu_key(key),
+            OnboardingState::ManagingProviders => self.handle_provider_management_key(key),
+            OnboardingState::LocalServerWaiting => self.handle_local_waiting_key(key),
+            OnboardingState::LocalServerSelect { .. } => self.handle_local_select_key(key),
+            OnboardingState::NoLocalServers => self.handle_no_local_servers_key(key),
+            OnboardingState::ProviderPresetList { .. } => self.handle_provider_preset_key(key),
+            OnboardingState::ApiKeyInput { .. } => self.handle_api_key_input_key(key),
+            OnboardingState::CustomEndpoint { .. } => self.handle_custom_endpoint_key(key),
+            OnboardingState::Busy { .. } => self.handle_busy_key(key),
+            OnboardingState::Success { .. } => {
+                self.state = OnboardingState::MainMenu { selected: 0 };
+                OnboardingAction::Continue
+            }
+            OnboardingState::Error { return_to, .. } => {
+                self.state = (**return_to).clone();
+                OnboardingAction::Continue
+            }
+        }
+    }
+
+    /// Poll background workers and update screen state.
+    pub fn handle_tick(&mut self) -> OnboardingAction {
+        if matches!(self.state, OnboardingState::ManagingProviders)
+            && let Some(screen) = &mut self.provider_management
+        {
+            match screen.handle_tick() {
+                ProviderManagementAction::Continue => {}
+                ProviderManagementAction::Close => {
+                    self.provider_management = None;
+                    self.state = OnboardingState::MainMenu { selected: 3 };
+                }
+                ProviderManagementAction::ConfigChanged {
+                    provider, model, ..
+                } => {
+                    self.persisted_reload_target = Some((provider, model));
+                }
+            }
+        }
+
+        let mut action = OnboardingAction::Continue;
+        while let Ok(event) = self.worker_rx.try_recv() {
+            action = self.handle_worker_event(event);
+            if !matches!(action, OnboardingAction::Continue) {
+                return action;
+            }
+        }
+        action
+    }
+
+    /// Render the onboarding screen into the provided area.
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        Clear.render(area, frame.buffer_mut());
+        let popup = centered_rect(area, 90, 80, 20, 18);
+        let block = Block::default()
+            .title(Line::from(vec![Span::styled(
+                " Welcome to Anie — First Run ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(popup);
+        block.render(popup, frame.buffer_mut());
+
+        let state = self.state.clone();
+        let spinner_frame = self.spinner.tick().to_string();
+        match state {
+            OnboardingState::MainMenu { selected } => self.render_main_menu(frame, inner, selected),
+            OnboardingState::ManagingProviders => {
+                if let Some(screen) = &mut self.provider_management {
+                    screen.render(frame, frame.area());
+                }
+            }
+            OnboardingState::LocalServerWaiting => self.render_busy_panel(
+                frame,
+                inner,
+                "Local Servers",
+                &format!("{} Scanning for local servers…", spinner_frame),
+                footer_line("[Esc] Back"),
+            ),
+            OnboardingState::LocalServerSelect { selected } => {
+                self.render_local_server_select(frame, inner, selected, &spinner_frame)
+            }
+            OnboardingState::NoLocalServers => self.render_busy_panel(
+                frame,
+                inner,
+                "Local Servers",
+                "No local model servers were detected. Use the custom endpoint flow to add one.",
+                footer_line("[Esc] Back   [Enter] Custom Endpoint"),
+            ),
+            OnboardingState::ProviderPresetList { selected } => {
+                self.render_provider_presets(frame, inner, selected)
+            }
+            OnboardingState::ApiKeyInput {
+                preset_index,
+                input,
+            } => self.render_api_key_input(frame, inner, preset_index, &input),
+            OnboardingState::CustomEndpoint { form } => {
+                self.render_custom_endpoint(frame, inner, &form)
+            }
+            OnboardingState::Busy { title, message, .. } => self.render_busy_panel(
+                frame,
+                inner,
+                &title,
+                &format!("{} {message}", spinner_frame),
+                footer_line("[Esc] Back"),
+            ),
+            OnboardingState::Success { message } => self.render_status_panel(
+                frame,
+                inner,
+                "Success",
+                &message,
+                Color::Green,
+                footer_line("[Any key] Continue"),
+            ),
+            OnboardingState::Error { message, .. } => self.render_status_panel(
+                frame,
+                inner,
+                "Error",
+                &message,
+                Color::Red,
+                footer_line("[Any key] Back"),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests() -> Self {
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        Self {
+            state: OnboardingState::MainMenu { selected: 0 },
+            credential_store: CredentialStore::with_config("anie-test", None)
+                .without_native_keyring(),
+            configured_providers: Vec::new(),
+            local_detection: LocalDetectionState::Ready(Vec::new()),
+            worker_tx,
+            worker_rx,
+            spinner: Spinner::new(),
+            provider_management: None,
+            persisted_reload_target: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_local_servers_for_tests(servers: Vec<LocalServer>) -> Self {
+        let mut screen = Self::new_for_tests();
+        screen.local_detection = LocalDetectionState::Ready(servers);
+        screen
+    }
+
+    fn start_local_detection(&mut self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.local_detection = LocalDetectionState::Ready(Vec::new());
+            return;
+        }
+
+        let tx = self.worker_tx.clone();
+        tokio::spawn(async move {
+            let servers = detect_local_servers().await;
+            let _ = tx.send(WorkerEvent::LocalServersDetected(servers));
+        });
+    }
+
+    fn handle_worker_event(&mut self, event: WorkerEvent) -> OnboardingAction {
+        match event {
+            WorkerEvent::LocalServersDetected(servers) => {
+                self.local_detection = LocalDetectionState::Ready(servers.clone());
+                if matches!(self.state, OnboardingState::LocalServerWaiting) {
+                    self.state = if servers.is_empty() {
+                        OnboardingState::NoLocalServers
+                    } else {
+                        OnboardingState::LocalServerSelect { selected: 0 }
+                    };
+                }
+            }
+            WorkerEvent::Progress(message) => {
+                if let OnboardingState::Busy {
+                    message: current, ..
+                } = &mut self.state
+                {
+                    *current = message;
+                }
+            }
+            WorkerEvent::ProviderConfigured(result) => {
+                let Some(return_to) = (match &self.state {
+                    OnboardingState::Busy { return_to, .. } => Some((**return_to).clone()),
+                    _ => None,
+                }) else {
+                    return OnboardingAction::Continue;
+                };
+
+                match result {
+                    Ok(configured) => {
+                        for provider in &mut self.configured_providers {
+                            provider.is_default = false;
+                        }
+                        let message = format!(
+                            "Configured {} with {} as the default model.",
+                            configured.model.provider, configured.model.id
+                        );
+                        self.configured_providers.push(configured);
+                        self.state = OnboardingState::Success { message };
+                    }
+                    Err(error) => {
+                        self.state = OnboardingState::Error {
+                            message: error,
+                            return_to: Box::new(return_to),
+                        };
+                    }
+                }
+            }
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_main_menu_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let current_selected = match &self.state {
+            OnboardingState::MainMenu { selected } => *selected,
+            _ => return OnboardingAction::Continue,
+        };
+        let item_count = self.main_menu_items().len();
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('q')) | (KeyModifiers::NONE, KeyCode::Esc) => {
+                OnboardingAction::Cancelled
+            }
+            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+                if let OnboardingState::MainMenu { selected } = &mut self.state {
+                    *selected = current_selected.saturating_sub(1);
+                }
+                OnboardingAction::Continue
+            }
+            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+                if let OnboardingState::MainMenu { selected } = &mut self.state {
+                    *selected = (current_selected + 1).min(item_count.saturating_sub(1));
+                }
+                OnboardingAction::Continue
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => self.activate_main_menu(current_selected),
+            _ => OnboardingAction::Continue,
+        }
+    }
+
+    fn activate_main_menu(&mut self, selected: usize) -> OnboardingAction {
+        match self
+            .main_menu_items()
+            .get(selected)
+            .copied()
+            .unwrap_or(MainMenuItem::AddApiKey)
+        {
+            MainMenuItem::LocalServer => {
+                self.state = match &self.local_detection {
+                    LocalDetectionState::Pending => OnboardingState::LocalServerWaiting,
+                    LocalDetectionState::Ready(servers) if servers.is_empty() => {
+                        OnboardingState::NoLocalServers
+                    }
+                    LocalDetectionState::Ready(_) => {
+                        OnboardingState::LocalServerSelect { selected: 0 }
+                    }
+                };
+                OnboardingAction::Continue
+            }
+            MainMenuItem::AddApiKey => {
+                self.state = OnboardingState::ProviderPresetList { selected: 0 };
+                OnboardingAction::Continue
+            }
+            MainMenuItem::ManageExisting => match ProviderManagementScreen::new() {
+                Ok(screen) => {
+                    self.provider_management = Some(screen);
+                    self.state = OnboardingState::ManagingProviders;
+                    OnboardingAction::Continue
+                }
+                Err(error) => {
+                    self.state = OnboardingState::Error {
+                        message: format!("Could not open provider management: {error}"),
+                        return_to: Box::new(OnboardingState::MainMenu { selected: 2 }),
+                    };
+                    OnboardingAction::Continue
+                }
+            },
+            MainMenuItem::CustomEndpoint => {
+                self.state = OnboardingState::CustomEndpoint {
+                    form: CustomEndpointForm::default(),
+                };
+                OnboardingAction::Continue
+            }
+            MainMenuItem::Done => OnboardingAction::Complete(OnboardingCompletion {
+                providers: self.configured_providers.clone(),
+                reload_target: self.persisted_reload_target.clone(),
+            }),
+        }
+    }
+
+    fn handle_provider_management_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let Some(screen) = &mut self.provider_management else {
+            self.state = OnboardingState::MainMenu { selected: 3 };
+            return OnboardingAction::Continue;
+        };
+
+        match screen.handle_key(key) {
+            ProviderManagementAction::Continue => {}
+            ProviderManagementAction::Close => {
+                self.provider_management = None;
+                self.state = OnboardingState::MainMenu { selected: 3 };
+            }
+            ProviderManagementAction::ConfigChanged {
+                provider, model, ..
+            } => {
+                self.persisted_reload_target = Some((provider, model));
+            }
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_local_waiting_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.state = OnboardingState::MainMenu { selected: 0 };
+            }
+            _ => {}
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_local_select_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let OnboardingState::LocalServerSelect { selected } = &mut self.state else {
+            return OnboardingAction::Continue;
+        };
+        let LocalDetectionState::Ready(servers) = &self.local_detection else {
+            self.state = OnboardingState::LocalServerWaiting;
+            return OnboardingAction::Continue;
+        };
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.state = OnboardingState::MainMenu { selected: 0 };
+            }
+            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+                *selected = selected.saturating_sub(1);
+            }
+            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+                *selected = (*selected + 1).min(servers.len().saturating_sub(1));
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if let Some(server) = servers.get(*selected)
+                    && let Some(model) = server.models.first()
+                {
+                    for provider in &mut self.configured_providers {
+                        provider.is_default = false;
+                    }
+                    self.configured_providers.push(ConfiguredProvider {
+                        model: model.clone(),
+                        kind: ConfiguredProviderKind::ConfigBacked,
+                        is_default: true,
+                    });
+                    self.state = OnboardingState::Success {
+                        message: format!(
+                            "Configured {} on {} with {} as the default model.",
+                            server.name, server.base_url, model.id
+                        ),
+                    };
+                }
+            }
+            _ => {}
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_no_local_servers_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.state = OnboardingState::MainMenu { selected: 0 };
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                self.state = OnboardingState::CustomEndpoint {
+                    form: CustomEndpointForm::default(),
+                };
+            }
+            _ => {}
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_provider_preset_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let OnboardingState::ProviderPresetList { selected } = &mut self.state else {
+            return OnboardingAction::Continue;
+        };
+        let presets = provider_presets();
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.state = OnboardingState::MainMenu { selected: 1 };
+            }
+            (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
+                *selected = selected.saturating_sub(1);
+            }
+            (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
+                *selected = (*selected + 1).min(presets.len().saturating_sub(1));
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                self.state = OnboardingState::ApiKeyInput {
+                    preset_index: *selected,
+                    input: TextField::masked(),
+                };
+            }
+            _ => {}
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_api_key_input_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let OnboardingState::ApiKeyInput {
+            preset_index,
+            input,
+        } = &mut self.state
+        else {
+            return OnboardingAction::Continue;
+        };
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.state = OnboardingState::ProviderPresetList {
+                    selected: *preset_index,
+                };
+                return OnboardingAction::Continue;
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let api_key = input.trimmed();
+                if api_key.is_empty() {
+                    self.state = OnboardingState::Error {
+                        message: "API key cannot be empty.".to_string(),
+                        return_to: Box::new(self.state.clone()),
+                    };
+                    return OnboardingAction::Continue;
+                }
+                let preset = provider_presets()
+                    .get(*preset_index)
+                    .cloned()
+                    .unwrap_or_else(default_openai_preset);
+                let return_to = self.state.clone();
+                self.state = OnboardingState::Busy {
+                    title: format!("{}", preset.display_name),
+                    message: "Verifying API key…".to_string(),
+                    return_to: Box::new(return_to),
+                };
+                self.spawn_configure_preset_worker(preset, api_key);
+                return OnboardingAction::Continue;
+            }
+            _ => {
+                input.handle_edit_key(key);
+            }
+        }
+
+        OnboardingAction::Continue
+    }
+
+    fn handle_custom_endpoint_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let OnboardingState::CustomEndpoint { form } = &mut self.state else {
+            return OnboardingAction::Continue;
+        };
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.state = OnboardingState::MainMenu { selected: 2 };
+                return OnboardingAction::Continue;
+            }
+            (KeyModifiers::SHIFT, KeyCode::BackTab)
+            | (KeyModifiers::NONE, KeyCode::Up)
+            | (KeyModifiers::NONE, KeyCode::BackTab) => {
+                form.selected_field = form.selected_field.saturating_sub(1);
+                return OnboardingAction::Continue;
+            }
+            (KeyModifiers::NONE, KeyCode::Tab) | (KeyModifiers::NONE, KeyCode::Down) => {
+                form.selected_field = (form.selected_field + 1).min(3);
+                return OnboardingAction::Continue;
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if form.selected_field < 3 {
+                    form.selected_field += 1;
+                    return OnboardingAction::Continue;
+                }
+
+                let base_url = form.base_url.trimmed();
+                let provider_name = if form.provider_name.trimmed().is_empty() {
+                    "custom".to_string()
+                } else {
+                    form.provider_name.trimmed()
+                };
+                let model_id = form.model_id.trimmed();
+                let api_key = form.api_key.trimmed();
+
+                if base_url.is_empty() || model_id.is_empty() {
+                    self.state = OnboardingState::Error {
+                        message: "Base URL and model ID are required.".to_string(),
+                        return_to: Box::new(self.state.clone()),
+                    };
+                    return OnboardingAction::Continue;
+                }
+
+                let return_to = self.state.clone();
+                self.state = OnboardingState::Busy {
+                    title: "Custom Endpoint".to_string(),
+                    message: "Testing endpoint…".to_string(),
+                    return_to: Box::new(return_to),
+                };
+                self.spawn_configure_custom_worker(base_url, provider_name, model_id, api_key);
+                return OnboardingAction::Continue;
+            }
+            _ => {
+                form.selected_field_mut().handle_edit_key(key);
+            }
+        }
+
+        OnboardingAction::Continue
+    }
+
+    fn handle_busy_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                if let OnboardingState::Busy { return_to, .. } = &self.state {
+                    self.state = (**return_to).clone();
+                }
+            }
+            _ => {}
+        }
+        OnboardingAction::Continue
+    }
+
+    fn spawn_configure_preset_worker(&self, preset: ProviderPreset, api_key: String) {
+        let tx = self.worker_tx.clone();
+        let credential_store = self.credential_store.clone();
+        if tokio::runtime::Handle::try_current().is_err() {
+            let _ = tx.send(WorkerEvent::ProviderConfigured(Err(
+                "Onboarding requires an async runtime to validate providers.".to_string(),
+            )));
+            return;
+        }
+
+        tokio::spawn(async move {
+            let result =
+                configure_preset_provider(preset, api_key, credential_store, tx.clone()).await;
+            let _ = tx.send(WorkerEvent::ProviderConfigured(result));
+        });
+    }
+
+    fn spawn_configure_custom_worker(
+        &self,
+        base_url: String,
+        provider_name: String,
+        model_id: String,
+        api_key: String,
+    ) {
+        let tx = self.worker_tx.clone();
+        let credential_store = self.credential_store.clone();
+        if tokio::runtime::Handle::try_current().is_err() {
+            let _ = tx.send(WorkerEvent::ProviderConfigured(Err(
+                "Onboarding requires an async runtime to validate providers.".to_string(),
+            )));
+            return;
+        }
+
+        tokio::spawn(async move {
+            let result = configure_custom_provider(
+                base_url,
+                provider_name,
+                model_id,
+                api_key,
+                credential_store,
+                tx.clone(),
+            )
+            .await;
+            let _ = tx.send(WorkerEvent::ProviderConfigured(result));
+        });
+    }
+
+    fn main_menu_items(&self) -> Vec<MainMenuItem> {
+        let mut items = vec![MainMenuItem::LocalServer, MainMenuItem::AddApiKey];
+        if self.has_existing_providers() {
+            items.push(MainMenuItem::ManageExisting);
+        }
+        items.push(MainMenuItem::CustomEndpoint);
+        items.push(MainMenuItem::Done);
+        items
+    }
+
+    fn has_existing_providers(&self) -> bool {
+        self.provider_management.is_some()
+            || global_config_path().as_deref().is_some_and(Path::exists)
+            || !self.credential_store.list_providers().is_empty()
+    }
+
+    fn render_main_menu(&mut self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
+        let items = self
+            .main_menu_items()
+            .into_iter()
+            .map(|item| ListItem::new(item.label(&self.local_detection)))
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(selected));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(2)])
+            .split(area);
+
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, chunks[0], &mut state);
+
+        let summary = if self.configured_providers.is_empty() {
+            "No providers configured yet."
+        } else {
+            "Providers configured in this run will be written when you choose Done."
+        };
+        Paragraph::new(vec![
+            Line::from(summary),
+            footer_line("[↑↓] Navigate   [Enter] Select   [q] Quit"),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(chunks[1], frame.buffer_mut());
+    }
+
+    fn render_local_server_select(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        selected: usize,
+        spinner_frame: &str,
+    ) {
+        let local_detection = self.local_detection.clone();
+        let LocalDetectionState::Ready(servers) = local_detection else {
+            self.render_busy_panel(
+                frame,
+                area,
+                "Local Servers",
+                &format!("{} Scanning for local servers…", spinner_frame),
+                footer_line("[Esc] Back"),
+            );
+            return;
+        };
+
+        let items = servers
+            .iter()
+            .map(|server| {
+                let model_summary = server
+                    .models
+                    .first()
+                    .map(|model| model.id.as_str())
+                    .unwrap_or("no models");
+                ListItem::new(format!(
+                    "{} — {} (default: {})",
+                    server.name, server.base_url, model_summary
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(selected));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(2)])
+            .split(area);
+
+        frame.render_stateful_widget(
+            List::new(items).highlight_symbol("› ").highlight_style(
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            chunks[0],
+            &mut state,
+        );
+        Paragraph::new(vec![
+            Line::from(
+                "Choose a detected local server. The first reported model becomes the default.",
+            ),
+            footer_line("[↑↓] Navigate   [Enter] Configure   [Esc] Back"),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(chunks[1], frame.buffer_mut());
+    }
+
+    fn render_provider_presets(&mut self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
+        let presets = provider_presets();
+        let items = presets
+            .iter()
+            .map(|preset| ListItem::new(format!("{} ({})", preset.display_name, preset.model.id)))
+            .collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(selected));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(2)])
+            .split(area);
+
+        frame.render_stateful_widget(
+            List::new(items).highlight_symbol("› ").highlight_style(
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            chunks[0],
+            &mut state,
+        );
+        Paragraph::new(vec![
+            Line::from("Select a provider preset, then enter its API key."),
+            footer_line("[↑↓] Navigate   [Enter] Select   [Esc] Back"),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(chunks[1], frame.buffer_mut());
+    }
+
+    fn render_api_key_input(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        preset_index: usize,
+        input: &TextField,
+    ) {
+        let preset = provider_presets()
+            .get(preset_index)
+            .cloned()
+            .unwrap_or_else(default_openai_preset);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        Paragraph::new(vec![
+            Line::from(vec![Span::styled(
+                preset.display_name,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(format!("Default model: {}", preset.model.id)),
+        ])
+        .render(chunks[0], frame.buffer_mut());
+
+        let input_block = Block::default().borders(Borders::ALL).title("API Key");
+        let input_area = input_block.inner(chunks[1]);
+        input_block.render(chunks[1], frame.buffer_mut());
+        Paragraph::new(input.render_value())
+            .style(Style::default().fg(Color::White))
+            .render(input_area, frame.buffer_mut());
+        frame.set_cursor_position((
+            input_area.x + input.cursor_x().min(input_area.width.saturating_sub(1)),
+            input_area.y,
+        ));
+
+        Paragraph::new(vec![
+            Line::from("The key is masked while you type."),
+            footer_line("[Enter] Verify & Save   [Esc] Back"),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(chunks[3], frame.buffer_mut());
+    }
+
+    fn render_custom_endpoint(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        form: &CustomEndpointForm,
+    ) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        Paragraph::new(vec![
+            Line::from("Add a custom OpenAI-compatible endpoint."),
+            Line::from("Leave API key empty for local providers."),
+        ])
+        .render(chunks[0], frame.buffer_mut());
+
+        self.render_labeled_field(
+            frame,
+            chunks[1],
+            "Base URL",
+            &form.base_url,
+            form.selected_field == 0,
+        );
+        self.render_labeled_field(
+            frame,
+            chunks[2],
+            "Provider Name",
+            &form.provider_name,
+            form.selected_field == 1,
+        );
+        self.render_labeled_field(
+            frame,
+            chunks[3],
+            "Default Model ID",
+            &form.model_id,
+            form.selected_field == 2,
+        );
+        self.render_labeled_field(
+            frame,
+            chunks[4],
+            "API Key",
+            &form.api_key,
+            form.selected_field == 3,
+        );
+
+        let selected_field = form.selected_field_ref();
+        let field_area = [chunks[1], chunks[2], chunks[3], chunks[4]][form.selected_field];
+        let inner = Block::default().borders(Borders::ALL).inner(field_area);
+        frame.set_cursor_position((
+            inner.x + selected_field.cursor_x().min(inner.width.saturating_sub(1)),
+            inner.y,
+        ));
+
+        Paragraph::new(footer_line(
+            "[Tab] Next   [Shift+Tab] Back   [Enter] Continue/Submit   [Esc] Back",
+        ))
+        .render(chunks[6], frame.buffer_mut());
+    }
+
+    fn render_labeled_field(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        label: &str,
+        field: &TextField,
+        focused: bool,
+    ) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(label)
+            .border_style(if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            });
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+        Paragraph::new(field.render_value())
+            .style(Style::default().fg(Color::White))
+            .render(inner, frame.buffer_mut());
+    }
+
+    fn render_busy_panel(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        title: &str,
+        body: &str,
+        footer: Line<'static>,
+    ) {
+        self.render_status_panel(frame, area, title, body, Color::Cyan, footer);
+    }
+
+    fn render_status_panel(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        title: &str,
+        body: &str,
+        color: Color,
+        footer: Line<'static>,
+    ) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        Paragraph::new(Line::from(vec![Span::styled(
+            title.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )]))
+        .alignment(Alignment::Center)
+        .render(chunks[0], frame.buffer_mut());
+        Paragraph::new(body)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(chunks[1], frame.buffer_mut());
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .render(chunks[2], frame.buffer_mut());
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MainMenuItem {
+    LocalServer,
+    AddApiKey,
+    ManageExisting,
+    CustomEndpoint,
+    Done,
+}
+
+impl MainMenuItem {
+    fn label(self, local_detection: &LocalDetectionState) -> String {
+        match self {
+            Self::LocalServer => match local_detection {
+                LocalDetectionState::Pending => "Configure Local Server (scanning…)".to_string(),
+                LocalDetectionState::Ready(servers) if servers.is_empty() => {
+                    "Configure Local Server".to_string()
+                }
+                LocalDetectionState::Ready(servers) => format!(
+                    "Configure Local Server ({} detected)",
+                    servers
+                        .iter()
+                        .map(|server| server.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+            Self::AddApiKey => "Add API Key Provider".to_string(),
+            Self::ManageExisting => "Manage Existing Providers".to_string(),
+            Self::CustomEndpoint => "Advanced / Custom OpenAI-compatible endpoint".to_string(),
+            Self::Done => "Done".to_string(),
+        }
+    }
+}
+
+impl Default for CustomEndpointForm {
+    fn default() -> Self {
+        Self {
+            base_url: TextField::default(),
+            provider_name: TextField::from("custom"),
+            model_id: TextField::default(),
+            api_key: TextField::masked(),
+            selected_field: 0,
+        }
+    }
+}
+
+impl CustomEndpointForm {
+    fn selected_field_mut(&mut self) -> &mut TextField {
+        match self.selected_field {
+            0 => &mut self.base_url,
+            1 => &mut self.provider_name,
+            2 => &mut self.model_id,
+            _ => &mut self.api_key,
+        }
+    }
+
+    fn selected_field_ref(&self) -> &TextField {
+        match self.selected_field {
+            0 => &self.base_url,
+            1 => &self.provider_name,
+            2 => &self.model_id,
+            _ => &self.api_key,
+        }
+    }
+}
+
+impl TextField {
+    fn from(value: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            cursor: value.len(),
+            masked: false,
+        }
+    }
+
+    fn masked() -> Self {
+        Self {
+            value: String::new(),
+            cursor: 0,
+            masked: true,
+        }
+    }
+
+    fn handle_edit_key(&mut self, key: KeyEvent) {
+        if let KeyCode::Char(ch) = key.code
+            && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+        {
+            self.insert_char(ch);
+            return;
+        }
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Backspace) => self.backspace(),
+            (KeyModifiers::NONE, KeyCode::Delete) => self.delete(),
+            (KeyModifiers::NONE, KeyCode::Left) => self.move_left(),
+            (KeyModifiers::NONE, KeyCode::Right) => self.move_right(),
+            (KeyModifiers::NONE, KeyCode::Home) | (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
+                self.cursor = 0
+            }
+            (KeyModifiers::NONE, KeyCode::End) | (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+                self.cursor = self.value.len()
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                self.value.clear();
+                self.cursor = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn render_value(&self) -> String {
+        if self.masked {
+            if self.value.is_empty() {
+                String::new()
+            } else {
+                "•".repeat(self.value.chars().count())
+            }
+        } else {
+            self.value.clone()
+        }
+    }
+
+    fn cursor_x(&self) -> u16 {
+        let visible = if self.masked {
+            "•".repeat(self.value[..self.cursor].chars().count())
+        } else {
+            self.value[..self.cursor].to_string()
+        };
+        u16::try_from(visible.chars().count()).unwrap_or(u16::MAX)
+    }
+
+    fn trimmed(&self) -> String {
+        self.value.trim().to_string()
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.value.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if let Some(previous) = previous_boundary(&self.value, self.cursor) {
+            self.value.drain(previous..self.cursor);
+            self.cursor = previous;
+        }
+    }
+
+    fn delete(&mut self) {
+        if let Some(next) = next_boundary(&self.value, self.cursor) {
+            self.value.drain(self.cursor..next);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if let Some(previous) = previous_boundary(&self.value, self.cursor) {
+            self.cursor = previous;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = next_boundary(&self.value, self.cursor) {
+            self.cursor = next;
+        }
+    }
+}
+
+/// Write configured providers into a config file and return the selected default.
+pub fn write_configured_providers(
+    path: &Path,
+    providers: &[ConfiguredProvider],
+) -> Result<Option<(String, String)>> {
+    if providers.is_empty() {
+        return Ok(None);
+    }
+
+    let mut mutator = ConfigMutator::load_or_create(path)?;
+    for configured in providers {
+        match configured.kind {
+            ConfiguredProviderKind::BuiltinHosted => {
+                mutator.ensure_provider(&configured.model.provider);
+            }
+            ConfiguredProviderKind::ConfigBacked => {
+                mutator.upsert_provider(
+                    &configured.model.provider,
+                    Some(configured.model.base_url.as_str()),
+                    Some(configured.model.api),
+                );
+                mutator.upsert_provider_model(&configured.model.provider, &configured.model);
+            }
+        }
+    }
+
+    let default = providers
+        .iter()
+        .rev()
+        .find(|provider| provider.is_default)
+        .or_else(|| providers.last())
+        .expect("providers should not be empty");
+    mutator.set_default_model(&default.model.provider, &default.model.id);
+    mutator.save()?;
+    Ok(Some((
+        default.model.provider.clone(),
+        default.model.id.clone(),
+    )))
+}
+
+async fn configure_preset_provider(
+    preset: ProviderPreset,
+    api_key: String,
+    credential_store: CredentialStore,
+    tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<ConfiguredProvider, String> {
+    validate_provider_connection(&preset.model, Some(api_key.as_str())).await?;
+    let _ = tx.send(WorkerEvent::Progress(
+        "Waiting for OS keyring authorization…".to_string(),
+    ));
+    credential_store
+        .set(preset.provider_name, &api_key)
+        .map_err(|error| format!("failed to save credential: {error}"))?;
+    Ok(ConfiguredProvider {
+        model: preset.model,
+        kind: preset.kind,
+        is_default: true,
+    })
+}
+
+async fn configure_custom_provider(
+    base_url: String,
+    provider_name: String,
+    model_id: String,
+    api_key: String,
+    credential_store: CredentialStore,
+    tx: mpsc::UnboundedSender<WorkerEvent>,
+) -> Result<ConfiguredProvider, String> {
+    let normalized_base_url = normalize_openai_base_url(&base_url);
+    let api_key = api_key.trim().to_string();
+    let api_key_option = if api_key.is_empty() {
+        None
+    } else {
+        Some(api_key.as_str())
+    };
+
+    validate_openai_compatible_endpoint(&normalized_base_url, api_key_option).await?;
+    if !api_key.is_empty() {
+        let _ = tx.send(WorkerEvent::Progress(
+            "Waiting for OS keyring authorization…".to_string(),
+        ));
+        credential_store
+            .set(&provider_name, &api_key)
+            .map_err(|error| format!("failed to save credential: {error}"))?;
+    }
+
+    Ok(ConfiguredProvider {
+        model: Model {
+            id: model_id.clone(),
+            name: model_id,
+            provider: provider_name,
+            api: ApiKind::OpenAICompletions,
+            base_url: normalized_base_url,
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+        },
+        kind: ConfiguredProviderKind::ConfigBacked,
+        is_default: true,
+    })
+}
+
+async fn validate_provider_connection(model: &Model, api_key: Option<&str>) -> Result<(), String> {
+    match model.api {
+        ApiKind::AnthropicMessages => {
+            validate_anthropic_endpoint(&model.base_url, model.id.as_str(), api_key).await
+        }
+        _ => validate_openai_compatible_endpoint(&model.base_url, api_key).await,
+    }
+}
+
+async fn validate_openai_compatible_endpoint(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("failed to create HTTP client: {error}"))?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut request = client.get(url);
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("connection failed: {error}"))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(format!(
+        "endpoint returned {} {}",
+        response.status().as_u16(),
+        response.status().canonical_reason().unwrap_or("error")
+    ))
+}
+
+async fn validate_anthropic_endpoint(
+    base_url: &str,
+    model_id: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let api_key = api_key.ok_or_else(|| "Anthropic API key is required.".to_string())?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("failed to create HTTP client: {error}"))?;
+    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+    let response = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": model_id,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}]
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("connection failed: {error}"))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(format!(
+        "endpoint returned {} {}",
+        response.status().as_u16(),
+        response.status().canonical_reason().unwrap_or("error")
+    ))
+}
+
+fn provider_presets() -> Vec<ProviderPreset> {
+    let openai = builtin_models()
+        .into_iter()
+        .find(|model| model.provider == "openai")
+        .unwrap_or_else(|| Model {
+            id: "gpt-4o".to_string(),
+            name: "GPT-4o".to_string(),
+            provider: "openai".to_string(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://api.openai.com/v1".to_string(),
+            context_window: 128_000,
+            max_tokens: 16_384,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: true,
+            cost_per_million: CostPerMillion::zero(),
+        });
+    let anthropic = builtin_models()
+        .into_iter()
+        .find(|model| model.provider == "anthropic")
+        .unwrap_or_else(|| Model {
+            id: "claude-sonnet-4-6".to_string(),
+            name: "Claude Sonnet 4.6".to_string(),
+            provider: "anthropic".to_string(),
+            api: ApiKind::AnthropicMessages,
+            base_url: "https://api.anthropic.com".to_string(),
+            context_window: 1_000_000,
+            max_tokens: 128_000,
+            supports_reasoning: true,
+            reasoning_capabilities: None,
+            supports_images: true,
+            cost_per_million: CostPerMillion::zero(),
+        });
+
+    vec![
+        ProviderPreset {
+            display_name: "Anthropic (Claude)",
+            provider_name: "anthropic",
+            kind: ConfiguredProviderKind::BuiltinHosted,
+            model: anthropic,
+        },
+        ProviderPreset {
+            display_name: "OpenAI (GPT-4o, o-series)",
+            provider_name: "openai",
+            kind: ConfiguredProviderKind::BuiltinHosted,
+            model: openai,
+        },
+        custom_openai_preset("xAI / Grok", "xai", "https://api.x.ai/v1", "grok-2-1212"),
+        custom_openai_preset(
+            "Groq",
+            "groq",
+            "https://api.groq.com/openai/v1",
+            "llama-3.3-70b-versatile",
+        ),
+        custom_openai_preset(
+            "Together.ai",
+            "together",
+            "https://api.together.xyz/v1",
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        ),
+        custom_openai_preset(
+            "Fireworks",
+            "fireworks",
+            "https://api.fireworks.ai/inference/v1",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+        ),
+        custom_openai_preset(
+            "Mistral",
+            "mistral",
+            "https://api.mistral.ai/v1",
+            "mistral-large-latest",
+        ),
+    ]
+}
+
+fn default_openai_preset() -> ProviderPreset {
+    provider_presets()
+        .into_iter()
+        .find(|preset| preset.provider_name == "openai")
+        .unwrap_or_else(|| {
+            custom_openai_preset("OpenAI", "openai", "https://api.openai.com/v1", "gpt-4o")
+        })
+}
+
+fn custom_openai_preset(
+    display_name: &'static str,
+    provider_name: &'static str,
+    base_url: &'static str,
+    model_id: &'static str,
+) -> ProviderPreset {
+    ProviderPreset {
+        display_name,
+        provider_name,
+        kind: ConfiguredProviderKind::ConfigBacked,
+        model: Model {
+            id: model_id.to_string(),
+            name: model_id.to_string(),
+            provider: provider_name.to_string(),
+            api: ApiKind::OpenAICompletions,
+            base_url: normalize_openai_base_url(base_url),
+            context_window: 128_000,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+        },
+    }
+}
+
+fn normalize_openai_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
+fn centered_rect(
+    area: Rect,
+    max_width_pct: u16,
+    max_height_pct: u16,
+    min_width: u16,
+    min_height: u16,
+) -> Rect {
+    let width = ((area.width as u32 * max_width_pct as u32) / 100)
+        .max(min_width as u32)
+        .min(area.width as u32) as u16;
+    let height = ((area.height as u32 * max_height_pct as u32) / 100)
+        .max(min_height as u32)
+        .min(area.height as u32) as u16;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn footer_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn previous_boundary(text: &str, index: usize) -> Option<usize> {
+    if index == 0 {
+        return None;
+    }
+    text[..index]
+        .char_indices()
+        .last()
+        .map(|(position, _)| position)
+}
+
+fn next_boundary(text: &str, index: usize) -> Option<usize> {
+    if index >= text.len() {
+        return None;
+    }
+    text[index..]
+        .char_indices()
+        .nth(1)
+        .map(|(offset, _)| index + offset)
+        .or(Some(text.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anie_provider::{ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode};
+
+    fn sample_local_server() -> LocalServer {
+        LocalServer {
+            name: "ollama".to_string(),
+            base_url: "http://localhost:11434".to_string(),
+            models: vec![Model {
+                id: "qwen3:32b".to_string(),
+                name: "Qwen 3 32B".to_string(),
+                provider: "ollama".to_string(),
+                api: ApiKind::OpenAICompletions,
+                base_url: "http://localhost:11434/v1".to_string(),
+                context_window: 32_768,
+                max_tokens: 8_192,
+                supports_reasoning: true,
+                reasoning_capabilities: Some(ReasoningCapabilities {
+                    control: Some(ReasoningControlMode::Native),
+                    output: Some(ReasoningOutputMode::Separated),
+                    tags: None,
+                }),
+                supports_images: false,
+                cost_per_million: CostPerMillion::zero(),
+            }],
+        }
+    }
+
+    #[test]
+    fn main_menu_navigation_moves_selection() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        assert!(matches!(
+            screen.state,
+            OnboardingState::MainMenu { selected: 0 }
+        ));
+
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::MainMenu { selected: 1 }
+        ));
+        screen.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::MainMenu { selected: 0 }
+        ));
+    }
+
+    #[test]
+    fn selecting_add_api_key_opens_preset_list() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            screen.state,
+            OnboardingState::ProviderPresetList { .. }
+        ));
+    }
+
+    #[test]
+    fn selecting_local_server_opens_detected_servers() {
+        let mut screen =
+            OnboardingScreen::with_local_servers_for_tests(vec![sample_local_server()]);
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            screen.state,
+            OnboardingState::LocalServerSelect { selected: 0 }
+        ));
+    }
+
+    #[test]
+    fn preset_selection_opens_masked_key_input() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::ProviderPresetList { selected: 0 };
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let OnboardingState::ApiKeyInput { input, .. } = &screen.state else {
+            panic!("expected api key input state");
+        };
+        assert!(input.masked);
+    }
+
+    #[test]
+    fn api_key_input_masks_rendered_value() {
+        let mut input = TextField::masked();
+        input.handle_edit_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        input.handle_edit_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        input.handle_edit_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+
+        assert_eq!(input.value, "sk-");
+        assert_eq!(input.render_value(), "•••");
+    }
+
+    #[test]
+    fn escape_returns_to_previous_state() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::ProviderPresetList { selected: 2 };
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::MainMenu { selected: 1 }
+        ));
+    }
+
+    #[test]
+    fn main_menu_quit_returns_cancelled() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        let action = screen.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(action, OnboardingAction::Cancelled);
+    }
+
+    #[test]
+    fn provider_success_returns_to_main_menu_after_ack() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::Busy {
+            title: "OpenAI".to_string(),
+            message: "Verifying…".to_string(),
+            return_to: Box::new(OnboardingState::ApiKeyInput {
+                preset_index: 1,
+                input: TextField::masked(),
+            }),
+        };
+        screen.handle_worker_event(WorkerEvent::ProviderConfigured(Ok(ConfiguredProvider {
+            model: default_openai_preset().model,
+            kind: ConfiguredProviderKind::BuiltinHosted,
+            is_default: true,
+        })));
+
+        assert!(matches!(screen.state, OnboardingState::Success { .. }));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::MainMenu { selected: 0 }
+        ));
+    }
+
+    #[test]
+    fn done_returns_complete_with_configured_providers() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.configured_providers.push(ConfiguredProvider {
+            model: default_openai_preset().model,
+            kind: ConfiguredProviderKind::BuiltinHosted,
+            is_default: true,
+        });
+        screen.state = OnboardingState::MainMenu { selected: 3 };
+
+        let action = screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let OnboardingAction::Complete(completion) = action else {
+            panic!("expected complete action");
+        };
+        assert_eq!(completion.providers.len(), 1);
+        assert_eq!(completion.providers[0].model.provider, "openai");
+        assert_eq!(completion.reload_target, None);
+    }
+
+    #[test]
+    fn custom_form_tab_navigation_advances_fields() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::CustomEndpoint {
+            form: CustomEndpointForm::default(),
+        };
+
+        screen.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let OnboardingState::CustomEndpoint { form } = &screen.state else {
+            panic!("expected custom endpoint state");
+        };
+        assert_eq!(form.selected_field, 1);
+    }
+
+    #[test]
+    fn normalize_openai_base_url_adds_v1_when_needed() {
+        assert_eq!(
+            normalize_openai_base_url("http://localhost:11434"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            normalize_openai_base_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1"
+        );
+    }
+}

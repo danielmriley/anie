@@ -61,7 +61,7 @@ max_tokens = 8192
 
 #[tokio::test]
 async fn auth_resolver_with_config_env_var_resolves_key() {
-    use anie_auth::AuthResolver;
+    use anie_auth::{AuthResolver, CredentialStore};
     use anie_config::AnieConfig;
     use anie_provider::RequestOptionsResolver;
 
@@ -77,8 +77,15 @@ async fn auth_resolver_with_config_env_var_resolves_key() {
             },
         );
 
-        let resolver = AuthResolver::new(None, config)
-            .with_auth_path(Some(std::path::PathBuf::from("/tmp/nonexistent-auth.json")));
+        let resolver = AuthResolver::with_credential_store(
+            None,
+            config,
+            CredentialStore::with_config(
+                "anie-test",
+                Some(std::path::PathBuf::from("/tmp/nonexistent-auth.json")),
+            )
+            .without_native_keyring(),
+        );
         let mut openai_model = anie_integration_tests::helpers::sample_model();
         openai_model.provider = "openai".into();
 

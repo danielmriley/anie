@@ -1,6 +1,6 @@
 # Onboarding & Credential Management
 
-**Status**: Proposed for v0.1 (post-keyring + TUI menu implementation)
+**Status**: Implemented in v0.1.0
 
 This document details the new credential storage system using the [`keyring`](https://crates.io/crates/keyring) crate and the improved, menu-driven onboarding experience. The design draws direct inspiration from **pi-mono**'s elegant TUI-first approach (`/login`, `/model`, `/settings` slash commands + interactive provider selection) while adapting it to Rust + `ratatui` + `crossterm`.
 
@@ -15,18 +15,17 @@ This document details the new credential storage system using the [`keyring`](ht
 |----------------|----------------------------------|--------------------------------------|----------|
 | **macOS**      | Apple Keychain                   | Keychain Access app                  | Touch ID / password |
 | **Windows**    | Windows Credential Manager       | Credential Manager                   | OS-level encryption |
-| **Linux**      | Secret Service (GNOME Keyring, etc.) | `secret-tool` or Seahorse GUI     | Login-session tied |
-| **BSD**        | Same as Linux                    | Same                                 | Same |
+| **Linux**      | Linux kernel keyring (`linux-native`) | Kernel keyring tooling / system inspection | Kernel/session scoped |
+| **BSD**        | Same as Linux (planned parity)   | Same                                 | Same |
 
 ### Adding the dependency (`crates/anie-auth/Cargo.toml`)
 
 ```toml
 [dependencies]
 keyring = { version = "3", features = [
-    "apple-native",          # macOS
-    "windows-native",        # Windows
-    "sync-secret-service",   # Linux + BSD (most common)
-    # "linux-native"         # optional: kernel keyring fallback
+    "apple-native",    # macOS
+    "windows-native",  # Windows
+    "linux-native",    # Linux build-friendly backend in the current implementation
 ] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -155,14 +154,26 @@ The onboarding lives in a new `OnboardingScreen` widget inside `crates/anie-tui`
 
 ## 3. Implementation Checklist
 
-- [ ] Add `keyring` dependency + features.
-- [ ] Implement `CredentialStore` + migration logic in `anie-auth`.
-- [ ] Add `OnboardingScreen` to `anie-tui`.
-- [ ] Wire `anie onboard` subcommand in `anie-cli`.
-- [ ] Update first-run logic in main entrypoint.
-- [ ] Add integration test for credential round-trip.
-- [ ] Update README with new "First run" GIF + `anie onboard` section.
-- [ ] Document in `docs/arch/` how providers now resolve (keyring → JSON fallback → env).
+- [x] Add `keyring` dependency + features.
+- [x] Implement `CredentialStore` + migration logic in `anie-auth`.
+- [x] Add `OnboardingScreen` to `anie-tui`.
+- [x] Wire `anie onboard` subcommand in `anie-cli`.
+- [x] Update first-run logic in main entrypoint.
+- [x] Add integration and unit coverage for credential round-trip and migration.
+- [x] Update README with the `anie onboard`, `/onboard`, and `/providers` flow.
+- [x] Document in `docs/arch/` how providers now resolve (keyring → JSON fallback → env).
+
+## 4. Implementation Deviations
+
+A few implementation details differ from the original proposal:
+
+- **Linux backend**: the current build uses `keyring`'s `linux-native` backend instead of Secret Service so the workspace can build and test without external `dbus-1` development packages.
+- **JSON compatibility mirror**: after successful native keyring writes, credentials are also mirrored into `~/.anie/auth.json` to preserve compatibility for provider enumeration and headless fallback.
+- **Config writes**: onboarding and provider-management changes are written through `anie-config::ConfigMutator` (`toml_edit`) so existing user comments and formatting are preserved.
+- **Provider management timing**: `/providers` is no longer just a future extension; it is implemented as a TUI overlay and is also reachable from the onboarding main menu when existing providers are present.
+- **README media**: the README was updated textually; no GIF asset was added in this implementation pass.
+
+## 5. Future Extensions
 
 ## 4. Future Extensions
 - OAuth support (Azure, Google Vertex, etc.) can slot into the same menu.

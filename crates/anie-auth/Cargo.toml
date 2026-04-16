@@ -9,10 +9,15 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["keyring-native"]
+keyring-native = ["dep:keyring"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
+keyring = { workspace = true, optional = true, features = ["apple-native", "windows-native", "linux-native"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

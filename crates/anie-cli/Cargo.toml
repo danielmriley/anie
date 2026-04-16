@@ -16,7 +16,9 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 dirs.workspace = true
+futures.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -37,3 +39,6 @@ anie-providers-builtin.workspace = true
 anie-session.workspace = true
 anie-tools.workspace = true
 anie-tui.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
