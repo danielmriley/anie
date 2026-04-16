@@ -165,9 +165,10 @@ impl AgentLoop {
                 model.base_url = base_url_override;
             }
 
+            let sanitized_context = sanitize_context_for_request(&context);
             let llm_context = LlmContext {
                 system_prompt: self.config.system_prompt.clone(),
-                messages: provider.convert_messages(&context),
+                messages: provider.convert_messages(&sanitized_context),
                 tools: self.tool_registry.definitions(),
             };
             let options = anie_provider::StreamOptions {
@@ -635,6 +636,46 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
+fn sanitize_context_for_request(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant(assistant) => {
+                sanitize_assistant_for_request(assistant).map(Message::Assistant)
+            }
+            _ => Some(message.clone()),
+        })
+        .collect()
+}
+
+fn sanitize_assistant_for_request(assistant: &AssistantMessage) -> Option<AssistantMessage> {
+    if matches!(
+        assistant.stop_reason,
+        StopReason::Error | StopReason::Aborted
+    ) {
+        return None;
+    }
+
+    let content = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } if text.trim().is_empty() => None,
+            ContentBlock::Thinking { thinking } if thinking.trim().is_empty() => None,
+            _ => Some(block.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(AssistantMessage {
+        content,
+        ..assistant.clone()
+    })
+}
+
 fn validate_tool_arguments(
     schema: &serde_json::Value,
     args: &serde_json::Value,
@@ -794,6 +835,11 @@ impl AssistantMessageBuilder {
             .content
             .into_iter()
             .map(BuilderContent::into_content_block)
+            .filter(|block| match block {
+                ContentBlock::Text { text } => !text.trim().is_empty(),
+                ContentBlock::Thinking { thinking } => !thinking.trim().is_empty(),
+                _ => true,
+            })
             .collect();
         if let Some(message) = &error_message
             && content.is_empty()
@@ -877,5 +923,106 @@ impl ToolCallBuilder {
             name: self.name,
             arguments: self.arguments_value.unwrap_or(serde_json::Value::Null),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_assistant_for_request, sanitize_context_for_request};
+    use anie_protocol::{
+        AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
+    };
+    use serde_json::json;
+
+    fn user_message(text: &str, timestamp: u64) -> Message {
+        Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            timestamp,
+        })
+    }
+
+    fn assistant_message(
+        content: Vec<ContentBlock>,
+        stop_reason: StopReason,
+        timestamp: u64,
+    ) -> AssistantMessage {
+        AssistantMessage {
+            content,
+            usage: Usage::default(),
+            stop_reason,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn sanitize_context_for_request_drops_empty_and_failed_assistants() {
+        let context = vec![
+            user_message("first", 1),
+            Message::Assistant(assistant_message(Vec::new(), StopReason::Stop, 2)),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text { text: "   ".into() }],
+                StopReason::Stop,
+                3,
+            )),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text {
+                    text: "failed".into(),
+                }],
+                StopReason::Error,
+                4,
+            )),
+            Message::Assistant(assistant_message(
+                vec![
+                    ContentBlock::Text { text: "  ".into() },
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_1".into(),
+                        name: "read".into(),
+                        arguments: json!({ "path": "README.md" }),
+                    }),
+                ],
+                StopReason::ToolUse,
+                5,
+            )),
+            user_message("second", 6),
+        ];
+
+        let sanitized = sanitize_context_for_request(&context);
+
+        assert_eq!(sanitized.len(), 3);
+        assert!(matches!(sanitized[0], Message::User(_)));
+        let assistant = match &sanitized[1] {
+            Message::Assistant(assistant) => assistant,
+            other => panic!("expected assistant, got {other:?}"),
+        };
+        assert_eq!(assistant.content.len(), 1);
+        assert!(matches!(assistant.content[0], ContentBlock::ToolCall(_)));
+        assert!(matches!(sanitized[2], Message::User(_)));
+    }
+
+    #[test]
+    fn sanitize_assistant_for_request_preserves_meaningful_thinking() {
+        let assistant = assistant_message(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "plan first".into(),
+                },
+                ContentBlock::Text { text: "   ".into() },
+            ],
+            StopReason::Stop,
+            1,
+        );
+
+        let sanitized = sanitize_assistant_for_request(&assistant).expect("assistant survives");
+
+        assert_eq!(sanitized.content.len(), 1);
+        assert_eq!(
+            sanitized.content,
+            vec![ContentBlock::Thinking {
+                thinking: "plan first".into(),
+            }]
+        );
     }
 }
