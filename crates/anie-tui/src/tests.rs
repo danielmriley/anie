@@ -975,13 +975,64 @@ fn slash_commands_route_actions_and_render_help() {
     )))
     .expect("submit help command");
 
-    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(60, 30)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
     assert!(screen.contains("/onboard"), "screen was:\n{screen}");
     assert!(screen.contains("/providers"), "screen was:\n{screen}");
+    assert!(screen.contains("/copy"), "screen was:\n{screen}");
+    assert!(screen.contains("/new"), "screen was:\n{screen}");
+    assert!(screen.contains("/reload"), "screen was:\n{screen}");
+}
+
+#[test]
+fn new_command_sends_new_session_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
+
+    submit_command(&mut app, "/new");
+    assert!(matches!(
+        action_rx.try_recv().expect("new session action"),
+        crate::UiAction::NewSession
+    ));
+}
+
+#[test]
+fn reload_command_sends_reload_config_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
+
+    submit_command(&mut app, "/reload");
+    assert!(matches!(
+        action_rx.try_recv().expect("reload action"),
+        crate::UiAction::ReloadConfig {
+            provider: None,
+            model: None,
+        }
+    ));
+}
+
+#[test]
+fn copy_command_without_messages_shows_error() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
+
+    submit_command(&mut app, "/copy");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+    assert!(
+        screen.contains("No assistant message to copy"),
+        "screen was:\n{screen}"
+    );
 }
 
 #[test]
@@ -1115,6 +1166,21 @@ fn render_buffer_to_string(buffer: &Buffer) -> String {
 
 fn non_empty_lines(rendered: &str) -> Vec<&str> {
     rendered.lines().filter(|line| !line.is_empty()).collect()
+}
+
+fn submit_command(app: &mut App, command: &str) {
+    for ch in command.chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit command");
 }
 
 // ---------------------------------------------------------------------------

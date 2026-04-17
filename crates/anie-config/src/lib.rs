@@ -164,6 +164,8 @@ pub struct CliOverrides {
     pub thinking: Option<ThinkingLevel>,
 }
 
+use std::time::SystemTime;
+
 /// A project-context file loaded into the system prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -173,6 +175,8 @@ pub struct ContextFile {
     pub contents: String,
     /// Whether the file was truncated by config caps.
     pub truncated: bool,
+    /// File modification time at the point of reading.
+    pub mtime: Option<SystemTime>,
 }
 
 /// Return the default global config path.
@@ -333,9 +337,12 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 
             total_loaded += u64::try_from(kept.len()).unwrap_or(0);
             files.push(ContextFile {
-                path: candidate,
+                path: candidate.clone(),
                 contents,
                 truncated,
+                mtime: fs::metadata(&candidate)
+                    .and_then(|m| m.modified())
+                    .ok(),
             });
         }
     }

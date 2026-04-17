@@ -9,38 +9,14 @@ ratio — smallest impactful changes first. Check off items as they ship.
 - [x] Thinking block display regression tests (7 tests added)
 - [x] Dynamic model discovery and picker menus
 - [x] Onboarding flow
+- [x] Context file hot-reload (mtime-based per-turn refresh)
+- [x] `/copy` command (clipboard copy of last assistant response)
+- [x] `/new` command (start fresh session without restart)
+- [x] `/reload` command (hot-reload config and context files)
 
 ## Next Up — Small, High-Impact
 
-### 1. Context file hot-reload
-**What**: Re-read AGENTS.md / CLAUDE.md before each LLM turn if changed.
-**Why**: Common papercut — users edit context files and changes don't take
-effect until restart.
-**Effort**: Small — stat-check mtime, rebuild system prompt if changed.
-**Details**: [docs/notes/context_file_handling.md](notes/context_file_handling.md)
-
-### 2. `/copy` command
-**What**: Copy the last assistant response to the system clipboard.
-**Why**: Frequently wanted, trivial to implement.
-**Effort**: Tiny — one command handler + clipboard crate.
-**Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
-
-### 3. `/new` command
-**What**: Start a fresh session without restarting anie.
-**Why**: Currently requires quitting and relaunching.
-**Effort**: Small — reset session state, clear transcript.
-**Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
-
-### 4. `/reload` command
-**What**: Hot-reload config, context files, and keybindings.
-**Why**: Enables mid-session config changes. Also makes context file
-hot-reload available on demand (complements item 1).
-**Effort**: Small — re-run config loading, rebuild system prompt.
-**Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
-
-## Medium-Term — Core Functionality
-
-### 5. Automatic context compaction
+### 1. Automatic context compaction
 **What**: Trigger compaction automatically when approaching the context limit.
 **Why**: Prevents context overflow errors. Currently compaction exists but
 must be triggered manually or by overflow recovery.

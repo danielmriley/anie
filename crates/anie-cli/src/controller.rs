@@ -512,6 +512,26 @@ impl InteractiveController {
             UiAction::ShowDiff => {
                 self.send_system_message(&self.state.session_diff()).await;
             }
+            UiAction::NewSession => {
+                if self.current_run.is_some() {
+                    self.send_system_message("Cannot start a new session while a run is active.")
+                        .await;
+                } else {
+                    self.state.new_session().await?;
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::TranscriptReplace {
+                            messages: Vec::new(),
+                        })
+                        .await;
+                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    self.send_system_message(&format!(
+                        "Started new session {}",
+                        self.state.session.id()
+                    ))
+                    .await;
+                }
+            }
             UiAction::ListSessions => {
                 let sessions = self.state.list_sessions()?;
                 self.send_system_message(&format_sessions(&sessions, self.state.session.id()))
@@ -597,6 +617,7 @@ impl InteractiveController {
             thinking = %format_thinking(self.state.current_thinking),
             "starting interactive run"
         );
+        self.state.refresh_system_prompt_if_needed();
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],
             timestamp: now_millis(),
@@ -630,6 +651,7 @@ impl InteractiveController {
         allow_overflow_retry: bool,
         retry_attempt: u32,
     ) -> Result<()> {
+        self.state.refresh_system_prompt_if_needed();
         let context = self
             .state
             .session_context()
@@ -677,6 +699,7 @@ struct ControllerState {
     tool_registry: Arc<ToolRegistry>,
     request_options_resolver: Arc<dyn RequestOptionsResolver>,
     system_prompt: String,
+    context_files_mtime: Option<std::time::SystemTime>,
     runtime_state: RuntimeState,
     retry_config: RetryConfig,
 }
@@ -770,6 +793,12 @@ impl ControllerState {
                     .await;
             }
         }
+        Ok(())
+    }
+
+    async fn new_session(&mut self) -> Result<()> {
+        self.session = SessionManager::new_session(&self.session_dir, &self.current_cwd)?;
+        self.persist_runtime_state();
         Ok(())
     }
 
@@ -1099,8 +1128,22 @@ impl ControllerState {
         ));
         self.system_prompt =
             build_system_prompt(&self.current_cwd, &self.tool_registry, &self.config)?;
+        self.context_files_mtime = max_context_files_mtime(&self.current_cwd, &self.config);
         self.persist_runtime_state();
         Ok(())
+    }
+
+    /// Rebuild the system prompt if any context file has been modified.
+    fn refresh_system_prompt_if_needed(&mut self) {
+        let current_mtime = max_context_files_mtime(&self.current_cwd, &self.config);
+        if current_mtime != self.context_files_mtime {
+            if let Ok(prompt) =
+                build_system_prompt(&self.current_cwd, &self.tool_registry, &self.config)
+            {
+                self.system_prompt = prompt;
+                self.context_files_mtime = current_mtime;
+            }
+        }
     }
 }
 
@@ -1141,6 +1184,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
 
     let tool_registry = build_tool_registry(&cwd, cli.no_tools);
     let system_prompt = build_system_prompt(&cwd, &tool_registry, &config)?;
+    let context_files_mtime = max_context_files_mtime(&cwd, &config);
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
 
@@ -1157,6 +1201,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
         tool_registry,
         request_options_resolver,
         system_prompt,
+        context_files_mtime,
         runtime_state: runtime_state.clone(),
         retry_config: RetryConfig::default(),
     };
@@ -1431,6 +1476,16 @@ pub fn build_system_prompt(
     parts.push(format!("Current date: {}", current_date_ymd()?));
     parts.push(format!("Current working directory: {}", cwd.display()));
     Ok(parts.join("\n\n"))
+}
+
+/// Return the maximum mtime across all context files, or `None` if none exist.
+fn max_context_files_mtime(
+    cwd: &Path,
+    config: &AnieConfig,
+) -> Option<std::time::SystemTime> {
+    collect_context_files(cwd, &config.context)
+        .ok()
+        .and_then(|files| files.into_iter().filter_map(|f| f.mtime).max())
 }
 
 async fn rpc_event_printer(mut event_rx: mpsc::Receiver<AgentEvent>) -> Result<()> {

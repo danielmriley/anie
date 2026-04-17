@@ -130,6 +130,8 @@ pub enum UiAction {
     ForkSession,
     /// Show a summary of file changes made in this session.
     ShowDiff,
+    /// Start a fresh session.
+    NewSession,
     /// Reload config after a local onboarding/provider-management change.
     ReloadConfig {
         provider: Option<String>,
@@ -631,6 +633,16 @@ impl App {
             }
             "/onboard" => self.open_onboarding_overlay(),
             "/providers" => self.open_provider_management_overlay(),
+            "/copy" => self.copy_last_assistant_to_clipboard(),
+            "/new" => {
+                let _ = self.action_tx.try_send(UiAction::NewSession);
+            }
+            "/reload" => {
+                let _ = self.action_tx.try_send(UiAction::ReloadConfig {
+                    provider: None,
+                    model: None,
+                });
+            }
             "/help" => self.show_help(),
             "/quit" | "/exit" => {
                 self.should_quit = true;
@@ -642,9 +654,33 @@ impl App {
         }
     }
 
+    fn copy_last_assistant_to_clipboard(&mut self) {
+        let Some(text) = self.output_pane.last_assistant_text() else {
+            self.output_pane
+                .add_system_message("No assistant message to copy.".into());
+            return;
+        };
+        let text = text.to_string();
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+            Ok(()) => {
+                let preview = if text.len() > 60 {
+                    format!("{}...", &text[..57])
+                } else {
+                    text
+                };
+                self.output_pane
+                    .add_system_message(format!("Copied to clipboard: {preview}"));
+            }
+            Err(error) => {
+                self.output_pane
+                    .add_system_message(format!("Clipboard error: {error}"));
+            }
+        }
+    }
+
     fn show_help(&mut self) {
         self.output_pane.add_system_message(
-            "Available commands:\n  /model [query]    — Open model picker (or switch if query is an exact match)\n  /thinking [level] — Show or change thinking (off, low, medium, high)\n  /compact          — Force context compaction\n  /fork             — Fork into a new child session\n  /diff             — Show file changes made in this session\n  /clear            — Clear the output pane\n  /session list     — List known sessions\n  /session <id>     — Switch to another session\n  /tools            — Show registered tools\n  /onboard          — Launch the onboarding flow\n  /providers        — Manage configured providers\n  /help             — Show this help\n  /quit             — Exit anie\n\nKeyboard shortcuts:\n  Ctrl+O            — Open model picker"
+            "Available commands:\n  /model [query]    — Open model picker (or switch if query is an exact match)\n  /thinking [level] — Show or change thinking (off, low, medium, high)\n  /compact          — Force context compaction\n  /new              — Start a fresh session\n  /fork             — Fork into a new child session\n  /diff             — Show file changes made in this session\n  /clear            — Clear the output pane\n  /copy             — Copy last assistant response to clipboard\n  /reload           — Reload config and context files\n  /session list     — List known sessions\n  /session <id>     — Switch to another session\n  /tools            — Show registered tools\n  /onboard          — Launch the onboarding flow\n  /providers        — Manage configured providers\n  /help             — Show this help\n  /quit             — Exit anie\n\nKeyboard shortcuts:\n  Ctrl+O            — Open model picker"
                 .to_string(),
         );
     }

@@ -73,6 +73,14 @@ impl OutputPane {
         self.add_block(RenderedBlock::UserMessage { text, timestamp });
     }
 
+    /// Return the visible text of the last assistant message, if any.
+    pub fn last_assistant_text(&self) -> Option<&str> {
+        self.blocks.iter().rev().find_map(|block| match block {
+            RenderedBlock::AssistantMessage { text, .. } if !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
     /// Add an empty streaming assistant block.
     pub fn add_streaming_assistant(&mut self) {
         self.add_block(RenderedBlock::AssistantMessage {
