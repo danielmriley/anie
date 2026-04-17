@@ -13,7 +13,7 @@ fn replay_events_and_render(events: &[AgentEvent], width: u16, height: u16) -> S
     // directly via handle_agent_event so neither channel is actually used.
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
 
     for event in events {
         app.handle_agent_event(event.clone()).expect("handle event");

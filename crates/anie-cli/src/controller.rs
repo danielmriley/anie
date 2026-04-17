@@ -26,7 +26,8 @@ use anie_protocol::{
     AgentEvent, ContentBlock, Message, StopReason, StreamDelta, UserMessage, now_millis,
 };
 use anie_provider::{
-    Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
+    ApiKind, CostPerMillion, Model, ProviderError, ProviderRegistry, RequestOptionsResolver,
+    ThinkingLevel,
 };
 use anie_providers_builtin::{builtin_models, detect_local_servers, register_builtin_providers};
 use anie_session::{
@@ -80,10 +81,11 @@ pub async fn run_interactive_mode(cli: Cli) -> Result<()> {
     let (ui_action_tx, ui_action_rx) = mpsc::channel(64);
     spawn_shutdown_signal_forwarder(ui_action_tx.clone());
 
+    let initial_models = state.model_catalog.clone();
     let controller = InteractiveController::new(state, ui_action_rx, agent_event_tx, false);
     let controller_task = tokio::spawn(async move { controller.run().await });
 
-    let mut app = App::new(agent_event_rx, ui_action_tx);
+    let mut app = App::new(agent_event_rx, ui_action_tx, initial_models);
     apply_status_event(app.status_bar_mut(), &initial_status);
     app.load_transcript(&transcript);
 
@@ -455,6 +457,15 @@ impl InteractiveController {
                     let _ = self.event_tx.send(self.state.status_event()).await;
                 }
             }
+            UiAction::SetResolvedModel(model) => {
+                if self.current_run.is_some() {
+                    self.send_system_message("Cannot change models while a run is active.")
+                        .await;
+                } else {
+                    self.state.set_model_resolved(model).await?;
+                    let _ = self.event_tx.send(self.state.status_event()).await;
+                }
+            }
             UiAction::SetThinking(level) => {
                 if self.current_run.is_some() {
                     self.send_system_message("Cannot change thinking while a run is active.")
@@ -674,6 +685,11 @@ impl ControllerState {
     async fn set_model(&mut self, requested: &str) -> Result<()> {
         let model =
             resolve_requested_model(requested, &self.current_model.provider, &self.model_catalog)?;
+        self.set_model_resolved(model).await
+    }
+
+    async fn set_model_resolved(&mut self, model: Model) -> Result<()> {
+        upsert_model(&mut self.model_catalog, &model);
         self.current_model = model;
         self.session
             .append_model_change(&self.current_model.provider, &self.current_model.id)?;
@@ -1010,7 +1026,16 @@ impl ControllerState {
                 .iter()
                 .find(|candidate| candidate.provider == provider && candidate.id == model_id)
                 .cloned()
+                .or_else(|| {
+                    fallback_model_from_provider(
+                        &provider,
+                        &model_id,
+                        &self.config,
+                        &self.model_catalog,
+                    )
+                })
         {
+            upsert_model(&mut self.model_catalog, &model);
             self.current_model = model;
         }
         if let Some(thinking) = context.thinking_level {
@@ -1044,12 +1069,25 @@ impl ControllerState {
             local_models_available,
         )
         .or_else(|_| {
+            fallback_model_from_provider(current_provider, current_model, &config, &model_catalog)
+                .ok_or_else(|| anyhow!("no model named '{current_model}' was found"))
+        })
+        .or_else(|_| {
             resolve_model(
                 Some(&config.model.provider),
                 Some(&config.model.id),
                 &model_catalog,
                 local_models_available,
             )
+        })
+        .or_else(|_| {
+            fallback_model_from_provider(
+                &config.model.provider,
+                &config.model.id,
+                &config,
+                &model_catalog,
+            )
+            .ok_or_else(|| anyhow!("no model named '{}' was found", config.model.id))
         })?;
 
         self.config = config;
@@ -1190,6 +1228,15 @@ fn resolve_initial_selection(
             local_models_available,
         )
         .or_else(|_| {
+            fallback_model_from_provider(
+                preferred_provider.as_str(),
+                preferred_model.as_str(),
+                config,
+                model_catalog,
+            )
+            .ok_or_else(|| anyhow!("no model named '{preferred_model}' was found"))
+        })
+        .or_else(|_| {
             resolve_model(
                 Some(preferred_provider.as_str()),
                 None,
@@ -1216,6 +1263,7 @@ fn resolve_requested_model(
     catalog: &[Model],
 ) -> Result<Model> {
     if let Some((provider, model_id)) = requested.split_once(':')
+        && catalog.iter().any(|model| model.provider == provider)
         && catalog
             .iter()
             .any(|model| model.provider == provider && model.id == model_id)
@@ -1276,6 +1324,59 @@ fn resolve_model(
         .first()
         .cloned()
         .ok_or_else(|| anyhow!("no models are configured or detected"))
+}
+
+fn fallback_model_from_provider(
+    provider: &str,
+    model_id: &str,
+    config: &AnieConfig,
+    catalog: &[Model],
+) -> Option<Model> {
+    let provider_config = config.providers.get(provider);
+    let api = provider_config
+        .and_then(|provider| provider.api)
+        .or_else(|| match provider {
+            "anthropic" => Some(ApiKind::AnthropicMessages),
+            _ => Some(ApiKind::OpenAICompletions),
+        })?;
+    let base_url = provider_config
+        .and_then(|provider| provider.base_url.clone())
+        .or_else(|| {
+            catalog
+                .iter()
+                .find(|candidate| candidate.provider == provider)
+                .map(|candidate| candidate.base_url.clone())
+        })
+        .or_else(|| match provider {
+            "anthropic" => Some("https://api.anthropic.com".to_string()),
+            "openai" => Some("https://api.openai.com/v1".to_string()),
+            _ => None,
+        })?;
+
+    Some(Model {
+        id: model_id.to_string(),
+        name: model_id.to_string(),
+        provider: provider.to_string(),
+        api,
+        base_url,
+        context_window: 32_768,
+        max_tokens: 8_192,
+        supports_reasoning: false,
+        reasoning_capabilities: None,
+        supports_images: false,
+        cost_per_million: CostPerMillion::zero(),
+    })
+}
+
+fn upsert_model(models: &mut Vec<Model>, model: &Model) {
+    if let Some(existing) = models
+        .iter_mut()
+        .find(|existing| existing.provider == model.provider && existing.id == model.id)
+    {
+        *existing = model.clone();
+    } else {
+        models.push(model.clone());
+    }
 }
 
 fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistry> {

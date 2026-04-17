@@ -6,7 +6,7 @@ use crossterm::event::EventStream;
 use futures::StreamExt;
 
 use anie_auth::CredentialStore;
-use anie_config::global_config_path;
+use anie_config::{global_config_path, preferred_write_target};
 use anie_tui::{
     OnboardingAction, OnboardingCompletion, OnboardingScreen, install_panic_hook, restore_terminal,
     setup_terminal, write_configured_providers,
@@ -30,7 +30,8 @@ fn is_first_run_with(config_path: Option<&Path>, credential_store: &CredentialSt
 pub async fn run_onboarding() -> Result<()> {
     install_panic_hook();
 
-    let config_path = global_config_path().context("home directory is not available")?;
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    let config_path = preferred_write_target(&cwd).context("home directory is not available")?;
     let mut screen = OnboardingScreen::new(CredentialStore::new());
     let mut terminal = setup_terminal()?;
     let mut events = EventStream::new();
@@ -88,7 +89,10 @@ pub async fn run_onboarding() -> Result<()> {
 
     match write_configured_providers(&config_path, &completion.providers)? {
         Some((provider, model)) => {
-            println!("Saved onboarding configuration using {provider}:{model}.");
+            println!(
+                "Saved onboarding configuration to {} using {provider}:{model}.",
+                config_path.display()
+            );
         }
         None => {
             println!("Onboarding finished with no configuration changes.");

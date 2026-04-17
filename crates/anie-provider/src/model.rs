@@ -63,6 +63,23 @@ pub struct ReasoningCapabilities {
     pub tags: Option<ReasoningTags>,
 }
 
+/// A model discovered from a provider endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// Model identifier as reported by the endpoint.
+    pub id: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Provider identifier.
+    pub provider: String,
+    /// Provider-advertised context window, when known.
+    pub context_length: Option<u64>,
+    /// Whether the model accepts images, when known.
+    pub supports_images: Option<bool>,
+    /// Whether the model supports reasoning features, when known.
+    pub supports_reasoning: Option<bool>,
+}
+
 /// Registered model metadata used to route and parameterize provider calls.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Model {
@@ -89,4 +106,67 @@ pub struct Model {
     pub supports_images: bool,
     /// Pricing metadata.
     pub cost_per_million: CostPerMillion,
+}
+
+impl ModelInfo {
+    /// Convert a discovered model into a runtime model definition using conservative defaults.
+    #[must_use]
+    pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
+        Model {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            provider: self.provider.clone(),
+            api,
+            base_url: base_url.to_string(),
+            context_window: self.context_length.unwrap_or(32_768),
+            max_tokens: 8_192,
+            supports_reasoning: self.supports_reasoning.unwrap_or(false),
+            reasoning_capabilities: None,
+            supports_images: self.supports_images.unwrap_or(false),
+            cost_per_million: CostPerMillion::zero(),
+        }
+    }
+}
+
+impl From<&Model> for ModelInfo {
+    fn from(value: &Model) -> Self {
+        Self {
+            id: value.id.clone(),
+            name: value.name.clone(),
+            provider: value.provider.clone(),
+            context_length: Some(value.context_window),
+            supports_images: Some(value.supports_images),
+            supports_reasoning: Some(value.supports_reasoning),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_info_to_model_uses_conservative_defaults() {
+        let info = ModelInfo {
+            id: "qwen3:32b".into(),
+            name: "Qwen 3 32B".into(),
+            provider: "ollama".into(),
+            context_length: None,
+            supports_images: None,
+            supports_reasoning: None,
+        };
+
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        assert_eq!(model.id, "qwen3:32b");
+        assert_eq!(model.name, "Qwen 3 32B");
+        assert_eq!(model.provider, "ollama");
+        assert_eq!(model.api, ApiKind::OpenAICompletions);
+        assert_eq!(model.base_url, "http://localhost:11434/v1");
+        assert_eq!(model.context_window, 32_768);
+        assert_eq!(model.max_tokens, 8_192);
+        assert!(!model.supports_reasoning);
+        assert!(!model.supports_images);
+        assert_eq!(model.cost_per_million, CostPerMillion::zero());
+        assert_eq!(model.reasoning_capabilities, None);
+    }
 }

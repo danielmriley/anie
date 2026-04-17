@@ -2,7 +2,9 @@
 
 **Status**: Implemented in v0.1.0
 
-This document details the new credential storage system using the [`keyring`](https://crates.io/crates/keyring) crate and the improved, menu-driven onboarding experience. The design draws direct inspiration from **pi-mono**'s elegant TUI-first approach (`/login`, `/model`, `/settings` slash commands + interactive provider selection) while adapting it to Rust + `ratatui` + `crossterm`.
+This document details the credential storage system using the [`keyring`](https://crates.io/crates/keyring) crate and the improved, menu-driven onboarding experience. The design draws direct inspiration from **pi-mono**'s elegant TUI-first approach (`/login`, `/model`, `/settings` slash commands + interactive provider selection) while adapting it to Rust + `ratatui` + `crossterm`.
+
+> Update: onboarding now also performs provider-aware model discovery and shows the shared inline model picker before finalizing configuration.
 
 ## 1. Credential Storage with `keyring`
 
@@ -162,6 +164,8 @@ The onboarding lives in a new `OnboardingScreen` widget inside `crates/anie-tui`
 - [x] Add integration and unit coverage for credential round-trip and migration.
 - [x] Update README with the `anie onboard`, `/onboard`, and `/providers` flow.
 - [x] Document in `docs/arch/` how providers now resolve (keyring → JSON fallback → env).
+- [x] Add dynamic model discovery and shared picker flows for onboarding, `/model`, and provider browsing.
+- [x] Add `anie models` for non-interactive model listing.
 
 ## 4. Implementation Deviations
 
@@ -171,6 +175,7 @@ A few implementation details differ from the original proposal:
 - **JSON compatibility mirror**: after successful native keyring writes, credentials are also mirrored into `~/.anie/auth.json` to preserve compatibility for provider enumeration and headless fallback.
 - **Config writes**: onboarding and provider-management changes are written through `anie-config::ConfigMutator` (`toml_edit`) so existing user comments and formatting are preserved.
 - **Provider management timing**: `/providers` is no longer just a future extension; it is implemented as a TUI overlay and is also reachable from the onboarding main menu when existing providers are present.
+- **Model selection**: onboarding, `/model`, and provider browsing now use a shared search-first picker backed by dynamic discovery plus an in-memory TTL cache.
 - **README media**: the README was updated textually; no GIF asset was added in this implementation pass.
 
 ## 5. Future Extensions

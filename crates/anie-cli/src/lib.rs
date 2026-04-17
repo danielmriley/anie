@@ -1,6 +1,7 @@
 //! CLI entry points for interactive, print, and RPC modes.
 
 mod controller;
+mod models_command;
 mod onboarding;
 mod runtime_state;
 
@@ -68,6 +69,13 @@ pub struct Cli {
 pub enum Command {
     /// Launch the interactive onboarding flow.
     Onboard,
+    /// List available models for configured providers.
+    Models {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 /// Run the CLI entry point.
@@ -79,8 +87,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             .with_context(|| format!("failed to change directory to {}", cwd.display()))?;
     }
 
-    if matches!(cli.command, Some(Command::Onboard)) {
-        return onboarding::run_onboarding().await;
+    match &cli.command {
+        Some(Command::Onboard) => return onboarding::run_onboarding().await,
+        Some(Command::Models { provider, refresh }) => {
+            return models_command::run_models_command(provider.as_deref(), *refresh).await;
+        }
+        None => {}
     }
 
     let credential_store = anie_auth::CredentialStore::new();
@@ -147,6 +159,18 @@ mod tests {
         let cli = Cli::parse_from(["anie", "hello world"]);
         assert_eq!(cli.command, None);
         assert_eq!(cli.prompt, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn parses_models_subcommand() {
+        let cli = Cli::parse_from(["anie", "models", "--provider", "openai", "--refresh"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Models {
+                provider: Some("openai".to_string()),
+                refresh: true,
+            })
+        );
     }
 
     #[test]

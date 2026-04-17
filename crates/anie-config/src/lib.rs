@@ -189,6 +189,12 @@ pub fn find_project_config(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Determine the preferred config file for writes from the current working tree.
+#[must_use]
+pub fn preferred_write_target(cwd: &Path) -> Option<PathBuf> {
+    find_project_config(cwd).or_else(global_config_path)
+}
+
 /// Load configuration from the standard global/project paths and apply CLI overrides.
 pub fn load_config(cli_overrides: CliOverrides) -> Result<AnieConfig> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
@@ -624,6 +630,29 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].provider, "local");
         assert_eq!(models[0].base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn preferred_write_target_returns_project_config_when_present() {
+        let tempdir = tempdir().expect("tempdir");
+        let project_root = tempdir.path().join("workspace");
+        let nested = project_root.join("src/module");
+        fs::create_dir_all(nested.join(".ignored")).expect("create nested dirs");
+        fs::create_dir_all(project_root.join(".anie")).expect("create .anie dir");
+        let project_config = project_root.join(".anie/config.toml");
+        fs::write(&project_config, "[model]\nid = \"gpt-4o\"\n").expect("write config");
+
+        assert_eq!(preferred_write_target(&nested), Some(project_config));
+    }
+
+    #[test]
+    fn preferred_write_target_falls_back_to_global_config() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("workspace");
+        fs::create_dir_all(&cwd).expect("create workspace");
+
+        let global = global_config_path();
+        assert_eq!(preferred_write_target(&cwd), global);
     }
 
     #[test]

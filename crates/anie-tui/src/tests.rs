@@ -6,14 +6,31 @@ use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StreamDelta, Usage, UserMessage,
 };
+use anie_provider::{ApiKind, CostPerMillion, Model};
 
 use crate::{AgentUiState, App, OutputPane, RenderedBlock};
+
+fn sample_models() -> Vec<Model> {
+    vec![Model {
+        id: "qwen3:32b".into(),
+        name: "Qwen 3 32B".into(),
+        provider: "ollama".into(),
+        api: ApiKind::OpenAICompletions,
+        base_url: "http://localhost:11434/v1".into(),
+        context_window: 32_768,
+        max_tokens: 8_192,
+        supports_reasoning: true,
+        reasoning_capabilities: None,
+        supports_images: false,
+        cost_per_million: CostPerMillion::zero(),
+    }]
+}
 
 #[test]
 fn static_layout_renders_output_status_and_input() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     {
         let status = app.status_bar_mut();
         status.provider_name = "anthropic".into();
@@ -59,7 +76,7 @@ fn shift_modified_characters_are_inserted() {
 fn wrapped_input_snapshot_is_stable() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     for ch in "This is a very long line that should wrap inside the input pane".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
             KeyCode::Char(ch),
@@ -82,7 +99,7 @@ fn wrapped_input_snapshot_is_stable() {
 fn replayed_assistant_renders_thinking_above_visible_response() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.load_transcript(&[Message::Assistant(AssistantMessage {
         content: vec![
             ContentBlock::Thinking {
@@ -121,7 +138,7 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
 fn streaming_assistant_renders_thinking_above_visible_response() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
 
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
@@ -211,7 +228,7 @@ fn empty_streaming_assistant_uses_generic_status() {
 fn event_to_render_streaming_and_tool_lifecycle() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
 
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
@@ -266,7 +283,7 @@ fn event_to_render_streaming_and_tool_lifecycle() {
 fn ctrl_c_marks_abort_while_active() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
     app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -282,7 +299,7 @@ fn ctrl_c_marks_abort_while_active() {
 fn second_ctrl_c_while_active_quits() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
     app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -309,7 +326,7 @@ fn second_ctrl_c_while_active_quits() {
 fn ctrl_c_while_idle_quits_immediately() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.handle_terminal_event(Event::Key(KeyEvent::new(
         KeyCode::Char('c'),
         KeyModifiers::CONTROL,
@@ -325,7 +342,7 @@ fn ctrl_c_while_idle_quits_immediately() {
 fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     for index in 0..12 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -412,7 +429,7 @@ fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
 fn home_and_end_navigate_transcript_when_input_is_empty() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -454,7 +471,7 @@ fn home_and_end_navigate_transcript_when_input_is_empty() {
 fn home_and_end_preserve_input_editing_when_draft_is_present() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -494,7 +511,7 @@ fn home_and_end_preserve_input_editing_when_draft_is_present() {
 fn mouse_wheel_scrolls_transcript_history() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -553,7 +570,7 @@ fn mouse_wheel_scrolls_transcript_history() {
 fn single_long_wrapped_assistant_message_is_navigable() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.load_transcript(&[Message::Assistant(AssistantMessage {
         content: vec![ContentBlock::Text {
             text: format!("BEGIN-{}-FINAL-SUFFIX", "abcdefghij".repeat(20)),
@@ -597,7 +614,7 @@ fn single_long_wrapped_assistant_message_is_navigable() {
 fn transcript_replace_resets_scroll_state_sanely() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     for index in 0..12 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -670,7 +687,7 @@ fn alt_arrow_word_movement_and_bash_title_render() {
 
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.handle_agent_event(AgentEvent::ToolExecStart {
         call_id: "call_bash".into(),
         tool_name: "bash".into(),
@@ -702,7 +719,7 @@ fn alt_arrow_word_movement_and_bash_title_render() {
 fn replayed_tool_results_restore_titles_from_details() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.load_transcript(&[
         Message::ToolResult(anie_protocol::ToolResultMessage {
             tool_call_id: "call_read".into(),
@@ -739,7 +756,7 @@ fn replayed_tool_results_restore_titles_from_details() {
 fn diff_rendering_shows_added_and_removed_lines() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.handle_agent_event(AgentEvent::ToolExecStart {
         call_id: "call_edit".into(),
         tool_name: "edit".into(),
@@ -771,10 +788,111 @@ fn diff_rendering_shows_added_and_removed_lines() {
 }
 
 #[test]
+fn model_command_opens_picker_in_bottom_pane_and_keeps_transcript_visible() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, sample_models());
+    app.status_bar_mut().provider_name = "ollama".into();
+    app.status_bar_mut().model_name = "qwen3:32b".into();
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: Message::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "keep transcript visible".into(),
+            }],
+            timestamp: 1,
+        }),
+    })
+    .expect("user message");
+
+    for ch in "/model".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit command");
+    assert!(action_rx.try_recv().is_err());
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+    assert!(
+        screen.contains("keep transcript visible"),
+        "screen was:\n{screen}"
+    );
+    assert!(screen.contains("Select Model"), "screen was:\n{screen}");
+    assert!(screen.contains("qwen3:32b"), "screen was:\n{screen}");
+}
+
+#[test]
+fn ctrl_o_opens_picker_and_escape_restores_editor_content() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, sample_models());
+    app.status_bar_mut().provider_name = "ollama".into();
+    app.status_bar_mut().model_name = "qwen3:32b".into();
+
+    for ch in "draft message".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type draft");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("open picker");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("cancel picker");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+    assert!(screen.contains("draft message"), "screen was:\n{screen}");
+    assert!(!screen.contains("Select Model"), "screen was:\n{screen}");
+}
+
+#[test]
+fn picker_selection_sends_resolved_model_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, sample_models());
+    app.status_bar_mut().provider_name = "ollama".into();
+    app.status_bar_mut().model_name = "qwen3:32b".into();
+
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("open picker");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("select model");
+
+    assert!(matches!(
+        action_rx.try_recv().expect("model action"),
+        crate::UiAction::SetResolvedModel(model) if model.id == "qwen3:32b"
+    ));
+}
+
+#[test]
 fn slash_commands_route_actions_and_render_help() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, sample_models());
 
     for ch in "/model qwen3:32b".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -788,9 +906,10 @@ fn slash_commands_route_actions_and_render_help() {
         KeyModifiers::NONE,
     )))
     .expect("submit model command");
-    assert!(
-        matches!(action_rx.try_recv().expect("model action"), crate::UiAction::SetModel(model) if model == "qwen3:32b")
-    );
+    assert!(matches!(
+        action_rx.try_recv().expect("model action"),
+        crate::UiAction::SetResolvedModel(model) if model.id == "qwen3:32b"
+    ));
 
     for ch in "/compact".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -869,7 +988,7 @@ fn slash_commands_route_actions_and_render_help() {
 fn onboarding_slash_command_opens_overlay_locally() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
 
     for ch in "/onboard".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -904,7 +1023,7 @@ fn onboarding_slash_command_opens_overlay_locally() {
 fn providers_slash_command_opens_provider_management_overlay() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
 
     for ch in "/providers".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -939,7 +1058,7 @@ fn providers_slash_command_opens_provider_management_overlay() {
 fn app_transitions_back_to_idle_after_agent_end() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
     app.handle_agent_event(AgentEvent::AgentEnd { messages: vec![] })

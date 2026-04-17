@@ -12,6 +12,7 @@ The workspace is split into focused crates for protocol types, provider abstract
 - **Session persistence** in append-only JSONL files with fork/resume support
 - **Automatic context compaction** when token budgets get tight
 - **Provider support** for Anthropic, OpenAI-compatible backends, and local servers such as Ollama and LM Studio
+- **Dynamic model pickers** for onboarding, `/model`, and provider browsing, with search and refresh
 - **Layered configuration** via `~/.anie/config.toml`, project `.anie/config.toml`, and CLI overrides
 - **Credential resolution** from CLI args, the OS keyring, JSON fallback files, configured env vars, or built-in provider env vars
 - **First-run onboarding** with a full-screen TUI, local-server detection, provider presets, and provider management overlays
@@ -66,6 +67,7 @@ The onboarding flow can:
 - detect a local model server such as Ollama or LM Studio
 - let you add an API-key-backed provider from a preset list
 - let you add a custom OpenAI-compatible endpoint
+- discover available models for each provider path and let you pick one inline
 - reopen later with `anie onboard` or `/onboard`
 
 ### Run a one-shot prompt
@@ -100,6 +102,11 @@ You can rerun the onboarding flow anytime with:
 anie onboard
 ```
 
+List available models from the CLI with:
+
+```bash
+anie models [--provider <name>] [--refresh]
+```
 
 - `--resume <session-id>` — reopen a previous session
 - `-C, --cwd <dir>` — run against a different working directory
@@ -178,7 +185,7 @@ Interactive mode is the default when you run `anie` without a prompt.
 
 Useful TUI slash commands include:
 
-- `/model [id]`
+- `/model [query]` — open the model picker, or switch immediately on an exact match
 - `/thinking [off|low|medium|high]`
 - `/compact`
 - `/fork`
@@ -191,6 +198,10 @@ Useful TUI slash commands include:
 - `/clear`
 - `/help`
 - `/quit`
+
+Useful keyboard shortcuts include:
+
+- `Ctrl+O` — open the model picker
 
 ### Print mode
 
@@ -219,6 +230,7 @@ The core toolset is intentionally small and focused:
 Common files and directories include:
 
 - `~/.anie/config.toml` — global config
+- `./.anie/config.toml` — nearest project config when present
 - `~/.anie/auth.json` — JSON credential fallback when native keyring storage is unavailable
 - `~/.anie/auth.json.migrated` — preserved backup after legacy credential migration
 - `~/.anie/state.json` — last-used non-secret runtime state

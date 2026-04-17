@@ -11,8 +11,8 @@ mod thinking;
 pub use api_kind::ApiKind;
 pub use error::ProviderError;
 pub use model::{
-    CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
-    ReasoningTags,
+    CostPerMillion, Model, ModelInfo, ReasoningCapabilities, ReasoningControlMode,
+    ReasoningOutputMode, ReasoningTags,
 };
 pub use options::{LlmContext, LlmMessage, ResolvedRequestOptions, StreamOptions};
 pub use provider::{Provider, ProviderEvent, ProviderStream, RequestOptionsResolver};

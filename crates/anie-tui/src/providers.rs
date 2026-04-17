@@ -19,12 +19,13 @@ use tokio::sync::mpsc;
 
 use anie_auth::CredentialStore;
 use anie_config::{
-    AnieConfig, CliOverrides, ConfigMutator, global_config_path, load_config_with_paths,
+    CliOverrides, ConfigMutator, find_project_config, global_config_path, load_config_with_paths,
+    preferred_write_target,
 };
-use anie_provider::{ApiKind, CostPerMillion, Model};
-use anie_providers_builtin::builtin_models;
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelInfo};
+use anie_providers_builtin::{ModelDiscoveryRequest, builtin_models, discover_models};
 
-use crate::Spinner;
+use crate::{ModelPickerAction, ModelPickerPane, Spinner};
 
 /// A configured provider shown in the management screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub struct ProviderEntry {
     pub name: String,
     pub provider_type: ProviderType,
     pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
     pub default_model: String,
     pub has_credential: bool,
     pub is_default: bool,
@@ -54,13 +56,14 @@ pub enum TestResult {
 }
 
 /// Actions returned by the provider management screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProviderManagementAction {
     Continue,
     Close,
     ConfigChanged {
         provider: Option<String>,
         model: Option<String>,
+        resolved_model: Option<Model>,
         message: String,
     },
 }
@@ -68,11 +71,24 @@ pub enum ProviderManagementAction {
 #[derive(Debug, Clone)]
 enum ProviderManagementMode {
     Table,
-    ActionMenu { selected: usize },
+    ActionMenu {
+        selected: usize,
+    },
     ConfirmDelete,
-    EditApiKey { input: TextField },
-    Busy { message: String },
-    Status { message: String, is_error: bool },
+    EditApiKey {
+        input: TextField,
+    },
+    Busy {
+        message: String,
+    },
+    PickingModel {
+        entry: ProviderEntry,
+        picker: ModelPickerPane,
+    },
+    Status {
+        message: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -85,11 +101,16 @@ enum WorkerEvent {
         provider: String,
         result: Result<(), String>,
     },
+    ModelsDiscovered {
+        entry: ProviderEntry,
+        result: Result<Vec<ModelInfo>, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ActionItem {
     TestConnection,
+    ViewModels,
     EditApiKey,
     SetAsDefault,
     DeleteProvider,
@@ -112,22 +133,30 @@ pub struct ProviderManagementScreen {
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     worker_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     spinner: Spinner,
-    global_config_path: PathBuf,
+    write_target: PathBuf,
 }
 
 impl ProviderManagementScreen {
     /// Create a management screen using the global config and default credential store.
     pub fn new() -> Result<Self> {
-        let global_config_path = global_config_path().context("home directory is not available")?;
+        let cwd = std::env::current_dir().context("failed to determine current directory")?;
+        let write_target =
+            preferred_write_target(&cwd).context("home directory is not available")?;
+        let project_config_path = find_project_config(&cwd);
         let credential_store = CredentialStore::new();
-        Self::with_config_path(global_config_path, credential_store)
+        Self::with_paths(write_target, project_config_path, credential_store)
     }
 
-    fn with_config_path(
-        global_config_path: PathBuf,
+    fn with_paths(
+        write_target: PathBuf,
+        project_config_path: Option<PathBuf>,
         credential_store: CredentialStore,
     ) -> Result<Self> {
-        let providers = load_provider_entries(&global_config_path, &credential_store)?;
+        let providers = load_provider_entries(
+            &write_target,
+            project_config_path.as_deref(),
+            &credential_store,
+        )?;
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         Ok(Self {
             providers,
@@ -138,7 +167,7 @@ impl ProviderManagementScreen {
             worker_tx,
             worker_rx,
             spinner: Spinner::new(),
-            global_config_path,
+            write_target,
         })
     }
 
@@ -150,6 +179,7 @@ impl ProviderManagementScreen {
             ProviderManagementMode::ConfirmDelete => self.handle_confirm_delete_key(key),
             ProviderManagementMode::EditApiKey { .. } => self.handle_edit_key_input(key),
             ProviderManagementMode::Busy { .. } => self.handle_busy_key(key),
+            ProviderManagementMode::PickingModel { .. } => self.handle_model_picker_key(key),
             ProviderManagementMode::Status { .. } => {
                 self.mode = ProviderManagementMode::Table;
                 ProviderManagementAction::Continue
@@ -214,6 +244,9 @@ impl ProviderManagementScreen {
                 Color::Cyan,
                 footer_line("[Esc] Back"),
             ),
+            ProviderManagementMode::PickingModel { picker, .. } => {
+                self.render_model_picker(frame, inner, &picker, &spinner_frame)
+            }
             ProviderManagementMode::Status { message, is_error } => self.render_status_panel(
                 frame,
                 inner,
@@ -238,7 +271,7 @@ impl ProviderManagementScreen {
             worker_tx,
             worker_rx,
             spinner: Spinner::new(),
-            global_config_path: PathBuf::from("/tmp/config.toml"),
+            write_target: PathBuf::from("/tmp/config.toml"),
         }
     }
 
@@ -278,6 +311,44 @@ impl ProviderManagementScreen {
                         message: error,
                         is_error: true,
                     };
+                }
+            },
+            WorkerEvent::ModelsDiscovered { entry, result } => match result {
+                Ok(models) => {
+                    if let ProviderManagementMode::PickingModel {
+                        entry: active_entry,
+                        picker,
+                    } = &mut self.mode
+                        && active_entry.name == entry.name
+                    {
+                        picker.set_models(models);
+                    } else {
+                        self.mode = ProviderManagementMode::PickingModel {
+                            picker: ModelPickerPane::new(
+                                models,
+                                entry.name.clone(),
+                                entry.default_model.clone(),
+                                None,
+                            ),
+                            entry,
+                        };
+                    }
+                }
+                Err(error) => {
+                    if let ProviderManagementMode::PickingModel {
+                        entry: active_entry,
+                        picker,
+                    } = &mut self.mode
+                        && active_entry.name == entry.name
+                    {
+                        picker.set_loading(false);
+                        picker.set_error(Some(error));
+                    } else {
+                        self.mode = ProviderManagementMode::Status {
+                            message: format!("Could not load models: {error}"),
+                            is_error: true,
+                        };
+                    }
                 }
             },
         }
@@ -341,6 +412,15 @@ impl ProviderManagementScreen {
                     self.mode = ProviderManagementMode::Table;
                     self.spawn_test_for_selected();
                 }
+                Some(ActionItem::ViewModels) => {
+                    self.mode = ProviderManagementMode::Busy {
+                        message: format!(
+                            "Loading models for '{}'…",
+                            self.selected_provider_name().unwrap_or_default()
+                        ),
+                    };
+                    self.spawn_model_discovery_for_selected();
+                }
                 Some(ActionItem::EditApiKey) => {
                     self.mode = ProviderManagementMode::EditApiKey {
                         input: TextField::masked(),
@@ -402,6 +482,39 @@ impl ProviderManagementScreen {
             (KeyModifiers::NONE, KeyCode::Esc)
         ) {
             self.mode = ProviderManagementMode::Table;
+        }
+        ProviderManagementAction::Continue
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> ProviderManagementAction {
+        let action = match &mut self.mode {
+            ProviderManagementMode::PickingModel { picker, .. } => picker.handle_key(key),
+            _ => return ProviderManagementAction::Continue,
+        };
+
+        match action {
+            ModelPickerAction::Continue => {}
+            ModelPickerAction::Cancelled => {
+                self.mode = ProviderManagementMode::ActionMenu { selected: 1 };
+            }
+            ModelPickerAction::Refresh => {
+                let entry = match &mut self.mode {
+                    ProviderManagementMode::PickingModel { entry, picker } => {
+                        picker.set_loading(true);
+                        picker.set_error(None);
+                        entry.clone()
+                    }
+                    _ => return ProviderManagementAction::Continue,
+                };
+                self.spawn_model_discovery(entry);
+            }
+            ModelPickerAction::Selected(model_info) => {
+                let entry = match &self.mode {
+                    ProviderManagementMode::PickingModel { entry, .. } => entry.clone(),
+                    _ => return ProviderManagementAction::Continue,
+                };
+                return self.apply_selected_model(entry, model_info);
+            }
         }
         ProviderManagementAction::Continue
     }
@@ -498,6 +611,7 @@ impl ProviderManagementScreen {
             .map(|item| {
                 ListItem::new(match item {
                     ActionItem::TestConnection => "Test connection",
+                    ActionItem::ViewModels => "View models",
                     ActionItem::EditApiKey => "Edit API key",
                     ActionItem::SetAsDefault => "Set as default",
                     ActionItem::DeleteProvider => "Delete provider",
@@ -546,6 +660,17 @@ impl ProviderManagementScreen {
         ));
         Paragraph::new(footer_line("[Enter] Save   [Esc] Cancel"))
             .render(chunks[2], frame.buffer_mut());
+    }
+
+    fn render_model_picker(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        picker: &ModelPickerPane,
+        spinner_frame: &str,
+    ) {
+        let cursor = picker.render(area, frame.buffer_mut(), spinner_frame);
+        frame.set_cursor_position(cursor);
     }
 
     fn render_status_panel(
@@ -649,6 +774,68 @@ impl ProviderManagementScreen {
         });
     }
 
+    fn spawn_model_discovery_for_selected(&mut self) {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return;
+        };
+        self.spawn_model_discovery(entry);
+    }
+
+    fn spawn_model_discovery(&self, entry: ProviderEntry) {
+        let tx = self.worker_tx.clone();
+        let credential_store = self.credential_store.clone();
+        if tokio::runtime::Handle::try_current().is_err() {
+            let _ = tx.send(WorkerEvent::ModelsDiscovered {
+                entry,
+                result: Err("model discovery requires an async runtime".to_string()),
+            });
+            return;
+        }
+
+        tokio::spawn(async move {
+            let result = discover_models_for_entry(&entry, &credential_store).await;
+            let _ = tx.send(WorkerEvent::ModelsDiscovered { entry, result });
+        });
+    }
+
+    fn apply_selected_model(
+        &mut self,
+        entry: ProviderEntry,
+        model_info: ModelInfo,
+    ) -> ProviderManagementAction {
+        match self.write_selected_model(&entry, &model_info) {
+            Ok((provider, model_id, resolved_model)) => {
+                for provider_entry in &mut self.providers {
+                    provider_entry.is_default = provider_entry.name == provider;
+                    if provider_entry.name == provider {
+                        provider_entry.default_model = model_id.clone();
+                    }
+                }
+                self.mode = ProviderManagementMode::Status {
+                    message: format!(
+                        "Saved default model for '{}' to {}.",
+                        provider,
+                        self.write_target.display()
+                    ),
+                    is_error: false,
+                };
+                ProviderManagementAction::ConfigChanged {
+                    provider: Some(provider),
+                    model: Some(model_id),
+                    resolved_model: Some(resolved_model),
+                    message: format!("Saved configuration to {}", self.write_target.display()),
+                }
+            }
+            Err(error) => {
+                self.mode = ProviderManagementMode::Status {
+                    message: format!("Could not update default model: {error}"),
+                    is_error: true,
+                };
+                ProviderManagementAction::Continue
+            }
+        }
+    }
+
     fn set_selected_as_default(&mut self) -> ProviderManagementAction {
         let Some(entry) = self.selected_entry().cloned() else {
             return ProviderManagementAction::Continue;
@@ -659,13 +846,18 @@ impl ProviderManagementScreen {
                     provider_entry.is_default = provider_entry.name == provider;
                 }
                 self.mode = ProviderManagementMode::Status {
-                    message: format!("Set '{}' as the default provider.", provider),
+                    message: format!(
+                        "Set '{}' as the default provider in {}.",
+                        provider,
+                        self.write_target.display()
+                    ),
                     is_error: false,
                 };
                 ProviderManagementAction::ConfigChanged {
                     provider: Some(provider),
                     model: Some(model),
-                    message: "Default provider updated.".to_string(),
+                    resolved_model: None,
+                    message: format!("Saved configuration to {}", self.write_target.display()),
                 }
             }
             Err(error) => {
@@ -685,7 +877,7 @@ impl ProviderManagementScreen {
 
         let outcome = (|| -> Result<(Option<String>, Option<String>)> {
             self.credential_store.delete(&entry.name)?;
-            let mut mutator = ConfigMutator::load_or_create(&self.global_config_path)?;
+            let mut mutator = ConfigMutator::load_or_create(&self.write_target)?;
             mutator.remove_provider(&entry.name);
             mutator.save()?;
 
@@ -715,7 +907,8 @@ impl ProviderManagementScreen {
                 ProviderManagementAction::ConfigChanged {
                     provider,
                     model,
-                    message: format!("Deleted provider '{}'.", entry.name),
+                    resolved_model: None,
+                    message: format!("Saved configuration to {}", self.write_target.display()),
                 }
             }
             Err(error) => {
@@ -729,16 +922,41 @@ impl ProviderManagementScreen {
     }
 
     fn write_default_selection(&self, provider: &str, model: &str) -> Result<(String, String)> {
-        let mut mutator = ConfigMutator::load_or_create(&self.global_config_path)?;
+        let mut mutator = ConfigMutator::load_or_create(&self.write_target)?;
         mutator.set_default_model(provider, model);
         mutator.save()?;
         Ok((provider.to_string(), model.to_string()))
+    }
+
+    fn write_selected_model(
+        &self,
+        entry: &ProviderEntry,
+        model_info: &ModelInfo,
+    ) -> Result<(String, String, Model)> {
+        let resolved_model = model_info_to_provider_model(entry, model_info);
+        let mut mutator = ConfigMutator::load_or_create(&self.write_target)?;
+        if !matches!(entry.provider_type, ProviderType::ApiKey) {
+            mutator.upsert_provider(
+                &entry.name,
+                Some(resolved_model.base_url.as_str()),
+                Some(resolved_model.api),
+            );
+            mutator.upsert_provider_model(&entry.name, &resolved_model);
+        }
+        mutator.set_default_model(&entry.name, &resolved_model.id);
+        mutator.save()?;
+        Ok((
+            entry.name.clone(),
+            resolved_model.id.clone(),
+            resolved_model,
+        ))
     }
 }
 
 fn action_items() -> &'static [ActionItem] {
     &[
         ActionItem::TestConnection,
+        ActionItem::ViewModels,
         ActionItem::EditApiKey,
         ActionItem::SetAsDefault,
         ActionItem::DeleteProvider,
@@ -746,19 +964,25 @@ fn action_items() -> &'static [ActionItem] {
 }
 
 fn load_provider_entries(
-    config_path: &PathBuf,
+    write_target: &PathBuf,
+    project_config_path: Option<&std::path::Path>,
     credential_store: &CredentialStore,
 ) -> Result<Vec<ProviderEntry>> {
-    let has_global_config = config_path.is_file();
-    let config = if has_global_config {
-        load_config_with_paths(Some(config_path.as_path()), None, CliOverrides::default())?
-    } else {
-        AnieConfig::default()
-    };
+    let global_config = global_config_path();
+    let config = load_config_with_paths(
+        global_config.as_deref(),
+        project_config_path,
+        CliOverrides::default(),
+    )?;
+    let has_any_config = global_config
+        .as_deref()
+        .is_some_and(std::path::Path::exists)
+        || project_config_path.is_some_and(std::path::Path::exists)
+        || write_target.is_file();
 
     let stored_credentials = credential_store.list_providers();
     let mut provider_names = config.providers.keys().cloned().collect::<Vec<_>>();
-    if has_global_config && !provider_names.contains(&config.model.provider) {
+    if has_any_config && !provider_names.contains(&config.model.provider) {
         provider_names.push(config.model.provider.clone());
     }
     for provider in stored_credentials {
@@ -775,7 +999,7 @@ fn load_provider_entries(
         .map(|name| {
             let provider_config = config.providers.get(&name);
             let builtin_default = builtin_catalog.iter().find(|model| model.provider == name);
-            let default_model = if has_global_config && config.model.provider == name {
+            let default_model = if has_any_config && config.model.provider == name {
                 config.model.id.clone()
             } else {
                 provider_config
@@ -790,10 +1014,11 @@ fn load_provider_entries(
             let provider_type = classify_provider_type(&name, base_url.as_deref());
             ProviderEntry {
                 has_credential: credential_store.get(&name).is_some(),
-                is_default: has_global_config && config.model.provider == name,
+                is_default: has_any_config && config.model.provider == name,
                 name,
                 provider_type,
                 base_url,
+                api_key_env: provider_config.and_then(|provider| provider.api_key_env.clone()),
                 default_model,
             }
         })
@@ -828,7 +1053,8 @@ fn is_local_base_url(base_url: &str) -> bool {
 async fn test_provider(entry: ProviderEntry, credential_store: CredentialStore) -> TestResult {
     let started = Instant::now();
     let model = model_for_entry(&entry);
-    let api_key = credential_store.get(&entry.name);
+    let api_key =
+        resolve_provider_api_key(&entry.name, entry.api_key_env.as_deref(), &credential_store);
     match validate_provider_connection(&model, api_key.as_deref()).await {
         Ok(()) => TestResult::Success {
             latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -864,6 +1090,56 @@ fn model_for_entry(entry: &ProviderEntry) -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
     }
+}
+
+fn model_info_to_provider_model(entry: &ProviderEntry, info: &ModelInfo) -> Model {
+    let model = model_for_entry(entry);
+    let mut resolved = info.to_model(model.api, &model.base_url);
+    resolved.provider = entry.name.clone();
+    resolved
+}
+
+fn resolve_provider_api_key(
+    provider_name: &str,
+    api_key_env: Option<&str>,
+    credential_store: &CredentialStore,
+) -> Option<String> {
+    credential_store.get(provider_name).or_else(|| {
+        api_key_env
+            .and_then(|name| std::env::var(name).ok())
+            .or_else(|| {
+                default_provider_env(provider_name).and_then(|name| std::env::var(name).ok())
+            })
+    })
+}
+
+fn default_provider_env(provider_name: &str) -> Option<&'static str> {
+    match provider_name {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        _ => None,
+    }
+}
+
+async fn discover_models_for_entry(
+    entry: &ProviderEntry,
+    credential_store: &CredentialStore,
+) -> Result<Vec<ModelInfo>, String> {
+    let model = model_for_entry(entry);
+    let request = ModelDiscoveryRequest {
+        provider_name: entry.name.clone(),
+        api: model.api,
+        base_url: model.base_url,
+        api_key: resolve_provider_api_key(
+            &entry.name,
+            entry.api_key_env.as_deref(),
+            credential_store,
+        ),
+        headers: HashMap::new(),
+    };
+    discover_models(&request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn validate_provider_connection(model: &Model, api_key: Option<&str>) -> Result<(), String> {
@@ -1078,6 +1354,7 @@ mod tests {
             name: name.to_string(),
             provider_type: ProviderType::ApiKey,
             base_url: Some("https://api.example.com/v1".to_string()),
+            api_key_env: None,
             default_model: "model".to_string(),
             has_credential: true,
             is_default,

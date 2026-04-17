@@ -1,5 +1,7 @@
 use std::{
     io::Stdout,
+    path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -16,18 +18,20 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use anie_auth::CredentialStore;
-use anie_config::global_config_path;
+use anie_config::{CliOverrides, load_config, preferred_write_target};
 use anie_protocol::{
     AgentEvent, ContentBlock, Message, StreamDelta, ToolResult, ToolResultMessage,
 };
+use anie_provider::{ApiKind, Model, ModelInfo};
+use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest};
 
 use crate::{
-    InputPane, OnboardingAction, OnboardingCompletion, OnboardingScreen, OutputPane,
-    ProviderManagementAction, ProviderManagementScreen, input::InputAction,
-    onboarding::write_configured_providers, output::RenderedBlock,
+    InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
+    OnboardingScreen, OutputPane, ProviderManagementAction, ProviderManagementScreen,
+    input::InputAction, onboarding::write_configured_providers, output::RenderedBlock,
 };
 
 /// Rendered tool result details re-exported for consumers.
@@ -38,6 +42,7 @@ pub struct App {
     output_pane: OutputPane,
     status_bar: StatusBarState,
     input_pane: InputPane,
+    bottom_pane: BottomPane,
     agent_state: AgentUiState,
     event_rx: mpsc::Receiver<AgentEvent>,
     action_tx: mpsc::Sender<UiAction>,
@@ -45,6 +50,35 @@ pub struct App {
     spinner: Spinner,
     last_ctrl_c: Option<Instant>,
     overlay: Option<OverlayState>,
+    known_models: Vec<Model>,
+    discovery_cache: Arc<Mutex<ModelDiscoveryCache>>,
+    worker_tx: mpsc::UnboundedSender<AppWorkerEvent>,
+    worker_rx: mpsc::UnboundedReceiver<AppWorkerEvent>,
+}
+
+enum BottomPane {
+    Editor,
+    ModelPicker(ModelPickerSession),
+}
+
+struct ModelPickerSession {
+    picker: ModelPickerPane,
+    context: ModelPickerContext,
+}
+
+#[derive(Debug, Clone)]
+struct ModelPickerContext {
+    provider_name: String,
+    api: ApiKind,
+    base_url: String,
+}
+
+#[derive(Debug)]
+enum AppWorkerEvent {
+    ModelDiscoveryComplete {
+        provider_name: String,
+        result: Result<Vec<ModelInfo>, String>,
+    },
 }
 
 enum OverlayState {
@@ -64,7 +98,7 @@ pub enum AgentUiState {
 }
 
 /// Actions emitted from the TUI to the controller layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
     /// Submit a user prompt.
     SubmitPrompt(String),
@@ -74,8 +108,10 @@ pub enum UiAction {
     Quit,
     /// Request a model picker.
     SelectModel,
-    /// Set the active model.
+    /// Set the active model by ID or `provider:model`.
     SetModel(String),
+    /// Set the active model using a fully-resolved model definition.
+    SetResolvedModel(Model),
     /// Set the active thinking level.
     SetThinking(String),
     /// Clear the output pane.
@@ -173,11 +209,17 @@ impl Default for Spinner {
 impl App {
     /// Create a new TUI app.
     #[must_use]
-    pub fn new(event_rx: mpsc::Receiver<AgentEvent>, action_tx: mpsc::Sender<UiAction>) -> Self {
+    pub fn new(
+        event_rx: mpsc::Receiver<AgentEvent>,
+        action_tx: mpsc::Sender<UiAction>,
+        initial_models: Vec<Model>,
+    ) -> Self {
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         Self {
             output_pane: OutputPane::new(),
             status_bar: StatusBarState::default(),
             input_pane: InputPane::new(),
+            bottom_pane: BottomPane::Editor,
             agent_state: AgentUiState::Idle,
             event_rx,
             action_tx,
@@ -185,6 +227,12 @@ impl App {
             spinner: Spinner::new(),
             last_ctrl_c: None,
             overlay: None,
+            known_models: initial_models,
+            discovery_cache: Arc::new(Mutex::new(ModelDiscoveryCache::new(Duration::from_secs(
+                300,
+            )))),
+            worker_tx,
+            worker_rx,
         }
     }
 
@@ -202,20 +250,39 @@ impl App {
 
     /// Render the full app frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
-        let input_height = self.input_pane.preferred_height(frame.area().width);
-        let (output_area, status_area, input_area) = layout(frame.area(), input_height);
+        let spinner_frame = self.spinner.tick().to_string();
+        let half_height = frame.area().height.saturating_sub(2).max(8) / 2;
+        let bottom_height = match &self.bottom_pane {
+            BottomPane::Editor => self
+                .input_pane
+                .preferred_height(frame.area().width)
+                .clamp(3, 8),
+            BottomPane::ModelPicker(session) => session
+                .picker
+                .preferred_height(frame.area().width)
+                .clamp(8, half_height.max(8)),
+        };
+        let (output_area, status_area, bottom_area) = layout(frame.area(), bottom_height);
 
         self.output_pane
-            .render(output_area, frame.buffer_mut(), self.spinner.tick());
+            .render(output_area, frame.buffer_mut(), &spinner_frame);
         render_status_bar(
             &self.status_bar,
             &self.agent_state,
             self.output_pane.is_scrolled(),
             status_area,
             frame.buffer_mut(),
-            self.spinner.tick(),
+            &spinner_frame,
         );
-        let cursor = self.input_pane.render(input_area, frame.buffer_mut());
+
+        let cursor = match &mut self.bottom_pane {
+            BottomPane::Editor => self.input_pane.render(bottom_area, frame.buffer_mut()),
+            BottomPane::ModelPicker(session) => {
+                session
+                    .picker
+                    .render(bottom_area, frame.buffer_mut(), &spinner_frame)
+            }
+        };
         frame.set_cursor_position(cursor);
 
         if let Some(overlay) = &mut self.overlay {
@@ -238,7 +305,13 @@ impl App {
         }
 
         match event {
-            Event::Key(key) => self.handle_key_event(key),
+            Event::Key(key) => {
+                if matches!(self.bottom_pane, BottomPane::ModelPicker(_)) {
+                    self.handle_model_picker_key(key);
+                } else {
+                    self.handle_key_event(key);
+                }
+            }
             Event::Mouse(mouse) => self.handle_mouse_event(mouse),
             Event::Resize(_, _) => {}
             _ => {}
@@ -394,6 +467,10 @@ impl App {
                 }
             }
         }
+
+        while let Ok(event) = self.worker_rx.try_recv() {
+            self.handle_worker_event(event);
+        }
         Ok(())
     }
 
@@ -431,7 +508,7 @@ impl App {
                 self.output_pane.scroll_to_bottom()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-                let _ = self.action_tx.try_send(UiAction::SelectModel);
+                self.open_model_picker_for_current_provider(None);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.output_pane.clear();
@@ -469,6 +546,9 @@ impl App {
             (KeyModifiers::NONE, KeyCode::PageDown) => self.output_pane.scroll_page_down(),
             (KeyModifiers::NONE, KeyCode::Home) => self.output_pane.scroll_to_top(),
             (KeyModifiers::NONE, KeyCode::End) => self.output_pane.scroll_to_bottom(),
+            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
+                self.open_model_picker_for_current_provider(None);
+            }
             _ => {}
         }
     }
@@ -500,16 +580,11 @@ impl App {
 
         match cmd {
             "/model" => match arg {
-                None => self.output_pane.add_system_message(format!(
-                    "Current model: {} ({})",
-                    self.status_bar.model_name, self.status_bar.provider_name,
-                )),
-                Some(model_id) => {
-                    let _ = self
-                        .action_tx
-                        .try_send(UiAction::SetModel(model_id.to_string()));
-                    self.output_pane
-                        .add_system_message(format!("Requested model switch: {model_id}"));
+                None => self.open_model_picker_for_current_provider(None),
+                Some(query) => {
+                    if !self.try_exact_model_switch(query) {
+                        self.open_model_picker_for_current_provider(Some(query.to_string()));
+                    }
                 }
             },
             "/thinking" => match arg {
@@ -569,9 +644,270 @@ impl App {
 
     fn show_help(&mut self) {
         self.output_pane.add_system_message(
-            "Available commands:\n  /model [id]       — Show or switch the active model\n  /thinking [level] — Show or change thinking (off, low, medium, high)\n  /compact          — Force context compaction\n  /fork             — Fork into a new child session\n  /diff             — Show file changes made in this session\n  /clear            — Clear the output pane\n  /session list     — List known sessions\n  /session <id>     — Switch to another session\n  /tools            — Show registered tools\n  /onboard          — Launch the onboarding flow\n  /providers        — Manage configured providers\n  /help             — Show this help\n  /quit             — Exit anie"
+            "Available commands:\n  /model [query]    — Open model picker (or switch if query is an exact match)\n  /thinking [level] — Show or change thinking (off, low, medium, high)\n  /compact          — Force context compaction\n  /fork             — Fork into a new child session\n  /diff             — Show file changes made in this session\n  /clear            — Clear the output pane\n  /session list     — List known sessions\n  /session <id>     — Switch to another session\n  /tools            — Show registered tools\n  /onboard          — Launch the onboarding flow\n  /providers        — Manage configured providers\n  /help             — Show this help\n  /quit             — Exit anie\n\nKeyboard shortcuts:\n  Ctrl+O            — Open model picker"
                 .to_string(),
         );
+    }
+
+    fn open_model_picker_for_current_provider(&mut self, initial_search: Option<String>) {
+        if self.agent_state != AgentUiState::Idle {
+            self.output_pane
+                .add_system_message("Cannot open model picker while a run is active.".to_string());
+            return;
+        }
+
+        let Some(context) = self.current_provider_context() else {
+            self.output_pane.add_system_message(
+                "No provider context is available for model selection.".to_string(),
+            );
+            return;
+        };
+
+        let mut models = self
+            .provider_models(&context.provider_name)
+            .into_iter()
+            .map(|model| ModelInfo::from(&model))
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        models.dedup_by(|left, right| left.provider == right.provider && left.id == right.id);
+
+        if models.is_empty()
+            && let Some(model) = self
+                .known_models
+                .iter()
+                .find(|model| {
+                    model.provider == context.provider_name
+                        && model.id == self.status_bar.model_name
+                })
+                .cloned()
+        {
+            models.push(ModelInfo::from(&model));
+        }
+
+        self.bottom_pane = BottomPane::ModelPicker(ModelPickerSession {
+            picker: ModelPickerPane::new(
+                models,
+                context.provider_name.clone(),
+                self.status_bar.model_name.clone(),
+                initial_search,
+            ),
+            context,
+        });
+    }
+
+    fn close_model_picker(&mut self) {
+        self.bottom_pane = BottomPane::Editor;
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) {
+        let action = match &mut self.bottom_pane {
+            BottomPane::Editor => return,
+            BottomPane::ModelPicker(session) => session.picker.handle_key(key),
+        };
+
+        match action {
+            ModelPickerAction::Continue => {}
+            ModelPickerAction::Cancelled => self.close_model_picker(),
+            ModelPickerAction::Refresh => {
+                let context = match &mut self.bottom_pane {
+                    BottomPane::ModelPicker(session) => {
+                        session.picker.set_loading(true);
+                        session.picker.set_error(None);
+                        session.context.clone()
+                    }
+                    BottomPane::Editor => return,
+                };
+                self.spawn_model_discovery(context);
+            }
+            ModelPickerAction::Selected(model_info) => {
+                let context = match &self.bottom_pane {
+                    BottomPane::ModelPicker(session) => session.context.clone(),
+                    BottomPane::Editor => return,
+                };
+                let model = self.resolve_selected_model(&context, &model_info);
+                self.upsert_known_model(model.clone());
+                self.close_model_picker();
+                let _ = self
+                    .action_tx
+                    .try_send(UiAction::SetResolvedModel(model.clone()));
+                self.output_pane
+                    .add_system_message(format!("Model: {}", model.id));
+            }
+        }
+    }
+
+    fn handle_worker_event(&mut self, event: AppWorkerEvent) {
+        match event {
+            AppWorkerEvent::ModelDiscoveryComplete {
+                provider_name,
+                result,
+            } => {
+                let (api, base_url) = match &self.bottom_pane {
+                    BottomPane::ModelPicker(session)
+                        if session.context.provider_name == provider_name =>
+                    {
+                        (session.context.api, session.context.base_url.clone())
+                    }
+                    _ => return,
+                };
+
+                match result {
+                    Ok(models) => {
+                        for model in &models {
+                            self.upsert_known_model(model.to_model(api, &base_url));
+                        }
+                        if let BottomPane::ModelPicker(session) = &mut self.bottom_pane {
+                            session.picker.set_models(models);
+                        }
+                    }
+                    Err(error) => {
+                        if let BottomPane::ModelPicker(session) = &mut self.bottom_pane {
+                            session.picker.set_loading(false);
+                            session.picker.set_error(Some(error));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_exact_model_switch(&mut self, query: &str) -> bool {
+        if self.agent_state != AgentUiState::Idle {
+            self.output_pane
+                .add_system_message("Cannot open model picker while a run is active.".to_string());
+            return true;
+        }
+
+        let Some(model) = self.find_exact_model(query) else {
+            return false;
+        };
+        let _ = self
+            .action_tx
+            .try_send(UiAction::SetResolvedModel(model.clone()));
+        self.output_pane
+            .add_system_message(format!("Model: {}", model.id));
+        true
+    }
+
+    fn find_exact_model(&self, query: &str) -> Option<Model> {
+        if let Some((provider, model_id)) = query.split_once(':')
+            && self
+                .known_models
+                .iter()
+                .any(|model| model.provider == provider)
+            && let Some(model) = self
+                .known_models
+                .iter()
+                .find(|model| model.provider == provider && model.id == model_id)
+        {
+            return Some(model.clone());
+        }
+
+        self.known_models
+            .iter()
+            .find(|model| model.provider == self.status_bar.provider_name && model.id == query)
+            .or_else(|| self.known_models.iter().find(|model| model.id == query))
+            .cloned()
+    }
+
+    fn current_provider_context(&self) -> Option<ModelPickerContext> {
+        if let Some(model) = self
+            .known_models
+            .iter()
+            .find(|model| {
+                model.provider == self.status_bar.provider_name
+                    && model.id == self.status_bar.model_name
+            })
+            .or_else(|| {
+                self.known_models
+                    .iter()
+                    .find(|model| model.provider == self.status_bar.provider_name)
+            })
+        {
+            return Some(ModelPickerContext {
+                provider_name: model.provider.clone(),
+                api: model.api,
+                base_url: model.base_url.clone(),
+            });
+        }
+
+        let config = load_config(CliOverrides::default()).ok()?;
+        if let Some(provider) = config.providers.get(&self.status_bar.provider_name)
+            && let Some(base_url) = provider.base_url.as_ref()
+        {
+            return Some(ModelPickerContext {
+                provider_name: self.status_bar.provider_name.clone(),
+                api: provider.api.unwrap_or(ApiKind::OpenAICompletions),
+                base_url: base_url.clone(),
+            });
+        }
+
+        default_provider_context(&self.status_bar.provider_name)
+    }
+
+    fn provider_models(&self, provider_name: &str) -> Vec<Model> {
+        self.known_models
+            .iter()
+            .filter(|model| model.provider == provider_name)
+            .cloned()
+            .collect()
+    }
+
+    fn resolve_selected_model(
+        &self,
+        context: &ModelPickerContext,
+        model_info: &ModelInfo,
+    ) -> Model {
+        self.known_models
+            .iter()
+            .find(|model| model.provider == context.provider_name && model.id == model_info.id)
+            .cloned()
+            .unwrap_or_else(|| model_info.to_model(context.api, &context.base_url))
+    }
+
+    fn spawn_model_discovery(&self, context: ModelPickerContext) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            let _ = self.worker_tx.send(AppWorkerEvent::ModelDiscoveryComplete {
+                provider_name: context.provider_name.clone(),
+                result: Err("model discovery requires an async runtime".to_string()),
+            });
+            return;
+        }
+
+        let api_key = resolve_provider_api_key(&context.provider_name);
+        let request = ModelDiscoveryRequest {
+            provider_name: context.provider_name.clone(),
+            api: context.api,
+            base_url: context.base_url.clone(),
+            api_key,
+            headers: std::collections::HashMap::new(),
+        };
+        let cache = Arc::clone(&self.discovery_cache);
+        let tx = self.worker_tx.clone();
+        tokio::spawn(async move {
+            let result = cache
+                .lock()
+                .await
+                .refresh(&request)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppWorkerEvent::ModelDiscoveryComplete {
+                provider_name: context.provider_name,
+                result,
+            });
+        });
+    }
+
+    fn upsert_known_model(&mut self, model: Model) {
+        if let Some(existing) = self
+            .known_models
+            .iter_mut()
+            .find(|existing| existing.provider == model.provider && existing.id == model.id)
+        {
+            *existing = model;
+        } else {
+            self.known_models.push(model);
+        }
     }
 
     fn open_onboarding_overlay(&mut self) {
@@ -638,12 +974,19 @@ impl App {
                     return Ok(());
                 }
 
-                let config_path =
-                    global_config_path().context("home directory is not available")?;
+                for configured in &providers {
+                    self.upsert_known_model(configured.model.clone());
+                }
+
+                let cwd =
+                    std::env::current_dir().context("failed to determine current directory")?;
+                let config_path = preferred_write_target(&cwd)
+                    .context("home directory is not available for config writes")?;
                 match write_configured_providers(&config_path, &providers) {
                     Ok(Some((provider, model))) => {
                         self.output_pane.add_system_message(format!(
-                            "Onboarding saved configuration for {provider}:{model}."
+                            "Saved configuration to {} ({provider}:{model}).",
+                            display_path(&config_path)
                         ));
                         let _ = self.action_tx.try_send(UiAction::ReloadConfig {
                             provider: Some(provider),
@@ -657,7 +1000,8 @@ impl App {
                     }
                     Err(error) => {
                         self.output_pane.add_system_message(format!(
-                            "Onboarding could not save configuration: {error}"
+                            "Onboarding could not save configuration to {}: {error}",
+                            display_path(&config_path)
                         ));
                     }
                 }
@@ -675,8 +1019,12 @@ impl App {
             ProviderManagementAction::ConfigChanged {
                 provider,
                 model,
+                resolved_model,
                 message,
             } => {
+                if let Some(model) = resolved_model {
+                    self.upsert_known_model(model);
+                }
                 self.output_pane.add_system_message(message);
                 let _ = self
                     .action_tx
@@ -747,16 +1095,58 @@ pub async fn run_tui(
     Ok(())
 }
 
-fn layout(area: Rect, input_height: u16) -> (Rect, Rect, Rect) {
+fn layout(area: Rect, bottom_height: u16) -> (Rect, Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(input_height.clamp(3, 8)),
+            Constraint::Length(bottom_height),
         ])
         .split(area);
     (chunks[0], chunks[1], chunks[2])
+}
+
+fn default_provider_context(provider_name: &str) -> Option<ModelPickerContext> {
+    match provider_name {
+        "anthropic" => Some(ModelPickerContext {
+            provider_name: provider_name.to_string(),
+            api: ApiKind::AnthropicMessages,
+            base_url: "https://api.anthropic.com".to_string(),
+        }),
+        "openai" => Some(ModelPickerContext {
+            provider_name: provider_name.to_string(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://api.openai.com/v1".to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn resolve_provider_api_key(provider_name: &str) -> Option<String> {
+    let credential_store = CredentialStore::new();
+    if let Some(key) = credential_store.get(provider_name) {
+        return Some(key);
+    }
+
+    let configured_env = load_config(CliOverrides::default())
+        .ok()
+        .and_then(|config| {
+            config
+                .providers
+                .get(provider_name)
+                .and_then(|provider| provider.api_key_env.clone())
+        })
+        .and_then(|env_name| std::env::var(env_name).ok());
+    configured_env.or_else(|| match provider_name {
+        "openai" => std::env::var("OPENAI_API_KEY").ok(),
+        "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
+        _ => None,
+    })
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
 }
 
 fn render_status_bar(

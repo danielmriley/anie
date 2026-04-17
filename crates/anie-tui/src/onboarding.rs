@@ -13,10 +13,14 @@ use tokio::sync::mpsc;
 
 use anie_auth::CredentialStore;
 use anie_config::{ConfigMutator, global_config_path};
-use anie_provider::{ApiKind, CostPerMillion, Model};
-use anie_providers_builtin::{LocalServer, builtin_models, detect_local_servers};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelInfo};
+use anie_providers_builtin::{
+    LocalServer, ModelDiscoveryRequest, builtin_models, detect_local_servers, discover_models,
+};
 
-use crate::{ProviderManagementAction, ProviderManagementScreen, Spinner};
+use crate::{
+    ModelPickerAction, ModelPickerPane, ProviderManagementAction, ProviderManagementScreen, Spinner,
+};
 
 /// A provider configured during onboarding.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +88,14 @@ enum OnboardingState {
         message: String,
         return_to: Box<OnboardingState>,
     },
+    DiscoveringModels {
+        context: ModelPickerContext,
+        message: String,
+    },
+    PickingModel {
+        context: ModelPickerContext,
+        picker: ModelPickerPane,
+    },
     Success {
         message: String,
     },
@@ -99,14 +111,44 @@ enum LocalDetectionState {
     Ready(Vec<LocalServer>),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum ModelPickerContext {
+    LocalServer {
+        selected: usize,
+        server: LocalServer,
+    },
+    ApiPreset {
+        preset_index: usize,
+        preset: ProviderPreset,
+        api_key: String,
+    },
+    CustomEndpoint {
+        form_snapshot: CustomEndpointForm,
+        api_key: String,
+        base_url: String,
+        provider_name: String,
+    },
+}
+
 #[derive(Debug)]
 enum WorkerEvent {
     LocalServersDetected(Vec<LocalServer>),
     Progress(String),
-    ProviderConfigured(Result<ConfiguredProvider, String>),
+    PresetValidated {
+        context: ModelPickerContext,
+        result: Result<(), String>,
+    },
+    CustomEndpointValidated {
+        context: ModelPickerContext,
+        result: Result<(), String>,
+    },
+    ModelsDiscovered {
+        context: ModelPickerContext,
+        result: Result<Vec<ModelInfo>, String>,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct ProviderPreset {
     display_name: &'static str,
     provider_name: &'static str,
@@ -114,7 +156,7 @@ struct ProviderPreset {
     model: Model,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct CustomEndpointForm {
     base_url: TextField,
     provider_name: TextField,
@@ -123,7 +165,7 @@ struct CustomEndpointForm {
     selected_field: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct TextField {
     value: String,
     cursor: usize,
@@ -181,6 +223,8 @@ impl OnboardingScreen {
             OnboardingState::ApiKeyInput { .. } => self.handle_api_key_input_key(key),
             OnboardingState::CustomEndpoint { .. } => self.handle_custom_endpoint_key(key),
             OnboardingState::Busy { .. } => self.handle_busy_key(key),
+            OnboardingState::DiscoveringModels { .. } => self.handle_busy_key(key),
+            OnboardingState::PickingModel { .. } => self.handle_model_picker_key(key),
             OnboardingState::Success { .. } => {
                 self.state = OnboardingState::MainMenu { selected: 0 };
                 OnboardingAction::Continue
@@ -280,6 +324,16 @@ impl OnboardingScreen {
                 &format!("{} {message}", spinner_frame),
                 footer_line("[Esc] Back"),
             ),
+            OnboardingState::DiscoveringModels { message, .. } => self.render_busy_panel(
+                frame,
+                inner,
+                "Model Discovery",
+                &format!("{} {message}", spinner_frame),
+                footer_line("[Esc] Back"),
+            ),
+            OnboardingState::PickingModel { picker, .. } => {
+                self.render_model_picker(frame, inner, &picker, &spinner_frame)
+            }
             OnboardingState::Success { message } => self.render_status_panel(
                 frame,
                 inner,
@@ -356,33 +410,43 @@ impl OnboardingScreen {
                     *current = message;
                 }
             }
-            WorkerEvent::ProviderConfigured(result) => {
-                let Some(return_to) = (match &self.state {
-                    OnboardingState::Busy { return_to, .. } => Some((**return_to).clone()),
-                    _ => None,
-                }) else {
-                    return OnboardingAction::Continue;
-                };
-
-                match result {
-                    Ok(configured) => {
-                        for provider in &mut self.configured_providers {
-                            provider.is_default = false;
-                        }
-                        let message = format!(
-                            "Configured {} with {} as the default model.",
-                            configured.model.provider, configured.model.id
-                        );
-                        self.configured_providers.push(configured);
-                        self.state = OnboardingState::Success { message };
-                    }
-                    Err(error) => {
-                        self.state = OnboardingState::Error {
-                            message: error,
-                            return_to: Box::new(return_to),
-                        };
-                    }
+            WorkerEvent::PresetValidated { context, result } => match result {
+                Ok(()) => self.start_model_discovery(context),
+                Err(error) => {
+                    self.state = OnboardingState::Error {
+                        message: error,
+                        return_to: Box::new(match context {
+                            ModelPickerContext::ApiPreset {
+                                preset_index,
+                                api_key,
+                                ..
+                            } => OnboardingState::ApiKeyInput {
+                                preset_index,
+                                input: TextField::masked_with_value(&api_key),
+                            },
+                            _ => OnboardingState::MainMenu { selected: 1 },
+                        }),
+                    };
                 }
+            },
+            WorkerEvent::CustomEndpointValidated { context, result } => match result {
+                Ok(()) => self.start_model_discovery(context),
+                Err(error) => {
+                    self.state = OnboardingState::Error {
+                        message: error,
+                        return_to: Box::new(match context {
+                            ModelPickerContext::CustomEndpoint { form_snapshot, .. } => {
+                                OnboardingState::CustomEndpoint {
+                                    form: form_snapshot,
+                                }
+                            }
+                            _ => OnboardingState::MainMenu { selected: 2 },
+                        }),
+                    };
+                }
+            },
+            WorkerEvent::ModelsDiscovered { context, result } => {
+                self.apply_model_discovery_result(context, result);
             }
         }
         OnboardingAction::Continue
@@ -498,8 +562,9 @@ impl OnboardingScreen {
     }
 
     fn handle_local_select_key(&mut self, key: KeyEvent) -> OnboardingAction {
-        let OnboardingState::LocalServerSelect { selected } = &mut self.state else {
-            return OnboardingAction::Continue;
+        let selected_index = match &self.state {
+            OnboardingState::LocalServerSelect { selected } => *selected,
+            _ => return OnboardingAction::Continue,
         };
         let LocalDetectionState::Ready(servers) = &self.local_detection else {
             self.state = OnboardingState::LocalServerWaiting;
@@ -511,29 +576,21 @@ impl OnboardingScreen {
                 self.state = OnboardingState::MainMenu { selected: 0 };
             }
             (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::NONE, KeyCode::Char('k')) => {
-                *selected = selected.saturating_sub(1);
+                if let OnboardingState::LocalServerSelect { selected } = &mut self.state {
+                    *selected = selected.saturating_sub(1);
+                }
             }
             (KeyModifiers::NONE, KeyCode::Down) | (KeyModifiers::NONE, KeyCode::Char('j')) => {
-                *selected = (*selected + 1).min(servers.len().saturating_sub(1));
+                if let OnboardingState::LocalServerSelect { selected } = &mut self.state {
+                    *selected = (*selected + 1).min(servers.len().saturating_sub(1));
+                }
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                if let Some(server) = servers.get(*selected)
-                    && let Some(model) = server.models.first()
-                {
-                    for provider in &mut self.configured_providers {
-                        provider.is_default = false;
-                    }
-                    self.configured_providers.push(ConfiguredProvider {
-                        model: model.clone(),
-                        kind: ConfiguredProviderKind::ConfigBacked,
-                        is_default: true,
+                if let Some(server) = servers.get(selected_index).cloned() {
+                    self.start_model_discovery(ModelPickerContext::LocalServer {
+                        selected: selected_index,
+                        server,
                     });
-                    self.state = OnboardingState::Success {
-                        message: format!(
-                            "Configured {} on {} with {} as the default model.",
-                            server.name, server.base_url, model.id
-                        ),
-                    };
                 }
             }
             _ => {}
@@ -584,24 +641,23 @@ impl OnboardingScreen {
     }
 
     fn handle_api_key_input_key(&mut self, key: KeyEvent) -> OnboardingAction {
-        let OnboardingState::ApiKeyInput {
-            preset_index,
-            input,
-        } = &mut self.state
-        else {
-            return OnboardingAction::Continue;
+        let (preset_index, api_key_snapshot) = match &self.state {
+            OnboardingState::ApiKeyInput {
+                preset_index,
+                input,
+            } => (*preset_index, input.trimmed()),
+            _ => return OnboardingAction::Continue,
         };
 
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 self.state = OnboardingState::ProviderPresetList {
-                    selected: *preset_index,
+                    selected: preset_index,
                 };
                 return OnboardingAction::Continue;
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                let api_key = input.trimmed();
-                if api_key.is_empty() {
+                if api_key_snapshot.is_empty() {
                     self.state = OnboardingState::Error {
                         message: "API key cannot be empty.".to_string(),
                         return_to: Box::new(self.state.clone()),
@@ -609,7 +665,7 @@ impl OnboardingScreen {
                     return OnboardingAction::Continue;
                 }
                 let preset = provider_presets()
-                    .get(*preset_index)
+                    .get(preset_index)
                     .cloned()
                     .unwrap_or_else(default_openai_preset);
                 let return_to = self.state.clone();
@@ -618,11 +674,17 @@ impl OnboardingScreen {
                     message: "Verifying API key…".to_string(),
                     return_to: Box::new(return_to),
                 };
-                self.spawn_configure_preset_worker(preset, api_key);
+                self.spawn_preset_validation_worker(ModelPickerContext::ApiPreset {
+                    preset_index,
+                    preset,
+                    api_key: api_key_snapshot,
+                });
                 return OnboardingAction::Continue;
             }
             _ => {
-                input.handle_edit_key(key);
+                if let OnboardingState::ApiKeyInput { input, .. } = &mut self.state {
+                    input.handle_edit_key(key);
+                }
             }
         }
 
@@ -630,8 +692,9 @@ impl OnboardingScreen {
     }
 
     fn handle_custom_endpoint_key(&mut self, key: KeyEvent) -> OnboardingAction {
-        let OnboardingState::CustomEndpoint { form } = &mut self.state else {
-            return OnboardingAction::Continue;
+        let form_snapshot = match &self.state {
+            OnboardingState::CustomEndpoint { form } => form.clone(),
+            _ => return OnboardingAction::Continue,
         };
 
         match (key.modifiers, key.code) {
@@ -642,31 +705,36 @@ impl OnboardingScreen {
             (KeyModifiers::SHIFT, KeyCode::BackTab)
             | (KeyModifiers::NONE, KeyCode::Up)
             | (KeyModifiers::NONE, KeyCode::BackTab) => {
-                form.selected_field = form.selected_field.saturating_sub(1);
+                if let OnboardingState::CustomEndpoint { form } = &mut self.state {
+                    form.selected_field = form.selected_field.saturating_sub(1);
+                }
                 return OnboardingAction::Continue;
             }
             (KeyModifiers::NONE, KeyCode::Tab) | (KeyModifiers::NONE, KeyCode::Down) => {
-                form.selected_field = (form.selected_field + 1).min(3);
+                if let OnboardingState::CustomEndpoint { form } = &mut self.state {
+                    form.selected_field = (form.selected_field + 1).min(3);
+                }
                 return OnboardingAction::Continue;
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                if form.selected_field < 3 {
-                    form.selected_field += 1;
+                if form_snapshot.selected_field < 3 {
+                    if let OnboardingState::CustomEndpoint { form } = &mut self.state {
+                        form.selected_field += 1;
+                    }
                     return OnboardingAction::Continue;
                 }
 
-                let base_url = form.base_url.trimmed();
-                let provider_name = if form.provider_name.trimmed().is_empty() {
+                let base_url = form_snapshot.base_url.trimmed();
+                let provider_name = if form_snapshot.provider_name.trimmed().is_empty() {
                     "custom".to_string()
                 } else {
-                    form.provider_name.trimmed()
+                    form_snapshot.provider_name.trimmed()
                 };
-                let model_id = form.model_id.trimmed();
-                let api_key = form.api_key.trimmed();
+                let api_key = form_snapshot.api_key.trimmed();
 
-                if base_url.is_empty() || model_id.is_empty() {
+                if base_url.is_empty() {
                     self.state = OnboardingState::Error {
-                        message: "Base URL and model ID are required.".to_string(),
+                        message: "Base URL is required.".to_string(),
                         return_to: Box::new(self.state.clone()),
                     };
                     return OnboardingAction::Continue;
@@ -678,11 +746,18 @@ impl OnboardingScreen {
                     message: "Testing endpoint…".to_string(),
                     return_to: Box::new(return_to),
                 };
-                self.spawn_configure_custom_worker(base_url, provider_name, model_id, api_key);
+                self.spawn_custom_validation_worker(ModelPickerContext::CustomEndpoint {
+                    form_snapshot,
+                    api_key,
+                    base_url,
+                    provider_name,
+                });
                 return OnboardingAction::Continue;
             }
             _ => {
-                form.selected_field_mut().handle_edit_key(key);
+                if let OnboardingState::CustomEndpoint { form } = &mut self.state {
+                    form.selected_field_mut().handle_edit_key(key);
+                }
             }
         }
 
@@ -691,61 +766,348 @@ impl OnboardingScreen {
 
     fn handle_busy_key(&mut self, key: KeyEvent) -> OnboardingAction {
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Esc) => {
-                if let OnboardingState::Busy { return_to, .. } = &self.state {
+            (KeyModifiers::NONE, KeyCode::Esc) => match &self.state {
+                OnboardingState::Busy { return_to, .. }
+                | OnboardingState::Error { return_to, .. } => {
                     self.state = (**return_to).clone();
                 }
-            }
+                OnboardingState::DiscoveringModels { context, .. } => {
+                    self.state = self.return_state_for_context(context);
+                }
+                _ => {}
+            },
             _ => {}
         }
         OnboardingAction::Continue
     }
 
-    fn spawn_configure_preset_worker(&self, preset: ProviderPreset, api_key: String) {
+    fn handle_model_picker_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let action = match &mut self.state {
+            OnboardingState::PickingModel { picker, .. } => picker.handle_key(key),
+            _ => return OnboardingAction::Continue,
+        };
+
+        match action {
+            ModelPickerAction::Continue => {}
+            ModelPickerAction::Cancelled => {
+                if let OnboardingState::PickingModel { context, .. } = &self.state {
+                    self.state = self.return_state_for_context(context);
+                }
+            }
+            ModelPickerAction::Refresh => {
+                let context = match &mut self.state {
+                    OnboardingState::PickingModel { context, picker } => {
+                        picker.set_loading(true);
+                        picker.set_error(None);
+                        context.clone()
+                    }
+                    _ => return OnboardingAction::Continue,
+                };
+                self.spawn_model_discovery_worker(context);
+            }
+            ModelPickerAction::Selected(model_info) => {
+                let context = match &self.state {
+                    OnboardingState::PickingModel { context, .. } => context.clone(),
+                    _ => return OnboardingAction::Continue,
+                };
+                self.finalize_configured_provider(
+                    self.configured_provider_from_context(&context, &model_info),
+                );
+            }
+        }
+
+        OnboardingAction::Continue
+    }
+
+    fn spawn_preset_validation_worker(&self, context: ModelPickerContext) {
         let tx = self.worker_tx.clone();
         let credential_store = self.credential_store.clone();
         if tokio::runtime::Handle::try_current().is_err() {
-            let _ = tx.send(WorkerEvent::ProviderConfigured(Err(
-                "Onboarding requires an async runtime to validate providers.".to_string(),
-            )));
+            let _ = tx.send(WorkerEvent::PresetValidated {
+                context,
+                result: Err(
+                    "Onboarding requires an async runtime to validate providers.".to_string(),
+                ),
+            });
             return;
         }
 
         tokio::spawn(async move {
-            let result =
-                configure_preset_provider(preset, api_key, credential_store, tx.clone()).await;
-            let _ = tx.send(WorkerEvent::ProviderConfigured(result));
+            let result = validate_preset_context(&context, credential_store, tx.clone()).await;
+            let _ = tx.send(WorkerEvent::PresetValidated { context, result });
         });
     }
 
-    fn spawn_configure_custom_worker(
-        &self,
-        base_url: String,
-        provider_name: String,
-        model_id: String,
-        api_key: String,
-    ) {
+    fn spawn_custom_validation_worker(&self, context: ModelPickerContext) {
         let tx = self.worker_tx.clone();
         let credential_store = self.credential_store.clone();
         if tokio::runtime::Handle::try_current().is_err() {
-            let _ = tx.send(WorkerEvent::ProviderConfigured(Err(
-                "Onboarding requires an async runtime to validate providers.".to_string(),
-            )));
+            let _ = tx.send(WorkerEvent::CustomEndpointValidated {
+                context,
+                result: Err(
+                    "Onboarding requires an async runtime to validate providers.".to_string(),
+                ),
+            });
             return;
         }
 
         tokio::spawn(async move {
-            let result = configure_custom_provider(
+            let result = validate_custom_context(&context, credential_store, tx.clone()).await;
+            let _ = tx.send(WorkerEvent::CustomEndpointValidated { context, result });
+        });
+    }
+
+    fn start_model_discovery(&mut self, context: ModelPickerContext) {
+        self.state = OnboardingState::DiscoveringModels {
+            message: context.discovery_message(),
+            context: context.clone(),
+        };
+        self.spawn_model_discovery_worker(context);
+    }
+
+    fn spawn_model_discovery_worker(&self, context: ModelPickerContext) {
+        let tx = self.worker_tx.clone();
+        if tokio::runtime::Handle::try_current().is_err() {
+            let _ = tx.send(WorkerEvent::ModelsDiscovered {
+                context,
+                result: Err("Onboarding requires an async runtime to discover models.".to_string()),
+            });
+            return;
+        }
+
+        tokio::spawn(async move {
+            let result = discover_models_for_context(&context).await;
+            let _ = tx.send(WorkerEvent::ModelsDiscovered { context, result });
+        });
+    }
+
+    fn apply_model_discovery_result(
+        &mut self,
+        context: ModelPickerContext,
+        result: Result<Vec<ModelInfo>, String>,
+    ) {
+        let is_refresh = matches!(
+            &self.state,
+            OnboardingState::PickingModel {
+                context: active_context,
+                ..
+            } if *active_context == context
+        );
+
+        match result {
+            Ok(models) if !models.is_empty() => {
+                if is_refresh {
+                    if let OnboardingState::PickingModel { picker, .. } = &mut self.state {
+                        picker.set_models(models);
+                    }
+                } else {
+                    self.state = OnboardingState::PickingModel {
+                        picker: ModelPickerPane::new(
+                            models,
+                            context.provider_name().to_string(),
+                            context.current_model_id().unwrap_or_default(),
+                            None,
+                        ),
+                        context,
+                    };
+                }
+            }
+            Ok(_) => {
+                let message = "No models were advertised by this endpoint.".to_string();
+                if is_refresh {
+                    if let OnboardingState::PickingModel { picker, .. } = &mut self.state {
+                        picker.set_loading(false);
+                        picker.set_error(Some(message));
+                    }
+                } else {
+                    match self.fallback_provider_for_context(&context, &message) {
+                        Some((configured, fallback_message)) => self
+                            .finalize_configured_provider_with_message(
+                                configured,
+                                fallback_message,
+                            ),
+                        None => {
+                            self.state = OnboardingState::Error {
+                                message,
+                                return_to: Box::new(self.return_state_for_context(&context)),
+                            };
+                        }
+                    }
+                }
+            }
+            Err(message) => {
+                if is_refresh {
+                    if let OnboardingState::PickingModel { picker, .. } = &mut self.state {
+                        picker.set_loading(false);
+                        picker.set_error(Some(message));
+                    }
+                } else {
+                    match self.fallback_provider_for_context(&context, &message) {
+                        Some((configured, fallback_message)) => self
+                            .finalize_configured_provider_with_message(
+                                configured,
+                                fallback_message,
+                            ),
+                        None => {
+                            self.state = OnboardingState::Error {
+                                message,
+                                return_to: Box::new(self.return_state_for_context(&context)),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn return_state_for_context(&self, context: &ModelPickerContext) -> OnboardingState {
+        match context {
+            ModelPickerContext::LocalServer { selected, .. } => {
+                OnboardingState::LocalServerSelect {
+                    selected: *selected,
+                }
+            }
+            ModelPickerContext::ApiPreset {
+                preset_index,
+                api_key,
+                ..
+            } => OnboardingState::ApiKeyInput {
+                preset_index: *preset_index,
+                input: TextField::masked_with_value(api_key),
+            },
+            ModelPickerContext::CustomEndpoint { form_snapshot, .. } => {
+                OnboardingState::CustomEndpoint {
+                    form: form_snapshot.clone(),
+                }
+            }
+        }
+    }
+
+    fn configured_provider_from_context(
+        &self,
+        context: &ModelPickerContext,
+        model_info: &ModelInfo,
+    ) -> ConfiguredProvider {
+        match context {
+            ModelPickerContext::LocalServer { server, .. } => {
+                let api = server
+                    .models
+                    .first()
+                    .map(|model| model.api)
+                    .unwrap_or(ApiKind::OpenAICompletions);
+                let base_url = server
+                    .models
+                    .first()
+                    .map(|model| model.base_url.clone())
+                    .unwrap_or_else(|| normalize_openai_base_url(&server.base_url));
+                ConfiguredProvider {
+                    model: model_info.to_model(api, &base_url),
+                    kind: ConfiguredProviderKind::ConfigBacked,
+                    is_default: true,
+                }
+            }
+            ModelPickerContext::ApiPreset { preset, .. } => ConfiguredProvider {
+                model: model_info.to_model(preset.model.api, &preset.model.base_url),
+                kind: preset.kind,
+                is_default: true,
+            },
+            ModelPickerContext::CustomEndpoint {
                 base_url,
                 provider_name,
-                model_id,
-                api_key,
-                credential_store,
-                tx.clone(),
-            )
-            .await;
-            let _ = tx.send(WorkerEvent::ProviderConfigured(result));
-        });
+                ..
+            } => {
+                let mut model = model_info.to_model(ApiKind::OpenAICompletions, base_url);
+                model.provider = provider_name.clone();
+                ConfiguredProvider {
+                    model,
+                    kind: ConfiguredProviderKind::ConfigBacked,
+                    is_default: true,
+                }
+            }
+        }
+    }
+
+    fn fallback_provider_for_context(
+        &self,
+        context: &ModelPickerContext,
+        message: &str,
+    ) -> Option<(ConfiguredProvider, String)> {
+        match context {
+            ModelPickerContext::ApiPreset { preset, .. } => {
+                let configured = ConfiguredProvider {
+                    model: preset.model.clone(),
+                    kind: preset.kind,
+                    is_default: true,
+                };
+                Some((
+                    configured,
+                    format!(
+                        "Model discovery failed ({message}). Falling back to {}.",
+                        preset.model.id
+                    ),
+                ))
+            }
+            ModelPickerContext::CustomEndpoint {
+                form_snapshot,
+                base_url,
+                provider_name,
+                ..
+            } if !form_snapshot.model_id.trimmed().is_empty() => {
+                let manual_model_id = form_snapshot.model_id.trimmed();
+                Some((
+                    ConfiguredProvider {
+                        model: Model {
+                            id: manual_model_id.clone(),
+                            name: manual_model_id.clone(),
+                            provider: provider_name.clone(),
+                            api: ApiKind::OpenAICompletions,
+                            base_url: normalize_openai_base_url(base_url),
+                            context_window: 32_768,
+                            max_tokens: 8_192,
+                            supports_reasoning: false,
+                            reasoning_capabilities: None,
+                            supports_images: false,
+                            cost_per_million: CostPerMillion::zero(),
+                        },
+                        kind: ConfiguredProviderKind::ConfigBacked,
+                        is_default: true,
+                    },
+                    format!(
+                        "Model discovery failed ({message}). Using manual model ID {}.",
+                        manual_model_id
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn finalize_configured_provider(&mut self, configured: ConfiguredProvider) {
+        let message = format!(
+            "Configured {} with {} as the default model.",
+            configured.model.provider, configured.model.id
+        );
+        self.finalize_configured_provider_with_message(configured, message);
+    }
+
+    fn finalize_configured_provider_with_message(
+        &mut self,
+        configured: ConfiguredProvider,
+        message: String,
+    ) {
+        for provider in &mut self.configured_providers {
+            provider.is_default = false;
+        }
+        if let Some(existing) = self
+            .configured_providers
+            .iter_mut()
+            .find(|provider| provider.model.provider == configured.model.provider)
+        {
+            *existing = configured;
+        } else {
+            self.configured_providers.push(configured);
+        }
+        self.state = OnboardingState::Success { message };
     }
 
     fn main_menu_items(&self) -> Vec<MainMenuItem> {
@@ -963,7 +1325,7 @@ impl OnboardingScreen {
 
         Paragraph::new(vec![
             Line::from("Add a custom OpenAI-compatible endpoint."),
-            Line::from("Leave API key empty for local providers."),
+            Line::from("Leave API key empty for local providers. Manual Model ID is only used if discovery fails."),
         ])
         .render(chunks[0], frame.buffer_mut());
 
@@ -984,7 +1346,7 @@ impl OnboardingScreen {
         self.render_labeled_field(
             frame,
             chunks[3],
-            "Default Model ID",
+            "Manual Model ID (fallback)",
             &form.model_id,
             form.selected_field == 2,
         );
@@ -1031,6 +1393,17 @@ impl OnboardingScreen {
         Paragraph::new(field.render_value())
             .style(Style::default().fg(Color::White))
             .render(inner, frame.buffer_mut());
+    }
+
+    fn render_model_picker(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        picker: &ModelPickerPane,
+        spinner_frame: &str,
+    ) {
+        let cursor = picker.render(area, frame.buffer_mut(), spinner_frame);
+        frame.set_cursor_position(cursor);
     }
 
     fn render_busy_panel(
@@ -1143,6 +1516,35 @@ impl CustomEndpointForm {
     }
 }
 
+impl ModelPickerContext {
+    fn provider_name(&self) -> &str {
+        match self {
+            Self::LocalServer { server, .. } => server.name.as_str(),
+            Self::ApiPreset { preset, .. } => preset.provider_name,
+            Self::CustomEndpoint { provider_name, .. } => provider_name.as_str(),
+        }
+    }
+
+    fn current_model_id(&self) -> Option<String> {
+        match self {
+            Self::LocalServer { server, .. } => server.models.first().map(|model| model.id.clone()),
+            Self::ApiPreset { preset, .. } => Some(preset.model.id.clone()),
+            Self::CustomEndpoint { form_snapshot, .. } => {
+                let model_id = form_snapshot.model_id.trimmed();
+                if model_id.is_empty() {
+                    None
+                } else {
+                    Some(model_id)
+                }
+            }
+        }
+    }
+
+    fn discovery_message(&self) -> String {
+        format!("Discovering models for {}…", self.provider_name())
+    }
+}
+
 impl TextField {
     fn from(value: &str) -> Self {
         Self {
@@ -1156,6 +1558,14 @@ impl TextField {
         Self {
             value: String::new(),
             cursor: 0,
+            masked: true,
+        }
+    }
+
+    fn masked_with_value(value: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            cursor: value.len(),
             masked: true,
         }
     }
@@ -1283,69 +1693,116 @@ pub fn write_configured_providers(
     )))
 }
 
-async fn configure_preset_provider(
-    preset: ProviderPreset,
-    api_key: String,
+async fn validate_preset_context(
+    context: &ModelPickerContext,
     credential_store: CredentialStore,
     tx: mpsc::UnboundedSender<WorkerEvent>,
-) -> Result<ConfiguredProvider, String> {
+) -> Result<(), String> {
+    let ModelPickerContext::ApiPreset {
+        preset, api_key, ..
+    } = context
+    else {
+        return Err("invalid preset validation context".to_string());
+    };
+
     validate_provider_connection(&preset.model, Some(api_key.as_str())).await?;
     let _ = tx.send(WorkerEvent::Progress(
         "Waiting for OS keyring authorization…".to_string(),
     ));
     credential_store
-        .set(preset.provider_name, &api_key)
+        .set(preset.provider_name, api_key)
         .map_err(|error| format!("failed to save credential: {error}"))?;
-    Ok(ConfiguredProvider {
-        model: preset.model,
-        kind: preset.kind,
-        is_default: true,
-    })
+    Ok(())
 }
 
-async fn configure_custom_provider(
-    base_url: String,
-    provider_name: String,
-    model_id: String,
-    api_key: String,
+async fn validate_custom_context(
+    context: &ModelPickerContext,
     credential_store: CredentialStore,
     tx: mpsc::UnboundedSender<WorkerEvent>,
-) -> Result<ConfiguredProvider, String> {
-    let normalized_base_url = normalize_openai_base_url(&base_url);
-    let api_key = api_key.trim().to_string();
-    let api_key_option = if api_key.is_empty() {
+) -> Result<(), String> {
+    let ModelPickerContext::CustomEndpoint {
+        api_key,
+        base_url,
+        provider_name,
+        ..
+    } = context
+    else {
+        return Err("invalid custom endpoint validation context".to_string());
+    };
+
+    let normalized_base_url = normalize_openai_base_url(base_url);
+    let trimmed_api_key = api_key.trim().to_string();
+    let api_key_option = if trimmed_api_key.is_empty() {
         None
     } else {
-        Some(api_key.as_str())
+        Some(trimmed_api_key.as_str())
     };
 
     validate_openai_compatible_endpoint(&normalized_base_url, api_key_option).await?;
-    if !api_key.is_empty() {
+    if !trimmed_api_key.is_empty() {
         let _ = tx.send(WorkerEvent::Progress(
             "Waiting for OS keyring authorization…".to_string(),
         ));
         credential_store
-            .set(&provider_name, &api_key)
+            .set(provider_name, &trimmed_api_key)
             .map_err(|error| format!("failed to save credential: {error}"))?;
     }
+    Ok(())
+}
 
-    Ok(ConfiguredProvider {
-        model: Model {
-            id: model_id.clone(),
-            name: model_id,
-            provider: provider_name,
+async fn discover_models_for_context(
+    context: &ModelPickerContext,
+) -> Result<Vec<ModelInfo>, String> {
+    let request = discovery_request_for_context(context)?;
+    discover_models(&request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn discovery_request_for_context(
+    context: &ModelPickerContext,
+) -> Result<ModelDiscoveryRequest, String> {
+    match context {
+        ModelPickerContext::LocalServer { server, .. } => {
+            let sample = server.models.first();
+            Ok(ModelDiscoveryRequest {
+                provider_name: server.name.clone(),
+                api: sample
+                    .map(|model| model.api)
+                    .unwrap_or(ApiKind::OpenAICompletions),
+                base_url: sample
+                    .map(|model| model.base_url.clone())
+                    .unwrap_or_else(|| normalize_openai_base_url(&server.base_url)),
+                api_key: None,
+                headers: std::collections::HashMap::new(),
+            })
+        }
+        ModelPickerContext::ApiPreset {
+            preset, api_key, ..
+        } => Ok(ModelDiscoveryRequest {
+            provider_name: preset.provider_name.to_string(),
+            api: preset.model.api,
+            base_url: preset.model.base_url.clone(),
+            api_key: Some(api_key.clone()),
+            headers: std::collections::HashMap::new(),
+        }),
+        ModelPickerContext::CustomEndpoint {
+            api_key,
+            base_url,
+            provider_name,
+            ..
+        } => Ok(ModelDiscoveryRequest {
+            provider_name: provider_name.clone(),
             api: ApiKind::OpenAICompletions,
-            base_url: normalized_base_url,
-            context_window: 32_768,
-            max_tokens: 8_192,
-            supports_reasoning: false,
-            reasoning_capabilities: None,
-            supports_images: false,
-            cost_per_million: CostPerMillion::zero(),
-        },
-        kind: ConfiguredProviderKind::ConfigBacked,
-        is_default: true,
-    })
+            base_url: normalize_openai_base_url(base_url),
+            api_key: if api_key.trim().is_empty() {
+                None
+            } else {
+                Some(api_key.clone())
+            },
+            headers: std::collections::HashMap::new(),
+        }),
+    }
 }
 
 async fn validate_provider_connection(model: &Model, api_key: Option<&str>) -> Result<(), String> {
@@ -1659,6 +2116,41 @@ mod tests {
     }
 
     #[test]
+    fn local_server_selection_starts_model_discovery() {
+        let mut screen =
+            OnboardingScreen::with_local_servers_for_tests(vec![sample_local_server()]);
+        screen.state = OnboardingState::LocalServerSelect { selected: 0 };
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            screen.state,
+            OnboardingState::DiscoveringModels { .. }
+        ));
+    }
+
+    #[test]
+    fn models_discovered_success_opens_picker() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        let context = ModelPickerContext::LocalServer {
+            selected: 0,
+            server: sample_local_server(),
+        };
+        screen.handle_worker_event(WorkerEvent::ModelsDiscovered {
+            context: context.clone(),
+            result: Ok(vec![ModelInfo {
+                id: "qwen3:32b".into(),
+                name: "Qwen 3 32B".into(),
+                provider: "ollama".into(),
+                context_length: Some(32_768),
+                supports_images: Some(false),
+                supports_reasoning: Some(true),
+            }]),
+        });
+
+        assert!(matches!(screen.state, OnboardingState::PickingModel { .. }));
+    }
+
+    #[test]
     fn preset_selection_opens_masked_key_input() {
         let mut screen = OnboardingScreen::new_for_tests();
         screen.state = OnboardingState::ProviderPresetList { selected: 0 };
@@ -1700,21 +2192,43 @@ mod tests {
     }
 
     #[test]
+    fn picker_cancel_returns_to_previous_state() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::PickingModel {
+            context: ModelPickerContext::LocalServer {
+                selected: 0,
+                server: sample_local_server(),
+            },
+            picker: ModelPickerPane::new(
+                vec![ModelInfo {
+                    id: "qwen3:32b".into(),
+                    name: "Qwen 3 32B".into(),
+                    provider: "ollama".into(),
+                    context_length: Some(32_768),
+                    supports_images: Some(false),
+                    supports_reasoning: Some(true),
+                }],
+                "ollama".into(),
+                "qwen3:32b".into(),
+                None,
+            ),
+        };
+
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::LocalServerSelect { selected: 0 }
+        ));
+    }
+
+    #[test]
     fn provider_success_returns_to_main_menu_after_ack() {
         let mut screen = OnboardingScreen::new_for_tests();
-        screen.state = OnboardingState::Busy {
-            title: "OpenAI".to_string(),
-            message: "Verifying…".to_string(),
-            return_to: Box::new(OnboardingState::ApiKeyInput {
-                preset_index: 1,
-                input: TextField::masked(),
-            }),
-        };
-        screen.handle_worker_event(WorkerEvent::ProviderConfigured(Ok(ConfiguredProvider {
+        screen.finalize_configured_provider(ConfiguredProvider {
             model: default_openai_preset().model,
             kind: ConfiguredProviderKind::BuiltinHosted,
             is_default: true,
-        })));
+        });
 
         assert!(matches!(screen.state, OnboardingState::Success { .. }));
         screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1741,6 +2255,30 @@ mod tests {
         assert_eq!(completion.providers.len(), 1);
         assert_eq!(completion.providers[0].model.provider, "openai");
         assert_eq!(completion.reload_target, None);
+    }
+
+    #[test]
+    fn custom_endpoint_discovery_failure_uses_manual_model_id_fallback() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        let mut form = CustomEndpointForm::default();
+        form.base_url = TextField::from("http://localhost:8080");
+        form.provider_name = TextField::from("custom");
+        form.model_id = TextField::from("manual-model");
+        let context = ModelPickerContext::CustomEndpoint {
+            form_snapshot: form,
+            api_key: String::new(),
+            base_url: "http://localhost:8080".into(),
+            provider_name: "custom".into(),
+        };
+
+        screen.handle_worker_event(WorkerEvent::ModelsDiscovered {
+            context,
+            result: Err("boom".into()),
+        });
+
+        assert!(matches!(screen.state, OnboardingState::Success { .. }));
+        assert_eq!(screen.configured_providers.len(), 1);
+        assert_eq!(screen.configured_providers[0].model.id, "manual-model");
     }
 
     #[test]
