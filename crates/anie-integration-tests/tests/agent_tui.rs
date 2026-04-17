@@ -165,7 +165,9 @@ async fn thinking_only_provider_response_becomes_error_not_visible_thinking() {
     // should result in an error, not a message with leaked thinking.
     let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![
         Ok(ProviderEvent::Start),
-        Ok(ProviderEvent::ThinkingDelta("internal reasoning only".into())),
+        Ok(ProviderEvent::ThinkingDelta(
+            "internal reasoning only".into(),
+        )),
         Err(ProviderError::Stream("empty assistant response".into())),
     ])]);
     let agent = build_agent(

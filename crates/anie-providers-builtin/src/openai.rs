@@ -9,8 +9,7 @@ use anie_protocol::{
 };
 use anie_provider::{
     ApiKind, LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent, ProviderStream,
-    ReasoningCapabilities, ReasoningControlMode, StreamOptions, ThinkingLevel,
-    ThinkingRequestMode,
+    ReasoningCapabilities, ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
 };
 
 use crate::{
@@ -1292,7 +1291,9 @@ mod tests {
                 r#"{"choices":[{"index":0,"delta":{"content":"","reasoning":"hello from reasoning"},"finish_reason":"stop"}]}"#,
             )
             .expect("events");
-        let error = state.finish_stream().expect_err("finish stream should fail");
+        let error = state
+            .finish_stream()
+            .expect_err("finish stream should fail");
 
         assert_eq!(
             events,

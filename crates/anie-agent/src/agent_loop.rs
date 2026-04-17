@@ -644,11 +644,10 @@ fn sanitize_context_for_request(
     messages
         .iter()
         .filter_map(|message| match message {
-            Message::Assistant(assistant) => sanitize_assistant_for_request(
-                assistant,
-                includes_thinking_in_replay,
-            )
-            .map(Message::Assistant),
+            Message::Assistant(assistant) => {
+                sanitize_assistant_for_request(assistant, includes_thinking_in_replay)
+                    .map(Message::Assistant)
+            }
             _ => Some(message.clone()),
         })
         .collect()
@@ -677,7 +676,9 @@ fn sanitize_assistant_for_request(
         .collect::<Vec<_>>();
 
     if content.is_empty()
-        || !content.iter().any(|block| !matches!(block, ContentBlock::Thinking { .. }))
+        || !content
+            .iter()
+            .any(|block| !matches!(block, ContentBlock::Thinking { .. }))
     {
         return None;
     }
@@ -1075,8 +1076,8 @@ mod tests {
             2,
         );
 
-        let sanitized = sanitize_assistant_for_request(&assistant, true)
-            .expect("tool assistant survives");
+        let sanitized =
+            sanitize_assistant_for_request(&assistant, true).expect("tool assistant survives");
 
         assert_eq!(sanitized.content, assistant.content);
     }

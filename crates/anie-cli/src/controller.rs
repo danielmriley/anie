@@ -1862,11 +1862,11 @@ mod tests {
     use std::{fs, path::Path, thread, time::Duration};
 
     use super::*;
-    use tempfile::tempdir;
     use anie_provider::{
         ApiKind, CostPerMillion, ProviderError, ReasoningCapabilities, ReasoningControlMode,
         ReasoningOutputMode, ThinkingRequestMode,
     };
+    use tempfile::tempdir;
 
     fn model(id: &str, provider: &str) -> Model {
         Model {
@@ -2036,7 +2036,10 @@ mod tests {
         fs::remove_file(&project_agents).expect("remove agents");
         let second = context_files_stamp(&nested, &config);
 
-        assert_ne!(first, second, "deleting a non-newest file should change stamp");
+        assert_ne!(
+            first, second,
+            "deleting a non-newest file should change stamp"
+        );
         assert_eq!(second.len(), 1);
     }
 

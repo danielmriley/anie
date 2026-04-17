@@ -340,9 +340,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
                 path: candidate.clone(),
                 contents,
                 truncated,
-                mtime: fs::metadata(&candidate)
-                    .and_then(|m| m.modified())
-                    .ok(),
+                mtime: fs::metadata(&candidate).and_then(|m| m.modified()).ok(),
             });
         }
     }
