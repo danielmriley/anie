@@ -13,7 +13,7 @@ mod mutation;
 
 use anie_provider::{
     ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
-    ReasoningOutputMode, ReasoningTags, ThinkingLevel,
+    ReasoningOutputMode, ReasoningTags, ThinkingLevel, ThinkingRequestMode,
 };
 
 pub use mutation::ConfigMutator;
@@ -103,6 +103,9 @@ pub struct CustomModelConfig {
     /// Optional explicit closing tag for tagged reasoning.
     #[serde(default)]
     pub reasoning_tag_close: Option<String>,
+    /// Optional explicit request-shape for thinking support.
+    #[serde(default)]
+    pub thinking_request_mode: Option<ThinkingRequestMode>,
     /// Whether the model supports images.
     #[serde(default)]
     pub supports_images: bool,
@@ -280,13 +283,18 @@ fn custom_model_reasoning_capabilities(model: &CustomModelConfig) -> Option<Reas
         _ => None,
     };
 
-    if model.reasoning_control.is_none() && model.reasoning_output.is_none() && tags.is_none() {
+    if model.reasoning_control.is_none()
+        && model.reasoning_output.is_none()
+        && tags.is_none()
+        && model.thinking_request_mode.is_none()
+    {
         None
     } else {
         Some(ReasoningCapabilities {
             control: model.reasoning_control,
             output: model.reasoning_output,
             tags,
+            request_mode: model.thinking_request_mode,
         })
     }
 }
@@ -338,7 +346,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 /// Return the default config template written on first run.
 #[must_use]
 pub fn default_config_template() -> &'static str {
-    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
+    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
 }
 
 fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
@@ -503,6 +511,7 @@ mod tests {
             reasoning_output = "Tagged"
             reasoning_tag_open = "<think>"
             reasoning_tag_close = "</think>"
+            thinking_request_mode = "NestedReasoning"
             "#,
         )
         .expect("parse config");
@@ -527,6 +536,10 @@ mod tests {
         assert_eq!(model.reasoning_output, Some(ReasoningOutputMode::Tagged));
         assert_eq!(model.reasoning_tag_open.as_deref(), Some("<think>"));
         assert_eq!(model.reasoning_tag_close.as_deref(), Some("</think>"));
+        assert_eq!(
+            model.thinking_request_mode,
+            Some(ThinkingRequestMode::NestedReasoning)
+        );
     }
 
     #[test]
@@ -580,6 +593,7 @@ mod tests {
                     reasoning_output: Some(ReasoningOutputMode::Tagged),
                     reasoning_tag_open: Some("<think>".into()),
                     reasoning_tag_close: Some("</think>".into()),
+                    thinking_request_mode: Some(ThinkingRequestMode::ReasoningEffort),
                     supports_images: false,
                 }],
             },
@@ -598,6 +612,7 @@ mod tests {
                     open: "<think>".into(),
                     close: "</think>".into(),
                 }),
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
             })
         );
     }
@@ -621,6 +636,7 @@ mod tests {
                     reasoning_output: None,
                     reasoning_tag_open: None,
                     reasoning_tag_close: None,
+                    thinking_request_mode: None,
                     supports_images: false,
                 }],
             },

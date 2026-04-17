@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    sync::{Arc, Mutex},
-};
+use std::collections::BTreeMap;
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -13,6 +10,7 @@ use anie_protocol::{
 use anie_provider::{
     ApiKind, LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent, ProviderStream,
     ReasoningCapabilities, ReasoningControlMode, StreamOptions, ThinkingLevel,
+    ThinkingRequestMode,
 };
 
 use crate::{
@@ -24,7 +22,6 @@ use crate::{
 #[derive(Clone)]
 pub struct OpenAIProvider {
     client: reqwest::Client,
-    negative_native_reasoning_strategies: Arc<Mutex<HashSet<NativeReasoningCacheKey>>>,
 }
 
 impl OpenAIProvider {
@@ -33,7 +30,6 @@ impl OpenAIProvider {
     pub fn new() -> Self {
         Self {
             client: create_http_client(),
-            negative_native_reasoning_strategies: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -226,7 +222,7 @@ impl OpenAIProvider {
                     if strategy != NativeReasoningRequestStrategy::NoNativeFields
                         && is_native_reasoning_compatibility_error(&error) =>
                 {
-                    self.cache_negative_native_reasoning_strategy(model, strategy);
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -242,65 +238,41 @@ impl OpenAIProvider {
         model: &Model,
         options: &StreamOptions,
     ) -> Vec<NativeReasoningRequestStrategy> {
-        if options.thinking == ThinkingLevel::Off
-            || effective_reasoning_capabilities(model)
-                .as_ref()
-                .and_then(|capabilities| capabilities.control)
-                != Some(ReasoningControlMode::Native)
-            || !is_local_openai_compatible_target(model)
-        {
+        if options.thinking == ThinkingLevel::Off || !is_local_openai_compatible_target(model) {
             return vec![NativeReasoningRequestStrategy::NoNativeFields];
         }
 
-        let mut strategies = match openai_compatible_backend(model) {
-            OpenAiCompatibleBackend::LmStudio => vec![
-                NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-                NativeReasoningRequestStrategy::LmStudioNestedReasoning,
-                NativeReasoningRequestStrategy::NoNativeFields,
-            ],
-            OpenAiCompatibleBackend::Ollama
-            | OpenAiCompatibleBackend::Vllm
-            | OpenAiCompatibleBackend::UnknownLocal => vec![
-                NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-                NativeReasoningRequestStrategy::NoNativeFields,
-            ],
-            OpenAiCompatibleBackend::Hosted => {
-                vec![NativeReasoningRequestStrategy::NoNativeFields]
+        let Some(capabilities) = effective_reasoning_capabilities(model) else {
+            return vec![NativeReasoningRequestStrategy::NoNativeFields];
+        };
+        if capabilities.control != Some(ReasoningControlMode::Native) {
+            return vec![NativeReasoningRequestStrategy::NoNativeFields];
+        }
+
+        let strategy = match capabilities.request_mode {
+            Some(ThinkingRequestMode::ReasoningEffort) => {
+                Some(NativeReasoningRequestStrategy::TopLevelReasoningEffort)
             }
+            Some(ThinkingRequestMode::NestedReasoning) => {
+                Some(NativeReasoningRequestStrategy::LmStudioNestedReasoning)
+            }
+            Some(ThinkingRequestMode::PromptSteering) => None,
+            None => match openai_compatible_backend(model) {
+                OpenAiCompatibleBackend::LmStudio => {
+                    Some(NativeReasoningRequestStrategy::LmStudioNestedReasoning)
+                }
+                OpenAiCompatibleBackend::Ollama
+                | OpenAiCompatibleBackend::Vllm
+                | OpenAiCompatibleBackend::UnknownLocal => {
+                    Some(NativeReasoningRequestStrategy::TopLevelReasoningEffort)
+                }
+                OpenAiCompatibleBackend::Hosted => None,
+            },
         };
 
-        strategies.retain(|strategy| {
-            *strategy == NativeReasoningRequestStrategy::NoNativeFields
-                || !self.is_negative_native_reasoning_strategy(model, *strategy)
-        });
-        if strategies.is_empty() {
-            strategies.push(NativeReasoningRequestStrategy::NoNativeFields);
-        }
-        strategies
-    }
-
-    fn is_negative_native_reasoning_strategy(
-        &self,
-        model: &Model,
-        strategy: NativeReasoningRequestStrategy,
-    ) -> bool {
-        self.negative_native_reasoning_strategies
-            .lock()
-            .map(|cache| cache.contains(&NativeReasoningCacheKey::new(model, strategy)))
-            .unwrap_or(false)
-    }
-
-    fn cache_negative_native_reasoning_strategy(
-        &self,
-        model: &Model,
-        strategy: NativeReasoningRequestStrategy,
-    ) {
-        if strategy == NativeReasoningRequestStrategy::NoNativeFields {
-            return;
-        }
-
-        if let Ok(mut cache) = self.negative_native_reasoning_strategies.lock() {
-            cache.insert(NativeReasoningCacheKey::new(model, strategy));
+        match strategy {
+            Some(strategy) => vec![strategy, NativeReasoningRequestStrategy::NoNativeFields],
+            None => vec![NativeReasoningRequestStrategy::NoNativeFields],
         }
     }
 }
@@ -399,7 +371,6 @@ fn assistant_message_to_openai_llm_message(
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -556,23 +527,6 @@ enum OpenAiCompatibleBackend {
     LmStudio,
     Vllm,
     UnknownLocal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct NativeReasoningCacheKey {
-    base_url: String,
-    model_id: String,
-    strategy: NativeReasoningRequestStrategy,
-}
-
-impl NativeReasoningCacheKey {
-    fn new(model: &Model, strategy: NativeReasoningRequestStrategy) -> Self {
-        Self {
-            base_url: model.base_url.clone(),
-            model_id: model.id.clone(),
-            strategy,
-        }
-    }
 }
 
 fn effective_reasoning_capabilities(model: &Model) -> Option<ReasoningCapabilities> {
@@ -1013,9 +967,7 @@ impl OpenAiStreamState {
     }
 
     fn has_meaningful_content(&self) -> bool {
-        !self.text.is_empty()
-            || !self.thinking.is_empty()
-            || self.tool_calls.values().any(|state| !state.id.is_empty())
+        !self.text.is_empty() || self.tool_calls.values().any(|state| !state.id.is_empty())
     }
 
     fn into_message(&mut self) -> AssistantMessage {
@@ -1084,6 +1036,7 @@ impl OpenAiToolCallState {
 mod tests {
     use anie_provider::{
         ApiKind, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
+        ThinkingRequestMode,
     };
 
     use super::*;
@@ -1124,7 +1077,11 @@ mod tests {
         sample_heuristic_local_model("ollama", "http://localhost:11434/v1", "qwen3:32b")
     }
 
-    fn sample_native_local_model(provider: &str, base_url: &str) -> Model {
+    fn sample_native_local_model(
+        provider: &str,
+        base_url: &str,
+        request_mode: ThinkingRequestMode,
+    ) -> Model {
         Model {
             id: "reasoner".into(),
             name: "Reasoner".into(),
@@ -1138,6 +1095,7 @@ mod tests {
                 control: Some(ReasoningControlMode::Native),
                 output: Some(ReasoningOutputMode::Tagged),
                 tags: None,
+                request_mode: Some(request_mode),
             }),
             supports_images: false,
             cost_per_million: anie_provider::CostPerMillion::zero(),
@@ -1219,6 +1177,12 @@ mod tests {
         assert_eq!(messages[1].content["content"], serde_json::Value::Null);
         assert!(messages[1].content["tool_calls"].is_array());
         assert_eq!(messages[2].role, "tool");
+    }
+
+    #[test]
+    fn openai_provider_does_not_replay_thinking_blocks() {
+        let provider = OpenAIProvider::new();
+        assert!(!provider.includes_thinking_in_replay());
     }
 
     #[test]
@@ -1321,22 +1285,38 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_only_stream_with_empty_content_finishes_as_thinking_not_empty_message() {
+    fn reasoning_only_stream_without_visible_content_is_an_error() {
         let mut state = OpenAiStreamState::new(&sample_local_model());
         let events = state
             .process_event(
                 r#"{"choices":[{"index":0,"delta":{"content":"","reasoning":"hello from reasoning"},"finish_reason":"stop"}]}"#,
             )
             .expect("events");
-        let finished = state.finish_stream().expect("finish stream");
-        let message = final_message(&finished);
+        let error = state.finish_stream().expect_err("finish stream should fail");
 
         assert_eq!(
             events,
             vec![ProviderEvent::ThinkingDelta("hello from reasoning".into())]
         );
-        assert_eq!(assistant_thinking(&message), "hello from reasoning");
-        assert_eq!(assistant_text(&message), "");
+        assert!(matches!(
+            error,
+            ProviderError::Stream(message) if message == "empty assistant response"
+        ));
+    }
+
+    #[test]
+    fn reasoning_with_visible_text_still_succeeds() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        state.process_event(
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"plan","content":"answer"},"finish_reason":"stop"}]}"#,
+        )
+        .expect("events");
+
+        let finished = state.finish_stream().expect("finish stream");
+        let message = final_message(&finished);
+
+        assert_eq!(assistant_thinking(&message), "plan");
+        assert_eq!(assistant_text(&message), "answer");
     }
 
     #[test]
@@ -1382,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_reasoning_only_assistant_messages_when_converting_messages() {
+    fn reasoning_only_assistant_messages_are_omitted_from_openai_replay() {
         let provider = OpenAIProvider::new();
         let messages = provider.convert_messages(&[Message::Assistant(AssistantMessage {
             content: vec![ContentBlock::Thinking {
@@ -1396,9 +1376,43 @@ mod tests {
             timestamp: 1,
         })]);
 
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn thinking_is_omitted_but_text_and_tools_preserved_in_openai_replay() {
+        let provider = OpenAIProvider::new();
+        let messages = provider.convert_messages(&[Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "plan first".into(),
+                },
+                ContentBlock::Text {
+                    text: "final answer".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "README.md" }),
+                }),
+            ],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider: "ollama".into(),
+            model: "qwen3:32b".into(),
+            timestamp: 1,
+        })]);
+
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
-        assert_eq!(messages[0].content["content"], json!("plan first"));
+        assert_eq!(messages[0].content["content"], json!("final answer"));
+        assert_eq!(messages[0].content["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(
+            messages[0].content["tool_calls"][0]["function"]["name"],
+            json!("read")
+        );
+        assert!(!messages[0].content.to_string().contains("plan first"));
     }
 
     #[test]
@@ -1784,7 +1798,11 @@ mod tests {
     #[test]
     fn ollama_native_reasoning_profile_emits_top_level_reasoning_effort() {
         let provider = OpenAIProvider::new();
-        let model = sample_native_local_model("ollama", "http://localhost:11434/v1");
+        let model = sample_native_local_model(
+            "ollama",
+            "http://localhost:11434/v1",
+            ThinkingRequestMode::ReasoningEffort,
+        );
         let options = StreamOptions {
             thinking: ThinkingLevel::High,
             ..StreamOptions::default()
@@ -1825,7 +1843,11 @@ mod tests {
     #[test]
     fn vllm_native_reasoning_profile_emits_top_level_reasoning_effort() {
         let provider = OpenAIProvider::new();
-        let model = sample_native_local_model("vllm", "http://localhost:8000/v1");
+        let model = sample_native_local_model(
+            "vllm",
+            "http://localhost:8000/v1",
+            ThinkingRequestMode::ReasoningEffort,
+        );
         let options = StreamOptions {
             thinking: ThinkingLevel::Medium,
             ..StreamOptions::default()
@@ -1854,27 +1876,18 @@ mod tests {
     }
 
     #[test]
-    fn lmstudio_native_reasoning_falls_back_to_nested_strategy_after_cached_failure() {
+    fn lmstudio_native_reasoning_profile_uses_nested_reasoning_effort() {
         let provider = OpenAIProvider::new();
-        let model = sample_native_local_model("lmstudio", "http://localhost:1234/v1");
+        let model = sample_native_local_model(
+            "lmstudio",
+            "http://localhost:1234/v1",
+            ThinkingRequestMode::NestedReasoning,
+        );
         let options = StreamOptions {
             thinking: ThinkingLevel::High,
             ..StreamOptions::default()
         };
 
-        assert_eq!(
-            provider.native_reasoning_request_strategies(&model, &options),
-            vec![
-                NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-                NativeReasoningRequestStrategy::LmStudioNestedReasoning,
-                NativeReasoningRequestStrategy::NoNativeFields,
-            ]
-        );
-
-        provider.cache_negative_native_reasoning_strategy(
-            &model,
-            NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-        );
         assert_eq!(
             provider.native_reasoning_request_strategies(&model, &options),
             vec![
@@ -1895,21 +1908,17 @@ mod tests {
             NativeReasoningRequestStrategy::LmStudioNestedReasoning,
         );
         assert_eq!(body["reasoning"], json!({ "effort": "high" }));
-
-        provider.cache_negative_native_reasoning_strategy(
-            &model,
-            NativeReasoningRequestStrategy::LmStudioNestedReasoning,
-        );
-        assert_eq!(
-            provider.native_reasoning_request_strategies(&model, &options),
-            vec![NativeReasoningRequestStrategy::NoNativeFields]
-        );
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
     fn thinking_off_does_not_force_native_reasoning_fields_for_local_native_models() {
         let provider = OpenAIProvider::new();
-        let model = sample_native_local_model("ollama", "http://localhost:11434/v1");
+        let model = sample_native_local_model(
+            "ollama",
+            "http://localhost:11434/v1",
+            ThinkingRequestMode::ReasoningEffort,
+        );
         let options = StreamOptions {
             thinking: ThinkingLevel::Off,
             ..StreamOptions::default()
@@ -1969,40 +1978,6 @@ mod tests {
     }
 
     #[test]
-    fn negative_native_reasoning_cache_is_scoped_by_base_url_model_and_strategy() {
-        let provider = OpenAIProvider::new();
-        let lmstudio = sample_native_local_model("lmstudio", "http://localhost:1234/v1");
-        let same_endpoint_other_model = Model {
-            id: "other-model".into(),
-            ..sample_native_local_model("lmstudio", "http://localhost:1234/v1")
-        };
-        let other_endpoint_same_model =
-            sample_native_local_model("lmstudio", "http://localhost:4321/v1");
-
-        provider.cache_negative_native_reasoning_strategy(
-            &lmstudio,
-            NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-        );
-
-        assert!(provider.is_negative_native_reasoning_strategy(
-            &lmstudio,
-            NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-        ));
-        assert!(!provider.is_negative_native_reasoning_strategy(
-            &lmstudio,
-            NativeReasoningRequestStrategy::LmStudioNestedReasoning,
-        ));
-        assert!(!provider.is_negative_native_reasoning_strategy(
-            &same_endpoint_other_model,
-            NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-        ));
-        assert!(!provider.is_negative_native_reasoning_strategy(
-            &other_endpoint_same_model,
-            NativeReasoningRequestStrategy::TopLevelReasoningEffort,
-        ));
-    }
-
-    #[test]
     fn backend_defaults_resolve_conservatively_for_local_models() {
         let provider = OpenAIProvider::new();
         let options = StreamOptions {
@@ -2028,7 +2003,6 @@ mod tests {
         assert_eq!(
             provider.native_reasoning_request_strategies(&lmstudio, &options),
             vec![
-                NativeReasoningRequestStrategy::TopLevelReasoningEffort,
                 NativeReasoningRequestStrategy::LmStudioNestedReasoning,
                 NativeReasoningRequestStrategy::NoNativeFields,
             ]
@@ -2046,6 +2020,7 @@ mod tests {
                 control: Some(ReasoningControlMode::Prompt),
                 output: None,
                 tags: None,
+                request_mode: Some(ThinkingRequestMode::PromptSteering),
             })
         );
         assert_eq!(

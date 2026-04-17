@@ -183,6 +183,10 @@ impl Provider for AnthropicProvider {
         converted
     }
 
+    fn includes_thinking_in_replay(&self) -> bool {
+        true
+    }
+
     fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
         tools
             .iter()
@@ -656,6 +660,12 @@ mod tests {
             block,
             ContentBlock::ToolCall(ToolCall { id, arguments, .. }) if id == "call_1" && arguments == &json!({"path":"Cargo.toml"})
         )));
+    }
+
+    #[test]
+    fn anthropic_provider_replays_thinking_blocks() {
+        let provider = AnthropicProvider::new();
+        assert!(provider.includes_thinking_in_replay());
     }
 
     #[test]

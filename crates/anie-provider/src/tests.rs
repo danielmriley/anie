@@ -7,7 +7,7 @@ use anie_protocol::{
 use crate::{
     ApiKind, CostPerMillion, LlmContext, Model, Provider, ProviderError, ProviderEvent,
     ProviderRegistry, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
-    ReasoningTags, StreamOptions,
+    ReasoningTags, StreamOptions, ThinkingRequestMode,
     mock::{MockProvider, MockStreamScript},
 };
 
@@ -89,6 +89,7 @@ fn model_serde_roundtrips_reasoning_capabilities() {
             open: "<think>".into(),
             close: "</think>".into(),
         }),
+        request_mode: Some(ThinkingRequestMode::ReasoningEffort),
     });
     model.supports_reasoning = true;
 

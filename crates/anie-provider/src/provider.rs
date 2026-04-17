@@ -43,6 +43,11 @@ pub trait Provider: Send + Sync {
     /// Convert protocol messages into the provider-native format.
     fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage>;
 
+    /// Whether assistant thinking blocks should be replayed back to this provider.
+    fn includes_thinking_in_replay(&self) -> bool {
+        false
+    }
+
     /// Convert registered tools into the provider-native format.
     fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value>;
 }

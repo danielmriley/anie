@@ -178,11 +178,17 @@ fn populate_model_table(table: &mut Table, model: &Model) {
             table.remove("reasoning_tag_open");
             table.remove("reasoning_tag_close");
         }
+        if let Some(request_mode) = reasoning.request_mode {
+            table["thinking_request_mode"] = value(format!("{request_mode:?}"));
+        } else {
+            table.remove("thinking_request_mode");
+        }
     } else {
         table.remove("reasoning_control");
         table.remove("reasoning_output");
         table.remove("reasoning_tag_open");
         table.remove("reasoning_tag_close");
+        table.remove("thinking_request_mode");
     }
 }
 
@@ -193,7 +199,7 @@ mod tests {
     use super::*;
     use anie_provider::{
         CostPerMillion, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
-        ReasoningTags,
+        ReasoningTags, ThinkingRequestMode,
     };
 
     fn sample_model() -> Model {
@@ -213,6 +219,7 @@ mod tests {
                     open: "<think>".into(),
                     close: "</think>".into(),
                 }),
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
             }),
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
@@ -265,6 +272,7 @@ mod tests {
         assert!(rendered.contains("reasoning_output = \"Tagged\""));
         assert!(rendered.contains("reasoning_tag_open = \"<think>\""));
         assert!(rendered.contains("reasoning_tag_close = \"</think>\""));
+        assert!(rendered.contains("thinking_request_mode = \"ReasoningEffort\""));
     }
 
     #[test]

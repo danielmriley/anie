@@ -165,7 +165,8 @@ impl AgentLoop {
                 model.base_url = base_url_override;
             }
 
-            let sanitized_context = sanitize_context_for_request(&context);
+            let sanitized_context =
+                sanitize_context_for_request(&context, provider.includes_thinking_in_replay());
             let llm_context = LlmContext {
                 system_prompt: self.config.system_prompt.clone(),
                 messages: provider.convert_messages(&sanitized_context),
@@ -636,19 +637,27 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
-fn sanitize_context_for_request(messages: &[Message]) -> Vec<Message> {
+fn sanitize_context_for_request(
+    messages: &[Message],
+    includes_thinking_in_replay: bool,
+) -> Vec<Message> {
     messages
         .iter()
         .filter_map(|message| match message {
-            Message::Assistant(assistant) => {
-                sanitize_assistant_for_request(assistant).map(Message::Assistant)
-            }
+            Message::Assistant(assistant) => sanitize_assistant_for_request(
+                assistant,
+                includes_thinking_in_replay,
+            )
+            .map(Message::Assistant),
             _ => Some(message.clone()),
         })
         .collect()
 }
 
-fn sanitize_assistant_for_request(assistant: &AssistantMessage) -> Option<AssistantMessage> {
+fn sanitize_assistant_for_request(
+    assistant: &AssistantMessage,
+    includes_thinking_in_replay: bool,
+) -> Option<AssistantMessage> {
     if matches!(
         assistant.stop_reason,
         StopReason::Error | StopReason::Aborted
@@ -662,11 +671,14 @@ fn sanitize_assistant_for_request(assistant: &AssistantMessage) -> Option<Assist
         .filter_map(|block| match block {
             ContentBlock::Text { text } if text.trim().is_empty() => None,
             ContentBlock::Thinking { thinking } if thinking.trim().is_empty() => None,
+            ContentBlock::Thinking { .. } if !includes_thinking_in_replay => None,
             _ => Some(block.clone()),
         })
         .collect::<Vec<_>>();
 
-    if content.is_empty() {
+    if content.is_empty()
+        || !content.iter().any(|block| !matches!(block, ContentBlock::Thinking { .. }))
+    {
         return None;
     }
 
@@ -989,7 +1001,7 @@ mod tests {
             user_message("second", 6),
         ];
 
-        let sanitized = sanitize_context_for_request(&context);
+        let sanitized = sanitize_context_for_request(&context, false);
 
         assert_eq!(sanitized.len(), 3);
         assert!(matches!(sanitized[0], Message::User(_)));
@@ -1003,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_assistant_for_request_preserves_meaningful_thinking() {
+    fn sanitize_assistant_for_request_drops_thinking_only_messages() {
         let assistant = assistant_message(
             vec![
                 ContentBlock::Thinking {
@@ -1015,14 +1027,57 @@ mod tests {
             1,
         );
 
-        let sanitized = sanitize_assistant_for_request(&assistant).expect("assistant survives");
+        let sanitized = sanitize_assistant_for_request(&assistant, true);
 
-        assert_eq!(sanitized.content.len(), 1);
+        assert!(sanitized.is_none());
+    }
+
+    #[test]
+    fn sanitize_assistant_for_request_strips_thinking_when_replay_disallowed() {
+        let assistant = assistant_message(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "plan first".into(),
+                },
+                ContentBlock::Text {
+                    text: "final answer".into(),
+                },
+            ],
+            StopReason::Stop,
+            1,
+        );
+
+        let sanitized = sanitize_assistant_for_request(&assistant, false)
+            .expect("assistant with text should survive");
+
         assert_eq!(
             sanitized.content,
-            vec![ContentBlock::Thinking {
-                thinking: "plan first".into(),
+            vec![ContentBlock::Text {
+                text: "final answer".into(),
             }]
         );
+    }
+
+    #[test]
+    fn sanitize_assistant_for_request_preserves_thinking_when_replay_allowed() {
+        let assistant = assistant_message(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "inspect file".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "README.md" }),
+                }),
+            ],
+            StopReason::ToolUse,
+            2,
+        );
+
+        let sanitized = sanitize_assistant_for_request(&assistant, true)
+            .expect("tool assistant survives");
+
+        assert_eq!(sanitized.content, assistant.content);
     }
 }

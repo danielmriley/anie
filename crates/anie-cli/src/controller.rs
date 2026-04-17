@@ -1794,7 +1794,7 @@ mod tests {
     use super::*;
     use anie_provider::{
         ApiKind, CostPerMillion, ProviderError, ReasoningCapabilities, ReasoningControlMode,
-        ReasoningOutputMode,
+        ReasoningOutputMode, ThinkingRequestMode,
     };
 
     fn model(id: &str, provider: &str) -> Model {
@@ -1844,6 +1844,7 @@ mod tests {
                     control: Some(ReasoningControlMode::Native),
                     output: Some(ReasoningOutputMode::Separated),
                     tags: None,
+                    request_mode: Some(ThinkingRequestMode::ReasoningEffort),
                 }),
                 ..model("o4-mini", "openai")
             },
@@ -1860,6 +1861,7 @@ mod tests {
                 control: Some(ReasoningControlMode::Native),
                 output: Some(ReasoningOutputMode::Separated),
                 tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
             })
         );
     }

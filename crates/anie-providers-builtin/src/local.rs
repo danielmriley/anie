@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anie_provider::{
     ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
-    ReasoningOutputMode,
+    ReasoningOutputMode, ThinkingRequestMode,
 };
 
 /// A detected local OpenAI-compatible server.
@@ -16,11 +16,14 @@ pub struct LocalServer {
     pub models: Vec<Model>,
 }
 
-fn native_separated_reasoning_capabilities() -> ReasoningCapabilities {
+fn native_separated_reasoning_capabilities(
+    request_mode: ThinkingRequestMode,
+) -> ReasoningCapabilities {
     ReasoningCapabilities {
         control: Some(ReasoningControlMode::Native),
         output: Some(ReasoningOutputMode::Separated),
         tags: None,
+        request_mode: Some(request_mode),
     }
 }
 
@@ -29,6 +32,7 @@ fn prompt_only_reasoning_capabilities() -> ReasoningCapabilities {
         control: Some(ReasoningControlMode::Prompt),
         output: None,
         tags: None,
+        request_mode: Some(ThinkingRequestMode::PromptSteering),
     }
 }
 
@@ -71,7 +75,12 @@ pub fn default_local_reasoning_capabilities(
         || base_url.contains(":1234");
 
     if known_native_backend && is_reasoning_capable_family(model_id) {
-        Some(native_separated_reasoning_capabilities())
+        let request_mode = if provider == "lmstudio" || base_url.contains(":1234") {
+            ThinkingRequestMode::NestedReasoning
+        } else {
+            ThinkingRequestMode::ReasoningEffort
+        };
+        Some(native_separated_reasoning_capabilities(request_mode))
     } else {
         Some(prompt_only_reasoning_capabilities())
     }
@@ -195,6 +204,7 @@ mod tests {
                 control: Some(ReasoningControlMode::Native),
                 output: Some(ReasoningOutputMode::Separated),
                 tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
             })
         );
 
@@ -213,6 +223,20 @@ mod tests {
                 control: Some(ReasoningControlMode::Native),
                 output: Some(ReasoningOutputMode::Separated),
                 tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+            })
+        );
+        assert_eq!(
+            default_local_reasoning_capabilities(
+                "lmstudio",
+                "http://localhost:1234/v1",
+                "qwen3:32b"
+            ),
+            Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::NestedReasoning),
             })
         );
         assert_eq!(
@@ -225,6 +249,7 @@ mod tests {
                 control: Some(ReasoningControlMode::Prompt),
                 output: None,
                 tags: None,
+                request_mode: Some(ThinkingRequestMode::PromptSteering),
             })
         );
         assert_eq!(

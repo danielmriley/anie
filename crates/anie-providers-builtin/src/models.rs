@@ -8,6 +8,7 @@ fn native_separated_reasoning() -> Option<ReasoningCapabilities> {
         control: Some(ReasoningControlMode::Native),
         output: Some(ReasoningOutputMode::Separated),
         tags: None,
+        request_mode: None,
     })
 }
 

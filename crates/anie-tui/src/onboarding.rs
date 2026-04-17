@@ -2045,7 +2045,9 @@ fn next_boundary(text: &str, index: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anie_provider::{ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode};
+    use anie_provider::{
+        ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode, ThinkingRequestMode,
+    };
 
     fn sample_local_server() -> LocalServer {
         LocalServer {
@@ -2064,6 +2066,7 @@ mod tests {
                     control: Some(ReasoningControlMode::Native),
                     output: Some(ReasoningOutputMode::Separated),
                     tags: None,
+                    request_mode: Some(ThinkingRequestMode::ReasoningEffort),
                 }),
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),

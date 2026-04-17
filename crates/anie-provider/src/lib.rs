@@ -12,7 +12,7 @@ pub use api_kind::ApiKind;
 pub use error::ProviderError;
 pub use model::{
     CostPerMillion, Model, ModelInfo, ReasoningCapabilities, ReasoningControlMode,
-    ReasoningOutputMode, ReasoningTags,
+    ReasoningOutputMode, ReasoningTags, ThinkingRequestMode,
 };
 pub use options::{LlmContext, LlmMessage, ResolvedRequestOptions, StreamOptions};
 pub use provider::{Provider, ProviderEvent, ProviderStream, RequestOptionsResolver};

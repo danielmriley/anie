@@ -40,6 +40,17 @@ pub enum ReasoningOutputMode {
     Separated,
 }
 
+/// How thinking should be requested for a model.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ThinkingRequestMode {
+    /// Use prompt-steering text to encourage or discourage reasoning.
+    PromptSteering,
+    /// Use the top-level `reasoning_effort` field.
+    ReasoningEffort,
+    /// Use a nested `reasoning.effort` field.
+    NestedReasoning,
+}
+
 /// Explicit opening/closing tags used for tagged reasoning output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReasoningTags {
@@ -61,6 +72,9 @@ pub struct ReasoningCapabilities {
     /// Optional explicit tags for tagged reasoning output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<ReasoningTags>,
+    /// Optional explicit request-shape hint for thinking support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_mode: Option<ThinkingRequestMode>,
 }
 
 /// A model discovered from a provider endpoint.
