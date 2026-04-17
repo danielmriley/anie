@@ -1,5 +1,13 @@
 # Plan 03 — Controller decomposition
 
+> **Revised 2026-04-17.** Phase 3's `SlashCommand` trait and
+> `CommandRegistry` are updated to carry `SlashCommandSource`
+> tagging (builtin / extension / prompt / skill), matching
+> pi-mono's `slash-commands.ts`. This prepares the registry for
+> extension-registered commands (plan 10) and future prompt-template
+> and skill integrations (`docs/ideas.md`) without a second
+> migration. See `pi_mono_comparison.md` for pi's shape.
+
 ## Motivation
 
 `crates/anie-cli/src/controller.rs` is 1967 LOC. `ControllerState`
@@ -205,22 +213,78 @@ All three should share a single helper (e.g.,
 
 ---
 
-## Phase 3 — Slash-command registry
+## Phase 3 — Slash-command registry (with source tagging)
 
 **Goal:** Replace the `handle_action` flat match with a registry-based
-dispatch. `/help` derives from the registry.
+dispatch. `/help` derives from the registry. Each command carries
+a `SlashCommandSource` tag so extensions, prompts, and skills can
+register into the same registry later (plans 10 and future work)
+without a second migration.
+
+pi-mono uses the same shape: see
+`~/Projects/agents/pi/packages/coding-agent/src/core/slash-commands.ts`,
+which declares:
+
+```ts
+export type SlashCommandSource = "extension" | "prompt" | "skill";
+```
+
+and pi's `SlashCommandInfo` carries source + `sourceInfo`. We
+adopt the same concept, extended with `Builtin` so the registry
+is uniform.
 
 ### Files to change
 
 | File | Change |
 |------|--------|
-| `crates/anie-cli/src/commands.rs` | New — `trait SlashCommand`, `struct CommandRegistry`, handler impls for `/model`, `/thinking`, `/compact`, `/fork`, `/diff`, `/session`, `/tools`, `/onboard`, `/providers`, `/clear`, `/help`, `/quit` |
+| `crates/anie-cli/src/commands/mod.rs` | New — `trait SlashCommand`, `struct CommandRegistry`, `enum SlashCommandSource`, `struct SourceInfo` |
+| `crates/anie-cli/src/commands/builtin.rs` | New — handler impls for `/model`, `/thinking`, `/compact`, `/fork`, `/diff`, `/session`, `/tools`, `/onboard`, `/providers`, `/clear`, `/help`, `/quit` |
 | `crates/anie-cli/src/controller.rs` | Replace `handle_action` slash-command match arms with `registry.dispatch(name, args, ctx)`; keep non-slash `UiAction` variants inline |
 | `crates/anie-cli/src/lib.rs` | `pub mod commands;` |
 
-(3 files — well under the 5-file cap.)
+(4 files — within the 5-file cap. Splitting `commands/mod.rs` from
+`commands/builtin.rs` keeps the trait + registry separate from
+the long list of builtin handlers, which matches pi's split.)
 
-### Sub-step A — Design the trait
+### Sub-step A — Source tag type
+
+```rust
+/// Where a slash command came from.
+///
+/// Mirrors pi-mono's `SlashCommandSource` with an added `Builtin`
+/// variant so the registry can represent every command uniformly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashCommandSource {
+    /// Shipped with anie.
+    Builtin,
+    /// Registered by an extension (see plan 10).
+    Extension { extension_name: String },
+    /// Registered by a prompt template (future — `docs/ideas.md`).
+    Prompt { template_path: PathBuf },
+    /// Registered by a skill (future — `docs/ideas.md`).
+    Skill { skill_name: String },
+}
+
+/// Display-facing source metadata. Used by `/help` output and by
+/// future `/settings` or autocomplete views to explain where a
+/// command comes from.
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub source: SlashCommandSource,
+    /// Human-readable origin (e.g., "builtin", "my-extension",
+    /// "prompt: review.md").
+    pub label: String,
+}
+
+impl SourceInfo {
+    pub fn builtin() -> Self { ... }
+    pub fn from_extension(name: &str) -> Self { ... }
+    pub fn from_prompt(path: &Path) -> Self { ... }
+    pub fn from_skill(name: &str) -> Self { ... }
+}
+```
+
+### Sub-step B — Design the trait
 
 ```rust
 pub struct CommandContext<'a> {
@@ -229,25 +293,139 @@ pub struct CommandContext<'a> {
     pub ui_tx: &'a mpsc::Sender<UiEvent>,
 }
 
+#[async_trait::async_trait]
 pub trait SlashCommand: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn summary(&self) -> &'static str;
-    fn usage(&self) -> &'static str { "" }
-    fn dispatch(&self, args: &str, ctx: &mut CommandContext<'_>) -> Result<Option<UiAction>>;
+    /// Command name without the leading slash (e.g., "model").
+    fn name(&self) -> &str;
+
+    /// One-line summary for `/help` output.
+    fn summary(&self) -> &str;
+
+    /// Optional longer usage string for `/help <name>`.
+    fn usage(&self) -> &str { "" }
+
+    /// Where this command came from. Defaults to builtin.
+    fn source_info(&self) -> SourceInfo {
+        SourceInfo::builtin()
+    }
+
+    /// Execute the command.
+    async fn dispatch(
+        &self,
+        args: &str,
+        ctx: &mut CommandContext<'_>,
+    ) -> Result<Option<UiAction>>;
 }
 ```
 
-### Sub-step B — Migrate one command at a time
+Builtins return `SourceInfo::builtin()` by default. Extensions,
+prompts, and skills override `source_info()` to describe their
+origin.
+
+### Sub-step C — Registry
+
+```rust
+pub struct CommandRegistry {
+    commands: HashMap<String, Arc<dyn SlashCommand>>,
+}
+
+impl CommandRegistry {
+    pub fn new() -> Self;
+    pub fn with_builtins() -> Self;
+
+    /// Register a command. Returns `Err` if the name is already
+    /// taken (policy: first-wins, extension attempts to override
+    /// builtin get a warning and are ignored; pi does the same —
+    /// see `pi_mono_comparison.md`).
+    pub fn register(&mut self, cmd: Arc<dyn SlashCommand>) -> Result<(), RegisterError>;
+
+    /// Look up a command by name.
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn SlashCommand>>;
+
+    /// All registered commands, in name order, with source info.
+    /// Used to derive `/help` and future autocomplete.
+    pub fn all(&self) -> Vec<CommandInfo>;
+
+    pub async fn dispatch(
+        &self,
+        name: &str,
+        args: &str,
+        ctx: &mut CommandContext<'_>,
+    ) -> Result<Option<UiAction>>;
+}
+
+pub struct CommandInfo {
+    pub name: String,
+    pub summary: String,
+    pub source: SourceInfo,
+}
+```
+
+### Sub-step D — Migrate one command at a time
 
 Port commands one by one, starting with the simplest (`/help`,
 `/quit`, `/clear`), to make each PR small. After each migration,
 delete the old match arm. After all commands are migrated, delete
 the giant match.
 
-### Sub-step C — Derive `/help` from the registry
+Each builtin looks like:
 
-`/help`'s handler returns a formatted list by iterating
-`registry.commands().map(|c| (c.name(), c.summary()))`.
+```rust
+pub struct HelpCommand;
+
+#[async_trait::async_trait]
+impl SlashCommand for HelpCommand {
+    fn name(&self) -> &str { "help" }
+    fn summary(&self) -> &str { "Show available commands" }
+
+    async fn dispatch(
+        &self,
+        _args: &str,
+        ctx: &mut CommandContext<'_>,
+    ) -> Result<Option<UiAction>> {
+        let infos = ctx.state.commands.all();
+        let output = format_help(&infos); // groups by source
+        // emit status event with output
+        Ok(None)
+    }
+}
+```
+
+### Sub-step E — `/help` is source-aware
+
+`/help` groups output by `SourceInfo::source`:
+
+```
+Commands:
+  Builtin:
+    /model [query]       — Select model
+    /thinking <level>    — Set reasoning level
+    ...
+
+  Extensions:
+    /mycmd               — (from my-extension)
+    ...
+
+  Prompts:
+    /review-pr           — (from prompt: review.md)
+    ...
+```
+
+If the only registered commands are builtins (current state), the
+groups degrade cleanly to a flat list.
+
+### Sub-step F — Name collision policy
+
+Matching pi: if an extension tries to register a command name that
+already exists, **the first registration wins** and a warning is
+logged. Builtins register first, so they always win collisions.
+Prompts and skills register after extensions by convention.
+
+```rust
+pub enum RegisterError {
+    DuplicateName { name: String, existing_source: SourceInfo },
+}
+```
 
 ### Files that must NOT change
 
@@ -261,18 +439,27 @@ the giant match.
 |---|------|
 | 1 | `registry_lookup_by_name_returns_handler` |
 | 2 | `unknown_command_returns_helpful_error` |
-| 3 | `help_lists_all_registered_commands` |
-| 4 | Each migrated command: one happy-path test (e.g., `/thinking medium` mutates controller state as expected). |
-| 5 | Existing TUI tests for `/help`, `/model`, `/thinking` still pass. |
+| 3 | `help_lists_all_registered_commands_grouped_by_source` |
+| 4 | `duplicate_registration_returns_err_and_keeps_first` |
+| 5 | `builtin_source_info_returns_builtin_variant` |
+| 6 | `extension_sourced_command_round_trips_source_info` (register a mock extension-sourced `SlashCommand`; assert `all()` reports `SlashCommandSource::Extension { .. }`) |
+| 7 | Each migrated builtin: one happy-path test (e.g., `/thinking medium` mutates controller state as expected) |
+| 8 | Existing TUI tests for `/help`, `/model`, `/thinking` still pass |
 
 ### Exit criteria
 
-- [ ] All slash commands live in `commands.rs` or in small files
-      imported from it.
+- [ ] All slash commands live in `commands/builtin.rs` or in small
+      files imported from it.
 - [ ] `handle_action` contains no slash-command match arms.
-- [ ] `/help` output is derived, not hand-maintained.
-- [ ] New `/settings` or `/copy` commands from `docs/ideas.md` can
-      be added by writing a single handler impl.
+- [ ] `/help` output is derived from `registry.all()`, grouped by
+      source.
+- [ ] Adding a new `/settings` or `/copy` command from
+      `docs/ideas.md` is: write a `SlashCommand` impl, register in
+      `CommandRegistry::with_builtins()`.
+- [ ] Extensions (plan 10 phase 4) can register commands with a
+      non-`Builtin` source; registry accepts and exposes them.
+- [ ] Prompts and skills (future) can register via the same API
+      with their own `SourceInfo`.
 
 ---
 

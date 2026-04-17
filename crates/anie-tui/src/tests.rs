@@ -1116,3 +1116,199 @@ fn render_buffer_to_string(buffer: &Buffer) -> String {
 fn non_empty_lines(rendered: &str) -> Vec<&str> {
     rendered.lines().filter(|line| !line.is_empty()).collect()
 }
+
+// ---------------------------------------------------------------------------
+// Thinking block display regression tests
+// ---------------------------------------------------------------------------
+
+/// Thinking text must never appear outside the "thinking" gutter section.
+/// This helper asserts that every occurrence of `thinking_text` in the
+/// rendered screen is inside a `│`-prefixed gutter line or the heading.
+fn assert_thinking_text_only_in_gutter(screen: &str, thinking_text: &str) {
+    for (line_no, line) in screen.lines().enumerate() {
+        if line.contains(thinking_text) {
+            let trimmed = line.trim();
+            let in_gutter = trimmed.starts_with('│');
+            let is_heading = trimmed == "thinking";
+            assert!(
+                in_gutter || is_heading,
+                "thinking text '{}' leaked outside gutter at line {}:\n  {}\nfull screen:\n{}",
+                thinking_text,
+                line_no + 1,
+                line,
+                screen
+            );
+        }
+    }
+}
+
+#[test]
+fn thinking_text_never_leaks_into_visible_answer_replayed() {
+    let screen = render_assistant_block("final answer", "secret plan", false, 40, 10);
+
+    assert!(screen.contains("final answer"), "screen was:\n{screen}");
+    assert!(screen.contains("secret plan"), "screen was:\n{screen}");
+    assert_thinking_text_only_in_gutter(&screen, "secret plan");
+    // Thinking must not appear concatenated with answer text
+    assert!(
+        !screen.contains("secret planfinal"),
+        "thinking concatenated with answer:\n{screen}"
+    );
+    assert!(
+        !screen.contains("final answersecret"),
+        "answer concatenated with thinking:\n{screen}"
+    );
+}
+
+#[test]
+fn thinking_text_never_leaks_into_visible_answer_streamed() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
+
+    // Simulate streaming: thinking first, then text, then done
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: Message::Assistant(AssistantMessage {
+            content: vec![],
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 1,
+        }),
+    })
+    .expect("assistant start");
+    app.handle_agent_event(AgentEvent::MessageDelta {
+        delta: StreamDelta::ThinkingDelta("secret plan".into()),
+    })
+    .expect("thinking delta");
+    app.handle_agent_event(AgentEvent::MessageDelta {
+        delta: StreamDelta::TextDelta("final answer".into()),
+    })
+    .expect("text delta");
+    app.handle_agent_event(AgentEvent::MessageEnd {
+        message: Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "secret plan".into(),
+                },
+                ContentBlock::Text {
+                    text: "final answer".into(),
+                },
+            ],
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 1,
+        }),
+    })
+    .expect("message end");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+
+    assert!(screen.contains("final answer"), "screen was:\n{screen}");
+    assert!(screen.contains("secret plan"), "screen was:\n{screen}");
+    assert_thinking_text_only_in_gutter(&screen, "secret plan");
+}
+
+#[test]
+fn multi_turn_thinking_stays_contained_in_each_message() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new());
+
+    // Load two assistant messages, each with thinking + text
+    app.load_transcript(&[
+        Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "first plan".into(),
+                },
+                ContentBlock::Text {
+                    text: "first answer".into(),
+                },
+            ],
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 1,
+        }),
+        Message::User(anie_protocol::UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "next question".into(),
+            }],
+            timestamp: 2,
+        }),
+        Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "second plan".into(),
+                },
+                ContentBlock::Text {
+                    text: "second answer".into(),
+                },
+            ],
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 3,
+        }),
+    ]);
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+
+    assert_thinking_text_only_in_gutter(&screen, "first plan");
+    assert_thinking_text_only_in_gutter(&screen, "second plan");
+    assert!(screen.contains("first answer"), "screen was:\n{screen}");
+    assert!(screen.contains("second answer"), "screen was:\n{screen}");
+}
+
+#[test]
+fn thinking_only_completed_message_shows_only_gutter() {
+    // A completed (non-streaming) message with only thinking and no text
+    // should render just the gutter section, no leaked text
+    let screen = render_assistant_block("", "only reasoning here", false, 40, 8);
+
+    assert_thinking_text_only_in_gutter(&screen, "only reasoning here");
+    let lines = non_empty_lines(&screen);
+    // Should only have "thinking" heading and the gutter line
+    assert_eq!(lines.len(), 2, "unexpected lines: {lines:?}");
+    assert_eq!(lines[0], "thinking");
+    assert!(lines[1].starts_with('│'), "line was: {}", lines[1]);
+}
+
+#[test]
+fn long_thinking_does_not_bleed_past_gutter_boundary() {
+    // A long thinking block that wraps should stay entirely in the gutter
+    let long_thinking = "a]b".repeat(50); // 150 chars
+    let screen = render_assistant_block("done", &long_thinking, false, 30, 20);
+
+    assert!(screen.contains("done"), "screen was:\n{screen}");
+    // Every line containing thinking content must be in gutter
+    for line in screen.lines() {
+        if line.contains("a]b") {
+            let trimmed = line.trim();
+            assert!(
+                trimmed.starts_with('│'),
+                "wrapped thinking leaked outside gutter: {line}\nfull screen:\n{screen}"
+            );
+        }
+    }
+}

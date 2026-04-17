@@ -1,5 +1,12 @@
 # Plan 02 — TUI overlay trait + shared widgets
 
+> **Revised 2026-04-17.** Extended with Phase 6 to establish an
+> `overlays/` directory scaffolded for the 10+ future selectors
+> pi-mono has (`session_picker`, `theme_picker`, `settings`,
+> `oauth`, `login`, `hotkeys`, etc.). See `pi_mono_comparison.md`
+> for the pi inventory. Directory scaffolding is cheap and
+> prevents re-migrating overlays as they're added.
+
 ## Motivation
 
 `crates/anie-tui/src/onboarding.rs` (2312 LOC) and
@@ -378,6 +385,202 @@ senders.
 
 ---
 
+## Phase 6 — Establish the `overlays/` directory
+
+**Goal:** Move the two existing overlays into a dedicated
+`overlays/` module and add placeholder files for the pi-shaped
+overlays anie will eventually need. This is structural
+scaffolding, not feature work — each placeholder is a short stub
+with a `TODO` and no rendering.
+
+pi-mono has these overlays today (see
+`~/Projects/agents/pi/packages/coding-agent/src/modes/interactive/
+components/`):
+
+- `model-selector` (already exists in anie as `model_picker.rs`)
+- `session-selector` + `session-selector-search`
+- `settings-selector`
+- `config-selector`
+- `oauth-selector`
+- `login-dialog`
+- `theme-selector`
+- `thinking-selector`
+- `scoped-models-selector`
+- `tree-selector`
+- `extension-selector` / `extension-editor` / `extension-input`
+- `user-message-selector`
+- `show-images-selector`
+- `hotkeys` (via command)
+
+Not every one needs a placeholder. This phase adds placeholders
+only for overlays that are on anie's near-term roadmap
+(`docs/ideas.md`).
+
+### Files to change
+
+| File | Change |
+|------|--------|
+| `crates/anie-tui/src/overlays/mod.rs` | New — module root; re-exports each submodule |
+| `crates/anie-tui/src/overlays/onboarding.rs` | Move from `src/onboarding.rs` |
+| `crates/anie-tui/src/overlays/providers.rs` | Move from `src/providers.rs` |
+| `crates/anie-tui/src/overlays/model_picker.rs` | Move from `src/model_picker.rs` |
+| `crates/anie-tui/src/lib.rs` | Replace `mod onboarding; mod providers; mod model_picker;` with `mod overlays;` and re-export top-level types through `overlays` |
+
+(5 files, within cap. Placeholder stubs land in a follow-up sub-phase.)
+
+### Sub-step A — Move the three existing overlays
+
+1. `git mv crates/anie-tui/src/onboarding.rs crates/anie-tui/src/overlays/onboarding.rs`
+2. `git mv crates/anie-tui/src/providers.rs crates/anie-tui/src/overlays/providers.rs`
+3. `git mv crates/anie-tui/src/model_picker.rs crates/anie-tui/src/overlays/model_picker.rs`
+4. Create `crates/anie-tui/src/overlays/mod.rs`:
+
+```rust
+//! Full-screen overlay screens.
+//!
+//! Each overlay implements the `OverlayScreen` trait (see
+//! `super::overlay`) and is selected at runtime. The app holds
+//! `Option<Box<dyn OverlayScreen>>`, not an enum, so adding a
+//! new overlay is a matter of creating a file here and
+//! implementing the trait.
+
+mod onboarding;
+mod providers;
+mod model_picker;
+
+pub use onboarding::{OnboardingScreen, OnboardingAction, OnboardingCompletion,
+                     ConfiguredProvider, ConfiguredProviderKind};
+pub use providers::{ProviderManagementScreen, ProviderManagementAction,
+                    ProviderEntry, ProviderType, TestResult};
+pub use model_picker::ModelPickerPane;
+```
+
+Adjust the exact re-export list to match the current public surface.
+
+5. Update `crates/anie-tui/src/lib.rs` to reference the new module
+   path. All external callers (`anie-cli`, tests) should continue
+   to work unchanged because the public re-exports are preserved.
+
+### Sub-step B — Add placeholder files for near-term overlays
+
+Create empty stubs for the overlays most likely to land next,
+based on `docs/ideas.md`. Each stub is a single file with:
+
+- A doc comment describing what the overlay will be.
+- A `pub struct <Name>;` placeholder with no fields.
+- A `todo!()` or trivial `impl OverlayScreen` that renders
+  "not yet implemented" and dismisses on any key.
+
+This lets plan 02's trait catch all future callers; it does **not**
+commit to implementing these overlays.
+
+| File | Corresponds to pi |
+|------|-------------------|
+| `crates/anie-tui/src/overlays/session_picker.rs` | `session-selector.ts` — ties to `/resume`, `/session list` |
+| `crates/anie-tui/src/overlays/settings.rs` | `settings-selector.ts` — ties to `/settings` from `docs/ideas.md` |
+| `crates/anie-tui/src/overlays/oauth.rs` | `oauth-selector.ts` + `login-dialog.ts` — ties to `/login` from `docs/ideas.md` |
+| `crates/anie-tui/src/overlays/theme_picker.rs` | `theme-selector.ts` — ties to theming from `docs/ideas.md` |
+| `crates/anie-tui/src/overlays/hotkeys.rs` | `/hotkeys` builtin — ties to `/hotkeys` from `docs/ideas.md` |
+| `crates/anie-tui/src/overlays/tree.rs` | `tree-selector.ts` — ties to `/tree` / session tree navigation |
+
+Each placeholder file follows this template:
+
+```rust
+//! <Name> overlay.
+//!
+//! Corresponds to pi's `<pi-file>.ts`. Tracks with `docs/ideas.md`
+//! item "<item name>". Not yet implemented — renders a
+//! placeholder and dismisses on any key.
+
+use crate::overlay::{OverlayContext, OverlayOutcome, OverlayScreen};
+use crossterm::event::KeyEvent;
+use ratatui::{layout::Rect, Frame};
+
+pub struct <Name>Screen;
+
+impl <Name>Screen {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl OverlayScreen for <Name>Screen {
+    fn handle_key(&mut self, _key: KeyEvent, _ctx: &mut OverlayContext<'_>) -> OverlayOutcome {
+        OverlayOutcome::Close
+    }
+
+    fn handle_tick(&mut self, _ctx: &mut OverlayContext<'_>) -> OverlayOutcome {
+        OverlayOutcome::Idle
+    }
+
+    fn handle_worker_event(&mut self, _event: WorkerEvent, _ctx: &mut OverlayContext<'_>) -> OverlayOutcome {
+        OverlayOutcome::Idle
+    }
+
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        // render "<Name> — not yet implemented. Press any key to close."
+        // using crate::widgets::panel::render_status_panel (from phase 2)
+    }
+}
+```
+
+These stubs are intentionally rendered, compiled code — no
+`todo!()` at runtime — so they don't panic if accidentally
+surfaced. If a user somehow opens them, they see a clear message
+and can close with any key.
+
+### Sub-step C — Do NOT wire the stubs into slash commands
+
+Adding stubs to the directory is structural. Wiring them into
+`/settings`, `/login`, etc. is feature work that lands when each
+overlay is actually implemented. Plan 02 does not register any
+new slash commands.
+
+### Sub-step D — Update `App` (if needed)
+
+If `App` in `app.rs` imports the three moved overlays, update the
+imports. If it uses `Option<Box<dyn OverlayScreen>>` from phase 3,
+no further changes. If phase 3 has not yet landed when phase 6
+runs, do phase 6 *after* phase 3.
+
+### Files that must NOT change
+
+- `crates/anie-tui/src/widgets/*` — shared widgets stay where
+  phases 1–2 placed them.
+- `crates/anie-tui/src/overlay.rs` — trait definition from phase 3
+  is unchanged.
+- Any call site that imports overlay types by their existing
+  public names — the re-exports preserve them.
+
+### Test plan
+
+| # | Test |
+|---|------|
+| 1 | `cargo check -p anie-tui` passes |
+| 2 | `cargo test -p anie-tui` passes (existing overlay tests find the overlays via the new path via re-exports) |
+| 3 | `cargo clippy --workspace --all-targets -- -D warnings` passes |
+| 4 | Manual: exercise onboarding end-to-end; visual unchanged |
+| 5 | Manual: exercise provider management end-to-end; visual unchanged |
+| 6 | `placeholder_overlay_compiles_and_renders_stub` — instantiate each placeholder, render into an off-screen buffer, assert the "not yet implemented" text appears |
+
+### Exit criteria
+
+- [ ] `crates/anie-tui/src/overlays/` exists as a module.
+- [ ] `onboarding.rs`, `providers.rs`, `model_picker.rs` live
+      under `overlays/` and their git history survives via
+      `--follow`.
+- [ ] Placeholder stubs exist for `session_picker`, `settings`,
+      `oauth`, `theme_picker`, `hotkeys`, `tree` — each is a
+      compilable `OverlayScreen` that renders "not implemented"
+      and dismisses on any key.
+- [ ] No external caller needed to change (public re-exports
+      preserved).
+- [ ] Adding a future overlay is: "create `overlays/foo.rs`,
+      implement `OverlayScreen`, register with `/foo` command."
+- [ ] Clippy clean, tests pass.
+
+---
+
 ## Files that must NOT change in any phase
 
 - `crates/anie-tui/src/input.rs` — main input editor.
@@ -392,12 +595,17 @@ senders.
 ```
 Phase 1 (TextField) ──┐
 Phase 2 (panel)     ──┼──► Phase 3 (trait) ──► Phase 4 (clone audit) ──► Phase 5 (tests)
+                                                                             │
+                                                                             ▼
+                                                                      Phase 6 (overlays/ dir)
 ```
 
 Phases 1 and 2 are independent and can ship in either order.
 Phase 3 depends on both (so it imports from `widgets` cleanly).
 Phase 4 is easier after 3 because the overlays are now objects.
-Phase 5 is last because the test seams are cleanest after 3 and 4.
+Phase 5 is last before phase 6 because the test seams are
+cleanest after 3 and 4. Phase 6 lands after 5 so its file moves
+don't invalidate test paths mid-phase.
 
 ## Out of scope
 

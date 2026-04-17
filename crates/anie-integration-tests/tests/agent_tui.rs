@@ -154,3 +154,98 @@ async fn agent_stream_error_renders_error_in_tui() {
         "error missing from:\n{screen}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Thinking block display regression tests (end-to-end through agent loop)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn thinking_only_provider_response_becomes_error_not_visible_thinking() {
+    // A provider that returns only thinking content and then errors
+    // should result in an error, not a message with leaked thinking.
+    let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![
+        Ok(ProviderEvent::Start),
+        Ok(ProviderEvent::ThinkingDelta("internal reasoning only".into())),
+        Err(ProviderError::Stream("empty assistant response".into())),
+    ])]);
+    let agent = build_agent(
+        provider,
+        std::sync::Arc::new(anie_agent::ToolRegistry::new()),
+    );
+    let (result, events) =
+        run_agent_collecting_events(agent, vec![user_prompt("Think.")], Vec::new()).await;
+
+    assert!(
+        result.terminal_error.is_some(),
+        "expected terminal error for thinking-only response"
+    );
+
+    let screen = replay_events_and_render(&events, 80, 24);
+
+    // The thinking text should be visible (it was streamed before the error)
+    // but it must be in the gutter, not as plain text
+    if screen.contains("internal reasoning only") {
+        for line in screen.lines() {
+            if line.contains("internal reasoning only") {
+                let trimmed = line.trim();
+                assert!(
+                    trimmed.starts_with('\u{2502}'),
+                    "thinking leaked outside gutter: {line}\nfull screen:\n{screen}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn multi_turn_with_thinking_keeps_thinking_in_gutter() {
+    // First turn: thinking + text. Render and verify thinking stays in gutter.
+    let turn1 = AssistantMessage {
+        content: vec![
+            ContentBlock::Thinking {
+                thinking: "plan step one".into(),
+            },
+            ContentBlock::Text {
+                text: "Here is my answer.".into(),
+            },
+        ],
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        provider: "mock".into(),
+        model: "mock-model".into(),
+        timestamp: 1,
+    };
+
+    let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![
+        Ok(ProviderEvent::Start),
+        Ok(ProviderEvent::ThinkingDelta("plan step one".into())),
+        Ok(ProviderEvent::TextDelta("Here is my answer.".into())),
+        Ok(ProviderEvent::Done(turn1)),
+    ])]);
+    let agent = build_agent(
+        provider,
+        std::sync::Arc::new(anie_agent::ToolRegistry::new()),
+    );
+    let (_result, events) =
+        run_agent_collecting_events(agent, vec![user_prompt("First.")], Vec::new()).await;
+
+    let screen = replay_events_and_render(&events, 80, 30);
+
+    // Thinking from turn 1 must be in gutter
+    for line in screen.lines() {
+        if line.contains("plan step one") {
+            let trimmed = line.trim();
+            assert!(
+                trimmed.starts_with('\u{2502}'),
+                "thinking leaked outside gutter: {line}\nfull screen:\n{screen}"
+            );
+        }
+    }
+
+    // Answer must be visible
+    assert!(
+        screen.contains("Here is my answer."),
+        "answer missing:\n{screen}"
+    );
+}
