@@ -699,7 +699,7 @@ struct ControllerState {
     tool_registry: Arc<ToolRegistry>,
     request_options_resolver: Arc<dyn RequestOptionsResolver>,
     system_prompt: String,
-    context_files_mtime: Option<std::time::SystemTime>,
+    context_files_stamp: Vec<(PathBuf, Option<std::time::SystemTime>)>,
     runtime_state: RuntimeState,
     retry_config: RetryConfig,
 }
@@ -1128,21 +1128,20 @@ impl ControllerState {
         ));
         self.system_prompt =
             build_system_prompt(&self.current_cwd, &self.tool_registry, &self.config)?;
-        self.context_files_mtime = max_context_files_mtime(&self.current_cwd, &self.config);
+        self.context_files_stamp = context_files_stamp(&self.current_cwd, &self.config);
         self.persist_runtime_state();
         Ok(())
     }
 
-    /// Rebuild the system prompt if any context file has been modified.
+    /// Rebuild the system prompt if the set of context files or any of their mtimes changed.
     fn refresh_system_prompt_if_needed(&mut self) {
-        let current_mtime = max_context_files_mtime(&self.current_cwd, &self.config);
-        if current_mtime != self.context_files_mtime {
-            if let Ok(prompt) =
+        let current_stamp = context_files_stamp(&self.current_cwd, &self.config);
+        if current_stamp != self.context_files_stamp
+            && let Ok(prompt) =
                 build_system_prompt(&self.current_cwd, &self.tool_registry, &self.config)
-            {
-                self.system_prompt = prompt;
-                self.context_files_mtime = current_mtime;
-            }
+        {
+            self.system_prompt = prompt;
+            self.context_files_stamp = current_stamp;
         }
     }
 }
@@ -1184,7 +1183,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
 
     let tool_registry = build_tool_registry(&cwd, cli.no_tools);
     let system_prompt = build_system_prompt(&cwd, &tool_registry, &config)?;
-    let context_files_mtime = max_context_files_mtime(&cwd, &config);
+    let context_files_stamp = context_files_stamp(&cwd, &config);
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
 
@@ -1201,7 +1200,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
         tool_registry,
         request_options_resolver,
         system_prompt,
-        context_files_mtime,
+        context_files_stamp,
         runtime_state: runtime_state.clone(),
         retry_config: RetryConfig::default(),
     };
@@ -1478,14 +1477,30 @@ pub fn build_system_prompt(
     Ok(parts.join("\n\n"))
 }
 
-/// Return the maximum mtime across all context files, or `None` if none exist.
-fn max_context_files_mtime(
+/// Return a deterministic stamp of the currently-visible context files and their mtimes.
+///
+/// Unlike a single max-mtime, this detects deletion or modification of any context file.
+fn context_files_stamp(
     cwd: &Path,
     config: &AnieConfig,
-) -> Option<std::time::SystemTime> {
-    collect_context_files(cwd, &config.context)
-        .ok()
-        .and_then(|files| files.into_iter().filter_map(|f| f.mtime).max())
+) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+
+    for directory in cwd.ancestors() {
+        for filename in &config.context.filenames {
+            let candidate = directory.join(filename);
+            if !candidate.is_file() || !seen.insert(candidate.clone()) {
+                continue;
+            }
+            let mtime = std::fs::metadata(&candidate)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            files.push((candidate, mtime));
+        }
+    }
+
+    files
 }
 
 async fn rpc_event_printer(mut event_rx: mpsc::Receiver<AgentEvent>) -> Result<()> {
@@ -1844,9 +1859,10 @@ impl From<AgentEvent> for RpcEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path, thread, time::Duration};
 
     use super::*;
+    use tempfile::tempdir;
     use anie_provider::{
         ApiKind, CostPerMillion, ProviderError, ReasoningCapabilities, ReasoningControlMode,
         ReasoningOutputMode, ThinkingRequestMode,
@@ -1998,6 +2014,30 @@ mod tests {
         assert_eq!(retry_delay_ms(&config, &error, 1), 1_000);
         assert_eq!(retry_delay_ms(&config, &error, 2), 2_000);
         assert_eq!(retry_delay_ms(&config, &error, 3), 4_000);
+    }
+
+    #[test]
+    fn context_files_stamp_detects_deleted_non_newest_file() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let nested = root.join("src/module");
+        fs::create_dir_all(&nested).expect("create nested dirs");
+
+        let project_agents = root.join("AGENTS.md");
+        let nested_claude = nested.join("CLAUDE.md");
+        fs::write(&project_agents, "project context").expect("write agents");
+        thread::sleep(Duration::from_millis(5));
+        fs::write(&nested_claude, "nested context").expect("write claude");
+
+        let config = AnieConfig::default();
+        let first = context_files_stamp(&nested, &config);
+        assert_eq!(first.len(), 2);
+
+        fs::remove_file(&project_agents).expect("remove agents");
+        let second = context_files_stamp(&nested, &config);
+
+        assert_ne!(first, second, "deleting a non-newest file should change stamp");
+        assert_eq!(second.len(), 1);
     }
 
     #[test]

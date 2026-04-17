@@ -1036,6 +1036,25 @@ fn copy_command_without_messages_shows_error() {
 }
 
 #[test]
+fn output_pane_last_assistant_text_skips_thinking_only_messages() {
+    let mut pane = OutputPane::new();
+    pane.add_block(RenderedBlock::AssistantMessage {
+        text: String::new(),
+        thinking: "plan only".into(),
+        is_streaming: false,
+        timestamp: 1,
+    });
+    pane.add_block(RenderedBlock::AssistantMessage {
+        text: "visible answer".into(),
+        thinking: "hidden reasoning".into(),
+        is_streaming: false,
+        timestamp: 2,
+    });
+
+    assert_eq!(pane.last_assistant_text(), Some("visible answer"));
+}
+
+#[test]
 fn onboarding_slash_command_opens_overlay_locally() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
