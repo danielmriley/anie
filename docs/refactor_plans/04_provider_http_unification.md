@@ -13,6 +13,17 @@
 >
 > The per-request body construction stays in each provider file.
 
+> **Status (2026-04-17):** partially landed.
+> - **Phase 1 (shared HTTP client):** `7948971`. Lazy-inited
+>   `OnceLock<Result<Client, _>>` in `http.rs`; both providers
+>   pull from it at `::new()` with a fallback to
+>   `create_http_client()` on init failure (preserves existing
+>   infallible `::new()` signature). `classify_http_error` in
+>   `util.rs` was already shared — no change needed there.
+> - **Phase 2 (ToolCallAssembler) & Phase 3 (unified discovery):**
+>   pending. Both are self-contained and can land in either order
+>   in a focused session.
+
 ## Motivation
 
 `crates/anie-providers-builtin/src/anthropic.rs` (687 LOC) and
