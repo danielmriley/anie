@@ -13,16 +13,31 @@
 >
 > The per-request body construction stays in each provider file.
 
-> **Status (2026-04-17):** partially landed.
+> **Status (2026-04-17):**
 > - **Phase 1 (shared HTTP client):** `7948971`. Lazy-inited
 >   `OnceLock<Result<Client, _>>` in `http.rs`; both providers
 >   pull from it at `::new()` with a fallback to
 >   `create_http_client()` on init failure (preserves existing
 >   infallible `::new()` signature). `classify_http_error` in
 >   `util.rs` was already shared — no change needed there.
-> - **Phase 2 (ToolCallAssembler) & Phase 3 (unified discovery):**
->   pending. Both are self-contained and can land in either order
->   in a focused session.
+> - **Phase 3 (unified discovery) — already factored.** Upon
+>   inspection, `discover_models` in `model_discovery.rs` already
+>   dispatches on `ApiKind` to per-API helpers
+>   (`discover_openai_compatible_models`,
+>   `discover_anthropic_models`, `discover_ollama_tags`). The
+>   shared pieces (`send_request`, `discovery_http_client`,
+>   `normalize_*_base_url`, `build_headers`) are already extracted.
+>   Further collapsing the three per-API functions into one would
+>   only merge the response-parsing code, which is genuinely
+>   different per API and would hurt readability. No action.
+> - **Phase 2 (ToolCallAssembler) — deferred.** On inspection,
+>   OpenAI's model (`arguments: String` accumulated, JSON-parsed at
+>   finish) and Anthropic's model (`partial_json` + pre-parsed
+>   `input: serde_json::Value` from `input_json_delta` events) are
+>   structurally different. A shared assembler would either pick
+>   one shape and wrap the other (imposing overhead) or parameterize
+>   heavily (defeating the point). Best left in place unless a
+>   third provider creates a clearer generalization target.
 
 ## Motivation
 
