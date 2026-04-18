@@ -8,7 +8,7 @@
 > and skill integrations (`docs/ideas.md`) without a second
 > migration. See `pi_mono_comparison.md` for pi's shape.
 
-> **Status (2026-04-18):**
+> **Status (2026-04-18):** all five phases landed.
 > - **Phase 1 (ModelCatalog):** `019c976`. Moved to a new
 >   `model_catalog.rs` as free functions (not a wrapper struct).
 >   `Vec<Model>` stays on `ControllerState`.
@@ -34,9 +34,27 @@
 >   `retry_delay_ms` moved to `retry_policy.rs`. The *decision*
 >   logic (schedule_transient_retry, retry_after_overflow,
 >   should_retry_transient) remains in the controller event loop.
-> - **Phase 5 pending.** Final recomposition of `ControllerState`
->   depends on this work being settled; queued for a follow-up
->   session.
+> - **Phase 5 (recompose `ControllerState`):** `e86a44d` +
+>   `405974c`. Two cohesive handles extracted into
+>   `crates/anie-cli/src/runtime/`:
+>   - `SessionHandle` (part 1, `e86a44d`) — owns
+>     `SessionManager` + `sessions_dir` + `cwd`. Exposes
+>     `id`, `context`, `context_without_entry`,
+>     `estimated_context_tokens`, `list`, `start_new`,
+>     `switch_to`, `fork`, `diff`, `flush`. The 60-line
+>     `session_diff` helper moved here verbatim.
+>   - `SystemPromptCache` (part 2, `405974c`) — owns
+>     `system_prompt` + `context_files_stamp`. Exposes `build`,
+>     `current`, `replace`, `refresh_if_stale`. On IO failure
+>     the cache is left intact rather than poisoned.
+>
+> `ControllerState` is no longer a god object — its remaining 13
+> fields all represent one concept each (session, current
+> selection, config, dependency handles, command metadata, retry
+> knobs). Its methods are thin delegators. `controller.rs` is
+> still ~1750 LOC because of the `InteractiveController` event
+> loop and tests; further splitting those is future work outside
+> this plan's original scope.
 
 ## Motivation
 
