@@ -17,7 +17,7 @@ use serde_json::json;
 use anie_protocol::{AssistantMessage, ContentBlock, StopReason, ToolCall, Usage, now_millis};
 use anie_provider::{Model, ProviderError, ProviderEvent};
 
-use super::native_reasoning_delta;
+use super::reasoning_strategy::native_reasoning_delta;
 use super::tagged_reasoning::{StreamContentPart, TaggedReasoningSplitter};
 
 pub(super) struct OpenAiStreamState {

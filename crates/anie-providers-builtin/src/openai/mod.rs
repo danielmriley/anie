@@ -4,21 +4,25 @@ use serde_json::json;
 
 use anie_protocol::{Message, ToolDef};
 use anie_provider::{
-    ApiKind, LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent, ProviderStream,
-    ReasoningCapabilities, ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
+    LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent, ProviderStream,
+    ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
 };
 
-use crate::{
-    classify_http_error, create_http_client, local::default_local_reasoning_capabilities,
-    parse_retry_after, sse_stream,
-};
+use crate::{classify_http_error, create_http_client, parse_retry_after, sse_stream};
 
 mod convert;
+mod reasoning_strategy;
 mod streaming;
 mod tagged_reasoning;
 
 use convert::{
     assistant_message_to_openai_llm_message, join_text_content, llm_message_to_openai_message,
+};
+use reasoning_strategy::{
+    NativeReasoningRequestStrategy, OpenAiCompatibleBackend, effective_max_tokens,
+    effective_reasoning_capabilities, is_local_openai_compatible_target,
+    is_native_reasoning_compatibility_error, local_reasoning_prompt_steering,
+    openai_compatible_backend, reasoning_effort,
 };
 use streaming::OpenAiStreamState;
 
@@ -367,166 +371,6 @@ impl Provider for OpenAIProvider {
     }
 }
 
-fn reasoning_effort(thinking: ThinkingLevel) -> Option<&'static str> {
-    match thinking {
-        ThinkingLevel::Off => None,
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-    }
-}
-
-fn is_local_openai_compatible_target(model: &Model) -> bool {
-    if model.api != ApiKind::OpenAICompletions {
-        return false;
-    }
-
-    if matches!(model.provider.as_str(), "ollama" | "lmstudio") {
-        return true;
-    }
-
-    let base_url = model.base_url.trim().to_ascii_lowercase();
-    [
-        "http://localhost",
-        "https://localhost",
-        "http://127.0.0.1",
-        "https://127.0.0.1",
-        "http://[::1]",
-        "https://[::1]",
-    ]
-    .iter()
-    .any(|prefix| base_url.starts_with(prefix))
-}
-
-fn local_reasoning_prompt_steering(thinking: ThinkingLevel) -> &'static str {
-    match thinking {
-        ThinkingLevel::Off => {
-            "For this response, answer directly and avoid a visible reasoning block unless it is necessary."
-        }
-        ThinkingLevel::Low => {
-            "For this response, do a brief internal plan and keep reasoning concise before answering."
-        }
-        ThinkingLevel::Medium => {
-            "For this response, do balanced internal planning and check key assumptions before answering."
-        }
-        ThinkingLevel::High => {
-            "For this response, reason deliberately and verify the answer before finalizing it."
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum NativeReasoningRequestStrategy {
-    NoNativeFields,
-    TopLevelReasoningEffort,
-    LmStudioNestedReasoning,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenAiCompatibleBackend {
-    Hosted,
-    Ollama,
-    LmStudio,
-    Vllm,
-    UnknownLocal,
-}
-
-fn effective_reasoning_capabilities(model: &Model) -> Option<ReasoningCapabilities> {
-    model.reasoning_capabilities.clone().or_else(|| {
-        default_local_reasoning_capabilities(&model.provider, &model.base_url, &model.id)
-    })
-}
-
-fn effective_max_tokens(model: &Model, options: &StreamOptions) -> Option<u64> {
-    let max_tokens = options.max_tokens?;
-    if !is_local_openai_compatible_target(model) {
-        return Some(max_tokens);
-    }
-
-    let visible_reasoning_output_likely = effective_reasoning_capabilities(model)
-        .as_ref()
-        .and_then(|capabilities| capabilities.output)
-        .is_some();
-    let base_headroom = match options.thinking {
-        ThinkingLevel::Off => 0,
-        ThinkingLevel::Low => max_tokens / 10,
-        ThinkingLevel::Medium => max_tokens / 5,
-        ThinkingLevel::High => max_tokens / 4,
-    };
-    let visible_reasoning_headroom = if visible_reasoning_output_likely {
-        match options.thinking {
-            ThinkingLevel::Off => 0,
-            ThinkingLevel::Low => 128,
-            ThinkingLevel::Medium => 256,
-            ThinkingLevel::High => 512,
-        }
-    } else {
-        0
-    };
-    let headroom = base_headroom
-        .saturating_add(visible_reasoning_headroom)
-        .min(max_tokens.saturating_sub(1));
-
-    Some(max_tokens.saturating_sub(headroom).max(1))
-}
-
-fn openai_compatible_backend(model: &Model) -> OpenAiCompatibleBackend {
-    if !is_local_openai_compatible_target(model) {
-        return OpenAiCompatibleBackend::Hosted;
-    }
-
-    if model.provider == "ollama" || model.base_url.contains(":11434") {
-        return OpenAiCompatibleBackend::Ollama;
-    }
-    if model.provider == "lmstudio" || model.base_url.contains(":1234") {
-        return OpenAiCompatibleBackend::LmStudio;
-    }
-    if model.provider.eq_ignore_ascii_case("vllm") {
-        return OpenAiCompatibleBackend::Vllm;
-    }
-
-    OpenAiCompatibleBackend::UnknownLocal
-}
-
-fn is_native_reasoning_compatibility_error(error: &ProviderError) -> bool {
-    let ProviderError::Http { status, body } = error else {
-        return false;
-    };
-    if *status != 400 {
-        return false;
-    }
-
-    let body = body.to_ascii_lowercase();
-    let mentions_reasoning_field = body.contains("reasoning_effort")
-        || body.contains("reasoning.effort")
-        || body.contains("\"reasoning\"")
-        || body.contains("'reasoning'")
-        || body.contains("reasoning")
-        || body.contains(" field required") && body.contains("reasoning");
-    let indicates_compatibility_failure = body.contains("unknown")
-        || body.contains("unsupported")
-        || body.contains("unexpected")
-        || body.contains("unrecognized")
-        || body.contains("extra inputs")
-        || body.contains("not permitted")
-        || body.contains("additional properties")
-        || body.contains("invalid")
-        || body.contains("bad request");
-
-    mentions_reasoning_field && indicates_compatibility_failure
-}
-
-fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
-    ["reasoning", "reasoning_content", "thinking"]
-        .iter()
-        .find_map(|field| {
-            delta
-                .get(*field)
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-}
 #[cfg(test)]
 mod tests {
     use anie_protocol::{AssistantMessage, ContentBlock, StopReason, ToolCall, Usage};
