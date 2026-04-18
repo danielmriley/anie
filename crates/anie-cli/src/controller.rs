@@ -685,6 +685,11 @@ struct ControllerState {
     context_files_stamp: Vec<(PathBuf, Option<std::time::SystemTime>)>,
     runtime_state: RuntimeState,
     retry_config: RetryConfig,
+    /// Catalog of registered slash commands. Sourced from
+    /// `commands::builtin_commands()` at startup; extensions and
+    /// prompt templates register additional entries here.
+    #[allow(dead_code)] // consumed by /help once wired up; see plan 03 phase 3 status
+    command_registry: crate::commands::CommandRegistry,
 }
 
 impl ControllerState {
@@ -1186,6 +1191,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
         context_files_stamp,
         runtime_state: runtime_state.clone(),
         retry_config: RetryConfig::default(),
+        command_registry: crate::commands::CommandRegistry::with_builtins(),
     };
     state.apply_session_overrides();
     state.persist_runtime_state();
