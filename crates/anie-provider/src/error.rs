@@ -1,39 +1,110 @@
 /// Structured provider failures propagated through the core architecture.
+///
+/// The taxonomy is designed so callers can make retry / recovery
+/// decisions via exhaustive `match`, never by inspecting error
+/// messages. When a new failure mode is genuinely distinct from the
+/// existing variants, add a variant rather than widening an existing
+/// one.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ProviderError {
+    // ---------------------------------------------------------------
+    // HTTP / network boundary
+    // ---------------------------------------------------------------
     /// Non-success HTTP status returned by a provider.
     #[error("HTTP error: {status} {body}")]
     Http { status: u16, body: String },
-    /// Authentication or authorization failure.
+
+    /// Authentication or authorization failure (401 / 403 / missing
+    /// credentials).
     #[error("Authentication failed: {0}")]
     Auth(String),
-    /// Request construction or dispatch failure.
-    #[error("Request building error: {0}")]
-    Request(String),
-    /// Mid-stream transport or protocol failure.
-    #[error("Stream error: {0}")]
-    Stream(String),
-    /// Rate-limited response.
+
+    /// Rate-limited response. `retry_after_ms` carries the server's
+    /// `Retry-After` hint when present.
     #[error("Rate limited (retry after {retry_after_ms:?}ms)")]
     RateLimited { retry_after_ms: Option<u64> },
-    /// Context-window overflow.
+
+    /// Context-window overflow. Triggers the compaction-retry path
+    /// rather than the transient-retry path.
     #[error("Context overflow: {0}")]
     ContextOverflow(String),
-    /// Miscellaneous provider failure.
-    #[error("{0}")]
-    Other(String),
+
+    // ---------------------------------------------------------------
+    // Request-side failures (before and during send)
+    // ---------------------------------------------------------------
+    /// Building the request body failed locally (serialization,
+    /// missing required data). Not retryable — a retry would fail
+    /// the same way.
+    #[error("Request build error: {0}")]
+    RequestBuild(String),
+
+    /// Transport-level failure talking to the provider (DNS, TLS,
+    /// connect timeout, network I/O). Retryable.
+    #[error("Transport error: {0}")]
+    Transport(String),
+
+    // ---------------------------------------------------------------
+    // Streaming failures (post-connect, parsing the SSE stream)
+    // ---------------------------------------------------------------
+    /// The stream completed with no visible assistant text and no
+    /// tool calls — only hidden reasoning or nothing. The existing
+    /// retry loop treats this as transient (the model sometimes
+    /// produces reasoning-only output on the first shot).
+    #[error("empty assistant response")]
+    EmptyAssistantResponse,
+
+    /// An SSE frame could not be parsed as JSON. Usually a transient
+    /// upstream issue; retryable.
+    #[error("invalid stream JSON: {0}")]
+    InvalidStreamJson(String),
+
+    /// An SSE frame parsed but had the wrong shape (missing required
+    /// field, unexpected event type we must honor).
+    #[error("malformed stream event: {0}")]
+    MalformedStreamEvent(String),
+
+    /// A tool-call's `arguments` JSON was malformed when the stream
+    /// finished. Not retryable — the model produced bad output,
+    /// re-running is unlikely to fix it.
+    #[error("tool call arguments not valid JSON: {0}")]
+    ToolCallMalformed(String),
+
+    /// The provider rejected our native-reasoning request fields
+    /// (`reasoning_effort` / `reasoning.effort`). Caller should
+    /// retry with `NoNativeFields` strategy; not a user-facing error
+    /// unless the fallback also fails.
+    #[error("native reasoning not supported by target: {0}")]
+    NativeReasoningUnsupported(String),
 }
 
 impl ProviderError {
-    /// Whether this provider error should be retried automatically.
+    /// Whether this provider error should be retried automatically
+    /// by the transient-retry path.
+    ///
+    /// - Rate limits → retry with backoff.
+    /// - HTTP 5xx / 429 / 529 → retry.
+    /// - Transport failures → retry.
+    /// - Streaming hiccups that could be transient (empty response,
+    ///   malformed JSON, malformed events) → retry.
+    /// - Terminal model output bugs (tool-call JSON, build errors,
+    ///   auth, context overflow, native-reasoning unsupported) →
+    ///   don't retry at this level. The compat-retry loop handles
+    ///   native-reasoning separately; context-overflow drives
+    ///   compaction.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::RateLimited { .. } => true,
+            Self::RateLimited { .. }
+            | Self::Transport(_)
+            | Self::EmptyAssistantResponse
+            | Self::InvalidStreamJson(_)
+            | Self::MalformedStreamEvent(_) => true,
             Self::Http { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 529),
-            Self::Stream(_) => true,
-            Self::ContextOverflow(_) => false,
-            Self::Auth(_) | Self::Request(_) | Self::Other(_) => false,
+            Self::Auth(_)
+            | Self::ContextOverflow(_)
+            | Self::RequestBuild(_)
+            | Self::ToolCallMalformed(_)
+            | Self::NativeReasoningUnsupported(_) => false,
         }
     }
 
@@ -48,7 +119,10 @@ impl ProviderError {
 }
 
 impl From<anyhow::Error> for ProviderError {
+    /// anyhow errors surface from construction-time failures (auth
+    /// resolution, credential store, etc.). Map them to
+    /// `RequestBuild` — they happen before any transport is touched.
     fn from(value: anyhow::Error) -> Self {
-        Self::Other(value.to_string())
+        Self::RequestBuild(value.to_string())
     }
 }

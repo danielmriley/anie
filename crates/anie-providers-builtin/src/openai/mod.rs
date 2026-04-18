@@ -8,7 +8,7 @@ use anie_provider::{
     ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
 };
 
-use crate::{classify_http_error, http::shared_http_client, parse_retry_after, sse_stream};
+use crate::{http::shared_http_client, parse_retry_after, sse_stream};
 
 mod convert;
 mod reasoning_strategy;
@@ -19,8 +19,8 @@ use convert::{
     assistant_message_to_openai_llm_message, join_text_content, llm_message_to_openai_message,
 };
 use reasoning_strategy::{
-    NativeReasoningRequestStrategy, OpenAiCompatibleBackend, effective_max_tokens,
-    effective_reasoning_capabilities, is_local_openai_compatible_target,
+    NativeReasoningRequestStrategy, OpenAiCompatibleBackend, classify_openai_http_error,
+    effective_max_tokens, effective_reasoning_capabilities, is_local_openai_compatible_target,
     is_native_reasoning_compatibility_error, local_reasoning_prompt_steering,
     openai_compatible_backend, reasoning_effort,
 };
@@ -173,7 +173,7 @@ impl OpenAIProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| ProviderError::Request(error.to_string()))
+            .map_err(|error| ProviderError::Transport(error.to_string()))
     }
 
     async fn send_stream_request_once(
@@ -201,10 +201,10 @@ impl OpenAIProvider {
             let status = fallback.status();
             let retry_after = parse_retry_after(&fallback);
             let body = fallback.text().await.unwrap_or_default();
-            return Err(classify_http_error(status, &body, retry_after));
+            return Err(classify_openai_http_error(status, &body, retry_after));
         }
 
-        Err(classify_http_error(status, &body, retry_after))
+        Err(classify_openai_http_error(status, &body, retry_after))
     }
 
     async fn send_stream_request(
@@ -241,7 +241,7 @@ impl OpenAIProvider {
             }
         }
 
-        Err(ProviderError::Request(
+        Err(ProviderError::RequestBuild(
             "no compatible OpenAI request strategy available".into(),
         ))
     }
@@ -317,7 +317,8 @@ impl Provider for OpenAIProvider {
             let mut events = sse_stream(response);
             let mut state = OpenAiStreamState::new(&state_model);
             while let Some(event) = events.next().await {
-                let event = event.map_err(|error| ProviderError::Stream(error.to_string()))?;
+                let event = event
+                    .map_err(|error| ProviderError::MalformedStreamEvent(error.to_string()))?;
                 for provider_event in state.process_event(&event.data)? {
                     yield provider_event;
                 }
@@ -645,10 +646,7 @@ mod tests {
             events,
             vec![ProviderEvent::ThinkingDelta("hello from reasoning".into())]
         );
-        assert!(matches!(
-            error,
-            ProviderError::Stream(message) if message == "empty assistant response"
-        ));
+        assert!(matches!(error, ProviderError::EmptyAssistantResponse));
     }
 
     #[test]
@@ -909,10 +907,7 @@ mod tests {
             .expect_err("empty response should error");
 
         assert!(events.is_empty());
-        assert!(matches!(
-            error,
-            ProviderError::Stream(message) if message == "empty assistant response"
-        ));
+        assert!(matches!(error, ProviderError::EmptyAssistantResponse));
     }
 
     #[test]
@@ -1292,17 +1287,16 @@ mod tests {
     }
 
     #[test]
-    fn native_reasoning_compatibility_errors_are_classified_narrowly() {
+    fn is_native_reasoning_compatibility_error_only_matches_typed_variant() {
+        // The detection is a simple typed match; body-string
+        // probing belongs to classify_openai_http_error (below).
         assert!(is_native_reasoning_compatibility_error(
+            &ProviderError::NativeReasoningUnsupported("unknown field reasoning".into()),
+        ));
+        assert!(!is_native_reasoning_compatibility_error(
             &ProviderError::Http {
                 status: 400,
                 body: "unknown field reasoning_effort".into(),
-            }
-        ));
-        assert!(is_native_reasoning_compatibility_error(
-            &ProviderError::Http {
-                status: 400,
-                body: "bad request: extra inputs are not permitted for reasoning".into(),
             }
         ));
         assert!(!is_native_reasoning_compatibility_error(
@@ -1316,12 +1310,36 @@ mod tests {
                 retry_after_ms: Some(500)
             }
         ));
-        assert!(!is_native_reasoning_compatibility_error(
-            &ProviderError::Http {
-                status: 400,
-                body: "missing required field messages".into(),
-            }
-        ));
+    }
+
+    #[test]
+    fn classify_openai_http_error_upgrades_reasoning_compat_bodies() {
+        // 400 + reasoning-field body → NativeReasoningUnsupported.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "unknown field reasoning_effort",
+            None,
+        );
+        assert!(matches!(err, ProviderError::NativeReasoningUnsupported(_)));
+
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "bad request: extra inputs are not permitted for reasoning",
+            None,
+        );
+        assert!(matches!(err, ProviderError::NativeReasoningUnsupported(_)));
+
+        // 400 without reasoning-field body → plain Http.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "missing required field messages",
+            None,
+        );
+        assert!(matches!(err, ProviderError::Http { .. }));
+
+        // Non-400 statuses flow through classify_http_error.
+        let err = classify_openai_http_error(reqwest::StatusCode::UNAUTHORIZED, "nope", None);
+        assert!(matches!(err, ProviderError::Auth(_)));
     }
 
     #[test]

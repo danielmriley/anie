@@ -35,7 +35,7 @@ impl ProviderRegistry {
         options: StreamOptions,
     ) -> Result<ProviderStream, ProviderError> {
         let provider = self.get(&model.api).ok_or_else(|| {
-            ProviderError::Request(format!("No provider registered for {:?}", model.api))
+            ProviderError::RequestBuild(format!("No provider registered for {:?}", model.api))
         })?;
         provider.stream(model, context, options)
     }

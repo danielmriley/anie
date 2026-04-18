@@ -45,7 +45,7 @@ pub async fn discover_models(
             discover_openai_compatible_models(request).await
         }
         ApiKind::AnthropicMessages => discover_anthropic_models(request).await,
-        ApiKind::GoogleGenerativeAI => Err(ProviderError::Other(
+        ApiKind::GoogleGenerativeAI => Err(ProviderError::RequestBuild(
             "model discovery for Google Generative AI is not implemented yet".to_string(),
         )),
     }
@@ -235,7 +235,7 @@ async fn discover_openai_compatible_models(
         .json::<OpenAiModelsResponse>()
         .await
         .map_err(|error| {
-            ProviderError::Other(format!(
+            ProviderError::InvalidStreamJson(format!(
                 "failed to parse OpenAI-compatible model list: {error}"
             ))
         })?;
@@ -276,7 +276,9 @@ async fn discover_anthropic_models(
         .json::<AnthropicModelsResponse>()
         .await
         .map_err(|error| {
-            ProviderError::Other(format!("failed to parse Anthropic model list: {error}"))
+            ProviderError::InvalidStreamJson(format!(
+                "failed to parse Anthropic model list: {error}"
+            ))
         })?;
 
     Ok(body
@@ -318,7 +320,7 @@ async fn discover_ollama_tags(
         .json::<OllamaTagsResponse>()
         .await
         .map_err(|error| {
-            ProviderError::Other(format!("failed to parse Ollama tag list: {error}"))
+            ProviderError::InvalidStreamJson(format!("failed to parse Ollama tag list: {error}"))
         })?;
 
     Ok(body
@@ -383,7 +385,7 @@ async fn send_request(
                 headers.insert(
                     HeaderName::from_static("x-api-key"),
                     HeaderValue::from_str(api_key)
-                        .map_err(|error| ProviderError::Request(error.to_string()))?,
+                        .map_err(|error| ProviderError::RequestBuild(error.to_string()))?,
                 );
                 req = client.get(url).headers(headers);
             }
@@ -391,7 +393,7 @@ async fn send_request(
     }
 
     let response = req.send().await.map_err(|error| {
-        ProviderError::Request(format!("model discovery request failed: {error}"))
+        ProviderError::Transport(format!("model discovery request failed: {error}"))
     })?;
     if response.status().is_success() {
         return Ok(response);
@@ -416,10 +418,10 @@ fn build_headers(
     let mut headers = HeaderMap::new();
     for (name, value) in &request.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-            ProviderError::Request(format!("invalid header name '{name}': {error}"))
+            ProviderError::RequestBuild(format!("invalid header name '{name}': {error}"))
         })?;
         let value = HeaderValue::from_str(value).map_err(|error| {
-            ProviderError::Request(format!(
+            ProviderError::RequestBuild(format!(
                 "invalid header value for '{}': {error}",
                 name.as_str()
             ))
@@ -444,7 +446,7 @@ fn discovery_http_client() -> Result<reqwest::Client, ProviderError> {
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|error| ProviderError::Request(format!("failed to create HTTP client: {error}")))
+        .map_err(|error| ProviderError::Transport(format!("failed to create HTTP client: {error}")))
 }
 
 fn should_try_ollama_tags(request: &ModelDiscoveryRequest) -> bool {

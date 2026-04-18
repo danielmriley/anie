@@ -134,7 +134,7 @@ async fn agent_thinking_events_render_thinking_section_above_answer() {
 async fn agent_stream_error_renders_error_in_tui() {
     let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![
         Ok(ProviderEvent::Start),
-        Err(ProviderError::Stream("connection lost".into())),
+        Err(ProviderError::Transport("connection lost".into())),
     ])]);
     let agent = build_agent(
         provider,
@@ -145,7 +145,7 @@ async fn agent_stream_error_renders_error_in_tui() {
 
     assert_eq!(
         result.terminal_error,
-        Some(ProviderError::Stream("connection lost".into()))
+        Some(ProviderError::Transport("connection lost".into()))
     );
 
     let screen = replay_events_and_render(&events, 80, 24);
@@ -168,7 +168,7 @@ async fn thinking_only_provider_response_becomes_error_not_visible_thinking() {
         Ok(ProviderEvent::ThinkingDelta(
             "internal reasoning only".into(),
         )),
-        Err(ProviderError::Stream("empty assistant response".into())),
+        Err(ProviderError::EmptyAssistantResponse),
     ])]);
     let agent = build_agent(
         provider,

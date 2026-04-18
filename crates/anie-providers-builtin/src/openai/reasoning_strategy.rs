@@ -157,17 +157,36 @@ pub(super) fn openai_compatible_backend(model: &Model) -> OpenAiCompatibleBacken
     OpenAiCompatibleBackend::UnknownLocal
 }
 
-/// True when `error` looks like a 400-response complaining that the
-/// target does not accept our native-reasoning fields, so the caller
-/// should retry with `NoNativeFields`.
+/// True when `error` is the typed `NativeReasoningUnsupported`
+/// variant, indicating the caller should retry with a
+/// `NoNativeFields` request strategy.
+///
+/// The body-pattern detection lives in `classify_openai_http_error`
+/// — this check is a simple typed match so callers don't stringly
+/// probe error contents.
 pub(super) fn is_native_reasoning_compatibility_error(error: &ProviderError) -> bool {
-    let ProviderError::Http { status, body } = error else {
-        return false;
-    };
-    if *status != 400 {
-        return false;
-    }
+    matches!(error, ProviderError::NativeReasoningUnsupported(_))
+}
 
+/// Classify an OpenAI non-success HTTP response, upgrading to
+/// `NativeReasoningUnsupported` when the 400 body matches the
+/// known patterns indicating the target rejected our reasoning
+/// fields.
+///
+/// Falls through to the generic `classify_http_error` for every
+/// other case. Body-string detection is confined to this one site.
+pub(super) fn classify_openai_http_error(
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after_ms: Option<u64>,
+) -> ProviderError {
+    if status.as_u16() == 400 && looks_like_native_reasoning_compat_body(body) {
+        return ProviderError::NativeReasoningUnsupported(body.to_string());
+    }
+    crate::classify_http_error(status, body, retry_after_ms)
+}
+
+fn looks_like_native_reasoning_compat_body(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     let mentions_reasoning_field = body.contains("reasoning_effort")
         || body.contains("reasoning.effort")

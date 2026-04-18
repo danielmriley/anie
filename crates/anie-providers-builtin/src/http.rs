@@ -6,7 +6,7 @@ use anie_provider::ProviderError;
 /// Shared HTTP client for built-in providers.
 ///
 /// Initialized lazily. Failure to initialize (TLS roots missing,
-/// etc.) is cached: every caller sees `ProviderError::Request`
+/// etc.) is cached: every caller sees `ProviderError::Transport`
 /// until the process restarts. Avoids a crash on provider
 /// construction when TLS roots are unavailable (e.g. locked-down
 /// CI environments).
@@ -19,13 +19,14 @@ struct ClientInitError {
 
 /// Return the shared HTTP client.
 ///
-/// Returns `Err(ProviderError::Request)` if the client failed to
+/// Returns `Err(ProviderError::Transport)` if the client failed to
 /// build at first use; the same error is returned for every
-/// subsequent call.
+/// subsequent call. Classified as Transport because the failure is
+/// always at the TLS / network-plumbing layer.
 pub fn shared_http_client() -> Result<&'static reqwest::Client, ProviderError> {
     match CLIENT.get_or_init(build_client) {
         Ok(client) => Ok(client),
-        Err(error) => Err(ProviderError::Request(format!(
+        Err(error) => Err(ProviderError::Transport(format!(
             "failed to initialize HTTP client: {}",
             error.message
         ))),

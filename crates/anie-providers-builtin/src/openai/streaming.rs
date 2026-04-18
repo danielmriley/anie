@@ -57,8 +57,8 @@ impl OpenAiStreamState {
             return self.finish_stream();
         }
 
-        let payload: serde_json::Value =
-            serde_json::from_str(data).map_err(|error| ProviderError::Stream(error.to_string()))?;
+        let payload: serde_json::Value = serde_json::from_str(data)
+            .map_err(|error| ProviderError::InvalidStreamJson(error.to_string()))?;
         let mut events = Vec::new();
 
         if let Some(usage) = payload.get("usage") {
@@ -192,7 +192,7 @@ impl OpenAiStreamState {
         let mut events = self.finish_tagged_content();
         events.extend(self.finish_tool_calls());
         if !self.has_meaningful_content() {
-            return Err(ProviderError::Stream("empty assistant response".into()));
+            return Err(ProviderError::EmptyAssistantResponse);
         }
         events.push(ProviderEvent::Done(self.into_message()));
         Ok(events)

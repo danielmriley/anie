@@ -139,9 +139,10 @@ fn registry_returns_structured_error_when_provider_missing() {
         panic!("missing provider should error")
     };
 
-    assert!(
-        matches!(error, ProviderError::Request(message) if message.contains("No provider registered"))
-    );
+    assert!(matches!(
+        error,
+        ProviderError::RequestBuild(message) if message.contains("No provider registered")
+    ));
 }
 
 #[tokio::test]
@@ -193,7 +194,7 @@ async fn mock_provider_can_stream_tool_calls_and_text() {
 async fn mock_provider_can_emit_mid_stream_errors() {
     let provider = MockProvider::new(vec![MockStreamScript::new(vec![
         Ok(ProviderEvent::Start),
-        Err(ProviderError::Stream("socket dropped".into())),
+        Err(ProviderError::MalformedStreamEvent("socket dropped".into())),
     ])]);
 
     let mut stream = provider
@@ -206,7 +207,7 @@ async fn mock_provider_can_emit_mid_stream_errors() {
     ));
     assert!(matches!(
         stream.next().await,
-        Some(Err(ProviderError::Stream(message))) if message == "socket dropped"
+        Some(Err(ProviderError::MalformedStreamEvent(message))) if message == "socket dropped"
     ));
 }
 
@@ -232,9 +233,18 @@ fn provider_error_retry_classification_is_stable() {
         }
         .is_retryable()
     );
-    assert!(ProviderError::Stream("socket dropped".into()).is_retryable());
+    // Transient stream flaws should still retry.
+    assert!(ProviderError::EmptyAssistantResponse.is_retryable());
+    assert!(ProviderError::InvalidStreamJson("garbled".into()).is_retryable());
+    assert!(ProviderError::MalformedStreamEvent("socket dropped".into()).is_retryable());
+    assert!(ProviderError::Transport("dns".into()).is_retryable());
+
+    // Terminal / model-output failures should not retry at this level.
     assert!(!ProviderError::Auth("bad key".into()).is_retryable());
     assert!(!ProviderError::ContextOverflow("too many tokens".into()).is_retryable());
+    assert!(!ProviderError::RequestBuild("bad body".into()).is_retryable());
+    assert!(!ProviderError::ToolCallMalformed("bad json".into()).is_retryable());
+    assert!(!ProviderError::NativeReasoningUnsupported("body".into()).is_retryable());
 }
 
 #[test]

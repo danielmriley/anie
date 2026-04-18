@@ -795,7 +795,7 @@ async fn provider_stream_error_is_preserved_and_stops_run() {
     let agent = agent_with_provider(
         Box::new(MockProvider::new(vec![MockStreamScript::new(vec![
             Ok(ProviderEvent::Start),
-            Err(ProviderError::Stream("boom".into())),
+            Err(ProviderError::MalformedStreamEvent("boom".into())),
         ])])),
         Arc::new(ToolRegistry::new()),
         ToolExecutionMode::Sequential,
@@ -822,7 +822,7 @@ async fn provider_stream_error_is_preserved_and_stops_run() {
     )));
     assert_eq!(
         result.terminal_error,
-        Some(ProviderError::Stream("boom".into()))
+        Some(ProviderError::MalformedStreamEvent("boom".into()))
     );
     assert!(event_kinds(&events).contains(&"MessageEnd"));
 }

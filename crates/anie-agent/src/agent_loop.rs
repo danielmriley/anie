@@ -420,7 +420,9 @@ impl AgentLoop {
                         }
                         None => {
                             self.finish_active_delta(event_tx, &mut active_delta).await;
-                            let error = ProviderError::Stream("Stream ended unexpectedly".into());
+                            let error = ProviderError::MalformedStreamEvent(
+                                "Stream ended unexpectedly".into(),
+                            );
                             let assistant = builder.finish(StopReason::Error, Some(error.to_string()));
                             let _ = event_tx.send(AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
                             return CollectedAssistant {

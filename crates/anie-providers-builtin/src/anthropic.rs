@@ -126,7 +126,7 @@ impl Provider for AnthropicProvider {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|error| ProviderError::Request(error.to_string()))?;
+                .map_err(|error| ProviderError::Transport(error.to_string()))?;
             let response = if response.status().is_success() {
                 response
             } else {
@@ -139,7 +139,8 @@ impl Provider for AnthropicProvider {
             let mut events = sse_stream(response);
             let mut state = AnthropicStreamState::new(model_clone);
             while let Some(event) = events.next().await {
-                let event = event.map_err(|error| ProviderError::Stream(error.to_string()))?;
+                let event = event
+                    .map_err(|error| ProviderError::MalformedStreamEvent(error.to_string()))?;
                 for provider_event in state.process_event(&event.event_type, &event.data)? {
                     yield provider_event;
                 }
@@ -316,8 +317,8 @@ impl AnthropicStreamState {
         event_type: &str,
         data: &str,
     ) -> Result<Vec<ProviderEvent>, ProviderError> {
-        let payload: serde_json::Value =
-            serde_json::from_str(data).map_err(|error| ProviderError::Stream(error.to_string()))?;
+        let payload: serde_json::Value = serde_json::from_str(data)
+            .map_err(|error| ProviderError::InvalidStreamJson(error.to_string()))?;
         let mut events = Vec::new();
 
         match event_type {
@@ -438,7 +439,7 @@ impl AnthropicStreamState {
                     .as_str()
                     .unwrap_or("Anthropic stream error")
                     .to_string();
-                return Err(ProviderError::Stream(message));
+                return Err(ProviderError::MalformedStreamEvent(message));
             }
             _ => {}
         }

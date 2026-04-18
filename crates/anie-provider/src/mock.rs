@@ -64,9 +64,11 @@ impl Provider for MockProvider {
         let script = self
             .scripts
             .lock()
-            .map_err(|_| ProviderError::Other("mock provider mutex poisoned".into()))?
+            .map_err(|_| ProviderError::RequestBuild("mock provider mutex poisoned".into()))?
             .pop_front()
-            .ok_or_else(|| ProviderError::Request("no scripted mock response available".into()))?;
+            .ok_or_else(|| {
+                ProviderError::RequestBuild("no scripted mock response available".into())
+            })?;
 
         let event_stream = stream! {
             for item in script.items {

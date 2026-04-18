@@ -1700,7 +1700,7 @@ mod tests {
             max_retries: 3,
             jitter: false,
         };
-        let error = ProviderError::Stream("socket dropped".into());
+        let error = ProviderError::MalformedStreamEvent("socket dropped".into());
         assert_eq!(retry_delay_ms(&config, &error, 1), 1_000);
         assert_eq!(retry_delay_ms(&config, &error, 2), 2_000);
         assert_eq!(retry_delay_ms(&config, &error, 3), 4_000);
