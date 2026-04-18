@@ -1,5 +1,13 @@
 # Plan 01 — `openai.rs` module split + streaming tests
 
+> **Status (2026-04-17):** Phases 1–5 complete on `refactor_branch`.
+> `openai/mod.rs` production code is ~370 LOC; the rest is the
+> test module which was kept in place (tests span multiple
+> submodule concerns — reorganizing them is future work, not a
+> prerequisite). Submodules: `tagged_reasoning`, `streaming`,
+> `convert`, `reasoning_strategy`. All 280 workspace tests pass;
+> clippy `-D warnings` clean; fmt clean.
+
 ## Motivation
 
 `crates/anie-providers-builtin/src/openai.rs` is 2084 lines and
