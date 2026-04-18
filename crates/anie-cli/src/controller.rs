@@ -27,9 +27,7 @@ use anie_provider::{
     Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
 };
 use anie_providers_builtin::register_builtin_providers;
-use anie_session::{
-    CompactionConfig, SessionContext, SessionInfo, SessionManager, estimate_context_tokens,
-};
+use anie_session::{CompactionConfig, SessionContext, SessionInfo, SessionManager};
 use anie_tools::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
 use anie_tui::{App, UiAction, install_panic_hook, restore_terminal, run_tui, setup_terminal};
 
@@ -40,6 +38,7 @@ use crate::{
         build_model_catalog, fallback_model_from_provider, resolve_initial_selection,
         resolve_model, resolve_requested_model, upsert_model,
     },
+    runtime::SessionHandle,
     runtime_state::{RuntimeState, load_runtime_state, save_runtime_state},
 };
 
@@ -606,7 +605,11 @@ impl InteractiveController {
             timestamp: now_millis(),
         });
 
-        let prompt_entry_id = self.state.session.append_message(&prompt_message)?;
+        let prompt_entry_id = self
+            .state
+            .session
+            .inner_mut()
+            .append_message(&prompt_message)?;
         if self.state.config.compaction.enabled {
             self.state.maybe_auto_compact(&self.event_tx).await?;
         }
@@ -672,9 +675,7 @@ impl InteractiveController {
 struct ControllerState {
     config: AnieConfig,
     cli_api_key: Option<String>,
-    current_cwd: PathBuf,
-    session_dir: PathBuf,
-    session: SessionManager,
+    session: SessionHandle,
     current_model: Model,
     current_thinking: ThinkingLevel,
     model_catalog: Vec<Model>,
@@ -703,6 +704,7 @@ impl ControllerState {
         upsert_model(&mut self.model_catalog, &model);
         self.current_model = model;
         self.session
+            .inner_mut()
             .append_model_change(&self.current_model.provider, &self.current_model.id)?;
         self.persist_runtime_state();
         Ok(())
@@ -710,7 +712,9 @@ impl ControllerState {
 
     async fn set_thinking(&mut self, requested: &str) -> Result<()> {
         self.current_thinking = parse_thinking_level(requested).map_err(|error| anyhow!(error))?;
-        self.session.append_thinking_change(self.current_thinking)?;
+        self.session
+            .inner_mut()
+            .append_thinking_change(self.current_thinking)?;
         self.persist_runtime_state();
         Ok(())
     }
@@ -755,7 +759,12 @@ impl ControllerState {
     async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
         let (config, strategy) =
             self.compaction_strategy(self.config.compaction.keep_recent_tokens);
-        if let Some(result) = self.session.auto_compact(&config, &strategy).await? {
+        if let Some(result) = self
+            .session
+            .inner_mut()
+            .auto_compact(&config, &strategy)
+            .await?
+        {
             let _ = event_tx.send(AgentEvent::CompactionStart).await;
             self.emit_compaction_end(event_tx, &result).await;
             let _ = event_tx.send(self.status_event()).await;
@@ -767,7 +776,12 @@ impl ControllerState {
         let (config, strategy) =
             self.compaction_strategy(self.config.compaction.keep_recent_tokens);
         let _ = event_tx.send(AgentEvent::CompactionStart).await;
-        match self.session.force_compact(&config, &strategy).await? {
+        match self
+            .session
+            .inner_mut()
+            .force_compact(&config, &strategy)
+            .await?
+        {
             Some(result) => {
                 self.emit_compaction_end(event_tx, &result).await;
                 let _ = event_tx.send(self.status_event()).await;
@@ -784,25 +798,20 @@ impl ControllerState {
     }
 
     async fn new_session(&mut self) -> Result<()> {
-        self.session = SessionManager::new_session(&self.session_dir, &self.current_cwd)?;
+        self.session.start_new()?;
         self.persist_runtime_state();
         Ok(())
     }
 
     async fn switch_session(&mut self, session_id: &str) -> Result<()> {
-        let path = self.session_dir.join(format!("{session_id}.jsonl"));
-        let session = SessionManager::open_session(&path)
-            .with_context(|| format!("failed to open session {session_id}"))?;
-        self.session = session;
+        self.session.switch_to(session_id)?;
         self.apply_session_overrides();
         self.persist_runtime_state();
         Ok(())
     }
 
     async fn fork_session(&mut self) -> Result<String> {
-        let child = self.session.fork_to_child_session(&self.session_dir)?;
-        let child_id = child.id().to_string();
-        self.session = child;
+        let child_id = self.session.fork()?;
         self.apply_session_overrides();
         self.persist_runtime_state();
         Ok(child_id)
@@ -815,7 +824,9 @@ impl ControllerState {
             model = %self.current_model.id,
             "persisting completed run"
         );
-        self.session.append_messages(&result.generated_messages)?;
+        self.session
+            .inner_mut()
+            .append_messages(&result.generated_messages)?;
         Ok(())
     }
 
@@ -878,7 +889,12 @@ impl ControllerState {
         let keep_recent = (self.config.compaction.keep_recent_tokens / 2).max(1_000);
         let (config, strategy) = self.compaction_strategy(keep_recent);
         let _ = event_tx.send(AgentEvent::CompactionStart).await;
-        match self.session.force_compact(&config, &strategy).await? {
+        match self
+            .session
+            .inner_mut()
+            .force_compact(&config, &strategy)
+            .await?
+        {
             Some(result) => {
                 self.emit_compaction_end(event_tx, &result).await;
                 let transcript = self
@@ -908,61 +924,7 @@ impl ControllerState {
     }
 
     fn session_diff(&self) -> String {
-        let Some(leaf_id) = self.session.leaf_id() else {
-            return "No file changes in this session yet.".into();
-        };
-
-        let branch = self.session.get_branch(leaf_id);
-        let mut modified_files = Vec::new();
-        let mut seen_paths = HashSet::new();
-        let mut diff_sections = Vec::new();
-
-        for entry in branch {
-            let anie_session::SessionEntry::Message { message, .. } = entry else {
-                continue;
-            };
-            let Message::ToolResult(tool_result) = message else {
-                continue;
-            };
-            if tool_result.tool_name != "edit" && tool_result.tool_name != "write" {
-                continue;
-            }
-
-            if let Some(path) = tool_result
-                .details
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                && seen_paths.insert(path.to_string())
-            {
-                modified_files.push(format!("- {} ({})", path, tool_result.tool_name));
-            }
-
-            if tool_result.tool_name == "edit"
-                && let Some(diff) = tool_result
-                    .details
-                    .get("diff")
-                    .and_then(serde_json::Value::as_str)
-            {
-                let title = tool_result
-                    .details
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("[unknown path]");
-                diff_sections.push(format!("--- {title} ---\n{diff}"));
-            }
-        }
-
-        if modified_files.is_empty() {
-            return "No file changes in this session yet.".into();
-        }
-
-        let mut output = String::from("Files modified in this session:\n");
-        output.push_str(&modified_files.join("\n"));
-        if !diff_sections.is_empty() {
-            output.push_str("\n\nEdit diffs:\n\n");
-            output.push_str(&diff_sections.join("\n\n"));
-        }
-        output
+        self.session.diff()
     }
 
     fn build_agent(&self) -> AgentLoop {
@@ -984,21 +946,15 @@ impl ControllerState {
     }
 
     fn session_context(&self) -> SessionContext {
-        self.session.build_context()
+        self.session.context()
     }
 
     fn context_without_entry(&self, entry_id: Option<&str>) -> Vec<Message> {
-        self.session
-            .build_context()
-            .messages
-            .into_iter()
-            .filter(|message| entry_id.is_none_or(|excluded| message.entry_id != excluded))
-            .map(|message| message.message)
-            .collect()
+        self.session.context_without_entry(entry_id)
     }
 
     fn estimated_context_tokens(&self) -> u64 {
-        estimate_context_tokens(&self.session.build_context().messages)
+        self.session.estimated_context_tokens()
     }
 
     fn status_event(&self) -> AgentEvent {
@@ -1008,17 +964,17 @@ impl ControllerState {
             thinking: format_thinking(self.current_thinking),
             estimated_context_tokens: self.estimated_context_tokens(),
             context_window: self.current_model.context_window,
-            cwd: self.current_cwd.display().to_string(),
+            cwd: self.session.cwd().display().to_string(),
             session_id: self.session.id().to_string(),
         }
     }
 
     fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        SessionManager::list_sessions(&self.session_dir)
+        self.session.list()
     }
 
     fn apply_session_overrides(&mut self) {
-        let context = self.session.build_context();
+        let context = self.session.context();
         if let Some((provider, model_id)) = context.model
             && let Some(model) = self
                 .model_catalog
@@ -1096,19 +1052,19 @@ impl ControllerState {
             self.cli_api_key.clone(),
             self.config.clone(),
         ));
-        self.system_prompt =
-            build_system_prompt(&self.current_cwd, &self.tool_registry, &self.config)?;
-        self.context_files_stamp = context_files_stamp(&self.current_cwd, &self.config);
+        let cwd = self.session.cwd().to_path_buf();
+        self.system_prompt = build_system_prompt(&cwd, &self.tool_registry, &self.config)?;
+        self.context_files_stamp = context_files_stamp(&cwd, &self.config);
         self.persist_runtime_state();
         Ok(())
     }
 
     /// Rebuild the system prompt if the set of context files or any of their mtimes changed.
     fn refresh_system_prompt_if_needed(&mut self) {
-        let current_stamp = context_files_stamp(&self.current_cwd, &self.config);
+        let cwd = self.session.cwd().to_path_buf();
+        let current_stamp = context_files_stamp(&cwd, &self.config);
         if current_stamp != self.context_files_stamp
-            && let Ok(prompt) =
-                build_system_prompt(&self.current_cwd, &self.tool_registry, &self.config)
+            && let Ok(prompt) = build_system_prompt(&cwd, &self.tool_registry, &self.config)
         {
             self.system_prompt = prompt;
             self.context_files_stamp = current_stamp;
@@ -1178,9 +1134,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
     let mut state = ControllerState {
         config,
         cli_api_key: cli.api_key.clone(),
-        current_cwd: cwd,
-        session_dir: sessions_dir,
-        session,
+        session: SessionHandle::from_manager(session, sessions_dir, cwd),
         current_model: selection.model,
         current_thinking: selection.thinking,
         model_catalog,
