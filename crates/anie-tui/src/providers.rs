@@ -122,12 +122,7 @@ enum ActionItem {
     DeleteProvider,
 }
 
-#[derive(Debug, Clone, Default)]
-struct TextField {
-    value: String,
-    cursor: usize,
-    masked: bool,
-}
+use crate::widgets::TextField;
 
 /// Provider-management overlay widget.
 pub struct ProviderManagementScreen {
@@ -1244,67 +1239,6 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     }
 }
 
-impl TextField {
-    fn masked() -> Self {
-        Self {
-            value: String::new(),
-            cursor: 0,
-            masked: true,
-        }
-    }
-
-    fn handle_edit_key(&mut self, key: KeyEvent) {
-        if let KeyCode::Char(ch) = key.code
-            && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
-        {
-            self.value.insert(self.cursor, ch);
-            self.cursor += ch.len_utf8();
-            return;
-        }
-
-        match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Backspace) => {
-                if let Some(previous) = previous_boundary(&self.value, self.cursor) {
-                    self.value.drain(previous..self.cursor);
-                    self.cursor = previous;
-                }
-            }
-            (KeyModifiers::NONE, KeyCode::Delete) => {
-                if let Some(next) = next_boundary(&self.value, self.cursor) {
-                    self.value.drain(self.cursor..next);
-                }
-            }
-            (KeyModifiers::NONE, KeyCode::Left) => {
-                if let Some(previous) = previous_boundary(&self.value, self.cursor) {
-                    self.cursor = previous;
-                }
-            }
-            (KeyModifiers::NONE, KeyCode::Right) => {
-                if let Some(next) = next_boundary(&self.value, self.cursor) {
-                    self.cursor = next;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn render_value(&self) -> String {
-        if self.masked {
-            "•".repeat(self.value.chars().count())
-        } else {
-            self.value.clone()
-        }
-    }
-
-    fn cursor_x(&self) -> u16 {
-        u16::try_from(self.value[..self.cursor].chars().count()).unwrap_or(u16::MAX)
-    }
-
-    fn trimmed(&self) -> String {
-        self.value.trim().to_string()
-    }
-}
-
 fn centered_rect(
     area: Rect,
     max_width_pct: u16,
@@ -1328,27 +1262,6 @@ fn footer_line(text: &str) -> Line<'static> {
         text.to_string(),
         Style::default().fg(Color::DarkGray),
     ))
-}
-
-fn previous_boundary(text: &str, index: usize) -> Option<usize> {
-    if index == 0 {
-        return None;
-    }
-    text[..index]
-        .char_indices()
-        .last()
-        .map(|(position, _)| position)
-}
-
-fn next_boundary(text: &str, index: usize) -> Option<usize> {
-    if index >= text.len() {
-        return None;
-    }
-    text[index..]
-        .char_indices()
-        .nth(1)
-        .map(|(offset, _)| index + offset)
-        .or(Some(text.len()))
 }
 
 #[cfg(test)]

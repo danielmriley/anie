@@ -165,12 +165,7 @@ struct CustomEndpointForm {
     selected_field: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-struct TextField {
-    value: String,
-    cursor: usize,
-    masked: bool,
-}
+use crate::widgets::TextField;
 
 /// Full-screen onboarding widget.
 pub struct OnboardingScreen {
@@ -1540,114 +1535,6 @@ impl ModelPickerContext {
     }
 }
 
-impl TextField {
-    fn from(value: &str) -> Self {
-        Self {
-            value: value.to_string(),
-            cursor: value.len(),
-            masked: false,
-        }
-    }
-
-    fn masked() -> Self {
-        Self {
-            value: String::new(),
-            cursor: 0,
-            masked: true,
-        }
-    }
-
-    fn masked_with_value(value: &str) -> Self {
-        Self {
-            value: value.to_string(),
-            cursor: value.len(),
-            masked: true,
-        }
-    }
-
-    fn handle_edit_key(&mut self, key: KeyEvent) {
-        if let KeyCode::Char(ch) = key.code
-            && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
-        {
-            self.insert_char(ch);
-            return;
-        }
-
-        match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Backspace) => self.backspace(),
-            (KeyModifiers::NONE, KeyCode::Delete) => self.delete(),
-            (KeyModifiers::NONE, KeyCode::Left) => self.move_left(),
-            (KeyModifiers::NONE, KeyCode::Right) => self.move_right(),
-            (KeyModifiers::NONE, KeyCode::Home) | (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
-                self.cursor = 0
-            }
-            (KeyModifiers::NONE, KeyCode::End) | (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
-                self.cursor = self.value.len()
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-                self.value.clear();
-                self.cursor = 0;
-            }
-            _ => {}
-        }
-    }
-
-    fn render_value(&self) -> String {
-        if self.masked {
-            if self.value.is_empty() {
-                String::new()
-            } else {
-                "•".repeat(self.value.chars().count())
-            }
-        } else {
-            self.value.clone()
-        }
-    }
-
-    fn cursor_x(&self) -> u16 {
-        let visible = if self.masked {
-            "•".repeat(self.value[..self.cursor].chars().count())
-        } else {
-            self.value[..self.cursor].to_string()
-        };
-        u16::try_from(visible.chars().count()).unwrap_or(u16::MAX)
-    }
-
-    fn trimmed(&self) -> String {
-        self.value.trim().to_string()
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        self.value.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
-    }
-
-    fn backspace(&mut self) {
-        if let Some(previous) = previous_boundary(&self.value, self.cursor) {
-            self.value.drain(previous..self.cursor);
-            self.cursor = previous;
-        }
-    }
-
-    fn delete(&mut self) {
-        if let Some(next) = next_boundary(&self.value, self.cursor) {
-            self.value.drain(self.cursor..next);
-        }
-    }
-
-    fn move_left(&mut self) {
-        if let Some(previous) = previous_boundary(&self.value, self.cursor) {
-            self.cursor = previous;
-        }
-    }
-
-    fn move_right(&mut self) {
-        if let Some(next) = next_boundary(&self.value, self.cursor) {
-            self.cursor = next;
-        }
-    }
-}
-
 /// Write configured providers into a config file and return the selected default.
 pub fn write_configured_providers(
     path: &Path,
@@ -2017,27 +1904,6 @@ fn footer_line(text: &str) -> Line<'static> {
         text.to_string(),
         Style::default().fg(Color::DarkGray),
     ))
-}
-
-fn previous_boundary(text: &str, index: usize) -> Option<usize> {
-    if index == 0 {
-        return None;
-    }
-    text[..index]
-        .char_indices()
-        .last()
-        .map(|(position, _)| position)
-}
-
-fn next_boundary(text: &str, index: usize) -> Option<usize> {
-    if index >= text.len() {
-        return None;
-    }
-    text[index..]
-        .char_indices()
-        .nth(1)
-        .map(|(offset, _)| index + offset)
-        .or(Some(text.len()))
 }
 
 #[cfg(test)]
