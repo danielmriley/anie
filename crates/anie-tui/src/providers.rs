@@ -137,6 +137,20 @@ pub struct ProviderManagementScreen {
     write_target: PathBuf,
 }
 
+impl crate::overlay::OverlayScreen for ProviderManagementScreen {
+    fn dispatch_key(&mut self, key: KeyEvent) -> crate::overlay::OverlayOutcome {
+        crate::overlay::OverlayOutcome::ProviderManagement(self.handle_key(key))
+    }
+
+    fn dispatch_tick(&mut self) -> crate::overlay::OverlayOutcome {
+        crate::overlay::OverlayOutcome::ProviderManagement(self.handle_tick())
+    }
+
+    fn dispatch_render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.render(frame, area);
+    }
+}
+
 impl ProviderManagementScreen {
     /// Create a management screen using the global config and default credential store.
     pub fn new() -> Result<Self> {

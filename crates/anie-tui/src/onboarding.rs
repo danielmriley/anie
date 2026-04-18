@@ -180,6 +180,20 @@ pub struct OnboardingScreen {
     persisted_reload_target: Option<(Option<String>, Option<String>)>,
 }
 
+impl crate::overlay::OverlayScreen for OnboardingScreen {
+    fn dispatch_key(&mut self, key: KeyEvent) -> crate::overlay::OverlayOutcome {
+        crate::overlay::OverlayOutcome::Onboarding(self.handle_key(key))
+    }
+
+    fn dispatch_tick(&mut self) -> crate::overlay::OverlayOutcome {
+        crate::overlay::OverlayOutcome::Onboarding(self.handle_tick())
+    }
+
+    fn dispatch_render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.render(frame, area);
+    }
+}
+
 impl OnboardingScreen {
     /// Create a new onboarding screen.
     #[must_use]

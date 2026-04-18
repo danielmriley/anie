@@ -6,6 +6,7 @@ mod input;
 mod model_picker;
 mod onboarding;
 mod output;
+mod overlay;
 mod providers;
 mod terminal;
 mod widgets;

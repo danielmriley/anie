@@ -31,7 +31,10 @@ use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest};
 use crate::{
     InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
     OnboardingScreen, OutputPane, ProviderManagementAction, ProviderManagementScreen,
-    input::InputAction, onboarding::write_configured_providers, output::RenderedBlock,
+    input::InputAction,
+    onboarding::write_configured_providers,
+    output::RenderedBlock,
+    overlay::{OverlayOutcome, OverlayScreen},
 };
 
 /// Rendered tool result details re-exported for consumers.
@@ -49,7 +52,7 @@ pub struct App {
     should_quit: bool,
     spinner: Spinner,
     last_ctrl_c: Option<Instant>,
-    overlay: Option<OverlayState>,
+    overlay: Option<Box<dyn OverlayScreen>>,
     known_models: Vec<Model>,
     discovery_cache: Arc<Mutex<ModelDiscoveryCache>>,
     worker_tx: mpsc::UnboundedSender<AppWorkerEvent>,
@@ -83,16 +86,6 @@ enum AppWorkerEvent {
         provider_name: String,
         result: Result<Vec<ModelInfo>, String>,
     },
-}
-
-// Plan 02 replaces this enum with `Option<Box<dyn OverlayScreen>>`, which
-// will also resolve the large-variant concern. Until then, accept the
-// disparity — the enum lives on the `App` for at most one active overlay
-// and is not cloned.
-#[allow(clippy::large_enum_variant)]
-enum OverlayState {
-    Onboarding(OnboardingScreen),
-    Providers(ProviderManagementScreen),
 }
 
 /// The current UI-level agent state.
@@ -297,10 +290,8 @@ impl App {
         frame.set_cursor_position(cursor);
 
         if let Some(overlay) = &mut self.overlay {
-            match overlay {
-                OverlayState::Onboarding(screen) => screen.render(frame, frame.area()),
-                OverlayState::Providers(screen) => screen.render(frame, frame.area()),
-            }
+            let area = frame.area();
+            overlay.dispatch_render(frame, area);
         }
     }
 
@@ -466,17 +457,9 @@ impl App {
 
     /// Poll overlay state that depends on background workers.
     pub fn handle_tick(&mut self) -> Result<()> {
-        if let Some(overlay) = &mut self.overlay {
-            match overlay {
-                OverlayState::Onboarding(screen) => {
-                    let action = screen.handle_tick();
-                    self.apply_onboarding_action(action)?;
-                }
-                OverlayState::Providers(screen) => {
-                    let action = screen.handle_tick();
-                    self.apply_provider_management_action(action);
-                }
-            }
+        if let Some(overlay) = self.overlay.as_mut() {
+            let outcome = overlay.dispatch_tick();
+            self.apply_overlay_outcome(outcome)?;
         }
 
         while let Ok(event) = self.worker_rx.try_recv() {
@@ -956,15 +939,13 @@ impl App {
     }
 
     fn open_onboarding_overlay(&mut self) {
-        self.overlay = Some(OverlayState::Onboarding(OnboardingScreen::new(
-            CredentialStore::new(),
-        )));
+        self.overlay = Some(Box::new(OnboardingScreen::new(CredentialStore::new())));
     }
 
     fn open_provider_management_overlay(&mut self) {
         match ProviderManagementScreen::new() {
             Ok(screen) => {
-                self.overlay = Some(OverlayState::Providers(screen));
+                self.overlay = Some(Box::new(screen));
             }
             Err(error) => self
                 .output_pane
@@ -973,17 +954,20 @@ impl App {
     }
 
     fn handle_overlay_key_event(&mut self, key: KeyEvent) -> Result<()> {
-        match &mut self.overlay {
-            Some(OverlayState::Onboarding(screen)) => {
-                let action = screen.handle_key(key);
-                self.apply_onboarding_action(action)
-            }
-            Some(OverlayState::Providers(screen)) => {
-                let action = screen.handle_key(key);
+        let Some(overlay) = self.overlay.as_mut() else {
+            return Ok(());
+        };
+        let outcome = overlay.dispatch_key(key);
+        self.apply_overlay_outcome(outcome)
+    }
+
+    fn apply_overlay_outcome(&mut self, outcome: OverlayOutcome) -> Result<()> {
+        match outcome {
+            OverlayOutcome::Onboarding(action) => self.apply_onboarding_action(action),
+            OverlayOutcome::ProviderManagement(action) => {
                 self.apply_provider_management_action(action);
                 Ok(())
             }
-            None => Ok(()),
         }
     }
 
