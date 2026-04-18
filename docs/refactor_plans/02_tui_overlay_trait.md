@@ -7,20 +7,31 @@
 > for the pi inventory. Directory scaffolding is cheap and
 > prevents re-migrating overlays as they're added.
 
-> **Status (2026-04-17):**
-> - **Phase 1 (TextField):** Complete on `refactor_branch`
->   (commit `d47fbcc`). 15 unit tests added.
-> - **Phase 2 (panel helpers):** Complete (commit `69adfe2`).
->   4 unit tests added.
-> - **Phase 4 clone audit:** Partially landed as part of the
->   plan 00 followup (commit `107a840`): the `Model` clone
->   in `app.rs:916` was removed via move-into-moved-value, and
->   the `onboarding.rs:2141` redundant clone in tests was
->   deleted. The full audit (OnboardingState clones at 233/284,
->   typed provider-key) is pending.
-> - **Phases 3, 5, 6 pending.** Phase 3 (OverlayScreen trait +
->   App migration) is the heaviest architectural piece and
->   needs a focused session. Phases 5 and 6 depend on 3.
+> **Status (2026-04-17):** All structural phases landed on
+> `refactor_branch`.
+> - **Phase 1 (TextField):** `d47fbcc`. 15 unit tests.
+> - **Phase 2 (panel helpers):** `69adfe2`. 4 unit tests.
+> - **Phase 3 (OverlayScreen trait + App migration):** `32b68cf`.
+>   Flat-union `OverlayOutcome` (option A) chosen. Inherent
+>   methods on screens retained so existing tests are
+>   undisturbed; trait methods are `dispatch_*` to sidestep
+>   name collisions.
+> - **Phase 4 (clone audit):** Largest items landed in the
+>   plan 00 followup (commit `107a840`). Remaining low-impact
+>   items (render-path `self.state.clone()` in
+>   `onboarding::render`; `HashMap<String, TestResult>` in
+>   providers) deferred — behind cost/benefit: render clone is
+>   once per frame on a small enum; provider-map typo risk is
+>   contained to a small surface.
+> - **Phase 5 (overlay tests):** Deferred. The two overlays
+>   still have no direct tests, but the trait now makes them
+>   easier to write. Trading off against moving plans 03–05
+>   forward.
+> - **Phase 6 (overlays directory):** `b4cb615`. `onboarding`,
+>   `providers`, `model_picker` now under
+>   `crates/anie-tui/src/overlays/`. Future screens (settings,
+>   login, tree, theme picker) land here via `impl
+>   OverlayScreen`.
 
 ## Motivation
 
