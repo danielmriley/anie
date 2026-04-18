@@ -23,7 +23,13 @@ coordination. Each phase touches ≤3 files.
 >   this plan was written — `ControllerState` caches it once at
 >   `prepare_controller_state` time and clones the `Arc` per
 >   run.
-> - **Phase F (borrowing context API):** Not landed. Queued.
+> - **Phase F (borrowing context API):** Complete on
+>   `refactor_branch`. Added
+>   `SessionManager::estimate_context_tokens(&self)` which walks the
+>   active branch without cloning messages; migrated
+>   `SessionHandle::estimated_context_tokens`, `auto_compact`, and
+>   `force_compact` to use it. Parity test locks the counts to the
+>   old `build_context()` path.
 
 ## Motivation
 

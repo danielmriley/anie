@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, Result};
 
 use anie_protocol::Message;
-use anie_session::{SessionContext, SessionInfo, SessionManager, estimate_context_tokens};
+use anie_session::{SessionContext, SessionInfo, SessionManager};
 
 /// Owns the currently-active session plus its directory context.
 pub(crate) struct SessionHandle {
@@ -91,7 +91,7 @@ impl SessionHandle {
 
     /// Estimate token usage for the active-branch context.
     pub(crate) fn estimated_context_tokens(&self) -> u64 {
-        estimate_context_tokens(&self.session.build_context().messages)
+        self.session.estimate_context_tokens()
     }
 
     /// List all sessions in `sessions_dir`, newest first.

@@ -640,6 +640,56 @@ impl SessionManager {
         }
     }
 
+    /// Estimate token usage for the current active branch without
+    /// materializing a full `SessionContext`. Produces the same total
+    /// as `estimate_context_tokens(&self.build_context().messages)`
+    /// but avoids cloning every message.
+    #[must_use]
+    pub fn estimate_context_tokens(&self) -> u64 {
+        let Some(leaf_id) = self.leaf_id.as_deref() else {
+            return 0;
+        };
+
+        let branch = self.get_branch(leaf_id);
+        let latest_compaction = branch.iter().rev().find_map(|entry| match entry {
+            SessionEntry::Compaction {
+                summary,
+                first_kept_entry_id,
+                ..
+            } => Some((summary.as_str(), first_kept_entry_id.as_str())),
+            _ => None,
+        });
+
+        let mut total: u64 = 0;
+        if let Some((summary, _)) = latest_compaction {
+            // Mirror the synthetic summary message produced by
+            // `build_context()` so the counts match exactly.
+            let prefix_len = "[Previous conversation summary]\n\n".len() as u64;
+            total = total.saturating_add((prefix_len + summary.len() as u64) / 4);
+        }
+
+        let mut keep_messages = latest_compaction.is_none();
+        for entry in branch {
+            if let Some((_, first_kept_entry_id)) = latest_compaction
+                && !keep_messages
+            {
+                if entry.base().id == first_kept_entry_id {
+                    keep_messages = true;
+                } else {
+                    continue;
+                }
+            }
+            if !keep_messages {
+                continue;
+            }
+            if let SessionEntry::Message { message, .. } = entry {
+                total = total.saturating_add(estimate_tokens(message));
+            }
+        }
+
+        total
+    }
+
     /// Compact the session if the current context exceeds the
     /// configured threshold. The summarizer is only invoked when
     /// compaction actually runs.
@@ -648,8 +698,7 @@ impl SessionManager {
         config: &CompactionConfig,
         summarizer: &dyn MessageSummarizer,
     ) -> Result<Option<CompactionResult>> {
-        let context = self.build_context();
-        let tokens_before = estimate_context_tokens(&context.messages);
+        let tokens_before = self.estimate_context_tokens();
         let threshold = config.context_window.saturating_sub(config.reserve_tokens);
         if tokens_before <= threshold {
             return Ok(None);
@@ -666,8 +715,7 @@ impl SessionManager {
         config: &CompactionConfig,
         summarizer: &dyn MessageSummarizer,
     ) -> Result<Option<CompactionResult>> {
-        let context = self.build_context();
-        let tokens_before = estimate_context_tokens(&context.messages);
+        let tokens_before = self.estimate_context_tokens();
         self.compact_internal(tokens_before, config.keep_recent_tokens, summarizer)
             .await
     }
@@ -1188,6 +1236,55 @@ mod tests {
         assert_eq!(context.messages[2].entry_id, fourth);
         assert_ne!(context.messages[1].entry_id, first);
         assert_ne!(context.messages[1].entry_id, second);
+    }
+
+    #[test]
+    fn estimate_context_tokens_matches_build_context_totals() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
+
+        assert_eq!(session.estimate_context_tokens(), 0);
+        assert_eq!(
+            session.estimate_context_tokens(),
+            estimate_context_tokens(&session.build_context().messages)
+        );
+
+        session
+            .append_message(&user_message(&"a".repeat(400), 1))
+            .expect("append user");
+        session
+            .append_message(&assistant_message(&"b".repeat(400), 2))
+            .expect("append assistant");
+        let third = session
+            .append_message(&user_message(&"c".repeat(400), 3))
+            .expect("append third");
+        session
+            .append_message(&assistant_message(&"d".repeat(400), 4))
+            .expect("append fourth");
+
+        let full_total = estimate_context_tokens(&session.build_context().messages);
+        assert_eq!(session.estimate_context_tokens(), full_total);
+        assert!(full_total > 0);
+
+        session
+            .add_entries(vec![SessionEntry::Compaction {
+                base: EntryBase {
+                    id: session.generate_id(),
+                    parent_id: session.leaf_id().map(str::to_string),
+                    timestamp: now_iso8601().expect("timestamp"),
+                },
+                summary: "rolled-up summary".into(),
+                tokens_before: full_total,
+                first_kept_entry_id: third,
+            }])
+            .expect("append compaction");
+
+        assert_eq!(
+            session.estimate_context_tokens(),
+            estimate_context_tokens(&session.build_context().messages)
+        );
     }
 
     #[test]
