@@ -44,26 +44,7 @@ use crate::{
 
 const DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day]");
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct RetryConfig {
-    max_retries: u32,
-    initial_delay_ms: u64,
-    max_delay_ms: u64,
-    backoff_multiplier: f64,
-    jitter: bool,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            initial_delay_ms: 1_000,
-            max_delay_ms: 30_000,
-            backoff_multiplier: 2.0,
-            jitter: true,
-        }
-    }
-}
+use crate::retry_policy::{RetryConfig, retry_delay_ms};
 
 /// Start the full interactive TUI mode.
 pub async fn run_interactive_mode(cli: Cli) -> Result<()> {
@@ -1427,31 +1408,6 @@ fn format_tokens(tokens: u64) -> String {
         tokens.to_string()
     }
 }
-
-fn retry_delay_ms(config: &RetryConfig, error: &ProviderError, retry_attempt: u32) -> u64 {
-    let base_delay = if let Some(retry_after_ms) = error.retry_after_ms() {
-        retry_after_ms
-    } else {
-        let exponent = retry_attempt.saturating_sub(1);
-        let mut delay = config.initial_delay_ms as f64;
-        for _ in 0..exponent {
-            delay *= config.backoff_multiplier;
-        }
-        delay as u64
-    };
-    let clamped = base_delay.min(config.max_delay_ms);
-    if !config.jitter {
-        return clamped;
-    }
-
-    let jitter = (clamped as f64 * 0.25) as u64;
-    if jitter == 0 {
-        return clamped;
-    }
-    let offset = rand::random::<u64>() % (jitter * 2 + 1);
-    clamped.saturating_sub(jitter) + offset
-}
-
 fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String {
     if sessions.is_empty() {
         return "No sessions found.".into();

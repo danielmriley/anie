@@ -5,6 +5,7 @@ mod controller;
 mod model_catalog;
 mod models_command;
 mod onboarding;
+mod retry_policy;
 mod runtime_state;
 
 use std::{path::PathBuf, sync::OnceLock};
