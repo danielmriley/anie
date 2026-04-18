@@ -80,7 +80,6 @@ dependencies = [
  "anie-agent",
  "anie-auth",
  "anie-config",
- "anie-extensions",
  "anie-protocol",
  "anie-provider",
  "anie-providers-builtin",
@@ -117,16 +116,6 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
-]
-
-[[package]]
-name = "anie-extensions"
-version = "0.1.0"
-dependencies = [
- "anie-agent",
- "anie-protocol",
- "async-trait",
- "serde_json",
 ]
 
 [[package]]

@@ -1,3 +1,12 @@
+//! Tool-execution hook traits used by the agent loop.
+//!
+//! These traits are reserved for the planned out-of-process JSON-RPC
+//! extension system (see
+//! `docs/refactor_plans/10_extension_system_pi_port.md`). When that
+//! lands, the extension host will implement them internally and pass
+//! trait objects into `AgentLoopConfig`. Until then, callers outside
+//! the crate should leave the hook fields set to `None`.
+
 use async_trait::async_trait;
 
 use anie_protocol::{ContentBlock, Message, ToolCall, ToolResult};

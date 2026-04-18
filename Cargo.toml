@@ -11,7 +11,6 @@ members = [
     "crates/anie-auth",
     "crates/anie-tui",
     "crates/anie-cli",
-    "crates/anie-extensions",
     "crates/anie-integration-tests",
 ]
 default-members = ["crates/anie-cli"]
@@ -66,7 +65,6 @@ anie-agent = { path = "crates/anie-agent" }
 anie-auth = { path = "crates/anie-auth" }
 anie-cli = { path = "crates/anie-cli" }
 anie-config = { path = "crates/anie-config" }
-anie-extensions = { path = "crates/anie-extensions" }
 anie-provider = { path = "crates/anie-provider" }
 anie-protocol = { path = "crates/anie-protocol" }
 anie-providers-builtin = { path = "crates/anie-providers-builtin" }

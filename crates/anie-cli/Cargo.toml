@@ -32,7 +32,6 @@ rpassword.workspace = true
 anie-agent.workspace = true
 anie-auth.workspace = true
 anie-config.workspace = true
-anie-extensions.workspace = true
 anie-provider.workspace = true
 anie-protocol.workspace = true
 anie-providers-builtin.workspace = true

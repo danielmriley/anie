@@ -261,7 +261,9 @@ The workspace is split into focused crates:
 - `crates/anie-provider` — provider traits, model types, and request/response abstractions
 - `crates/anie-providers-builtin` — built-in provider implementations and local-server detection
 - `crates/anie-protocol` — shared protocol/message/event/content types
-- `crates/anie-extensions` — placeholder crate reserved for future extension hooks
+
+Extensions are designed as a future out-of-process plugin system;
+see `docs/refactor_plans/10_extension_system_pi_port.md`.
 
 For more detail, see:
 
