@@ -8,7 +8,7 @@ use anie_provider::{
     ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
 };
 
-use crate::{classify_http_error, create_http_client, parse_retry_after, sse_stream};
+use crate::{classify_http_error, http::shared_http_client, parse_retry_after, sse_stream};
 
 mod convert;
 mod reasoning_strategy;
@@ -33,11 +33,16 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    /// Create a new provider with the shared HTTP client configuration.
+    /// Create a new provider, using the workspace-shared HTTP client
+    /// when available. Falls back to a fresh client (which will panic
+    /// the same way legacy code did) if the shared init fails — this
+    /// keeps `::new()` infallible.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: create_http_client(),
+            client: shared_http_client()
+                .cloned()
+                .unwrap_or_else(|_| crate::http::create_http_client()),
         }
     }
 

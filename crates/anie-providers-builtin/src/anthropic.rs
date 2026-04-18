@@ -13,7 +13,7 @@ use anie_provider::{
     StreamOptions, ThinkingLevel,
 };
 
-use crate::{classify_http_error, create_http_client, parse_retry_after, sse_stream};
+use crate::{classify_http_error, http::shared_http_client, parse_retry_after, sse_stream};
 
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
@@ -21,11 +21,14 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    /// Create a new Anthropic provider.
+    /// Create a new Anthropic provider, pulling the workspace-shared
+    /// HTTP client when available.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: create_http_client(),
+            client: shared_http_client()
+                .cloned()
+                .unwrap_or_else(|_| crate::http::create_http_client()),
         }
     }
 
