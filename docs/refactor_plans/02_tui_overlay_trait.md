@@ -23,10 +23,11 @@
 >   providers) deferred — behind cost/benefit: render clone is
 >   once per frame on a small enum; provider-map typo risk is
 >   contained to a small surface.
-> - **Phase 5 (overlay tests):** Deferred. The two overlays
->   still have no direct tests, but the trait now makes them
->   easier to write. Trading off against moving plans 03–05
->   forward.
+> - **Phase 5 (overlay tests):** Complete on `refactor_branch`.
+>   `OnboardingScreen` covered by 21 tests; `ProviderManagementScreen`
+>   by 11 (including busy→status transitions, delete+cascade, a
+>   `#[tokio::test]` that writes a real credential via JSON fallback,
+>   and a worker-event-driven model-picker open).
 > - **Phase 6 (overlays directory):** `b4cb615`. `onboarding`,
 >   `providers`, `model_picker` now under
 >   `crates/anie-tui/src/overlays/`. Future screens (settings,

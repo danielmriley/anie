@@ -2154,6 +2154,126 @@ mod tests {
     }
 
     #[test]
+    fn local_server_waiting_transitions_when_detection_completes() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.local_detection = LocalDetectionState::Pending;
+        screen.state = OnboardingState::LocalServerWaiting;
+
+        screen.handle_worker_event(WorkerEvent::LocalServersDetected(vec![
+            sample_local_server(),
+        ]));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::LocalServerSelect { selected: 0 }
+        ));
+    }
+
+    #[test]
+    fn local_server_waiting_falls_through_to_no_servers_when_detection_empty() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.local_detection = LocalDetectionState::Pending;
+        screen.state = OnboardingState::LocalServerWaiting;
+
+        screen.handle_worker_event(WorkerEvent::LocalServersDetected(Vec::new()));
+        assert!(matches!(screen.state, OnboardingState::NoLocalServers));
+    }
+
+    #[test]
+    fn custom_endpoint_form_fields_accept_input_in_order() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::CustomEndpoint {
+            form: CustomEndpointForm::default(),
+        };
+
+        for c in "http://localhost:9000".chars() {
+            screen.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        screen.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // provider_name defaults to "custom"; replace by backspacing first.
+        for _ in 0.."custom".len() {
+            screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in "my-provider".chars() {
+            screen.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        screen.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for c in "my-model".chars() {
+            screen.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        screen.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for c in "sk-local".chars() {
+            screen.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let OnboardingState::CustomEndpoint { form } = &screen.state else {
+            panic!("expected custom endpoint state");
+        };
+        assert_eq!(form.base_url.value, "http://localhost:9000");
+        assert_eq!(form.provider_name.value, "my-provider");
+        assert_eq!(form.model_id.value, "my-model");
+        assert_eq!(form.api_key.value, "sk-local");
+        assert_eq!(form.selected_field, 3);
+    }
+
+    #[test]
+    fn preset_validation_failure_transitions_to_error_state() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        let preset = default_openai_preset();
+        let context = ModelPickerContext::ApiPreset {
+            preset_index: 0,
+            preset: preset.clone(),
+            api_key: "bad-key".into(),
+        };
+        screen.state = OnboardingState::Busy {
+            title: preset.display_name.to_string(),
+            message: "Verifying API key…".into(),
+            return_to: Box::new(OnboardingState::ApiKeyInput {
+                preset_index: 0,
+                input: TextField::masked_with_value("bad-key"),
+            }),
+        };
+
+        screen.handle_worker_event(WorkerEvent::PresetValidated {
+            context,
+            result: Err("401 unauthorized".into()),
+        });
+        assert!(matches!(screen.state, OnboardingState::Error { .. }));
+    }
+
+    #[test]
+    fn escape_returns_to_main_menu_from_custom_endpoint() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::CustomEndpoint {
+            form: CustomEndpointForm::default(),
+        };
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::MainMenu { selected: 2 }
+        ));
+    }
+
+    #[test]
+    fn escape_returns_to_main_menu_from_api_key_input() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::ApiKeyInput {
+            preset_index: 1,
+            input: TextField::masked(),
+        };
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // Esc from ApiKeyInput returns to the preset list, not main menu.
+        assert!(matches!(
+            screen.state,
+            OnboardingState::ProviderPresetList { selected: 1 }
+        ));
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            screen.state,
+            OnboardingState::MainMenu { selected: 1 }
+        ));
+    }
+
+    #[test]
     fn normalize_openai_base_url_adds_v1_when_needed() {
         assert_eq!(
             normalize_openai_base_url("http://localhost:11434"),

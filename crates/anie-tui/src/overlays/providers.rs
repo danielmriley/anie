@@ -275,18 +275,30 @@ impl ProviderManagementScreen {
 
     #[cfg(test)]
     fn new_for_tests(entries: Vec<ProviderEntry>) -> Self {
+        Self::new_for_tests_with(
+            entries,
+            CredentialStore::with_config("anie-test", None).without_native_keyring(),
+            PathBuf::from("/tmp/config.toml"),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_tests_with(
+        entries: Vec<ProviderEntry>,
+        credential_store: CredentialStore,
+        write_target: PathBuf,
+    ) -> Self {
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         Self {
             providers: entries,
             selected: 0,
             mode: ProviderManagementMode::Table,
-            credential_store: CredentialStore::with_config("anie-test", None)
-                .without_native_keyring(),
+            credential_store,
             test_results: HashMap::new(),
             worker_tx,
             worker_rx,
             spinner: Spinner::new(),
-            write_target: PathBuf::from("/tmp/config.toml"),
+            write_target,
         }
     }
 
@@ -1336,5 +1348,122 @@ mod tests {
         let mut screen = ProviderManagementScreen::new_for_tests(vec![entry("openai", true)]);
         let action = screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(action, ProviderManagementAction::Close);
+    }
+
+    #[test]
+    fn test_provider_transitions_to_busy_then_status() {
+        let mut screen = ProviderManagementScreen::new_for_tests(vec![entry("openai", true)]);
+        screen.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(matches!(screen.mode, ProviderManagementMode::Busy { .. }));
+        assert_eq!(
+            screen.test_results.get("openai"),
+            Some(&TestResult::Pending)
+        );
+
+        // Outside a tokio runtime, spawn_test_for_selected synchronously
+        // sends a TestCompleted(Failed) event; handle_tick processes it.
+        let action = screen.handle_tick();
+        assert_eq!(action, ProviderManagementAction::Continue);
+        assert!(matches!(
+            screen.mode,
+            ProviderManagementMode::Status { is_error: true, .. }
+        ));
+        assert!(matches!(
+            screen.test_results.get("openai"),
+            Some(TestResult::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn delete_provider_removes_row() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let write_target = tempdir.path().join("config.toml");
+        let json_fallback = tempdir.path().join("auth.json");
+        let credential_store =
+            CredentialStore::with_config("anie-test", Some(json_fallback)).without_native_keyring();
+        let mut screen = ProviderManagementScreen::new_for_tests_with(
+            vec![entry("openai", true), entry("anthropic", false)],
+            credential_store,
+            write_target,
+        );
+
+        screen.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(screen.mode, ProviderManagementMode::ConfirmDelete));
+
+        let action = screen.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(
+            action,
+            ProviderManagementAction::ConfigChanged { .. }
+        ));
+        assert_eq!(screen.providers.len(), 1);
+        assert_eq!(screen.providers[0].name, "anthropic");
+    }
+
+    #[tokio::test]
+    async fn edit_api_key_stores_new_key_via_credential_store() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let json_fallback = tempdir.path().join("auth.json");
+        let credential_store =
+            CredentialStore::with_config("anie-test", Some(json_fallback.clone()))
+                .without_native_keyring();
+        let mut screen = ProviderManagementScreen::new_for_tests_with(
+            vec![entry("openai", true)],
+            credential_store.clone(),
+            tempdir.path().join("config.toml"),
+        );
+
+        screen.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        for c in "sk-test".chars() {
+            screen.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(screen.mode, ProviderManagementMode::Busy { .. }));
+
+        // Let the tokio::spawn task write the credential, then drain
+        // the worker channel.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        screen.handle_tick();
+
+        assert_eq!(
+            credential_store.get("openai").as_deref(),
+            Some("sk-test"),
+            "credential store should have the new key",
+        );
+        assert!(matches!(
+            screen.mode,
+            ProviderManagementMode::Status {
+                is_error: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn view_models_opens_busy_then_picker_on_discovery() {
+        let mut screen = ProviderManagementScreen::new_for_tests(vec![entry("openai", true)]);
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Action menu second item is ViewModels.
+        screen.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(screen.mode, ProviderManagementMode::Busy { .. }));
+
+        // Inject a successful discovery to open the picker.
+        let selected = screen.selected_entry().cloned().expect("selected entry");
+        screen.handle_worker_event(WorkerEvent::ModelsDiscovered {
+            entry: selected,
+            result: Ok(vec![ModelInfo {
+                id: "gpt-4o".into(),
+                name: "GPT-4o".into(),
+                provider: "openai".into(),
+                context_length: Some(128_000),
+                supports_images: Some(true),
+                supports_reasoning: Some(false),
+            }]),
+        });
+        assert!(matches!(
+            screen.mode,
+            ProviderManagementMode::PickingModel { .. }
+        ));
     }
 }

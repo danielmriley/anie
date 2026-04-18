@@ -23,3 +23,6 @@ anie-config.workspace = true
 anie-provider.workspace = true
 anie-protocol.workspace = true
 anie-providers-builtin.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
