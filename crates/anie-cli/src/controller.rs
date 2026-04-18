@@ -19,17 +19,14 @@ use tracing::{info, warn};
 
 use anie_agent::{AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry};
 use anie_auth::AuthResolver;
-use anie_config::{
-    AnieConfig, CliOverrides, collect_context_files, configured_models, load_config,
-};
+use anie_config::{AnieConfig, CliOverrides, collect_context_files, load_config};
 use anie_protocol::{
     AgentEvent, ContentBlock, Message, StopReason, StreamDelta, UserMessage, now_millis,
 };
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ProviderError, ProviderRegistry, RequestOptionsResolver,
-    ThinkingLevel,
+    Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
 };
-use anie_providers_builtin::{builtin_models, detect_local_servers, register_builtin_providers};
+use anie_providers_builtin::register_builtin_providers;
 use anie_session::{
     CompactionConfig, SessionContext, SessionInfo, SessionManager, estimate_context_tokens,
 };
@@ -38,6 +35,10 @@ use anie_tui::{App, UiAction, install_panic_hook, restore_terminal, run_tui, set
 
 use crate::{
     Cli,
+    model_catalog::{
+        build_model_catalog, fallback_model_from_provider, resolve_initial_selection,
+        resolve_model, resolve_requested_model, upsert_model,
+    },
     runtime_state::{RuntimeState, load_runtime_state, save_runtime_state},
 };
 
@@ -1229,218 +1230,6 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
     Ok(state)
 }
 
-async fn build_model_catalog(config: &AnieConfig) -> (Vec<Model>, bool) {
-    let local_servers = detect_local_servers().await;
-    let local_models = local_servers
-        .iter()
-        .flat_map(|server| server.models.clone())
-        .collect::<Vec<_>>();
-    let mut model_catalog = builtin_models();
-    model_catalog.extend(configured_models(config));
-    model_catalog.extend(local_models);
-    dedupe_models(&mut model_catalog);
-    (model_catalog, !local_servers.is_empty())
-}
-
-struct InitialSelection {
-    model: Model,
-    thinking: ThinkingLevel,
-}
-
-fn resolve_initial_selection(
-    cli: &Cli,
-    config: &AnieConfig,
-    runtime_state: &RuntimeState,
-    session_context: &SessionContext,
-    model_catalog: &[Model],
-    local_models_available: bool,
-) -> Result<InitialSelection> {
-    let cli_model = cli.model.clone();
-    let cli_provider = cli.provider.clone();
-    let session_model = session_context.model.clone();
-    let runtime_model = runtime_state.model.clone();
-    let runtime_provider = runtime_state.provider.clone();
-
-    let preferred_provider = cli_provider
-        .or_else(|| session_model.as_ref().map(|(provider, _)| provider.clone()))
-        .or(runtime_provider)
-        .unwrap_or_else(|| config.model.provider.clone());
-    let preferred_model = cli_model
-        .or_else(|| session_model.as_ref().map(|(_, model)| model.clone()))
-        .or(runtime_model)
-        .unwrap_or_else(|| config.model.id.clone());
-    let thinking = cli
-        .thinking
-        .or(session_context.thinking_level)
-        .or(runtime_state.thinking)
-        .unwrap_or(config.model.thinking);
-
-    let model = if cli.provider.is_some() && cli.model.is_none() {
-        resolve_model(
-            Some(preferred_provider.as_str()),
-            None,
-            model_catalog,
-            local_models_available,
-        )
-    } else {
-        resolve_model(
-            Some(preferred_provider.as_str()),
-            Some(preferred_model.as_str()),
-            model_catalog,
-            local_models_available,
-        )
-        .or_else(|_| {
-            fallback_model_from_provider(
-                preferred_provider.as_str(),
-                preferred_model.as_str(),
-                config,
-                model_catalog,
-            )
-            .ok_or_else(|| anyhow!("no model named '{preferred_model}' was found"))
-        })
-        .or_else(|_| {
-            resolve_model(
-                Some(preferred_provider.as_str()),
-                None,
-                model_catalog,
-                local_models_available,
-            )
-        })
-        .or_else(|_| {
-            resolve_model(
-                None,
-                Some(&preferred_model),
-                model_catalog,
-                local_models_available,
-            )
-        })
-    }?;
-
-    Ok(InitialSelection { model, thinking })
-}
-
-fn resolve_requested_model(
-    requested: &str,
-    current_provider: &str,
-    catalog: &[Model],
-) -> Result<Model> {
-    if let Some((provider, model_id)) = requested.split_once(':')
-        && catalog.iter().any(|model| model.provider == provider)
-        && catalog
-            .iter()
-            .any(|model| model.provider == provider && model.id == model_id)
-    {
-        return catalog
-            .iter()
-            .find(|model| model.provider == provider && model.id == model_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("no model named '{model_id}' for provider '{provider}'"));
-    }
-
-    catalog
-        .iter()
-        .find(|model| model.provider == current_provider && model.id == requested)
-        .cloned()
-        .or_else(|| catalog.iter().find(|model| model.id == requested).cloned())
-        .ok_or_else(|| anyhow!("no model named '{requested}' was found"))
-}
-
-fn resolve_model(
-    provider: Option<&str>,
-    model_id: Option<&str>,
-    model_catalog: &[Model],
-    local_models_available: bool,
-) -> Result<Model> {
-    if let (Some(provider), Some(model_id)) = (provider, model_id) {
-        if let Some(model) = model_catalog
-            .iter()
-            .find(|model| model.provider == provider && model.id == model_id)
-        {
-            return Ok(model.clone());
-        }
-    }
-
-    if let Some(model_id) = model_id
-        && let Some(model) = model_catalog.iter().find(|model| model.id == model_id)
-    {
-        return Ok(model.clone());
-    }
-
-    if let Some(provider) = provider
-        && let Some(model) = model_catalog
-            .iter()
-            .find(|model| model.provider == provider)
-    {
-        return Ok(model.clone());
-    }
-
-    if local_models_available
-        && let Some(local_model) = model_catalog
-            .iter()
-            .find(|model| model.provider == "ollama" || model.provider == "lmstudio")
-    {
-        return Ok(local_model.clone());
-    }
-
-    model_catalog
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("no models are configured or detected"))
-}
-
-fn fallback_model_from_provider(
-    provider: &str,
-    model_id: &str,
-    config: &AnieConfig,
-    catalog: &[Model],
-) -> Option<Model> {
-    let provider_config = config.providers.get(provider);
-    let api = provider_config
-        .and_then(|provider| provider.api)
-        .or(Some(match provider {
-            "anthropic" => ApiKind::AnthropicMessages,
-            _ => ApiKind::OpenAICompletions,
-        }))?;
-    let base_url = provider_config
-        .and_then(|provider| provider.base_url.clone())
-        .or_else(|| {
-            catalog
-                .iter()
-                .find(|candidate| candidate.provider == provider)
-                .map(|candidate| candidate.base_url.clone())
-        })
-        .or_else(|| match provider {
-            "anthropic" => Some("https://api.anthropic.com".to_string()),
-            "openai" => Some("https://api.openai.com/v1".to_string()),
-            _ => None,
-        })?;
-
-    Some(Model {
-        id: model_id.to_string(),
-        name: model_id.to_string(),
-        provider: provider.to_string(),
-        api,
-        base_url,
-        context_window: 32_768,
-        max_tokens: 8_192,
-        supports_reasoning: false,
-        reasoning_capabilities: None,
-        supports_images: false,
-        cost_per_million: CostPerMillion::zero(),
-    })
-}
-
-fn upsert_model(models: &mut Vec<Model>, model: &Model) {
-    if let Some(existing) = models
-        .iter_mut()
-        .find(|existing| existing.provider == model.provider && existing.id == model.id)
-    {
-        *existing = model.clone();
-    } else {
-        models.push(model.clone());
-    }
-}
-
 fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistry> {
     let mut tools = ToolRegistry::new();
     if no_tools {
@@ -1593,13 +1382,6 @@ fn apply_status_event(status_bar: &mut anie_tui::StatusBarState, event: &AgentEv
         status_bar.cwd = cwd.clone();
         status_bar.session_id = session_id.clone();
     }
-}
-
-fn dedupe_models(models: &mut Vec<Model>) {
-    let mut seen = HashSet::new();
-    models.reverse();
-    models.retain(|model| seen.insert((model.provider.clone(), model.id.clone())));
-    models.reverse();
 }
 
 fn current_date_ymd() -> Result<String> {
@@ -1878,6 +1660,7 @@ mod tests {
     use std::{fs, path::Path, thread, time::Duration};
 
     use super::*;
+    use crate::model_catalog::dedupe_models;
     use anie_provider::{
         ApiKind, CostPerMillion, ProviderError, ReasoningCapabilities, ReasoningControlMode,
         ReasoningOutputMode, ThinkingRequestMode,

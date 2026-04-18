@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod controller;
+mod model_catalog;
 mod models_command;
 mod onboarding;
 mod runtime_state;
