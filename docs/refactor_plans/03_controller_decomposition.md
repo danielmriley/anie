@@ -8,6 +8,24 @@
 > and skill integrations (`docs/ideas.md`) without a second
 > migration. See `pi_mono_comparison.md` for pi's shape.
 
+> **Status (2026-04-17):** partially landed on `refactor_branch`.
+> - **Phase 1 (ModelCatalog):** `019c976`. Moved to a new
+>   `model_catalog.rs` as free functions (not a wrapper struct)
+>   — `Vec<Model>` stays on `ControllerState`, and converting
+>   to a struct would ripple through more call sites than the
+>   scope allows. Module doc-comment marks the struct wrapper
+>   as a future step.
+> - **Phase 4 (RetryPolicy):** `9d9c236`. `RetryConfig` and
+>   `retry_delay_ms` moved to `retry_policy.rs`. The *decision*
+>   logic (schedule_transient_retry, retry_after_overflow,
+>   should_retry_transient) remains in the controller event loop
+>   — it's interleaved with event emission.
+> - **Phases 2, 3, 5 pending.** Phase 2 (compaction into
+>   anie-session behind a `MessageSummarizer` trait) and Phase 3
+>   (slash-command registry) are substantial architectural moves
+>   that need a focused session. Phase 5 (final recomposition of
+>   `ControllerState`) depends on both.
+
 ## Motivation
 
 `crates/anie-cli/src/controller.rs` is 1967 LOC. `ControllerState`
