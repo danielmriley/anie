@@ -122,7 +122,7 @@ enum ActionItem {
     DeleteProvider,
 }
 
-use crate::widgets::TextField;
+use crate::widgets::{TextField, centered_rect, footer_line};
 
 /// Provider-management overlay widget.
 pub struct ProviderManagementScreen {
@@ -1237,31 +1237,6 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
             .collect::<String>();
         format!("{truncated}…")
     }
-}
-
-fn centered_rect(
-    area: Rect,
-    max_width_pct: u16,
-    max_height_pct: u16,
-    min_width: u16,
-    min_height: u16,
-) -> Rect {
-    let width = ((area.width as u32 * max_width_pct as u32) / 100)
-        .max(min_width as u32)
-        .min(area.width as u32) as u16;
-    let height = ((area.height as u32 * max_height_pct as u32) / 100)
-        .max(min_height as u32)
-        .min(area.height as u32) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect::new(x, y, width, height)
-}
-
-fn footer_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(Color::DarkGray),
-    ))
 }
 
 #[cfg(test)]
