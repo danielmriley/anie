@@ -1,5 +1,15 @@
 # Plan 05 — Provider error taxonomy
 
+> **Status (2026-04-18):** complete on `refactor_branch` (commit
+> `3f8393c`). Landed as a single commit across 14 files, as the
+> plan required — partial migration would have broken the build at
+> the removed `Other` variant. Non-test call sites now use typed
+> variants; `classify_openai_http_error` is the single place where
+> error-body string detection still lives, and it upgrades 400
+> responses whose body looks like native-reasoning rejection to
+> `NativeReasoningUnsupported`. Test assertions use `matches!` on
+> variants rather than `.contains(...)` on messages.
+
 ## Motivation
 
 `ProviderError` (in `crates/anie-provider/src/error.rs`) currently
