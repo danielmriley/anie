@@ -2,7 +2,7 @@ use async_stream::try_stream;
 use futures::StreamExt;
 use serde_json::json;
 
-use anie_protocol::{AssistantMessage, ContentBlock, Message, ToolDef};
+use anie_protocol::{Message, ToolDef};
 use anie_provider::{
     ApiKind, LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent, ProviderStream,
     ReasoningCapabilities, ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
@@ -13,9 +13,13 @@ use crate::{
     parse_retry_after, sse_stream,
 };
 
+mod convert;
 mod streaming;
 mod tagged_reasoning;
 
+use convert::{
+    assistant_message_to_openai_llm_message, join_text_content, llm_message_to_openai_message,
+};
 use streaming::OpenAiStreamState;
 
 /// OpenAI-compatible chat-completions provider implementation.
@@ -363,108 +367,6 @@ impl Provider for OpenAIProvider {
     }
 }
 
-fn assistant_message_to_openai_llm_message(
-    assistant_message: &AssistantMessage,
-) -> Option<LlmMessage> {
-    let text = assistant_message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let tool_calls = assistant_message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolCall(tool_call) => Some(json!({
-                "id": tool_call.id,
-                "type": "function",
-                "function": {
-                    "name": tool_call.name,
-                    "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "null".into()),
-                }
-            })),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    if text.is_empty() && tool_calls.is_empty() {
-        return None;
-    }
-
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "content".into(),
-        if text.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::String(text)
-        },
-    );
-    if !tool_calls.is_empty() {
-        payload.insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
-    }
-
-    Some(LlmMessage {
-        role: "assistant".into(),
-        content: serde_json::Value::Object(payload),
-    })
-}
-
-fn llm_message_to_openai_message(message: &LlmMessage) -> serde_json::Value {
-    match message.role.as_str() {
-        "assistant" => {
-            if let Some(content) = message.content.as_object() {
-                let mut payload = serde_json::Map::new();
-                payload.insert("role".into(), json!("assistant"));
-                payload.insert(
-                    "content".into(),
-                    content
-                        .get("content")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                );
-                if let Some(tool_calls) = content.get("tool_calls") {
-                    payload.insert("tool_calls".into(), tool_calls.clone());
-                }
-                serde_json::Value::Object(payload)
-            } else {
-                json!({ "role": "assistant", "content": message.content })
-            }
-        }
-        "tool" => {
-            if let Some(content) = message.content.as_object() {
-                json!({
-                    "role": "tool",
-                    "tool_call_id": content.get("tool_call_id").cloned().unwrap_or(serde_json::Value::Null),
-                    "content": content.get("content").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                })
-            } else {
-                json!({ "role": "tool", "content": message.content })
-            }
-        }
-        _ => json!({ "role": message.role, "content": message.content }),
-    }
-}
-
-fn join_text_content(content: &[ContentBlock]) -> String {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
-            ContentBlock::Thinking { thinking } => Some(thinking.clone()),
-            ContentBlock::Image { media_type, data } => {
-                Some(format!("[image:{media_type};base64,{data}]"))
-            }
-            ContentBlock::ToolCall(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn reasoning_effort(thinking: ThinkingLevel) -> Option<&'static str> {
     match thinking {
         ThinkingLevel::Off => None,
@@ -627,7 +529,7 @@ fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
 }
 #[cfg(test)]
 mod tests {
-    use anie_protocol::{StopReason, ToolCall, Usage};
+    use anie_protocol::{AssistantMessage, ContentBlock, StopReason, ToolCall, Usage};
     use anie_provider::{
         ApiKind, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
         ThinkingRequestMode,
