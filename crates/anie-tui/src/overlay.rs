@@ -9,8 +9,8 @@
 use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect};
 
-use crate::onboarding::OnboardingAction;
-use crate::providers::ProviderManagementAction;
+use crate::overlays::onboarding::OnboardingAction;
+use crate::overlays::providers::ProviderManagementAction;
 
 /// Dispatched outcome from an overlay's event handler.
 ///

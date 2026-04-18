@@ -3,24 +3,20 @@
 
 mod app;
 mod input;
-mod model_picker;
-mod onboarding;
 mod output;
 mod overlay;
-mod providers;
+mod overlays;
 mod terminal;
 mod widgets;
 
 pub use app::{AgentUiState, App, Spinner, StatusBarState, ToolCallResult, UiAction, run_tui};
 pub use input::InputPane;
-pub use model_picker::{ModelPickerAction, ModelPickerPane};
-pub use onboarding::{
-    ConfiguredProvider, ConfiguredProviderKind, OnboardingAction, OnboardingCompletion,
-    OnboardingScreen, write_configured_providers,
-};
 pub use output::{OutputPane, RenderedBlock};
-pub use providers::{
-    ProviderEntry, ProviderManagementAction, ProviderManagementScreen, ProviderType, TestResult,
+pub use overlays::{
+    ConfiguredProvider, ConfiguredProviderKind, ModelPickerAction, ModelPickerPane,
+    OnboardingAction, OnboardingCompletion, OnboardingScreen, ProviderEntry,
+    ProviderManagementAction, ProviderManagementScreen, ProviderType, TestResult,
+    write_configured_providers,
 };
 pub use terminal::{install_panic_hook, restore_terminal, setup_terminal};
 

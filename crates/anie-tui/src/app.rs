@@ -32,9 +32,9 @@ use crate::{
     InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
     OnboardingScreen, OutputPane, ProviderManagementAction, ProviderManagementScreen,
     input::InputAction,
-    onboarding::write_configured_providers,
     output::RenderedBlock,
     overlay::{OverlayOutcome, OverlayScreen},
+    overlays::onboarding::write_configured_providers,
 };
 
 /// Rendered tool result details re-exported for consumers.
