@@ -8,23 +8,35 @@
 > and skill integrations (`docs/ideas.md`) without a second
 > migration. See `pi_mono_comparison.md` for pi's shape.
 
-> **Status (2026-04-17):** partially landed on `refactor_branch`.
+> **Status (2026-04-18):**
 > - **Phase 1 (ModelCatalog):** `019c976`. Moved to a new
->   `model_catalog.rs` as free functions (not a wrapper struct)
->   — `Vec<Model>` stays on `ControllerState`, and converting
->   to a struct would ripple through more call sites than the
->   scope allows. Module doc-comment marks the struct wrapper
->   as a future step.
+>   `model_catalog.rs` as free functions (not a wrapper struct).
+>   `Vec<Model>` stays on `ControllerState`.
+> - **Phase 2 (MessageSummarizer):** `d191ea5`. `anie-session`
+>   gains a `MessageSummarizer` trait; compaction is now driven
+>   through it. `anie-cli` gains `CompactionStrategy` which
+>   implements the trait against the live `ProviderRegistry` +
+>   resolver + model. The three controller call sites are
+>   collapsed via shared `compaction_strategy(keep_recent)` and
+>   `emit_compaction_end(result)` helpers. Event ordering
+>   preserved exactly. Session crate no longer depends on
+>   anie-provider for compaction logic (ThinkingLevel is still
+>   imported for the ThinkingChange entry variant).
+> - **Phase 3 (slash-command registry):** `1e0819a`.
+>   `crates/anie-cli/src/commands.rs` holds pi-style metadata +
+>   source tagging (Builtin / Extension / Prompt / Skill). The
+>   dispatch layer (the 20-arm match in `handle_action`) stays
+>   as-is — pi's own slash-commands.ts also keeps dispatch
+>   separate from metadata. Registry is wired onto
+>   `ControllerState`, ready for `/help` to consume once that
+>   lands.
 > - **Phase 4 (RetryPolicy):** `9d9c236`. `RetryConfig` and
 >   `retry_delay_ms` moved to `retry_policy.rs`. The *decision*
 >   logic (schedule_transient_retry, retry_after_overflow,
->   should_retry_transient) remains in the controller event loop
->   — it's interleaved with event emission.
-> - **Phases 2, 3, 5 pending.** Phase 2 (compaction into
->   anie-session behind a `MessageSummarizer` trait) and Phase 3
->   (slash-command registry) are substantial architectural moves
->   that need a focused session. Phase 5 (final recomposition of
->   `ControllerState`) depends on both.
+>   should_retry_transient) remains in the controller event loop.
+> - **Phase 5 pending.** Final recomposition of `ControllerState`
+>   depends on this work being settled; queued for a follow-up
+>   session.
 
 ## Motivation
 
