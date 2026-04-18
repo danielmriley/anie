@@ -321,7 +321,7 @@ impl InteractiveController {
     }
 
     async fn run(mut self) -> Result<()> {
-        let _ = self.event_tx.send(self.state.status_event()).await;
+        anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
         let _ = self
             .event_tx
             .send(AgentEvent::SystemMessage {
@@ -358,7 +358,7 @@ impl InteractiveController {
                                             self.state.finish_run(&result).await?;
                                         }
                                         Err(error) => {
-                                            let _ = self.event_tx.send(AgentEvent::SystemMessage {
+                                            anie_agent::send_event(&self.event_tx, AgentEvent::SystemMessage {
                                                 text: format!("Overflow recovery failed: {error}"),
                                             }).await;
                                             self.state.finish_run(&result).await?;
@@ -379,7 +379,7 @@ impl InteractiveController {
                                 }
                             }
                             Err(error) => {
-                                let _ = self.event_tx.send(AgentEvent::SystemMessage {
+                                anie_agent::send_event(&self.event_tx, AgentEvent::SystemMessage {
                                     text: format!("Agent task failed: {error}"),
                                 }).await;
                             }
@@ -436,7 +436,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_model(&requested).await?;
-                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                 }
             }
             UiAction::SetResolvedModel(model) => {
@@ -445,7 +445,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_model_resolved(model).await?;
-                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                 }
             }
             UiAction::SetThinking(level) => {
@@ -454,7 +454,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_thinking(&level).await?;
-                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                 }
             }
             UiAction::Compact => {
@@ -484,7 +484,7 @@ impl InteractiveController {
                             messages: transcript,
                         })
                         .await;
-                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Forked into child session {new_session_id}"
                     ))
@@ -506,7 +506,7 @@ impl InteractiveController {
                             messages: Vec::new(),
                         })
                         .await;
-                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Started new session {}",
                         self.state.session.id()
@@ -538,7 +538,7 @@ impl InteractiveController {
                             messages: transcript,
                         })
                         .await;
-                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     let _ = self
                         .event_tx
                         .send(AgentEvent::SystemMessage {
@@ -561,7 +561,7 @@ impl InteractiveController {
                 self.send_system_message(&body).await;
             }
             UiAction::GetState => {
-                let _ = self.event_tx.send(self.state.status_event()).await;
+                anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                 self.send_system_message(&format!(
                     "Session: {}\nProvider: {}\nModel: {}\nThinking: {}",
                     self.state.session.id(),
@@ -583,7 +583,7 @@ impl InteractiveController {
                     self.state
                         .reload_config(provider.as_deref(), model.as_deref())
                         .await?;
-                    let _ = self.event_tx.send(self.state.status_event()).await;
+                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message("Configuration reloaded.").await;
                 }
             }
@@ -746,13 +746,15 @@ impl ControllerState {
         result: &anie_session::CompactionResult,
     ) {
         let tokens_after = self.estimated_context_tokens();
-        let _ = event_tx
-            .send(AgentEvent::CompactionEnd {
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::CompactionEnd {
                 summary: result.summary.clone(),
                 tokens_before: result.tokens_before,
                 tokens_after,
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
@@ -764,9 +766,9 @@ impl ControllerState {
             .auto_compact(&config, &strategy)
             .await?
         {
-            let _ = event_tx.send(AgentEvent::CompactionStart).await;
+            anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
             self.emit_compaction_end(event_tx, &result).await;
-            let _ = event_tx.send(self.status_event()).await;
+            anie_agent::send_event(event_tx, self.status_event()).await;
         }
         Ok(())
     }
@@ -774,7 +776,7 @@ impl ControllerState {
     async fn force_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
         let (config, strategy) =
             self.compaction_strategy(self.config.compaction.keep_recent_tokens);
-        let _ = event_tx.send(AgentEvent::CompactionStart).await;
+        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
         match self
             .session
             .inner_mut()
@@ -783,14 +785,16 @@ impl ControllerState {
         {
             Some(result) => {
                 self.emit_compaction_end(event_tx, &result).await;
-                let _ = event_tx.send(self.status_event()).await;
+                anie_agent::send_event(event_tx, self.status_event()).await;
             }
             None => {
-                let _ = event_tx
-                    .send(AgentEvent::SystemMessage {
+                anie_agent::send_event(
+                    event_tx,
+                    AgentEvent::SystemMessage {
                         text: "Nothing to compact yet.".into(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
         }
         Ok(())
@@ -852,42 +856,48 @@ impl ControllerState {
         retry_attempt: u32,
     ) -> Result<()> {
         let delay_ms = retry_delay_ms(&self.retry_config, error, retry_attempt);
-        let _ = event_tx
-            .send(AgentEvent::RetryScheduled {
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::RetryScheduled {
                 attempt: retry_attempt,
                 max_retries: self.retry_config.max_retries,
                 delay_ms,
                 error: error.to_string(),
-            })
-            .await;
+            },
+        )
+        .await;
         let transcript = self
             .session_context()
             .messages
             .into_iter()
             .map(|message| message.message)
             .collect::<Vec<_>>();
-        let _ = event_tx
-            .send(AgentEvent::TranscriptReplace {
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::TranscriptReplace {
                 messages: transcript,
-            })
-            .await;
-        let _ = event_tx.send(self.status_event()).await;
+            },
+        )
+        .await;
+        anie_agent::send_event(event_tx, self.status_event()).await;
         info!(retry_attempt, delay_ms, error = %error, "scheduling transient provider retry");
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         Ok(())
     }
 
     async fn retry_after_overflow(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<bool> {
-        let _ = event_tx
-            .send(AgentEvent::SystemMessage {
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::SystemMessage {
                 text: "Context window exceeded; compacting and retrying...".into(),
-            })
-            .await;
+            },
+        )
+        .await;
         // Overflow recovery halves the keep-recent budget — we're already
         // over the context window, so we need to discard more aggressively.
         let keep_recent = (self.config.compaction.keep_recent_tokens / 2).max(1_000);
         let (config, strategy) = self.compaction_strategy(keep_recent);
-        let _ = event_tx.send(AgentEvent::CompactionStart).await;
+        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
         match self
             .session
             .inner_mut()
@@ -902,21 +912,25 @@ impl ControllerState {
                     .into_iter()
                     .map(|message| message.message)
                     .collect::<Vec<_>>();
-                let _ = event_tx
-                    .send(AgentEvent::TranscriptReplace {
+                anie_agent::send_event(
+                    event_tx,
+                    AgentEvent::TranscriptReplace {
                         messages: transcript,
-                    })
-                    .await;
-                let _ = event_tx.send(self.status_event()).await;
+                    },
+                )
+                .await;
+                anie_agent::send_event(event_tx, self.status_event()).await;
                 Ok(true)
             }
             None => {
-                let _ = event_tx
-                    .send(AgentEvent::SystemMessage {
+                anie_agent::send_event(
+                    event_tx,
+                    AgentEvent::SystemMessage {
                         text: "Context overflow recovery could not compact the session further."
                             .into(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 Ok(false)
             }
         }

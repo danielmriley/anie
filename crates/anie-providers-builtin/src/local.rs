@@ -88,14 +88,24 @@ pub fn default_local_reasoning_capabilities(
 
 /// Detect commonly-used local model servers using the OpenAI-compatible `/v1/models` route.
 ///
-/// Panics if the HTTP client cannot be built (TLS roots). Plan 08-B converts
-/// this to propagate a `Result` alongside the main HTTP client cleanup.
-#[allow(clippy::expect_used)]
+/// Returns an empty vec if the detection HTTP client cannot be built
+/// (TLS roots unavailable, etc.) — discovery is a best-effort
+/// feature and should never prevent startup. A warning is logged so
+/// the failure is visible.
 pub async fn detect_local_servers() -> Vec<LocalServer> {
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
-        .expect("failed to build local detection client");
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to build local-detection HTTP client; skipping local-server discovery"
+            );
+            return Vec::new();
+        }
+    };
 
     let mut servers = Vec::new();
     if let Some(server) = probe_openai_compatible(&client, "ollama", "http://localhost:11434").await

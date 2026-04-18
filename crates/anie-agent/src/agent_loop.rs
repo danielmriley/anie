@@ -1,9 +1,33 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use futures::{StreamExt, future::join_all};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+/// Process-global "have we already warned about a closed AgentEvent
+/// channel?" flag. First failure per process lifetime logs a
+/// warning; every subsequent drop is silent. Not reset between
+/// runs — a receiver-gone condition is interesting once, not per
+/// event.
+static EVENT_DROP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Send an `AgentEvent` to the UI/controller, warning once per
+/// process lifetime when the receiver has dropped. Replaces the
+/// `let _ = tx.send(...).await` pattern so silent channel closure
+/// becomes visible without flooding logs. Shared across agent_loop
+/// and the CLI controller so both sides trip the same latch.
+pub async fn send_event(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent) {
+    if tx.send(event).await.is_err() && !EVENT_DROP_WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "agent event channel closed; subsequent events in this run will be dropped \
+             silently (the consumer has likely exited)"
+        );
+    }
+}
 
 use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, StreamDelta, ToolCall,
@@ -93,21 +117,30 @@ impl AgentLoop {
         let mut context = context;
         let mut generated_messages = Vec::new();
         context.extend(prompts.iter().cloned());
+        // Reborrow event_tx as a shared reference so every call site
+        // below and the helper methods (which already take `&`) share
+        // the same shape. `.clone()` on `&Sender` still works where we
+        // need to move a sender into a spawned task.
+        let event_tx = &event_tx;
 
-        let _ = event_tx.send(AgentEvent::AgentStart).await;
-        let _ = event_tx.send(AgentEvent::TurnStart).await;
+        send_event(event_tx, AgentEvent::AgentStart).await;
+        send_event(event_tx, AgentEvent::TurnStart).await;
 
         for prompt in &prompts {
-            let _ = event_tx
-                .send(AgentEvent::MessageStart {
+            send_event(
+                event_tx,
+                AgentEvent::MessageStart {
                     message: prompt.clone(),
-                })
-                .await;
-            let _ = event_tx
-                .send(AgentEvent::MessageEnd {
+                },
+            )
+            .await;
+            send_event(
+                event_tx,
+                AgentEvent::MessageEnd {
                     message: prompt.clone(),
-                })
-                .await;
+                },
+            )
+            .await;
         }
 
         loop {
@@ -125,7 +158,7 @@ impl AgentLoop {
                         assistant,
                         &mut context,
                         &mut generated_messages,
-                        &event_tx,
+                        event_tx,
                         Vec::new(),
                     )
                     .await;
@@ -146,7 +179,7 @@ impl AgentLoop {
                     assistant,
                     &mut context,
                     &mut generated_messages,
-                    &event_tx,
+                    event_tx,
                     Vec::new(),
                 )
                 .await;
@@ -186,7 +219,7 @@ impl AgentLoop {
                         assistant,
                         &mut context,
                         &mut generated_messages,
-                        &event_tx,
+                        event_tx,
                         Vec::new(),
                     )
                     .await;
@@ -198,7 +231,7 @@ impl AgentLoop {
                 }
             };
 
-            let collected = self.collect_stream(stream, &event_tx, &cancel).await;
+            let collected = self.collect_stream(stream, event_tx, &cancel).await;
             let assistant = collected.assistant;
             let assistant_message = Message::Assistant(assistant.clone());
             context.push(assistant_message.clone());
@@ -210,17 +243,21 @@ impl AgentLoop {
                     StopReason::Error | StopReason::Aborted
                 )
             {
-                let _ = event_tx
-                    .send(AgentEvent::TurnEnd {
+                send_event(
+                    event_tx,
+                    AgentEvent::TurnEnd {
                         assistant,
                         tool_results: Vec::new(),
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(AgentEvent::AgentEnd {
+                    },
+                )
+                .await;
+                send_event(
+                    event_tx,
+                    AgentEvent::AgentEnd {
                         messages: generated_messages.clone(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 return AgentRunResult {
                     generated_messages,
                     final_context: context,
@@ -234,28 +271,34 @@ impl AgentLoop {
                     let follow_up_messages = get_follow_up_messages();
                     if !follow_up_messages.is_empty() {
                         context.extend(follow_up_messages);
-                        let _ = event_tx
-                            .send(AgentEvent::TurnEnd {
+                        send_event(
+                            event_tx,
+                            AgentEvent::TurnEnd {
                                 assistant,
                                 tool_results: Vec::new(),
-                            })
-                            .await;
-                        let _ = event_tx.send(AgentEvent::TurnStart).await;
+                            },
+                        )
+                        .await;
+                        send_event(event_tx, AgentEvent::TurnStart).await;
                         continue;
                     }
                 }
 
-                let _ = event_tx
-                    .send(AgentEvent::TurnEnd {
+                send_event(
+                    event_tx,
+                    AgentEvent::TurnEnd {
                         assistant,
                         tool_results: Vec::new(),
-                    })
-                    .await;
-                let _ = event_tx
-                    .send(AgentEvent::AgentEnd {
+                    },
+                )
+                .await;
+                send_event(
+                    event_tx,
+                    AgentEvent::AgentEnd {
                         messages: generated_messages.clone(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 return AgentRunResult {
                     generated_messages,
                     final_context: context,
@@ -264,7 +307,7 @@ impl AgentLoop {
             }
 
             let tool_results = self
-                .execute_tool_calls(&tool_calls, &context, &event_tx, &cancel)
+                .execute_tool_calls(&tool_calls, &context, event_tx, &cancel)
                 .await;
 
             for tool_result in &tool_results {
@@ -277,19 +320,23 @@ impl AgentLoop {
                 context.extend(get_steering_messages());
             }
 
-            let _ = event_tx
-                .send(AgentEvent::TurnEnd {
+            send_event(
+                event_tx,
+                AgentEvent::TurnEnd {
                     assistant,
                     tool_results: tool_results.clone(),
-                })
-                .await;
+                },
+            )
+            .await;
 
             if cancel.is_cancelled() {
-                let _ = event_tx
-                    .send(AgentEvent::AgentEnd {
+                send_event(
+                    event_tx,
+                    AgentEvent::AgentEnd {
                         messages: generated_messages.clone(),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 return AgentRunResult {
                     generated_messages,
                     final_context: context,
@@ -297,7 +344,7 @@ impl AgentLoop {
                 };
             }
 
-            let _ = event_tx.send(AgentEvent::TurnStart).await;
+            send_event(event_tx, AgentEvent::TurnStart).await;
         }
     }
 
@@ -310,29 +357,37 @@ impl AgentLoop {
         tool_results: Vec<ToolResultMessage>,
     ) {
         let message = Message::Assistant(assistant.clone());
-        let _ = event_tx
-            .send(AgentEvent::MessageStart {
+        send_event(
+            event_tx,
+            AgentEvent::MessageStart {
                 message: message.clone(),
-            })
-            .await;
-        let _ = event_tx
-            .send(AgentEvent::MessageEnd {
+            },
+        )
+        .await;
+        send_event(
+            event_tx,
+            AgentEvent::MessageEnd {
                 message: message.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
         context.push(message.clone());
         generated_messages.push(message);
-        let _ = event_tx
-            .send(AgentEvent::TurnEnd {
+        send_event(
+            event_tx,
+            AgentEvent::TurnEnd {
                 assistant,
                 tool_results,
-            })
-            .await;
-        let _ = event_tx
-            .send(AgentEvent::AgentEnd {
+            },
+        )
+        .await;
+        send_event(
+            event_tx,
+            AgentEvent::AgentEnd {
                 messages: generated_messages.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     async fn collect_stream(
@@ -346,11 +401,13 @@ impl AgentLoop {
             self.config.model.id.clone(),
         );
         let placeholder = Message::Assistant(builder.placeholder_message());
-        let _ = event_tx
-            .send(AgentEvent::MessageStart {
+        send_event(
+            event_tx,
+            AgentEvent::MessageStart {
                 message: placeholder,
-            })
-            .await;
+            },
+        )
+        .await;
 
         tokio::pin!(stream);
         let mut active_delta = None;
@@ -360,7 +417,7 @@ impl AgentLoop {
                 _ = cancel.cancelled() => {
                     self.finish_active_delta(event_tx, &mut active_delta).await;
                     let assistant = builder.finish(StopReason::Aborted, Some("Run aborted".into()));
-                    let _ = event_tx.send(AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
+                    send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
                     return CollectedAssistant {
                         assistant,
                         provider_error: None,
@@ -373,21 +430,21 @@ impl AgentLoop {
                             ProviderEvent::TextDelta(text) => {
                                 self.start_delta_if_needed(event_tx, &mut active_delta, ActiveDelta::Text).await;
                                 builder.push_text(&text);
-                                let _ = event_tx.send(AgentEvent::MessageDelta { delta: StreamDelta::TextDelta(text) }).await;
+                                send_event(event_tx, AgentEvent::MessageDelta { delta: StreamDelta::TextDelta(text) }).await;
                             }
                             ProviderEvent::ThinkingDelta(thinking) => {
                                 self.start_delta_if_needed(event_tx, &mut active_delta, ActiveDelta::Thinking).await;
                                 builder.push_thinking(&thinking);
-                                let _ = event_tx.send(AgentEvent::MessageDelta { delta: StreamDelta::ThinkingDelta(thinking) }).await;
+                                send_event(event_tx, AgentEvent::MessageDelta { delta: StreamDelta::ThinkingDelta(thinking) }).await;
                             }
                             ProviderEvent::ToolCallStart(tool_call) => {
                                 self.finish_active_delta(event_tx, &mut active_delta).await;
                                 builder.start_tool_call(tool_call.clone());
-                                let _ = event_tx.send(AgentEvent::MessageDelta { delta: StreamDelta::ToolCallStart(tool_call) }).await;
+                                send_event(event_tx, AgentEvent::MessageDelta { delta: StreamDelta::ToolCallStart(tool_call) }).await;
                             }
                             ProviderEvent::ToolCallDelta { id, arguments_delta } => {
                                 builder.append_tool_call_delta(&id, &arguments_delta);
-                                let _ = event_tx.send(AgentEvent::MessageDelta {
+                                send_event(event_tx, AgentEvent::MessageDelta {
                                     delta: StreamDelta::ToolCallDelta {
                                         id,
                                         arguments_delta,
@@ -396,13 +453,13 @@ impl AgentLoop {
                             }
                             ProviderEvent::ToolCallEnd { id } => {
                                 builder.finish_tool_call(&id);
-                                let _ = event_tx.send(AgentEvent::MessageDelta {
+                                send_event(event_tx, AgentEvent::MessageDelta {
                                     delta: StreamDelta::ToolCallEnd { id },
                                 }).await;
                             }
                             ProviderEvent::Done(message) => {
                                 self.finish_active_delta(event_tx, &mut active_delta).await;
-                                let _ = event_tx.send(AgentEvent::MessageEnd { message: Message::Assistant(message.clone()) }).await;
+                                send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(message.clone()) }).await;
                                 return CollectedAssistant {
                                     assistant: message,
                                     provider_error: None,
@@ -412,7 +469,7 @@ impl AgentLoop {
                         Some(Err(error)) => {
                             self.finish_active_delta(event_tx, &mut active_delta).await;
                             let assistant = builder.finish(StopReason::Error, Some(error.to_string()));
-                            let _ = event_tx.send(AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
+                            send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
                             return CollectedAssistant {
                                 assistant,
                                 provider_error: Some(error),
@@ -424,7 +481,7 @@ impl AgentLoop {
                                 "Stream ended unexpectedly".into(),
                             );
                             let assistant = builder.finish(StopReason::Error, Some(error.to_string()));
-                            let _ = event_tx.send(AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
+                            send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
                             return CollectedAssistant {
                                 assistant,
                                 provider_error: Some(error),
@@ -451,7 +508,7 @@ impl AgentLoop {
             ActiveDelta::Text => StreamDelta::TextStart,
             ActiveDelta::Thinking => StreamDelta::ThinkingStart,
         };
-        let _ = event_tx.send(AgentEvent::MessageDelta { delta }).await;
+        send_event(event_tx, AgentEvent::MessageDelta { delta }).await;
         *active_delta = Some(next);
     }
 
@@ -465,7 +522,7 @@ impl AgentLoop {
                 ActiveDelta::Text => StreamDelta::TextEnd,
                 ActiveDelta::Thinking => StreamDelta::ThinkingEnd,
             };
-            let _ = event_tx.send(AgentEvent::MessageDelta { delta }).await;
+            send_event(event_tx, AgentEvent::MessageDelta { delta }).await;
         }
     }
 
@@ -503,23 +560,27 @@ impl AgentLoop {
         event_tx: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> ToolResultMessage {
-        let _ = event_tx
-            .send(AgentEvent::ToolExecStart {
+        send_event(
+            event_tx,
+            AgentEvent::ToolExecStart {
                 call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
                 args: tool_call.arguments.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
 
         let Some(tool) = self.tool_registry.get(&tool_call.name) else {
             let result = error_tool_result(format!("Tool not found: {}", tool_call.name));
-            let _ = event_tx
-                .send(AgentEvent::ToolExecEnd {
+            send_event(
+                event_tx,
+                AgentEvent::ToolExecEnd {
                     call_id: tool_call.id.clone(),
                     result: result.clone(),
                     is_error: true,
-                })
-                .await;
+                },
+            )
+            .await;
             return tool_result_message(&tool_call, result, true);
         };
 
@@ -527,13 +588,15 @@ impl AgentLoop {
         if let Err(message) = validate_tool_arguments(&definition.parameters, &tool_call.arguments)
         {
             let result = error_tool_result(message);
-            let _ = event_tx
-                .send(AgentEvent::ToolExecEnd {
+            send_event(
+                event_tx,
+                AgentEvent::ToolExecEnd {
                     call_id: tool_call.id.clone(),
                     result: result.clone(),
                     is_error: true,
-                })
-                .await;
+                },
+            )
+            .await;
             return tool_result_message(&tool_call, result, true);
         }
 
@@ -545,13 +608,15 @@ impl AgentLoop {
                 BeforeToolCallResult::Allow => {}
                 BeforeToolCallResult::Block { reason } => {
                     let result = error_tool_result(reason);
-                    let _ = event_tx
-                        .send(AgentEvent::ToolExecEnd {
+                    send_event(
+                        event_tx,
+                        AgentEvent::ToolExecEnd {
                             call_id: tool_call.id.clone(),
                             result: result.clone(),
                             is_error: true,
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                     return tool_result_message(&tool_call, result, true);
                 }
             }
@@ -595,13 +660,15 @@ impl AgentLoop {
 
         attach_tool_invocation_details(&tool_call, &mut result.details);
 
-        let _ = event_tx
-            .send(AgentEvent::ToolExecEnd {
+        send_event(
+            event_tx,
+            AgentEvent::ToolExecEnd {
                 call_id: tool_call.id.clone(),
                 result: result.clone(),
                 is_error,
-            })
-            .await;
+            },
+        )
+        .await;
 
         tool_result_message(&tool_call, result, is_error)
     }
