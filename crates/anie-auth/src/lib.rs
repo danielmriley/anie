@@ -111,7 +111,7 @@ impl RequestOptionsResolver for AuthResolver {
 }
 
 pub(crate) fn default_auth_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".anie/auth.json"))
+    anie_config::anie_auth_json_path()
 }
 
 pub(crate) fn load_auth_store_at(path: &Path) -> Result<AuthStore> {

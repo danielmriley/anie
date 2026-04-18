@@ -4,6 +4,27 @@ A bundle of individually small items called out in the review. Each
 is its own phase so they can be picked up one at a time without
 coordination. Each phase touches ≤3 files.
 
+> **Status (2026-04-17):**
+> - **Phase A (`.anie/` paths):** Complete on `refactor_branch`.
+>   Added `anie_dir`, `anie_auth_json_path`, `anie_sessions_dir`,
+>   `anie_logs_dir`, `anie_state_json_path` helpers to
+>   `anie-config`; all callers updated.
+> - **Phase B (HTTP panics):** Not landed — plan 04 phase 1
+>   provides the better fix (shared `http::client() ->
+>   Result<...>`). The current `#[allow(clippy::expect_used)]`
+>   with justification is the interim.
+> - **Phase C (`.expect` audit):** The production-code sites
+>   flagged in the review (onboarding.rs:1682, model_picker
+>   tests) were addressed during the plan 00 CI followup —
+>   test-module uses are now covered by the workspace
+>   `cfg_attr(test, allow(clippy::expect_used))`.
+> - **Phase D (event send logging):** Not landed. Queued.
+> - **Phase E (cached ToolRegistry):** Was already done before
+>   this plan was written — `ControllerState` caches it once at
+>   `prepare_controller_state` time and clones the `Arc` per
+>   run.
+> - **Phase F (borrowing context API):** Not landed. Queued.
+
 ## Motivation
 
 These didn't fit cleanly into plans 01–07:

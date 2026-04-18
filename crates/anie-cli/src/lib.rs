@@ -121,7 +121,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "anie=info".into());
 
-    if let Some(log_dir) = dirs::home_dir().map(|home| home.join(".anie/logs")) {
+    if let Some(log_dir) = anie_config::anie_logs_dir() {
         if std::fs::create_dir_all(&log_dir).is_ok() {
             let file_appender = tracing_appender::rolling::daily(&log_dir, "anie.log");
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);

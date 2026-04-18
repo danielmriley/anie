@@ -24,7 +24,7 @@ pub struct RuntimeState {
 /// Return the default runtime-state file path.
 #[must_use]
 pub fn state_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".anie/state.json"))
+    anie_config::anie_state_json_path()
 }
 
 /// Load runtime state from the standard location.

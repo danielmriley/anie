@@ -1157,9 +1157,8 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
 
     let (model_catalog, local_models_available) = build_model_catalog(&config).await;
 
-    let sessions_dir = dirs::home_dir()
-        .context("home directory is not available")?
-        .join(".anie/sessions");
+    let sessions_dir =
+        anie_config::anie_sessions_dir().context("home directory is not available")?;
     std::fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("failed to create {}", sessions_dir.display()))?;
 

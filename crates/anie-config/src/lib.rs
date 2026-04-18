@@ -169,10 +169,40 @@ pub struct ContextFile {
     pub mtime: Option<SystemTime>,
 }
 
-/// Return the default global config path.
+/// Return `~/.anie/` — anie's per-user state directory.
+#[must_use]
+pub fn anie_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".anie"))
+}
+
+/// Return the default global config path (`~/.anie/config.toml`).
 #[must_use]
 pub fn global_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".anie/config.toml"))
+    anie_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// Return the JSON auth fallback path (`~/.anie/auth.json`).
+#[must_use]
+pub fn anie_auth_json_path() -> Option<PathBuf> {
+    anie_dir().map(|dir| dir.join("auth.json"))
+}
+
+/// Return the sessions directory (`~/.anie/sessions/`).
+#[must_use]
+pub fn anie_sessions_dir() -> Option<PathBuf> {
+    anie_dir().map(|dir| dir.join("sessions"))
+}
+
+/// Return the logs directory (`~/.anie/logs/`).
+#[must_use]
+pub fn anie_logs_dir() -> Option<PathBuf> {
+    anie_dir().map(|dir| dir.join("logs"))
+}
+
+/// Return the runtime state file (`~/.anie/state.json`).
+#[must_use]
+pub fn anie_state_json_path() -> Option<PathBuf> {
+    anie_dir().map(|dir| dir.join("state.json"))
 }
 
 /// Walk upward from `start` to find a project config file.
