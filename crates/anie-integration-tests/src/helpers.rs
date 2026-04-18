@@ -109,18 +109,16 @@ pub fn create_temp_session() -> (tempfile::TempDir, SessionManager) {
 /// "persist → close → reopen → build_context" roundtrip used by many tests.
 pub fn persist_and_reopen(cwd: &Path, prompt: &Message, result: &AgentRunResult) -> SessionContext {
     let sessions_dir = cwd.join("sessions");
-    let mut session = SessionManager::new_session(&sessions_dir, cwd).expect("new session");
-    session.append_message(prompt).expect("persist prompt");
-    session
-        .append_messages(&result.generated_messages)
-        .expect("persist result");
-
-    let session_path = std::fs::read_dir(&sessions_dir)
-        .expect("read sessions dir")
-        .filter_map(Result::ok)
-        .next()
-        .expect("session file")
-        .path();
+    let session_path = {
+        let mut session = SessionManager::new_session(&sessions_dir, cwd).expect("new session");
+        session.append_message(prompt).expect("persist prompt");
+        session
+            .append_messages(&result.generated_messages)
+            .expect("persist result");
+        session.path().to_path_buf()
+        // `session` drops here, releasing its advisory file lock so the
+        // reopen below can acquire it.
+    };
     let reopened = SessionManager::open_session(&session_path).expect("reopen");
     reopened.build_context()
 }

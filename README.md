@@ -239,6 +239,14 @@ Common files and directories include:
 
 You can resume a session with `anie --resume <session-id>` or switch sessions inside the TUI with `/session list` and `/session <id>`.
 
+anie takes an exclusive advisory lock on the session file for the
+lifetime of the open session. If you try to `--resume` a session
+another `anie` process currently has open, the second process
+exits with an error pointing you to `/fork` or a new session. On
+filesystems that don't support advisory locks (some network
+filesystems), the lock attempt is a no-op and a warning is
+logged.
+
 ## Workspace layout
 
 The workspace is split into focused crates:

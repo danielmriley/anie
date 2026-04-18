@@ -1,4 +1,17 @@
 //! Session persistence and context compaction for anie-rs.
+//!
+//! ## Concurrency
+//!
+//! A session file is opened with an exclusive advisory file lock
+//! (via `fs4`). A second attempt to open the same file returns
+//! `SessionError::AlreadyOpen`. On platforms that don't support
+//! advisory locks (some network filesystems), the lock attempt is
+//! a no-op and a warning is logged.
+//!
+//! Within a single process, a `SessionManager` owns its file; there
+//! is no cross-task sharing. Concurrent writes from multiple tasks
+//! in the same process are also undefined — clone the session via
+//! `fork_to_child_session` if you need a second writer.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 use std::{
@@ -10,11 +23,45 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use fs4::fs_std::FileExt;
 use futures::{StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::warn;
 use uuid::Uuid;
+
+/// Domain errors returned by the session subsystem.
+#[derive(Debug, Error)]
+pub enum SessionError {
+    /// Another process or in-process owner holds the session file.
+    #[error("session file {0} is already open by another writer")]
+    AlreadyOpen(PathBuf),
+}
+
+/// Try to acquire an exclusive advisory lock on the given file.
+///
+/// Returns `Ok(true)` when the lock was acquired, `Ok(false)` when
+/// the filesystem does not support locking (we log a warning and
+/// proceed without a lock), and `Err` when another writer holds it.
+fn try_acquire_session_lock(file: &File, path: &Path) -> Result<bool, SessionError> {
+    match FileExt::try_lock_exclusive(file) {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(SessionError::AlreadyOpen(path.to_path_buf())),
+        Err(error) => {
+            // Best-effort: some filesystems (older NFS, WSL edge cases)
+            // return errors instead of `Ok(false)`. Log and proceed
+            // without the lock rather than blocking the user.
+            warn!(
+                path = %path.display(),
+                %error,
+                "filesystem does not support advisory file locking; \
+                 concurrent writers will not be detected"
+            );
+            Ok(false)
+        }
+    }
+}
 
 use anie_protocol::{AssistantMessage, ContentBlock, Message, UserMessage, now_millis};
 use anie_provider::{
@@ -266,6 +313,7 @@ impl SessionManager {
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to reopen {}", path.display()))?;
+        try_acquire_session_lock(&file_handle, &path)?;
 
         Ok(Self {
             path,
@@ -298,6 +346,7 @@ impl SessionManager {
             .append(true)
             .open(path)
             .with_context(|| format!("failed to reopen {}", path.display()))?;
+        try_acquire_session_lock(&file_handle, path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1472,5 +1521,69 @@ mod tests {
         assert!(
             matches!(&context.messages[0].message, Message::User(user) if join_text_content(&user.content).contains("Goal"))
         );
+    }
+
+    #[test]
+    fn single_open_succeeds() {
+        let sessions_dir = tempdir().expect("tempdir");
+        let cwd = tempdir().expect("cwd tempdir");
+        let session = SessionManager::new_session(sessions_dir.path(), cwd.path())
+            .expect("first open succeeds");
+        assert!(session.path().exists());
+    }
+
+    #[test]
+    fn second_open_same_file_fails_with_already_open() {
+        let sessions_dir = tempdir().expect("tempdir");
+        let cwd = tempdir().expect("cwd tempdir");
+        let first = SessionManager::new_session(sessions_dir.path(), cwd.path())
+            .expect("first open succeeds");
+        let path = first.path().to_path_buf();
+
+        match SessionManager::open_session(&path) {
+            Ok(_) => panic!("second open must fail while first holds the lock"),
+            Err(err) => {
+                let cause = err.chain().find_map(|e| e.downcast_ref::<SessionError>());
+                assert!(
+                    matches!(cause, Some(SessionError::AlreadyOpen(p)) if p == &path),
+                    "expected AlreadyOpen({path:?}), got chain {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn second_open_after_first_dropped_succeeds() {
+        let sessions_dir = tempdir().expect("tempdir");
+        let cwd = tempdir().expect("cwd tempdir");
+        let first = SessionManager::new_session(sessions_dir.path(), cwd.path())
+            .expect("first open succeeds");
+        let path = first.path().to_path_buf();
+        drop(first);
+
+        let _second =
+            SessionManager::open_session(&path).expect("reopen after drop should succeed");
+    }
+
+    #[test]
+    fn write_then_reopen_sees_all_entries() {
+        let sessions_dir = tempdir().expect("tempdir");
+        let cwd = tempdir().expect("cwd tempdir");
+        let mut first = SessionManager::new_session(sessions_dir.path(), cwd.path())
+            .expect("first open succeeds");
+        let path = first.path().to_path_buf();
+        let id = first
+            .append_message(&Message::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: 0,
+            }))
+            .expect("append message");
+        first.flush().expect("flush");
+        drop(first);
+
+        let second = SessionManager::open_session(&path).expect("reopen");
+        assert!(second.by_id.contains_key(&id));
     }
 }

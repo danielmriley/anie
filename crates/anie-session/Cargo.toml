@@ -11,9 +11,11 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+fs4.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true

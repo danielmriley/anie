@@ -1165,8 +1165,27 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
 
     let session = if let Some(session_id) = &cli.resume {
         let path = sessions_dir.join(format!("{session_id}.jsonl"));
-        SessionManager::open_session(&path)
-            .with_context(|| format!("failed to open session {session_id}"))?
+        SessionManager::open_session(&path).map_err(|err| {
+            // Detect the AlreadyOpen variant anywhere in the error
+            // chain and surface a more actionable message.
+            if err.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<anie_session::SessionError>(),
+                    Some(anie_session::SessionError::AlreadyOpen(_))
+                )
+            }) {
+                anyhow::anyhow!(
+                    "Session {session_id} is already open in another anie process.\n\
+                     \n\
+                     Options:\n\
+                     - Close the other anie session and try again.\n\
+                     - Use `/fork` from within the other process to branch.\n\
+                     - Start a new session by omitting --resume."
+                )
+            } else {
+                err.context(format!("failed to open session {session_id}"))
+            }
+        })?
     } else {
         SessionManager::new_session(&sessions_dir, &cwd)?
     };
