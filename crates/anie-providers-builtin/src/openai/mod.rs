@@ -17,6 +17,10 @@ use crate::{
     parse_retry_after, sse_stream,
 };
 
+mod tagged_reasoning;
+
+use tagged_reasoning::{StreamContentPart, TaggedReasoningSplitter};
+
 /// OpenAI-compatible chat-completions provider implementation.
 #[derive(Clone)]
 pub struct OpenAIProvider {
@@ -623,159 +627,6 @@ fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         })
-}
-
-const TAGGED_REASONING_TAGS: [(&str, &str); 3] = [
-    ("<think>", "</think>"),
-    ("<thinking>", "</thinking>"),
-    ("<reasoning>", "</reasoning>"),
-];
-
-enum StreamContentPart {
-    Text(String),
-    Thinking(String),
-}
-
-#[derive(Clone, Copy)]
-enum TaggedReasoningMode {
-    Text,
-    Thinking { closing_tag: &'static str },
-}
-
-struct TaggedReasoningSplitter {
-    mode: TaggedReasoningMode,
-    pending: String,
-}
-
-impl Default for TaggedReasoningSplitter {
-    fn default() -> Self {
-        Self {
-            mode: TaggedReasoningMode::Text,
-            pending: String::new(),
-        }
-    }
-}
-
-impl TaggedReasoningSplitter {
-    fn push(&mut self, fragment: &str) -> Vec<StreamContentPart> {
-        self.pending.push_str(fragment);
-        self.drain(false)
-    }
-
-    fn finish(&mut self) -> Vec<StreamContentPart> {
-        self.drain(true)
-    }
-
-    fn drain(&mut self, finish: bool) -> Vec<StreamContentPart> {
-        let mut parts = Vec::new();
-
-        loop {
-            match self.mode {
-                TaggedReasoningMode::Text => {
-                    if self.pending.is_empty() {
-                        break;
-                    }
-
-                    if let Some(open_index) = self.pending.find('<') {
-                        if open_index > 0 {
-                            let text = self.pending.drain(..open_index).collect::<String>();
-                            Self::push_part(&mut parts, StreamContentPart::Text(text));
-                            continue;
-                        }
-
-                        if let Some((open_tag, closing_tag)) =
-                            tagged_reasoning_open_tag(&self.pending)
-                        {
-                            self.pending.drain(..open_tag.len());
-                            self.mode = TaggedReasoningMode::Thinking { closing_tag };
-                            continue;
-                        }
-
-                        if !finish && is_prefix_of_any_open_tag(&self.pending) {
-                            break;
-                        }
-
-                        let text = drain_first_char(&mut self.pending);
-                        Self::push_part(&mut parts, StreamContentPart::Text(text));
-                        continue;
-                    }
-
-                    let text = std::mem::take(&mut self.pending);
-                    Self::push_part(&mut parts, StreamContentPart::Text(text));
-                    break;
-                }
-                TaggedReasoningMode::Thinking { closing_tag } => {
-                    if self.pending.is_empty() {
-                        break;
-                    }
-
-                    if let Some(close_index) = self.pending.find('<') {
-                        if close_index > 0 {
-                            let thinking = self.pending.drain(..close_index).collect::<String>();
-                            Self::push_part(&mut parts, StreamContentPart::Thinking(thinking));
-                            continue;
-                        }
-
-                        if self.pending.starts_with(closing_tag) {
-                            self.pending.drain(..closing_tag.len());
-                            self.mode = TaggedReasoningMode::Text;
-                            continue;
-                        }
-
-                        if !finish && closing_tag.starts_with(&self.pending) {
-                            break;
-                        }
-
-                        let thinking = drain_first_char(&mut self.pending);
-                        Self::push_part(&mut parts, StreamContentPart::Thinking(thinking));
-                        continue;
-                    }
-
-                    let thinking = std::mem::take(&mut self.pending);
-                    Self::push_part(&mut parts, StreamContentPart::Thinking(thinking));
-                    break;
-                }
-            }
-        }
-
-        parts
-    }
-
-    fn push_part(parts: &mut Vec<StreamContentPart>, part: StreamContentPart) {
-        match part {
-            StreamContentPart::Text(text) if text.is_empty() => {}
-            StreamContentPart::Thinking(thinking) if thinking.is_empty() => {}
-            StreamContentPart::Text(text) => match parts.last_mut() {
-                Some(StreamContentPart::Text(existing)) => existing.push_str(&text),
-                _ => parts.push(StreamContentPart::Text(text)),
-            },
-            StreamContentPart::Thinking(thinking) => match parts.last_mut() {
-                Some(StreamContentPart::Thinking(existing)) => existing.push_str(&thinking),
-                _ => parts.push(StreamContentPart::Thinking(thinking)),
-            },
-        }
-    }
-}
-
-fn tagged_reasoning_open_tag(input: &str) -> Option<(&'static str, &'static str)> {
-    TAGGED_REASONING_TAGS
-        .iter()
-        .find_map(|(open_tag, closing_tag)| {
-            input
-                .starts_with(open_tag)
-                .then_some((*open_tag, *closing_tag))
-        })
-}
-
-fn is_prefix_of_any_open_tag(input: &str) -> bool {
-    TAGGED_REASONING_TAGS
-        .iter()
-        .any(|(open_tag, _)| open_tag.starts_with(input))
-}
-
-fn drain_first_char(input: &mut String) -> String {
-    let first_char_len = input.chars().next().map_or(0, char::len_utf8);
-    input.drain(..first_char_len).collect()
 }
 
 struct OpenAiStreamState {
