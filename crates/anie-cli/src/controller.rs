@@ -38,7 +38,7 @@ use crate::{
         build_model_catalog, fallback_model_from_provider, resolve_initial_selection,
         resolve_model, resolve_requested_model, upsert_model,
     },
-    runtime::SessionHandle,
+    runtime::{SessionHandle, SystemPromptCache},
     runtime_state::{RuntimeState, load_runtime_state, save_runtime_state},
 };
 
@@ -682,8 +682,7 @@ struct ControllerState {
     provider_registry: Arc<ProviderRegistry>,
     tool_registry: Arc<ToolRegistry>,
     request_options_resolver: Arc<dyn RequestOptionsResolver>,
-    system_prompt: String,
-    context_files_stamp: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    prompt_cache: SystemPromptCache,
     runtime_state: RuntimeState,
     retry_config: RetryConfig,
     /// Catalog of registered slash commands. Sourced from
@@ -933,7 +932,7 @@ impl ControllerState {
             Arc::clone(&self.tool_registry),
             AgentLoopConfig {
                 model: self.current_model.clone(),
-                system_prompt: self.system_prompt.clone(),
+                system_prompt: self.prompt_cache.current().to_string(),
                 thinking: self.current_thinking,
                 tool_execution: ToolExecutionMode::Parallel,
                 request_options_resolver: Arc::clone(&self.request_options_resolver),
@@ -1053,8 +1052,8 @@ impl ControllerState {
             self.config.clone(),
         ));
         let cwd = self.session.cwd().to_path_buf();
-        self.system_prompt = build_system_prompt(&cwd, &self.tool_registry, &self.config)?;
-        self.context_files_stamp = context_files_stamp(&cwd, &self.config);
+        self.prompt_cache
+            .replace(&cwd, &self.tool_registry, &self.config)?;
         self.persist_runtime_state();
         Ok(())
     }
@@ -1062,13 +1061,8 @@ impl ControllerState {
     /// Rebuild the system prompt if the set of context files or any of their mtimes changed.
     fn refresh_system_prompt_if_needed(&mut self) {
         let cwd = self.session.cwd().to_path_buf();
-        let current_stamp = context_files_stamp(&cwd, &self.config);
-        if current_stamp != self.context_files_stamp
-            && let Ok(prompt) = build_system_prompt(&cwd, &self.tool_registry, &self.config)
-        {
-            self.system_prompt = prompt;
-            self.context_files_stamp = current_stamp;
-        }
+        self.prompt_cache
+            .refresh_if_stale(&cwd, &self.tool_registry, &self.config);
     }
 }
 
@@ -1126,8 +1120,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
     )?;
 
     let tool_registry = build_tool_registry(&cwd, cli.no_tools);
-    let system_prompt = build_system_prompt(&cwd, &tool_registry, &config)?;
-    let context_files_stamp = context_files_stamp(&cwd, &config);
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
 
@@ -1141,8 +1134,7 @@ async fn prepare_controller_state(cli: &Cli) -> Result<ControllerState> {
         provider_registry,
         tool_registry,
         request_options_resolver,
-        system_prompt,
-        context_files_stamp,
+        prompt_cache,
         runtime_state: runtime_state.clone(),
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
@@ -1211,7 +1203,7 @@ pub fn build_system_prompt(
 /// Return a deterministic stamp of the currently-visible context files and their mtimes.
 ///
 /// Unlike a single max-mtime, this detects deletion or modification of any context file.
-fn context_files_stamp(
+pub(crate) fn context_files_stamp(
     cwd: &Path,
     config: &AnieConfig,
 ) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
