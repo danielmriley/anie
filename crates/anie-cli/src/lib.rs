@@ -1,6 +1,7 @@
 //! CLI entry points for interactive, print, and RPC modes.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+mod compaction;
 mod controller;
 mod model_catalog;
 mod models_command;

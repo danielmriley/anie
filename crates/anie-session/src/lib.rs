@@ -23,8 +23,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use fs4::fs_std::FileExt;
-use futures::{StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -63,11 +63,8 @@ fn try_acquire_session_lock(file: &File, path: &Path) -> Result<bool, SessionErr
     }
 }
 
-use anie_protocol::{AssistantMessage, ContentBlock, Message, UserMessage, now_millis};
-use anie_provider::{
-    LlmContext, Model, ProviderEvent, ProviderRegistry, RequestOptionsResolver, StreamOptions,
-    ThinkingLevel,
-};
+use anie_protocol::{ContentBlock, Message, UserMessage};
+use anie_provider::ThinkingLevel;
 
 /// Session-file header. Always the first line in a session JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -228,6 +225,32 @@ pub struct CompactionConfig {
     pub reserve_tokens: u64,
     /// Recent token budget kept verbatim.
     pub keep_recent_tokens: u64,
+}
+
+/// Summarizes a range of messages into compact text for context
+/// compaction.
+///
+/// The session crate no longer knows how to talk to LLM providers —
+/// callers (typically the CLI's `CompactionStrategy`) implement this
+/// trait against their `ProviderRegistry` + resolver + selected
+/// model. Keeping the contract narrow lets the session crate stay
+/// provider-agnostic.
+#[async_trait]
+pub trait MessageSummarizer: Send + Sync {
+    /// Produce a summary of `messages`.
+    ///
+    /// - `messages` is the conversation slice to be compacted.
+    /// - `existing_summary` is the most recent prior compaction
+    ///   summary on the active branch, if any. Implementations
+    ///   should merge with rather than replace it.
+    ///
+    /// Returns the new summary text. Must return an error if the
+    /// summary is empty or the underlying request fails.
+    async fn summarize(
+        &self,
+        messages: &[Message],
+        existing_summary: Option<&str>,
+    ) -> Result<String>;
 }
 
 /// Listed session metadata for `/session list` and resume flows.
@@ -617,13 +640,13 @@ impl SessionManager {
         }
     }
 
-    /// Compact the session if the current context exceeds the configured threshold.
+    /// Compact the session if the current context exceeds the
+    /// configured threshold. The summarizer is only invoked when
+    /// compaction actually runs.
     pub async fn auto_compact(
         &mut self,
         config: &CompactionConfig,
-        model: &Model,
-        request_options_resolver: &dyn RequestOptionsResolver,
-        provider_registry: &ProviderRegistry,
+        summarizer: &dyn MessageSummarizer,
     ) -> Result<Option<CompactionResult>> {
         let context = self.build_context();
         let tokens_before = estimate_context_tokens(&context.messages);
@@ -631,34 +654,22 @@ impl SessionManager {
         if tokens_before <= threshold {
             return Ok(None);
         }
-        self.compact_internal(
-            tokens_before,
-            config.keep_recent_tokens,
-            model,
-            request_options_resolver,
-            provider_registry,
-        )
-        .await
+        self.compact_internal(tokens_before, config.keep_recent_tokens, summarizer)
+            .await
     }
 
-    /// Force a compaction attempt even if the threshold has not yet been exceeded.
+    /// Force a compaction attempt even if the threshold has not yet
+    /// been exceeded. Returns `Ok(None)` if there isn't enough
+    /// discardable context to compact.
     pub async fn force_compact(
         &mut self,
         config: &CompactionConfig,
-        model: &Model,
-        request_options_resolver: &dyn RequestOptionsResolver,
-        provider_registry: &ProviderRegistry,
+        summarizer: &dyn MessageSummarizer,
     ) -> Result<Option<CompactionResult>> {
         let context = self.build_context();
         let tokens_before = estimate_context_tokens(&context.messages);
-        self.compact_internal(
-            tokens_before,
-            config.keep_recent_tokens,
-            model,
-            request_options_resolver,
-            provider_registry,
-        )
-        .await
+        self.compact_internal(tokens_before, config.keep_recent_tokens, summarizer)
+            .await
     }
 
     /// Return the latest compaction summary on the active branch, if any.
@@ -745,9 +756,7 @@ impl SessionManager {
         &mut self,
         tokens_before: u64,
         keep_recent_tokens: u64,
-        model: &Model,
-        request_options_resolver: &dyn RequestOptionsResolver,
-        provider_registry: &ProviderRegistry,
+        summarizer: &dyn MessageSummarizer,
     ) -> Result<Option<CompactionResult>> {
         let context = self.build_context();
         let Ok((discard, _keep, first_kept_entry_id)) =
@@ -756,8 +765,13 @@ impl SessionManager {
             return Ok(None);
         };
 
-        let summary = self
-            .summarize_messages(&discard, model, request_options_resolver, provider_registry)
+        let source_messages = discard
+            .iter()
+            .map(|message| message.message.clone())
+            .collect::<Vec<_>>();
+        let existing_summary = self.latest_compaction_summary();
+        let summary = summarizer
+            .summarize(&source_messages, existing_summary.as_deref())
             .await?;
 
         let entry = SessionEntry::Compaction {
@@ -778,84 +792,6 @@ impl SessionManager {
             first_kept_entry_id,
             messages_discarded: discard.len(),
         }))
-    }
-
-    async fn summarize_messages(
-        &self,
-        messages: &[SessionContextMessage],
-        model: &Model,
-        request_options_resolver: &dyn RequestOptionsResolver,
-        provider_registry: &ProviderRegistry,
-    ) -> Result<String> {
-        let source_messages = messages
-            .iter()
-            .map(|message| message.message.clone())
-            .collect::<Vec<_>>();
-        let prompt = build_compaction_prompt(
-            &source_messages,
-            self.latest_compaction_summary().as_deref(),
-        );
-
-        let summary_prompt = vec![Message::User(UserMessage {
-            content: vec![ContentBlock::Text { text: prompt }],
-            timestamp: now_millis(),
-        })];
-
-        let request = request_options_resolver
-            .resolve(model, &source_messages)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let provider = provider_registry
-            .get(&model.api)
-            .ok_or_else(|| anyhow!("no provider registered for {:?}", model.api))?;
-
-        let mut resolved_model = model.clone();
-        if let Some(base_url_override) = request.base_url_override {
-            resolved_model.base_url = base_url_override;
-        }
-
-        let llm_context = LlmContext {
-            system_prompt: "You summarize coding-assistant sessions so work can continue after context compaction. Preserve goals, progress, key decisions, file paths, and remaining tasks.".into(),
-            messages: provider.convert_messages(&summary_prompt),
-            tools: Vec::new(),
-        };
-        let options = StreamOptions {
-            api_key: request.api_key,
-            temperature: None,
-            max_tokens: Some(resolved_model.max_tokens.min(4_096)),
-            thinking: ThinkingLevel::Off,
-            headers: request.headers,
-        };
-
-        let stream = provider
-            .stream(&resolved_model, llm_context, options)
-            .map_err(anyhow::Error::from)?;
-        pin_mut!(stream);
-
-        let mut collected = String::new();
-        while let Some(event) = stream.next().await {
-            match event.map_err(anyhow::Error::from)? {
-                ProviderEvent::TextDelta(text) | ProviderEvent::ThinkingDelta(text) => {
-                    collected.push_str(&text);
-                }
-                ProviderEvent::Done(message) => {
-                    if collected.trim().is_empty() {
-                        collected = join_assistant_text(&message);
-                    }
-                    break;
-                }
-                ProviderEvent::Start
-                | ProviderEvent::ToolCallStart(_)
-                | ProviderEvent::ToolCallDelta { .. }
-                | ProviderEvent::ToolCallEnd { .. } => {}
-            }
-        }
-
-        let summary = collected.trim().to_string();
-        if summary.is_empty() {
-            return Err(anyhow!("compaction summary was empty"));
-        }
-        Ok(summary)
     }
 }
 
@@ -1046,18 +982,6 @@ fn join_text_content(blocks: &[ContentBlock]) -> String {
         .join("\n")
 }
 
-fn join_assistant_text(message: &AssistantMessage) -> String {
-    let text = join_text_content(&message.content);
-    if text.is_empty() {
-        message
-            .error_message
-            .clone()
-            .unwrap_or_else(|| String::from("[empty summary response]"))
-    } else {
-        text
-    }
-}
-
 fn now_iso8601() -> Result<String> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -1071,38 +995,35 @@ mod tests {
 
     use super::*;
     use anie_protocol::{AssistantMessage, StopReason, ToolResultMessage, Usage};
-    use anie_provider::{
-        ApiKind, CostPerMillion, Model, ProviderError, ProviderEvent, ProviderRegistry,
-        ResolvedRequestOptions,
-        mock::{MockProvider, MockStreamScript},
-    };
 
-    struct StaticResolver;
+    /// Test double for `MessageSummarizer`. Records every call and
+    /// returns a pre-baked summary string.
+    struct RecordingSummarizer {
+        summary: String,
+        calls: std::sync::Mutex<Vec<(Vec<Message>, Option<String>)>>,
+    }
 
-    #[async_trait]
-    impl RequestOptionsResolver for StaticResolver {
-        async fn resolve(
-            &self,
-            _model: &Model,
-            _context: &[Message],
-        ) -> Result<ResolvedRequestOptions, ProviderError> {
-            Ok(ResolvedRequestOptions::default())
+    impl RecordingSummarizer {
+        fn with_summary(summary: &str) -> Self {
+            Self {
+                summary: summary.to_string(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
         }
     }
 
-    fn sample_model() -> Model {
-        Model {
-            id: "mock-model".into(),
-            name: "Mock Model".into(),
-            provider: "mock".into(),
-            api: ApiKind::OpenAICompletions,
-            base_url: "http://localhost".into(),
-            context_window: 128_000,
-            max_tokens: 8_192,
-            supports_reasoning: false,
-            reasoning_capabilities: None,
-            supports_images: false,
-            cost_per_million: CostPerMillion::zero(),
+    #[async_trait]
+    impl MessageSummarizer for RecordingSummarizer {
+        async fn summarize(
+            &self,
+            messages: &[Message],
+            existing_summary: Option<&str>,
+        ) -> Result<String> {
+            self.calls
+                .lock()
+                .expect("summarizer call log lock")
+                .push((messages.to_vec(), existing_summary.map(str::to_string)));
+            Ok(self.summary.clone())
         }
     }
 
@@ -1394,76 +1315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_compact_collects_thinking_deltas_for_reasoning_heavy_transcripts() {
-        let tempdir = tempdir().expect("tempdir");
-        let cwd = tempdir.path().join("project");
-        fs::create_dir_all(&cwd).expect("cwd");
-        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
-        session
-            .append_message(&user_message(&"a".repeat(3_000), 1))
-            .expect("append first");
-        session
-            .append_message(&assistant_message_with_thinking(
-                &"p".repeat(2_000),
-                &"b".repeat(2_000),
-                2,
-            ))
-            .expect("append second");
-        session
-            .append_message(&user_message("recent prompt", 3))
-            .expect("append third");
-
-        let summary_message = AssistantMessage {
-            content: vec![
-                ContentBlock::Thinking {
-                    thinking: "Reasoning ".into(),
-                },
-                ContentBlock::Text {
-                    text: "Summary".into(),
-                },
-            ],
-            usage: Usage::default(),
-            stop_reason: StopReason::Stop,
-            error_message: None,
-            provider: "mock".into(),
-            model: "mock-model".into(),
-            timestamp: 10,
-        };
-        let mut registry = ProviderRegistry::new();
-        registry.register(
-            ApiKind::OpenAICompletions,
-            Box::new(MockProvider::new(vec![MockStreamScript::new(vec![
-                Ok(ProviderEvent::Start),
-                Ok(ProviderEvent::ThinkingDelta("Reasoning ".into())),
-                Ok(ProviderEvent::TextDelta("Summary".into())),
-                Ok(ProviderEvent::Done(summary_message)),
-            ])])),
-        );
-
-        let result = session
-            .auto_compact(
-                &CompactionConfig {
-                    context_window: 1_000,
-                    reserve_tokens: 100,
-                    keep_recent_tokens: 100,
-                },
-                &sample_model(),
-                &StaticResolver,
-                &registry,
-            )
-            .await
-            .expect("auto compact")
-            .expect("compaction result");
-
-        assert_eq!(result.summary, "Reasoning Summary");
-        let context = session.build_context();
-        assert!(
-            matches!(&context.messages[0].message, Message::User(user) if join_text_content(&user.content).contains("Reasoning Summary"))
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_compact_summarizes_and_persists_entry() {
+    async fn auto_compact_invokes_summarizer_and_persists_entry() {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("project");
         fs::create_dir_all(&cwd).expect("cwd");
@@ -1478,24 +1330,7 @@ mod tests {
             .append_message(&user_message("recent prompt", 3))
             .expect("append third");
 
-        let summary_message = AssistantMessage {
-            content: vec![ContentBlock::Text {
-                text: "Goal\n\nProgress".into(),
-            }],
-            usage: Usage::default(),
-            stop_reason: StopReason::Stop,
-            error_message: None,
-            provider: "mock".into(),
-            model: "mock-model".into(),
-            timestamp: 10,
-        };
-        let mut registry = ProviderRegistry::new();
-        registry.register(
-            ApiKind::OpenAICompletions,
-            Box::new(MockProvider::new(vec![MockStreamScript::from_message(
-                summary_message,
-            )])),
-        );
+        let summarizer = RecordingSummarizer::with_summary("Goal\n\nProgress");
 
         let result = session
             .auto_compact(
@@ -1504,9 +1339,7 @@ mod tests {
                     reserve_tokens: 100,
                     keep_recent_tokens: 100,
                 },
-                &sample_model(),
-                &StaticResolver,
-                &registry,
+                &summarizer,
             )
             .await
             .expect("auto compact")

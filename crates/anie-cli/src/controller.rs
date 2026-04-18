@@ -35,6 +35,7 @@ use anie_tui::{App, UiAction, install_panic_hook, restore_terminal, run_tui, set
 
 use crate::{
     Cli,
+    compaction::CompactionStrategy,
     model_catalog::{
         build_model_catalog, fallback_model_from_provider, resolve_initial_selection,
         resolve_model, resolve_requested_model, upsert_model,
@@ -709,62 +710,61 @@ impl ControllerState {
         Ok(())
     }
 
-    async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
+    /// Build the compaction config + summarizer for the current
+    /// session state. Used by every compaction call site.
+    fn compaction_strategy(
+        &self,
+        keep_recent_tokens: u64,
+    ) -> (CompactionConfig, CompactionStrategy) {
         let config = CompactionConfig {
             context_window: self.current_model.context_window,
             reserve_tokens: self.config.compaction.reserve_tokens,
-            keep_recent_tokens: self.config.compaction.keep_recent_tokens,
+            keep_recent_tokens,
         };
-        if let Some(result) = self
-            .session
-            .auto_compact(
-                &config,
-                &self.current_model,
-                self.request_options_resolver.as_ref(),
-                self.provider_registry.as_ref(),
-            )
-            .await?
-        {
+        let strategy = CompactionStrategy::new(
+            self.current_model.clone(),
+            Arc::clone(&self.provider_registry),
+            Arc::clone(&self.request_options_resolver),
+        );
+        (config, strategy)
+    }
+
+    /// Emit the `CompactionEnd` event for a successful compaction.
+    /// Callers decide whether to follow with a status refresh or a
+    /// transcript replacement, since the ordering matters visually.
+    async fn emit_compaction_end(
+        &self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        result: &anie_session::CompactionResult,
+    ) {
+        let tokens_after = self.estimated_context_tokens();
+        let _ = event_tx
+            .send(AgentEvent::CompactionEnd {
+                summary: result.summary.clone(),
+                tokens_before: result.tokens_before,
+                tokens_after,
+            })
+            .await;
+    }
+
+    async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
+        let (config, strategy) =
+            self.compaction_strategy(self.config.compaction.keep_recent_tokens);
+        if let Some(result) = self.session.auto_compact(&config, &strategy).await? {
             let _ = event_tx.send(AgentEvent::CompactionStart).await;
-            let tokens_after = self.estimated_context_tokens();
-            let _ = event_tx
-                .send(AgentEvent::CompactionEnd {
-                    summary: result.summary,
-                    tokens_before: result.tokens_before,
-                    tokens_after,
-                })
-                .await;
+            self.emit_compaction_end(event_tx, &result).await;
             let _ = event_tx.send(self.status_event()).await;
         }
         Ok(())
     }
 
     async fn force_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
-        let config = CompactionConfig {
-            context_window: self.current_model.context_window,
-            reserve_tokens: self.config.compaction.reserve_tokens,
-            keep_recent_tokens: self.config.compaction.keep_recent_tokens,
-        };
+        let (config, strategy) =
+            self.compaction_strategy(self.config.compaction.keep_recent_tokens);
         let _ = event_tx.send(AgentEvent::CompactionStart).await;
-        match self
-            .session
-            .force_compact(
-                &config,
-                &self.current_model,
-                self.request_options_resolver.as_ref(),
-                self.provider_registry.as_ref(),
-            )
-            .await?
-        {
+        match self.session.force_compact(&config, &strategy).await? {
             Some(result) => {
-                let tokens_after = self.estimated_context_tokens();
-                let _ = event_tx
-                    .send(AgentEvent::CompactionEnd {
-                        summary: result.summary,
-                        tokens_before: result.tokens_before,
-                        tokens_after,
-                    })
-                    .await;
+                self.emit_compaction_end(event_tx, &result).await;
                 let _ = event_tx.send(self.status_event()).await;
             }
             None => {
@@ -868,31 +868,14 @@ impl ControllerState {
                 text: "Context window exceeded; compacting and retrying...".into(),
             })
             .await;
-        let config = CompactionConfig {
-            context_window: self.current_model.context_window,
-            reserve_tokens: self.config.compaction.reserve_tokens,
-            keep_recent_tokens: (self.config.compaction.keep_recent_tokens / 2).max(1_000),
-        };
+        // Overflow recovery halves the keep-recent budget — we're already
+        // over the context window, so we need to discard more aggressively.
+        let keep_recent = (self.config.compaction.keep_recent_tokens / 2).max(1_000);
+        let (config, strategy) = self.compaction_strategy(keep_recent);
         let _ = event_tx.send(AgentEvent::CompactionStart).await;
-        match self
-            .session
-            .force_compact(
-                &config,
-                &self.current_model,
-                self.request_options_resolver.as_ref(),
-                self.provider_registry.as_ref(),
-            )
-            .await?
-        {
+        match self.session.force_compact(&config, &strategy).await? {
             Some(result) => {
-                let tokens_after = self.estimated_context_tokens();
-                let _ = event_tx
-                    .send(AgentEvent::CompactionEnd {
-                        summary: result.summary,
-                        tokens_before: result.tokens_before,
-                        tokens_after,
-                    })
-                    .await;
+                self.emit_compaction_end(event_tx, &result).await;
                 let transcript = self
                     .session_context()
                     .messages

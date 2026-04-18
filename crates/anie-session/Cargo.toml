@@ -11,19 +11,17 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 fs4.workspace = true
-futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-anie-provider.workspace = true
 anie-protocol.workspace = true
+anie-provider.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-anie-provider = { workspace = true, features = ["mock"] }
