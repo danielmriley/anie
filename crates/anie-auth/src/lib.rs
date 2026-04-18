@@ -1,4 +1,5 @@
 //! API-key storage and async request-option resolution.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod store;
 

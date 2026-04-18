@@ -1,4 +1,5 @@
 //! Core agent loop, tool contracts, and execution hooks for anie-rs.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod agent_loop;
 mod hooks;

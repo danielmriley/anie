@@ -88,7 +88,7 @@ impl Provider for MockProvider {
                     Message::Custom(_) => "custom",
                 }
                 .to_string(),
-                content: serde_json::to_value(message).unwrap_or_else(|_| serde_json::Value::Null),
+                content: serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
             })
             .collect()
     }

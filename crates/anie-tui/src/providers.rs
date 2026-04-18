@@ -56,6 +56,10 @@ pub enum TestResult {
 }
 
 /// Actions returned by the provider management screen.
+///
+/// The `ConfigChanged` variant is large because it carries a full `Model`;
+/// kept inline to avoid boxing on a cold path (user-initiated action).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderManagementAction {
     Continue,
@@ -68,6 +72,8 @@ pub enum ProviderManagementAction {
     },
 }
 
+// Plan 02 replaces this enum with a trait-object-based overlay shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum ProviderManagementMode {
     Table,
@@ -240,7 +246,7 @@ impl ProviderManagementScreen {
                 frame,
                 inner,
                 "Working",
-                &format!("{} {message}", spinner_frame),
+                &format!("{spinner_frame} {message}"),
                 Color::Cyan,
                 footer_line("[Esc] Back"),
             ),
@@ -729,7 +735,7 @@ impl ProviderManagementScreen {
         let credential_store = self.credential_store.clone();
         if tokio::runtime::Handle::try_current().is_err() {
             let _ = tx.send(WorkerEvent::TestCompleted {
-                provider: entry.name.clone(),
+                provider: entry.name,
                 result: TestResult::Failed {
                     error: "provider testing requires an async runtime".to_string(),
                 },
@@ -751,13 +757,13 @@ impl ProviderManagementScreen {
             return;
         };
         self.mode = ProviderManagementMode::Busy {
-            message: format!("Saving API key for '{}'…", provider_name),
+            message: format!("Saving API key for '{provider_name}'…"),
         };
         let tx = self.worker_tx.clone();
         let credential_store = self.credential_store.clone();
         if tokio::runtime::Handle::try_current().is_err() {
             let _ = tx.send(WorkerEvent::ApiKeySaved {
-                provider: provider_name.clone(),
+                provider: provider_name,
                 result: Err("saving API keys requires an async runtime".to_string()),
             });
             return;
@@ -964,7 +970,7 @@ fn action_items() -> &'static [ActionItem] {
 }
 
 fn load_provider_entries(
-    write_target: &PathBuf,
+    write_target: &std::path::Path,
     project_config_path: Option<&std::path::Path>,
     credential_store: &CredentialStore,
 ) -> Result<Vec<ProviderEntry>> {

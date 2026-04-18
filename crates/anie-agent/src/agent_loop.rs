@@ -137,27 +137,24 @@ impl AgentLoop {
                 }
             };
 
-            let provider = match self.provider_registry.get(&self.config.model.api) {
-                Some(provider) => provider,
-                None => {
-                    let assistant = self.error_assistant_message(
-                        format!("No provider registered for {:?}", self.config.model.api),
-                        StopReason::Error,
-                    );
-                    self.finish_with_assistant(
-                        assistant,
-                        &mut context,
-                        &mut generated_messages,
-                        &event_tx,
-                        Vec::new(),
-                    )
-                    .await;
-                    return AgentRunResult {
-                        generated_messages,
-                        final_context: context,
-                        terminal_error: None,
-                    };
-                }
+            let Some(provider) = self.provider_registry.get(&self.config.model.api) else {
+                let assistant = self.error_assistant_message(
+                    format!("No provider registered for {:?}", self.config.model.api),
+                    StopReason::Error,
+                );
+                self.finish_with_assistant(
+                    assistant,
+                    &mut context,
+                    &mut generated_messages,
+                    &event_tx,
+                    Vec::new(),
+                )
+                .await;
+                return AgentRunResult {
+                    generated_messages,
+                    final_context: context,
+                    terminal_error: None,
+                };
             };
 
             let mut model = self.config.model.clone();

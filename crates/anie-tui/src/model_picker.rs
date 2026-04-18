@@ -259,7 +259,7 @@ impl ModelPickerPane {
             ];
         }
 
-        let visible = list_height.max(1).min(10);
+        let visible = list_height.clamp(1, 10);
         let start = self
             .scroll
             .min(self.filtered_indices.len().saturating_sub(1));

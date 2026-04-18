@@ -232,25 +232,25 @@ fn convert_single_message(message: &Message) -> LlmMessage {
 fn content_blocks_to_anthropic(content: &[ContentBlock]) -> Vec<serde_json::Value> {
     content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
-            ContentBlock::Image { media_type, data } => Some(json!({
+        .map(|block| match block {
+            ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+            ContentBlock::Image { media_type, data } => json!({
                 "type": "image",
                 "source": {
                     "type": "base64",
                     "media_type": media_type,
                     "data": data,
                 }
-            })),
+            }),
             ContentBlock::Thinking { thinking } => {
-                Some(json!({ "type": "thinking", "thinking": thinking }))
+                json!({ "type": "thinking", "thinking": thinking })
             }
-            ContentBlock::ToolCall(tool_call) => Some(json!({
+            ContentBlock::ToolCall(tool_call) => json!({
                 "type": "tool_use",
                 "id": tool_call.id,
                 "name": tool_call.name,
                 "input": tool_call.arguments,
-            })),
+            }),
         })
         .collect()
 }
@@ -443,6 +443,10 @@ impl AnthropicStreamState {
         Ok(events)
     }
 
+    // Consumes the current state by marking `finished` and taking owned
+    // buffers out. Name kept as `into_*` for readability, even though the
+    // receiver is `&mut self`, because the result is a materialized value.
+    #[allow(clippy::wrong_self_convention)]
     fn into_message(&mut self) -> AssistantMessage {
         self.finished = true;
         let content = self

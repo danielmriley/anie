@@ -1,6 +1,10 @@
 use std::time::Duration;
 
 /// Create the shared HTTP client used by built-in providers.
+///
+/// Panics if TLS roots cannot be loaded. Plan 04 / 08-B replaces
+/// this with a proper `Result` return.
+#[allow(clippy::expect_used)]
 pub fn create_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(300))

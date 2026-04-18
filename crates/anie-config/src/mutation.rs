@@ -137,6 +137,10 @@ fn remove_key_from_table(item: &mut Item, key: &str) {
     }
 }
 
+// Internal helper: callers always pass an item created as a table, and we
+// assign `ArrayOfTables` immediately before the second downcast. The
+// invariants are local to this file.
+#[allow(clippy::expect_used)]
 fn ensure_models_array(provider_item: &mut Item) -> &mut ArrayOfTables {
     let table = provider_item
         .as_table_mut()

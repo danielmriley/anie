@@ -1,4 +1,5 @@
 //! Built-in provider implementations and shared HTTP/SSE helpers.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod anthropic;
 mod http;

@@ -1,4 +1,5 @@
 //! Shared protocol types used across the anie-rs workspace.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod content;
 mod events;

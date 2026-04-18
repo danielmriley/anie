@@ -622,9 +622,7 @@ fn boxed_lines(
 fn diff_line_style(line: &str, is_error: bool) -> Style {
     if line.starts_with('+') {
         Style::default().fg(Color::Green)
-    } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
-    } else if is_error {
+    } else if line.starts_with('-') || is_error {
         Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::DarkGray)

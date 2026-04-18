@@ -205,7 +205,7 @@ impl InputPane {
 
     fn move_to_line_end(&mut self) {
         let suffix = &self.content[self.cursor..];
-        self.cursor = self.cursor + suffix.find('\n').unwrap_or(suffix.len());
+        self.cursor += suffix.find('\n').unwrap_or(suffix.len());
     }
 
     fn move_word_left(&mut self) {

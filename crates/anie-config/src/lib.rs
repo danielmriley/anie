@@ -1,4 +1,5 @@
 //! TOML configuration loading, merging, and project-context discovery.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,7 +20,7 @@ use anie_provider::{
 pub use mutation::ConfigMutator;
 
 /// Fully-resolved application configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AnieConfig {
     /// Default model configuration.
     pub model: ModelConfig,
@@ -29,17 +30,6 @@ pub struct AnieConfig {
     pub compaction: CompactionConfig,
     /// Project-context discovery limits.
     pub context: ContextConfig,
-}
-
-impl Default for AnieConfig {
-    fn default() -> Self {
-        Self {
-            model: ModelConfig::default(),
-            providers: HashMap::new(),
-            compaction: CompactionConfig::default(),
-            context: ContextConfig::default(),
-        }
-    }
 }
 
 /// Default model selection.

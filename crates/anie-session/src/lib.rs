@@ -1,4 +1,5 @@
 //! Session persistence and context compaction for anie-rs.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -419,7 +420,8 @@ impl SessionManager {
             message: message.clone(),
         };
         let mut ids = self.add_entries(vec![entry])?;
-        Ok(ids.pop().expect("message append should return one id"))
+        ids.pop()
+            .ok_or_else(|| anyhow::anyhow!("message append returned no id"))
     }
 
     /// Append multiple messages in sequence at the current leaf.
@@ -453,7 +455,8 @@ impl SessionManager {
             model: model.to_string(),
         };
         let mut ids = self.add_entries(vec![entry])?;
-        Ok(ids.pop().expect("model change append should return one id"))
+        ids.pop()
+            .ok_or_else(|| anyhow::anyhow!("model change append returned no id"))
     }
 
     /// Persist a thinking-level change.
@@ -467,9 +470,8 @@ impl SessionManager {
             level,
         };
         let mut ids = self.add_entries(vec![entry])?;
-        Ok(ids
-            .pop()
-            .expect("thinking change append should return one id"))
+        ids.pop()
+            .ok_or_else(|| anyhow::anyhow!("thinking change append returned no id"))
     }
 
     /// Return the active branch from root to leaf.

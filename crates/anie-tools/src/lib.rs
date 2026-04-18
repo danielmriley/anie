@@ -1,4 +1,5 @@
 //! Core read/write/bash tool implementations and file-mutation serialization.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod bash;
 mod edit;

@@ -863,10 +863,7 @@ impl OpenAiStreamState {
                             .get("index")
                             .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0) as usize;
-                        let state = self
-                            .tool_calls
-                            .entry(index)
-                            .or_insert_with(OpenAiToolCallState::new);
+                        let state = self.tool_calls.entry(index).or_default();
                         if let Some(id) = tool_call.get("id").and_then(serde_json::Value::as_str) {
                             state.id = id.to_string();
                         }
@@ -969,6 +966,10 @@ impl OpenAiStreamState {
         !self.text.is_empty() || self.tool_calls.values().any(|state| !state.id.is_empty())
     }
 
+    // Materializes the accumulated state into an `AssistantMessage`. Uses
+    // `&mut self` (not `self`) so the state machine can keep draining any
+    // buffered tagged-reasoning content before returning.
+    #[allow(clippy::wrong_self_convention)]
     fn into_message(&mut self) -> AssistantMessage {
         self.finished = true;
         let _ = self.finish_tagged_content();
@@ -1023,12 +1024,6 @@ struct OpenAiToolCallState {
     arguments: String,
     started: bool,
     ended: bool,
-}
-
-impl OpenAiToolCallState {
-    fn new() -> Self {
-        Self::default()
-    }
 }
 
 #[cfg(test)]

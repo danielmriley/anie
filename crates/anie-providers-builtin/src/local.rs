@@ -87,6 +87,10 @@ pub fn default_local_reasoning_capabilities(
 }
 
 /// Detect commonly-used local model servers using the OpenAI-compatible `/v1/models` route.
+///
+/// Panics if the HTTP client cannot be built (TLS roots). Plan 08-B converts
+/// this to propagate a `Result` alongside the main HTTP client cleanup.
+#[allow(clippy::expect_used)]
 pub async fn detect_local_servers() -> Vec<LocalServer> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))

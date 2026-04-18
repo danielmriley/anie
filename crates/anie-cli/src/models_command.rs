@@ -214,8 +214,6 @@ fn print_models_table(rows: &[(String, ModelInfo)]) {
 
 fn format_context(value: Option<u64>) -> String {
     match value {
-        Some(tokens) if tokens >= 1_000_000 => format!("{}", tokens),
-        Some(tokens) if tokens >= 1_000 => format!("{}", tokens),
         Some(tokens) => tokens.to_string(),
         None => String::new(),
     }

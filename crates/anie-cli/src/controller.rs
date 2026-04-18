@@ -1379,10 +1379,10 @@ fn fallback_model_from_provider(
     let provider_config = config.providers.get(provider);
     let api = provider_config
         .and_then(|provider| provider.api)
-        .or_else(|| match provider {
-            "anthropic" => Some(ApiKind::AnthropicMessages),
-            _ => Some(ApiKind::OpenAICompletions),
-        })?;
+        .or(Some(match provider {
+            "anthropic" => ApiKind::AnthropicMessages,
+            _ => ApiKind::OpenAICompletions,
+        }))?;
     let base_url = provider_config
         .and_then(|provider| provider.base_url.clone())
         .or_else(|| {
@@ -1537,13 +1537,11 @@ fn spawn_shutdown_signal_forwarder(action_tx: mpsc::Sender<UiAction>) {
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
 
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(signal) => signal,
-                Err(_) => return,
+            let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+                return;
             };
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(signal) => signal,
-                Err(_) => return,
+            let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+                return;
             };
 
             tokio::select! {
@@ -1614,13 +1612,13 @@ fn format_thinking(level: ThinkingLevel) -> String {
 
 fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
-        if tokens.is_multiple_of(1_000_000) {
+        if tokens % 1_000_000 == 0 {
             format!("{}M", tokens / 1_000_000)
         } else {
             format!("{:.1}M", tokens as f64 / 1_000_000.0)
         }
     } else if tokens >= 1_000 {
-        if tokens.is_multiple_of(1_000) {
+        if tokens % 1_000 == 0 {
             format!("{}k", tokens / 1_000)
         } else {
             format!("{:.1}k", tokens as f64 / 1_000.0)

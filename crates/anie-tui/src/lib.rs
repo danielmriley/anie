@@ -1,4 +1,5 @@
 //! Terminal UI rendering for anie-rs.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod app;
 mod input;

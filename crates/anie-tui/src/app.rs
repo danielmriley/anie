@@ -56,6 +56,10 @@ pub struct App {
     worker_rx: mpsc::UnboundedReceiver<AppWorkerEvent>,
 }
 
+// The ModelPicker variant is intentionally large; the enum holds at most
+// one pane and is not cloned on a hot path. Plan 02's overlay trait
+// supersedes this shape in time.
+#[allow(clippy::large_enum_variant)]
 enum BottomPane {
     Editor,
     ModelPicker(ModelPickerSession),
@@ -81,6 +85,11 @@ enum AppWorkerEvent {
     },
 }
 
+// Plan 02 replaces this enum with `Option<Box<dyn OverlayScreen>>`, which
+// will also resolve the large-variant concern. Until then, accept the
+// disparity — the enum lives on the `App` for at most one active overlay
+// and is not cloned.
+#[allow(clippy::large_enum_variant)]
 enum OverlayState {
     Onboarding(OnboardingScreen),
     Providers(ProviderManagementScreen),
@@ -904,7 +913,7 @@ impl App {
     fn spawn_model_discovery(&self, context: ModelPickerContext) {
         if tokio::runtime::Handle::try_current().is_err() {
             let _ = self.worker_tx.send(AppWorkerEvent::ModelDiscoveryComplete {
-                provider_name: context.provider_name.clone(),
+                provider_name: context.provider_name,
                 result: Err("model discovery requires an async runtime".to_string()),
             });
             return;
@@ -1223,13 +1232,13 @@ fn render_status_bar(
 
 fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
-        if tokens.is_multiple_of(1_000_000) {
+        if tokens % 1_000_000 == 0 {
             format!("{}M", tokens / 1_000_000)
         } else {
             format!("{:.1}M", tokens as f64 / 1_000_000.0)
         }
     } else if tokens >= 1_000 {
-        if tokens.is_multiple_of(1_000) {
+        if tokens % 1_000 == 0 {
             format!("{}k", tokens / 1_000)
         } else {
             format!("{:.1}k", tokens as f64 / 1_000.0)

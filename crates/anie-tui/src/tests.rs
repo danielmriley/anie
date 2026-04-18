@@ -1176,7 +1176,7 @@ fn render_buffer_to_string(buffer: &Buffer) -> String {
     for y in 0..area.height {
         let mut row = String::new();
         for x in 0..area.width {
-            row.push_str(&buffer[(x, y)].symbol());
+            row.push_str(buffer[(x, y)].symbol());
         }
         rows.push(row.trim_end().to_string());
     }

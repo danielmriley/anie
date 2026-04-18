@@ -1,4 +1,5 @@
 //! Provider traits, model metadata, and request-resolution contracts for anie-rs.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod api_kind;
 mod error;

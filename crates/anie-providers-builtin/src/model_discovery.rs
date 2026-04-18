@@ -331,7 +331,7 @@ async fn discover_ollama_tags(
                     .details
                     .as_ref()
                     .and_then(|details| {
-                        details.family.as_ref().map(String::as_str).or_else(|| {
+                        details.family.as_deref().or_else(|| {
                             details
                                 .families
                                 .as_ref()

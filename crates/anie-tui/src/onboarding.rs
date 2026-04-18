@@ -294,7 +294,7 @@ impl OnboardingScreen {
                 frame,
                 inner,
                 "Local Servers",
-                &format!("{} Scanning for local servers…", spinner_frame),
+                &format!("{spinner_frame} Scanning for local servers…"),
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::LocalServerSelect { selected } => {
@@ -321,14 +321,14 @@ impl OnboardingScreen {
                 frame,
                 inner,
                 &title,
-                &format!("{} {message}", spinner_frame),
+                &format!("{spinner_frame} {message}"),
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::DiscoveringModels { message, .. } => self.render_busy_panel(
                 frame,
                 inner,
                 "Model Discovery",
-                &format!("{} {message}", spinner_frame),
+                &format!("{spinner_frame} {message}"),
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::PickingModel { picker, .. } => {
@@ -552,11 +552,8 @@ impl OnboardingScreen {
     }
 
     fn handle_local_waiting_key(&mut self, key: KeyEvent) -> OnboardingAction {
-        match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Esc) => {
-                self.state = OnboardingState::MainMenu { selected: 0 };
-            }
-            _ => {}
+        if let (KeyModifiers::NONE, KeyCode::Esc) = (key.modifiers, key.code) {
+            self.state = OnboardingState::MainMenu { selected: 0 };
         }
         OnboardingAction::Continue
     }
@@ -670,7 +667,7 @@ impl OnboardingScreen {
                     .unwrap_or_else(default_openai_preset);
                 let return_to = self.state.clone();
                 self.state = OnboardingState::Busy {
-                    title: format!("{}", preset.display_name),
+                    title: preset.display_name.to_string(),
                     message: "Verifying API key…".to_string(),
                     return_to: Box::new(return_to),
                 };
@@ -765,8 +762,8 @@ impl OnboardingScreen {
     }
 
     fn handle_busy_key(&mut self, key: KeyEvent) -> OnboardingAction {
-        match (key.modifiers, key.code) {
-            (KeyModifiers::NONE, KeyCode::Esc) => match &self.state {
+        if let (KeyModifiers::NONE, KeyCode::Esc) = (key.modifiers, key.code) {
+            match &self.state {
                 OnboardingState::Busy { return_to, .. }
                 | OnboardingState::Error { return_to, .. } => {
                     self.state = (**return_to).clone();
@@ -775,8 +772,7 @@ impl OnboardingScreen {
                     self.state = self.return_state_for_context(context);
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
         OnboardingAction::Continue
     }
@@ -1073,8 +1069,7 @@ impl OnboardingScreen {
                         is_default: true,
                     },
                     format!(
-                        "Model discovery failed ({message}). Using manual model ID {}.",
-                        manual_model_id
+                        "Model discovery failed ({message}). Using manual model ID {manual_model_id}.",
                     ),
                 ))
             }
@@ -1175,7 +1170,7 @@ impl OnboardingScreen {
                 frame,
                 area,
                 "Local Servers",
-                &format!("{} Scanning for local servers…", spinner_frame),
+                &format!("{spinner_frame} Scanning for local servers…"),
                 footer_line("[Esc] Back"),
             );
             return;
@@ -1679,6 +1674,9 @@ pub fn write_configured_providers(
         }
     }
 
+    // Safe because `providers` is verified non-empty above (caller asserts;
+    // the file rewrites are called after the list is populated).
+    #[allow(clippy::expect_used)]
     let default = providers
         .iter()
         .rev()
@@ -2139,7 +2137,7 @@ mod tests {
             server: sample_local_server(),
         };
         screen.handle_worker_event(WorkerEvent::ModelsDiscovered {
-            context: context.clone(),
+            context,
             result: Ok(vec![ModelInfo {
                 id: "qwen3:32b".into(),
                 name: "Qwen 3 32B".into(),
@@ -2263,10 +2261,12 @@ mod tests {
     #[test]
     fn custom_endpoint_discovery_failure_uses_manual_model_id_fallback() {
         let mut screen = OnboardingScreen::new_for_tests();
-        let mut form = CustomEndpointForm::default();
-        form.base_url = TextField::from("http://localhost:8080");
-        form.provider_name = TextField::from("custom");
-        form.model_id = TextField::from("manual-model");
+        let form = CustomEndpointForm {
+            base_url: TextField::from("http://localhost:8080"),
+            provider_name: TextField::from("custom"),
+            model_id: TextField::from("manual-model"),
+            ..CustomEndpointForm::default()
+        };
         let context = ModelPickerContext::CustomEndpoint {
             form_snapshot: form,
             api_key: String::new(),

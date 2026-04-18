@@ -134,9 +134,9 @@ async fn registry_streams_using_registered_provider() {
 #[test]
 fn registry_returns_structured_error_when_provider_missing() {
     let registry = ProviderRegistry::new();
-    let error = match registry.stream(&sample_model(), sample_context(), StreamOptions::default()) {
-        Ok(_) => panic!("missing provider should error"),
-        Err(error) => error,
+    let Err(error) = registry.stream(&sample_model(), sample_context(), StreamOptions::default())
+    else {
+        panic!("missing provider should error")
     };
 
     assert!(

@@ -222,10 +222,10 @@ impl CredentialStore {
 
     fn read_provider_from_path(&self, path: Option<&Path>, provider: &str) -> Option<String> {
         let store = load_store_if_present(path)?;
-        match store.providers.get(provider) {
-            Some(AuthCredential::ApiKey { key }) => Some(key.clone()),
-            None => None,
-        }
+        store
+            .providers
+            .get(provider)
+            .map(|AuthCredential::ApiKey { key }| key.clone())
     }
 
     fn migrated_fallback_path(&self) -> Option<PathBuf> {

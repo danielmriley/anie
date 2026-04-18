@@ -52,7 +52,8 @@ impl ToolRegistry {
 
     /// Register a tool, replacing any existing tool with the same name.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.definition().name.clone(), tool);
+        let name = tool.definition().name;
+        self.tools.insert(name, tool);
     }
 
     /// Look up a tool by name.
