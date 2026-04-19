@@ -9,6 +9,30 @@
 //! The state machine delegates tag extraction to `TaggedReasoningSplitter`
 //! (see `super::tagged_reasoning`) and per-slot tool-call tracking to
 //! `OpenAiToolCallState` (local to this module).
+//!
+//! # Round-trip contract
+//!
+//! Provider-minted opaque fields preserved through parse → store →
+//! replay:
+//!
+//! | Field                         | Landing spot                             |
+//! |-------------------------------|------------------------------------------|
+//! | `tool_calls[].id`             | `ToolCall::id`                           |
+//! | `tool_calls[].function.name`  | `ToolCall::name`                         |
+//! | `tool_calls[].function.args`  | `ToolCall::arguments` (accumulated)      |
+//!
+//! Intentionally dropped on replay (captured for display only):
+//!
+//! | Field                                 | Why                           |
+//! |---------------------------------------|-------------------------------|
+//! | `reasoning` / `reasoning_content` /   | OpenAI chat-completions does  |
+//! | `thinking` deltas                     | not round-trip reasoning as   |
+//! |                                       | assistant content.            |
+//! | Tagged `<think>…</think>` etc.        | Local-model thinking output;  |
+//! |                                       | same reason.                  |
+//!
+//! **Last verified against provider docs: 2026-04-19.** Re-audit
+//! quarterly. See docs/api_integrity_plans/03a_stream_field_audit.md.
 
 use std::collections::BTreeMap;
 

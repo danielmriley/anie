@@ -1,3 +1,33 @@
+//! Anthropic Messages API provider.
+//!
+//! # Round-trip contract
+//!
+//! Provider-minted opaque fields preserved through parse → store →
+//! replay (breaking any of these produces HTTP 400 on turn 2+):
+//!
+//! | Field                      | Source SSE event            | Landing spot                             |
+//! |----------------------------|-----------------------------|------------------------------------------|
+//! | `thinking.signature`       | `signature_delta`           | `ContentBlock::Thinking::signature`      |
+//! | `redacted_thinking.data`   | `content_block_start`       | `ContentBlock::RedactedThinking::data`   |
+//! | `tool_use.id`              | `content_block_start`       | `ToolCall::id`                           |
+//! | `tool_use.name`            | `content_block_start`       | `ToolCall::name`                         |
+//! | `tool_use.input`           | `input_json_delta` stream   | `ToolCall::arguments`                    |
+//!
+//! Stream events or fields we intentionally ignore (as of the last
+//! audit below):
+//!
+//! | Event / field                          | Why safe to drop                                |
+//! |----------------------------------------|-------------------------------------------------|
+//! | `ping`                                 | Heartbeat; no payload.                          |
+//! | Usage cache read/write token counters  | Informational; server re-derives from request.  |
+//! | Unknown top-level event type           | Server-side features we don't support yet;      |
+//! |                                        | plan 03b rejects the known-unsupported set.     |
+//!
+//! **Last verified against provider docs: 2026-04-19.**
+//! Re-audit quarterly; bump the date after each audit. If you add a
+//! new field to the parser, add it to the table above.
+//! See docs/api_integrity_plans/03a_stream_field_audit.md.
+
 use std::collections::BTreeMap;
 
 use async_stream::try_stream;
@@ -442,6 +472,12 @@ impl AnthropicStreamState {
                             arguments: serde_json::Value::Null,
                         }));
                     }
+                    // Unknown content_block types. Server-side tool
+                    // usage (`server_tool_use`, `web_search_tool_result`)
+                    // and citation blocks fall here today; plan 03b
+                    // promotes those to typed `UnsupportedStreamFeature`
+                    // errors. Truly new types are ignored until we
+                    // see them in logs and add handling.
                     _ => {}
                 }
             }
@@ -501,6 +537,11 @@ impl AnthropicStreamState {
                             state.signature.push_str(signature);
                         }
                     }
+                    // As of 2026-04-19 Anthropic's content_block_delta
+                    // emits: text_delta, thinking_delta, signature_delta,
+                    // input_json_delta. Any other delta type is either
+                    // internal telemetry we don't need, or a new API
+                    // feature — add handling explicitly if seen in logs.
                     _ => {}
                 }
             }
@@ -536,6 +577,9 @@ impl AnthropicStreamState {
                     .to_string();
                 return Err(ProviderError::MalformedStreamEvent(message));
             }
+            // Unknown top-level event type. Known benign events:
+            // `ping` (heartbeat, no payload). Truly new event types
+            // are ignored until we see them in logs.
             _ => {}
         }
 
