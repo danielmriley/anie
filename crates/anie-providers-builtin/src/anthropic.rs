@@ -95,10 +95,14 @@ impl AnthropicProvider {
         }
     }
 
-    // Test-visible so plan 03d / plan 06 fixture tests can assert on
-    // outbound request shape without hitting the network.
-    #[cfg(test)]
-    pub(crate) fn build_request_body_for_test(
+    /// Test-only: expose the serialized request body so integration
+    /// tests can assert on outbound wire shape without hitting the
+    /// network. Gated on `cfg(any(test, feature = "test-utils"))` so
+    /// it never appears in release builds.
+    ///
+    /// See docs/api_integrity_plans/06_integration_tests_multi_turn.md.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn build_request_body_for_test(
         &self,
         model: &Model,
         context: &LlmContext,

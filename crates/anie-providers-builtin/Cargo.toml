@@ -9,6 +9,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes build_request_body_for_test on AnthropicProvider and
+# OpenAIProvider so integration tests can assert on outbound request
+# shape without hitting the network. See
+# docs/api_integrity_plans/06_integration_tests_multi_turn.md.
+test-utils = []
+
 [dependencies]
 anyhow.workspace = true
 async-stream.workspace = true

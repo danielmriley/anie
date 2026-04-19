@@ -10,7 +10,7 @@ anie-auth.workspace = true
 anie-config.workspace = true
 anie-protocol.workspace = true
 anie-provider = { workspace = true, features = ["mock"] }
-anie-providers-builtin.workspace = true
+anie-providers-builtin = { workspace = true, features = ["test-utils"] }
 anie-session.workspace = true
 anie-tools.workspace = true
 anie-tui.workspace = true

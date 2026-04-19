@@ -116,6 +116,19 @@ impl OpenAIProvider {
         )
     }
 
+    /// Test-only: expose the serialized request body so integration
+    /// tests can assert on outbound wire shape without hitting the
+    /// network. See plan 06 for the multi-turn replay harness.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn build_request_body_for_test(
+        &self,
+        model: &Model,
+        context: &LlmContext,
+        options: &StreamOptions,
+    ) -> serde_json::Value {
+        self.build_request_body(model, context, options, true)
+    }
+
     fn build_request_body_with_native_reasoning_strategy(
         &self,
         model: &Model,
