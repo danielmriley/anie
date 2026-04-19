@@ -79,6 +79,17 @@ pub enum ProviderError {
     /// unless the fallback also fails.
     #[error("native reasoning not supported by target: {0}")]
     NativeReasoningUnsupported(String),
+
+    /// The provider stream contained a content-block or event type
+    /// this client cannot round-trip. Usually indicates a server-
+    /// side feature (server tools, citations, web search) was
+    /// enabled somewhere but the client was not built to preserve
+    /// the resulting blocks. Not retryable — the same block would
+    /// appear on a retry.
+    ///
+    /// See docs/api_integrity_plans/03b_unsupported_block_rejection.md.
+    #[error("Unsupported provider stream feature: {0}")]
+    UnsupportedStreamFeature(String),
 }
 
 impl ProviderError {

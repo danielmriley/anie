@@ -80,7 +80,8 @@ impl<'a> RetryPolicy<'a> {
             ProviderError::Auth(_)
             | ProviderError::RequestBuild(_)
             | ProviderError::ToolCallMalformed(_)
-            | ProviderError::NativeReasoningUnsupported(_) => RetryDecision::GiveUp {
+            | ProviderError::NativeReasoningUnsupported(_)
+            | ProviderError::UnsupportedStreamFeature(_) => RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             },
             ProviderError::RateLimited { .. }
@@ -182,6 +183,21 @@ mod tests {
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
             policy.decide(&ProviderError::Auth("bad key".into()), 0, false),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_stream_feature_gives_up_immediately() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::UnsupportedStreamFeature("server_tool_use".into()),
+                0,
+                false,
+            ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }

@@ -472,13 +472,32 @@ impl AnthropicStreamState {
                             arguments: serde_json::Value::Null,
                         }));
                     }
-                    // Unknown content_block types. Server-side tool
-                    // usage (`server_tool_use`, `web_search_tool_result`)
-                    // and citation blocks fall here today; plan 03b
-                    // promotes those to typed `UnsupportedStreamFeature`
-                    // errors. Truly new types are ignored until we
-                    // see them in logs and add handling.
-                    _ => {}
+                    // Known server-side feature blocks we cannot
+                    // round-trip. Fail loudly rather than silently
+                    // drop — a silent drop here would set up a
+                    // harder-to-diagnose 400 on the next turn. See
+                    // docs/api_integrity_plans/03b.
+                    Some(other)
+                        if other.starts_with("server_tool_use")
+                            || other.starts_with("web_search")
+                            || other == "citations" =>
+                    {
+                        return Err(ProviderError::UnsupportedStreamFeature(format!(
+                            "anthropic block type '{other}' \
+                             — server-side tools and citations are not \
+                             yet supported by anie (see \
+                             docs/api_integrity_plans/03b_unsupported_block_rejection.md)"
+                        )));
+                    }
+                    // Truly unknown types fall through. Log so we can
+                    // spot new API features in logs before they cause
+                    // downstream trouble.
+                    Some(other) => {
+                        eprintln!(
+                            "anthropic: unknown content_block type {other:?} (ignoring)"
+                        );
+                    }
+                    None => {}
                 }
             }
             "content_block_delta" => {
@@ -1042,6 +1061,54 @@ mod tests {
             )),
             "expected redacted thinking block captured verbatim"
         );
+    }
+
+    #[test]
+    fn rejects_server_tool_use_blocks_explicitly() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        let err = state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"server_tool_use","id":"x","name":"web_search"}}"#,
+            )
+            .expect_err("must reject");
+        assert!(matches!(err, ProviderError::UnsupportedStreamFeature(_)));
+    }
+
+    #[test]
+    fn rejects_web_search_result_blocks_explicitly() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        let err = state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"web_search_tool_result"}}"#,
+            )
+            .expect_err("must reject");
+        assert!(matches!(err, ProviderError::UnsupportedStreamFeature(_)));
+    }
+
+    #[test]
+    fn rejects_citations_blocks_explicitly() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        let err = state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"citations"}}"#,
+            )
+            .expect_err("must reject");
+        assert!(matches!(err, ProviderError::UnsupportedStreamFeature(_)));
+    }
+
+    #[test]
+    fn unknown_block_types_are_ignored_softly() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        let events = state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"futuristic_new_block"}}"#,
+            )
+            .expect("soft ignore");
+        assert!(events.is_empty());
     }
 
     #[test]
