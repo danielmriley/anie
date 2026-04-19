@@ -362,8 +362,22 @@ impl AnthropicStreamState {
                             .insert(index, AnthropicBlockState::Text(String::new()));
                     }
                     Some("thinking") => {
-                        self.blocks
-                            .insert(index, AnthropicBlockState::Thinking(String::new()));
+                        // Some Anthropic SSE implementations include an
+                        // initial `signature` on the start event; seed
+                        // the state with it. Deltas accumulate onto the
+                        // same buffer via `signature_delta`.
+                        let signature = block
+                            .get("signature")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        self.blocks.insert(
+                            index,
+                            AnthropicBlockState::Thinking(AnthropicThinkingState {
+                                thinking: String::new(),
+                                signature,
+                            }),
+                        );
                     }
                     Some("tool_use") => {
                         let id = block["id"].as_str().unwrap_or_default().to_string();
@@ -410,10 +424,10 @@ impl AnthropicStreamState {
                             .or_else(|| delta.get("text").and_then(serde_json::Value::as_str))
                             .unwrap_or_default()
                             .to_string();
-                        if let Some(AnthropicBlockState::Thinking(existing)) =
+                        if let Some(AnthropicBlockState::Thinking(state)) =
                             self.blocks.get_mut(&index)
                         {
-                            existing.push_str(&thinking);
+                            state.thinking.push_str(&thinking);
                         }
                         events.push(ProviderEvent::ThinkingDelta(thinking));
                     }
@@ -432,7 +446,20 @@ impl AnthropicStreamState {
                             });
                         }
                     }
-                    Some("signature_delta") => {}
+                    Some("signature_delta") => {
+                        // Opaque signature covering the thinking block;
+                        // required on replay per Anthropic's contract.
+                        // See docs/api_integrity_plans/01b_stream_capture.md.
+                        let signature = delta
+                            .get("signature")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(AnthropicBlockState::Thinking(state)) =
+                            self.blocks.get_mut(&index)
+                        {
+                            state.signature.push_str(signature);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -500,17 +527,22 @@ impl AnthropicStreamState {
 
 enum AnthropicBlockState {
     Text(String),
-    Thinking(String),
+    Thinking(AnthropicThinkingState),
     ToolUse(AnthropicToolUseState),
+}
+
+struct AnthropicThinkingState {
+    thinking: String,
+    signature: String,
 }
 
 impl AnthropicBlockState {
     fn to_content_block(&self) -> ContentBlock {
         match self {
             Self::Text(text) => ContentBlock::Text { text: text.clone() },
-            Self::Thinking(thinking) => ContentBlock::Thinking {
-                thinking: thinking.clone(),
-                signature: None,
+            Self::Thinking(state) => ContentBlock::Thinking {
+                thinking: state.thinking.clone(),
+                signature: (!state.signature.is_empty()).then(|| state.signature.clone()),
             },
             Self::ToolUse(tool_use) => ContentBlock::ToolCall(ToolCall {
                 id: tool_use.id.clone(),
@@ -746,6 +778,158 @@ mod tests {
     fn anthropic_provider_replays_thinking_blocks() {
         let provider = AnthropicProvider::new();
         assert!(provider.includes_thinking_in_replay());
+    }
+
+    #[test]
+    fn captures_signature_delta_on_thinking_block() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "message_start",
+                r#"{"message":{"usage":{"input_tokens":10}}}"#,
+            )
+            .expect("message start");
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"thinking"}}"#,
+            )
+            .expect("thinking start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"reasoning"}}"#,
+            )
+            .expect("thinking delta");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"signature_delta","signature":"SIG_abc"}}"#,
+            )
+            .expect("signature delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+        state
+            .process_event(
+                "message_delta",
+                r#"{"delta":{"stop_reason":"end_turn"}}"#,
+            )
+            .expect("message delta");
+        let done = state
+            .process_event("message_stop", "{}")
+            .expect("message stop");
+
+        let ProviderEvent::Done(message) = done.last().expect("done event") else {
+            panic!("expected done event");
+        };
+        assert!(
+            message.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Thinking { thinking, signature: Some(sig) }
+                    if thinking == "reasoning" && sig == "SIG_abc"
+            )),
+            "expected thinking block with signature captured"
+        );
+    }
+
+    #[test]
+    fn concatenates_split_signature_deltas() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"thinking"}}"#,
+            )
+            .expect("thinking start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"signature_delta","signature":"PART_A_"}}"#,
+            )
+            .expect("signature delta A");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"signature_delta","signature":"PART_B"}}"#,
+            )
+            .expect("signature delta B");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"x"}}"#,
+            )
+            .expect("thinking delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+
+        let message = state.into_message();
+        assert!(
+            message.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Thinking { signature: Some(sig), .. } if sig == "PART_A_PART_B"
+            )),
+            "expected concatenated signature"
+        );
+    }
+
+    #[test]
+    fn uses_content_block_start_signature_when_present() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"thinking","signature":"SEED"}}"#,
+            )
+            .expect("thinking start with signature");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"x"}}"#,
+            )
+            .expect("thinking delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+
+        let message = state.into_message();
+        assert!(
+            message.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Thinking { signature: Some(sig), .. } if sig == "SEED"
+            )),
+            "expected seeded signature"
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_block_has_none_signature() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"thinking"}}"#,
+            )
+            .expect("thinking start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"x"}}"#,
+            )
+            .expect("thinking delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+
+        let message = state.into_message();
+        assert!(
+            message.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Thinking { signature: None, .. }
+            )),
+            "expected unsigned thinking to yield None signature"
+        );
     }
 
     #[test]
