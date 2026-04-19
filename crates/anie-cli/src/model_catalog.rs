@@ -260,3 +260,111 @@ pub(crate) fn dedupe_models(models: &mut Vec<Model>) {
     models.retain(|model| seen.insert((model.provider.clone(), model.id.clone())));
     models.reverse();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_state::RuntimeState;
+    use anie_provider::{
+        ApiKind, CostPerMillion, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
+        ThinkingRequestMode,
+    };
+
+    fn model(id: &str, provider: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: id.into(),
+            provider: provider.into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "http://localhost:11434/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+        }
+    }
+
+    #[test]
+    fn dedupe_models_keeps_later_entries_for_same_provider_and_id() {
+        let mut models = vec![
+            model("o4-mini", "openai"),
+            Model {
+                max_tokens: 16_384,
+                supports_reasoning: true,
+                reasoning_capabilities: Some(ReasoningCapabilities {
+                    control: Some(ReasoningControlMode::Native),
+                    output: Some(ReasoningOutputMode::Separated),
+                    tags: None,
+                    request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+                }),
+                ..model("o4-mini", "openai")
+            },
+        ];
+
+        dedupe_models(&mut models);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].max_tokens, 16_384);
+        assert!(models[0].supports_reasoning);
+        assert_eq!(
+            models[0].reasoning_capabilities,
+            Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_model_honors_provider_and_id() {
+        let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
+        let resolved =
+            resolve_model(Some("ollama"), Some("qwen3:32b"), &models, true).expect("resolve model");
+        assert_eq!(resolved.provider, "ollama");
+        assert_eq!(resolved.id, "qwen3:32b");
+    }
+
+    #[test]
+    fn resolve_model_prefers_local_when_no_hints() {
+        let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
+        let resolved = resolve_model(None, None, &models, true).expect("resolve model");
+        assert_eq!(resolved.provider, "ollama");
+    }
+
+    #[test]
+    fn resolve_initial_selection_prefers_provider_only_override() {
+        let cli = Cli {
+            command: None,
+            interactive: false,
+            print: true,
+            rpc: false,
+            no_tools: false,
+            prompt: vec!["hello".into()],
+            model: None,
+            provider: Some("ollama".into()),
+            api_key: None,
+            thinking: None,
+            resume: None,
+            cwd: None,
+        };
+        let config = AnieConfig::default();
+        let runtime_state = RuntimeState::default();
+        let session_context = SessionContext::empty();
+        let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
+
+        let selection = resolve_initial_selection(
+            &cli,
+            &config,
+            &runtime_state,
+            &session_context,
+            &models,
+            true,
+        )
+        .expect("resolve selection");
+        assert_eq!(selection.model.provider, "ollama");
+    }
+}

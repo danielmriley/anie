@@ -127,6 +127,8 @@ pub enum UiAction {
     SwitchSession(String),
     /// Show registered tools.
     ShowTools,
+    /// Show slash-command help.
+    ShowHelp,
     /// Request the current controller state.
     GetState,
     /// Fork the current conversation into a child session.
@@ -637,7 +639,9 @@ impl App {
                     model: None,
                 });
             }
-            "/help" => self.show_help(),
+            "/help" => {
+                let _ = self.action_tx.try_send(UiAction::ShowHelp);
+            }
             "/quit" | "/exit" => {
                 self.should_quit = true;
                 let _ = self.action_tx.try_send(UiAction::Quit);
@@ -686,13 +690,6 @@ impl App {
         }
     }
 
-    fn show_help(&mut self) {
-        self.output_pane.add_system_message(
-            "Available commands:\n  /model [query]    — Open model picker (or switch if query is an exact match)\n  /thinking [level] — Show or change thinking (off, low, medium, high)\n  /compact          — Force context compaction\n  /new              — Start a fresh session\n  /fork             — Fork into a new child session\n  /diff             — Show file changes made in this session\n  /clear            — Clear the output pane\n  /copy             — Copy last assistant response to clipboard\n  /reload           — Reload config and context files\n  /session list     — List known sessions\n  /session <id>     — Switch to another session\n  /tools            — Show registered tools\n  /onboard          — Launch the onboarding flow\n  /providers        — Manage configured providers\n  /help             — Show this help\n  /quit             — Exit anie\n\nKeyboard shortcuts:\n  Ctrl+O            — Open model picker"
-                .to_string(),
-        );
-    }
-
     fn open_model_picker_for_current_provider(&mut self, initial_search: Option<String>) {
         if self.agent_state != AgentUiState::Idle {
             self.output_pane
@@ -728,15 +725,23 @@ impl App {
             models.push(ModelInfo::from(&model));
         }
 
+        let picker = ModelPickerPane::new(
+            models,
+            context.provider_name.clone(),
+            self.status_bar.model_name.clone(),
+            initial_search,
+        );
+        // Kick off live discovery so the list grows to include every
+        // model the provider currently offers, not just the subset
+        // persisted to config at onboarding time.  We do NOT set
+        // loading=true: the static models stay visible and selectable
+        // immediately; the list updates silently when the response
+        // arrives (set_models preserves the active cursor position).
         self.bottom_pane = BottomPane::ModelPicker(ModelPickerSession {
-            picker: ModelPickerPane::new(
-                models,
-                context.provider_name.clone(),
-                self.status_bar.model_name.clone(),
-                initial_search,
-            ),
-            context,
+            picker,
+            context: context.clone(),
         });
+        self.spawn_model_discovery(context);
     }
 
     fn close_model_picker(&mut self) {
@@ -798,7 +803,17 @@ impl App {
                 match result {
                     Ok(models) => {
                         for model in &models {
-                            self.upsert_known_model(model.to_model(api, &base_url));
+                            // Only add models that are not already in the catalog.
+                            // Existing entries carry richer metadata (accurate
+                            // max_tokens, reasoning_capabilities, etc.) that
+                            // ModelInfo::to_model() cannot reconstruct from a
+                            // bare discovery response; overwriting them produces
+                            // requests with wrong parameters and 400 errors.
+                            if !self.known_models.iter().any(|known| {
+                                known.provider == model.provider && known.id == model.id
+                            }) {
+                                self.known_models.push(model.to_model(api, &base_url));
+                            }
                         }
                         if let BottomPane::ModelPicker(session) = &mut self.bottom_pane {
                             session.picker.set_models(models);
@@ -984,6 +999,11 @@ impl App {
                 self.apply_provider_management_action(action);
                 Ok(())
             }
+            OverlayOutcome::Dismiss => {
+                self.overlay = None;
+                Ok(())
+            }
+            OverlayOutcome::Idle => Ok(()),
         }
     }
 

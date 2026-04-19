@@ -15,7 +15,7 @@ use anie_provider::LlmMessage;
 /// empty assistant turn has no stable replay representation. Thinking
 /// blocks are intentionally dropped: OpenAI-compatible backends do not
 /// round-trip historical reasoning as assistant content (see
-/// `docs/reasoning_fix_plan.md` phase 1 sub-step C).
+/// `docs/completed/reasoning_fix_plan.md` phase 1 sub-step C).
 pub(super) fn assistant_message_to_openai_llm_message(
     assistant_message: &AssistantMessage,
 ) -> Option<LlmMessage> {
@@ -123,4 +123,142 @@ pub(super) fn join_text_content(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use anie_protocol::{AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage};
+    use anie_provider::Provider;
+
+    use crate::OpenAIProvider;
+
+    #[test]
+    fn converts_messages_for_openai_chat_completions() {
+        let provider = OpenAIProvider::new();
+        let messages = provider.convert_messages(&[
+            Message::User(anie_protocol::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: 1,
+            }),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "src/main.rs" }),
+                })],
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                timestamp: 2,
+            }),
+            Message::ToolResult(anie_protocol::ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "read".into(),
+                content: vec![ContentBlock::Text {
+                    text: "fn main() {}".into(),
+                }],
+                details: serde_json::Value::Null,
+                is_error: false,
+                timestamp: 3,
+            }),
+        ]);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content["content"], serde_json::Value::Null);
+        assert!(messages[1].content["tool_calls"].is_array());
+        assert_eq!(messages[2].role, "tool");
+    }
+
+    #[test]
+    fn skips_empty_assistant_messages_when_converting_messages() {
+        let provider = OpenAIProvider::new();
+        let messages = provider.convert_messages(&[
+            Message::User(anie_protocol::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "first".into(),
+                }],
+                timestamp: 1,
+            }),
+            Message::Assistant(AssistantMessage {
+                content: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider: "ollama".into(),
+                model: "qwen3.5:9b".into(),
+                timestamp: 2,
+            }),
+            Message::User(anie_protocol::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "second".into(),
+                }],
+                timestamp: 3,
+            }),
+        ]);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.role == "user"));
+    }
+
+    #[test]
+    fn reasoning_only_assistant_messages_are_omitted_from_openai_replay() {
+        let provider = OpenAIProvider::new();
+        let messages = provider.convert_messages(&[Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Thinking {
+                thinking: "plan first".into(),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "ollama".into(),
+            model: "qwen3:32b".into(),
+            timestamp: 1,
+        })]);
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn thinking_is_omitted_but_text_and_tools_preserved_in_openai_replay() {
+        let provider = OpenAIProvider::new();
+        let messages = provider.convert_messages(&[Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "plan first".into(),
+                },
+                ContentBlock::Text {
+                    text: "final answer".into(),
+                },
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "README.md" }),
+                }),
+            ],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider: "ollama".into(),
+            model: "qwen3:32b".into(),
+            timestamp: 1,
+        })]);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content["content"], json!("final answer"));
+        assert_eq!(messages[0].content["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(
+            messages[0].content["tool_calls"][0]["function"]["name"],
+            json!("read")
+        );
+        assert!(!messages[0].content.to_string().contains("plan first"));
+    }
 }

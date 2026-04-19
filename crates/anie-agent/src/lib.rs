@@ -6,7 +6,6 @@ mod hooks;
 mod tool;
 
 pub use agent_loop::{AgentLoop, AgentLoopConfig, AgentRunResult, ToolExecutionMode, send_event};
-pub use hooks::{AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride};
 pub use tool::{Tool, ToolError, ToolRegistry};
 
 #[cfg(test)]

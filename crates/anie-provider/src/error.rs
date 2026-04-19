@@ -5,6 +5,10 @@
 /// messages. When a new failure mode is genuinely distinct from the
 /// existing variants, add a variant rather than widening an existing
 /// one.
+///
+/// Retry *decisions* live in `anie-cli`'s `RetryPolicy::decide`.
+/// This type only carries descriptive error data plus trivial field
+/// accessors such as `retry_after_ms()`.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ProviderError {
     // ---------------------------------------------------------------
@@ -78,36 +82,6 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
-    /// Whether this provider error should be retried automatically
-    /// by the transient-retry path.
-    ///
-    /// - Rate limits → retry with backoff.
-    /// - HTTP 5xx / 429 / 529 → retry.
-    /// - Transport failures → retry.
-    /// - Streaming hiccups that could be transient (empty response,
-    ///   malformed JSON, malformed events) → retry.
-    /// - Terminal model output bugs (tool-call JSON, build errors,
-    ///   auth, context overflow, native-reasoning unsupported) →
-    ///   don't retry at this level. The compat-retry loop handles
-    ///   native-reasoning separately; context-overflow drives
-    ///   compaction.
-    #[must_use]
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::RateLimited { .. }
-            | Self::Transport(_)
-            | Self::EmptyAssistantResponse
-            | Self::InvalidStreamJson(_)
-            | Self::MalformedStreamEvent(_) => true,
-            Self::Http { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 529),
-            Self::Auth(_)
-            | Self::ContextOverflow(_)
-            | Self::RequestBuild(_)
-            | Self::ToolCallMalformed(_)
-            | Self::NativeReasoningUnsupported(_) => false,
-        }
-    }
-
     /// Suggested retry-after delay in milliseconds, when available.
     #[must_use]
     pub fn retry_after_ms(&self) -> Option<u64> {

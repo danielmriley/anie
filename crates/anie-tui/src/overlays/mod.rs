@@ -5,15 +5,18 @@
 //! new overlay is: create a file here, implement the trait, wire
 //! up the opener and the `OverlayOutcome` variant in `app.rs`.
 //!
-//! pi-mono has ~14 overlays in
-//! `packages/coding-agent/src/modes/interactive/components/`. The
-//! ones listed in `docs/ideas.md` for anie's near-term roadmap
-//! (`/settings`, `/login`, `/tree`, theme picker, hotkeys viewer,
-//! session picker) land here as they're implemented.
+//! Real overlays and roadmap placeholder stubs both live here so
+//! future UI work has a stable landing pad.
 
+pub(crate) mod hotkeys;
 pub(crate) mod model_picker;
+pub(crate) mod oauth;
 pub(crate) mod onboarding;
 pub(crate) mod providers;
+pub(crate) mod session_picker;
+pub(crate) mod settings;
+pub(crate) mod theme_picker;
+pub(crate) mod tree;
 
 pub use model_picker::{ModelPickerAction, ModelPickerPane};
 pub use onboarding::{

@@ -1,9 +1,11 @@
 //! Shared layout / styling helpers for overlay panels.
 
 use ratatui::{
-    layout::Rect,
-    style::{Color, Style},
+    Frame,
+    layout::{Alignment, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
 
 /// Compute a rectangle centered in `area` bounded by percentage-of-area
@@ -39,9 +41,56 @@ pub(crate) fn footer_line(text: &str) -> Line<'static> {
     ))
 }
 
+/// Render a centered placeholder panel for not-yet-implemented overlays.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn render_placeholder_panel(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str) {
+    Clear.render(area, frame.buffer_mut());
+    let panel = centered_rect(area, 70, 45, 36, 9);
+    let block = Block::default()
+        .title(Line::from(vec![Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(panel);
+
+    Clear.render(panel, frame.buffer_mut());
+    block.render(panel, frame.buffer_mut());
+
+    let mut lines = body
+        .lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect::<Vec<_>>();
+    lines.push(Line::default());
+    lines.push(footer_line("Press any key to close."));
+
+    Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .render(inner, frame.buffer_mut());
+}
+
 #[cfg(test)]
 mod tests {
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
     use super::*;
+
+    fn render_buffer_to_string(buffer: &Buffer) -> String {
+        let area = buffer.area;
+        let mut rows = Vec::new();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            rows.push(row.trim_end().to_string());
+        }
+        rows.join("\n")
+    }
 
     #[test]
     fn centered_rect_caps_to_percentage() {
@@ -78,5 +127,26 @@ mod tests {
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].content, "hello");
         assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn placeholder_panel_renders_body_and_footer() {
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_placeholder_panel(
+                    frame,
+                    frame.area(),
+                    "Settings",
+                    "Configuration screen not yet implemented.",
+                );
+            })
+            .expect("draw placeholder panel");
+        let rendered = render_buffer_to_string(terminal.backend().buffer());
+        assert!(rendered.contains("Settings"));
+        assert!(rendered.contains("Configuration"));
+        assert!(rendered.contains("implemented"));
+        assert!(rendered.contains("Press any key to close"));
     }
 }

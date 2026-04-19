@@ -73,3 +73,39 @@ impl SystemPromptCache {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, thread, time::Duration};
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn context_files_stamp_detects_deleted_non_newest_file() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let nested = root.join("src/module");
+        fs::create_dir_all(&nested).expect("create nested dirs");
+
+        let project_agents = root.join("AGENTS.md");
+        let nested_claude = nested.join("CLAUDE.md");
+        fs::write(&project_agents, "project context").expect("write agents");
+        thread::sleep(Duration::from_millis(5));
+        fs::write(&nested_claude, "nested context").expect("write claude");
+
+        let config = AnieConfig::default();
+        let first = crate::controller::context_files_stamp(&nested, &config);
+        assert_eq!(first.len(), 2);
+
+        fs::remove_file(&project_agents).expect("remove agents");
+        let second = crate::controller::context_files_stamp(&nested, &config);
+
+        assert_ne!(
+            first, second,
+            "deleting a non-newest file should change stamp"
+        );
+        assert_eq!(second.len(), 1);
+    }
+}

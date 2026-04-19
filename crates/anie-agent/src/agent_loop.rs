@@ -29,6 +29,161 @@ pub async fn send_event(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent) {
     }
 }
 
+#[cfg(test)]
+mod send_event_tests {
+    use std::{
+        io,
+        sync::{Arc, Mutex, OnceLock},
+    };
+
+    use tokio::sync::Mutex as AsyncMutex;
+    use tracing_subscriber::{
+        fmt::{self, writer::MakeWriter},
+        layer::SubscriberExt,
+    };
+
+    use super::*;
+
+    static SEND_EVENT_TEST_GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().expect("log lock").clone()).expect("utf8 logs")
+        }
+    }
+
+    fn test_guard() -> &'static AsyncMutex<()> {
+        SEND_EVENT_TEST_GUARD.get_or_init(|| AsyncMutex::new(()))
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_event_logs_once_when_channel_closed() {
+        let _guard = test_guard().lock().await;
+        EVENT_DROP_WARNED.store(false, Ordering::Relaxed);
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_writer(capture.clone()),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (tx, rx) = mpsc::channel::<AgentEvent>(1);
+        drop(rx);
+
+        send_event(
+            &tx,
+            AgentEvent::SystemMessage {
+                text: "first".into(),
+            },
+        )
+        .await;
+        send_event(
+            &tx,
+            AgentEvent::SystemMessage {
+                text: "second".into(),
+            },
+        )
+        .await;
+        send_event(
+            &tx,
+            AgentEvent::SystemMessage {
+                text: "third".into(),
+            },
+        )
+        .await;
+
+        let logs = capture.contents();
+        assert_eq!(count_occurrences(&logs, "agent event channel closed"), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_event_does_not_log_on_first_success() {
+        let _guard = test_guard().lock().await;
+        EVENT_DROP_WARNED.store(false, Ordering::Relaxed);
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_writer(capture.clone()),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+        send_event(&tx, AgentEvent::SystemMessage { text: "ok".into() }).await;
+
+        assert_eq!(
+            count_occurrences(&capture.contents(), "agent event channel closed"),
+            0
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(AgentEvent::SystemMessage { text }) if text == "ok"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_event_latch_is_process_global() {
+        let _guard = test_guard().lock().await;
+        EVENT_DROP_WARNED.store(false, Ordering::Relaxed);
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_writer(capture.clone()),
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (tx1, rx1) = mpsc::channel::<AgentEvent>(1);
+        let (tx2, rx2) = mpsc::channel::<AgentEvent>(1);
+        drop(rx1);
+        drop(rx2);
+
+        send_event(&tx1, AgentEvent::SystemMessage { text: "a".into() }).await;
+        send_event(&tx2, AgentEvent::SystemMessage { text: "b".into() }).await;
+
+        let logs = capture.contents();
+        assert_eq!(count_occurrences(&logs, "agent event channel closed"), 1);
+    }
+}
+
 use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, StreamDelta, ToolCall,
     ToolResult, ToolResultMessage, now_millis,
@@ -38,8 +193,9 @@ use anie_provider::{
     RequestOptionsResolver, ThinkingLevel,
 };
 
-use crate::{
-    AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolRegistry, ToolResultOverride,
+use crate::ToolRegistry;
+use crate::hooks::{
+    AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride,
 };
 
 /// Agent-loop execution mode for tool calls.
@@ -53,24 +209,72 @@ pub enum ToolExecutionMode {
 
 /// Immutable configuration for an agent loop instance.
 pub struct AgentLoopConfig {
-    /// Selected model.
-    pub model: Model,
-    /// Final system prompt.
-    pub system_prompt: String,
-    /// Requested thinking level.
-    pub thinking: ThinkingLevel,
-    /// Tool execution strategy.
-    pub tool_execution: ToolExecutionMode,
-    /// Per-request auth/options resolver.
-    pub request_options_resolver: Arc<dyn RequestOptionsResolver>,
-    /// Optional steering-message hook.
-    pub get_steering_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
-    /// Optional follow-up-message hook.
-    pub get_follow_up_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
-    /// Optional before-tool-call hook.
-    pub before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
-    /// Optional after-tool-call hook.
-    pub after_tool_call_hook: Option<Arc<dyn AfterToolCallHook>>,
+    model: Model,
+    system_prompt: String,
+    thinking: ThinkingLevel,
+    tool_execution: ToolExecutionMode,
+    request_options_resolver: Arc<dyn RequestOptionsResolver>,
+    get_steering_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
+    get_follow_up_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
+    before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
+    after_tool_call_hook: Option<Arc<dyn AfterToolCallHook>>,
+}
+
+impl AgentLoopConfig {
+    /// Create a config with no steering/follow-up/tool hooks.
+    #[must_use]
+    pub fn new(
+        model: Model,
+        system_prompt: String,
+        thinking: ThinkingLevel,
+        tool_execution: ToolExecutionMode,
+        request_options_resolver: Arc<dyn RequestOptionsResolver>,
+    ) -> Self {
+        Self {
+            model,
+            system_prompt,
+            thinking,
+            tool_execution,
+            request_options_resolver,
+            get_steering_messages: None,
+            get_follow_up_messages: None,
+            before_tool_call_hook: None,
+            after_tool_call_hook: None,
+        }
+    }
+
+    /// Attach a per-turn steering-message provider.
+    #[must_use]
+    pub fn with_steering_messages(
+        mut self,
+        get_steering_messages: Arc<dyn Fn() -> Vec<Message> + Send + Sync>,
+    ) -> Self {
+        self.get_steering_messages = Some(get_steering_messages);
+        self
+    }
+
+    /// Attach a post-tool follow-up-message provider.
+    #[must_use]
+    pub fn with_follow_up_messages(
+        mut self,
+        get_follow_up_messages: Arc<dyn Fn() -> Vec<Message> + Send + Sync>,
+    ) -> Self {
+        self.get_follow_up_messages = Some(get_follow_up_messages);
+        self
+    }
+
+    /// Attach internal tool-execution hooks.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_hooks(
+        mut self,
+        before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
+        after_tool_call_hook: Option<Arc<dyn AfterToolCallHook>>,
+    ) -> Self {
+        self.before_tool_call_hook = before_tool_call_hook;
+        self.after_tool_call_hook = after_tool_call_hook;
+        self
+    }
 }
 
 /// Final agent-run output.

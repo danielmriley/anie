@@ -30,30 +30,30 @@ Equivalent of the Codex CLI architecture diagram, adapted for anie-rs.
         │   AgentLoop::run(prompts, owned_context, event_tx, cancel)     │
         │   -> AgentRunResult                                             │
         │   ToolRegistry (trait objects)                                  │
-        │   BeforeToolCall / AfterToolCall hooks                         │
+        │   Internal before/after-tool-call seams                         │
         │   Prompt → Stream → ToolExec → Loop → AgentEnd                 │
-        └───┬───────────┬─────────────┬─────────────────────────────┬───┘
-            │           │             │                             │
-            ▼           ▼             ▼                             ▼
-     ┌───────────┐ ┌──────────┐ ┌───────────┐              ┌─────────────┐
-     │ anie-     │ │ anie-    │ │ anie-     │              │ anie-       │
-     │ protocol  │ │ provider │ │ tools     │              │ extensions  │
-     │           │ │          │ │           │              │             │
-     │ Message   │ │ Provider │ │ ReadTool  │              │ Extension   │
-     │ (User,    │ │ trait    │ │ WriteTool │              │ trait       │
-     │  Asst,    │ │          │ │ EditTool  │              │             │
-     │  ToolRes, │ │ Provider │ │ BashTool  │              │ Extension   │
-     │  Custom)  │ │ Registry │ │           │              │ Runner      │
-     │           │ │          │ │ FileMut-  │              │             │
-     │ AgentEvent│ │ Model    │ │ ationQueue│              │ Hooks:      │
-     │ StreamΔ   │ │ ApiKind  │ │           │              │ before_     │
-     │ ToolDef   │ │ Thinking │ │ Tool trait│              │ agent_start │
-     │ ToolResult│ │ Level    │ │ impl per  │              │ session_    │
-     │ Usage     │ │          │ │ tool      │              │ start       │
-     │ Cost      │ │ LlmCtx   │ └───────────┘              │ before/     │
-     │ StopReason│ │ StreamOpt│                             │ after_      │
-     └───────────┘ │ Provider │                             │ tool_call   │
-                   │ Event    │                             └─────────────┘
+        └───┬───────────┬─────────────┬─────────────────────────────┘
+            │           │             │
+            ▼           ▼             ▼
+     ┌───────────┐ ┌──────────┐ ┌───────────┐
+     │ anie-     │ │ anie-    │ │ anie-     │
+     │ protocol  │ │ provider │ │ tools     │
+     │           │ │          │ │           │
+     │ Message   │ │ Provider │ │ ReadTool  │
+     │ (User,    │ │ trait    │ │ WriteTool │
+     │  Asst,    │ │          │ │ EditTool  │
+     │  ToolRes, │ │ Provider │ │ BashTool  │
+     │  Custom)  │ │ Registry │ │           │
+     │           │ │          │ │ FileMut-  │
+     │ AgentEvent│ │ Model    │ │ ationQueue│
+     │ StreamΔ   │ │ ApiKind  │ │           │
+     │ ToolDef   │ │ Thinking │ │ Tool trait│
+     │ ToolResult│ │ Level    │ │ impl per  │
+     │ Usage     │ │          │ │ tool      │
+     │ Cost      │ │ LlmCtx   │ └───────────┘
+     │ StopReason│ │ StreamOpt│
+     └───────────┘ │ Provider │
+                   │ Event    │
                    └─────┬────┘
                          │
            ┌─────────────┼─────────────────────┐
@@ -94,6 +94,13 @@ Equivalent of the Codex CLI architecture diagram, adapted for anie-rs.
    └──────────────────────────────────────────────────────────────────────┘
 ```
 
+**Concurrent writers.** Session files are opened with an exclusive
+advisory lock. A second process attempting to open the same session
+gets `SessionError::AlreadyOpen`, which the CLI surfaces as an
+actionable non-zero-exit error. On filesystems without advisory-lock
+support, the lock attempt degrades to a warning rather than a hard
+failure.
+
 ---
 
 ## Data Flow
@@ -109,9 +116,6 @@ anie-cli interactive controller: builds UserMessage, persists to anie-session
       │
       ▼
 anie-agent: AgentLoop::run(prompts, owned_context, event_tx, cancel)
-      │
-      ├─► anie-extensions: before_agent_start hook
-      │     may modify system_prompt, inject messages
       │
       ├─► anie-session: check auto-compaction threshold
       │     if context_tokens > context_window - reserve:
@@ -139,7 +143,6 @@ anie-agent: AgentLoop::run(prompts, owned_context, event_tx, cancel)
       │     for each ToolCall (parallel or sequential):
       │       │
       │       ├─► validate args against ToolDef JSON Schema
-      │       ├─► anie-extensions: before_tool_call (can block)
       │       ├─► anie-tools: Tool::execute(call_id, args, cancel)
       │       │     │
       │       │     ├── ReadTool: read file, truncate, return content
@@ -147,7 +150,6 @@ anie-agent: AgentLoop::run(prompts, owned_context, event_tx, cancel)
       │       │     ├── EditTool: match oldText, apply edits, return diff
       │       │     └── BashTool: spawn shell, stream output, return result
       │       │
-      │       ├─► anie-extensions: after_tool_call (can override result)
       │       ├─► emit ToolExecEnd
       │       └─► push ToolResultMessage to context
       │
@@ -167,7 +169,6 @@ anie-cli
   ├── anie-agent
   ├── anie-auth
   ├── anie-config
-  ├── anie-extensions
   ├── anie-providers-builtin
   ├── anie-session
   ├── anie-tools
@@ -184,10 +185,6 @@ anie-auth
 
 anie-config
   └── anie-provider
-
-anie-extensions
-  ├── anie-agent
-  └── anie-protocol
 
 anie-providers-builtin
   ├── anie-provider
@@ -208,6 +205,13 @@ Legend:
   This is the compile-time crate graph, not the runtime event flow
   No cycles exist
 ```
+
+**Extensions.** A future out-of-process JSON-RPC extension system is
+tracked in
+[`docs/refactor_plans/10_extension_system_pi_port.md`](../refactor_plans/10_extension_system_pi_port.md).
+Today there is no extension crate in the workspace; the hook traits in
+`anie-agent/src/hooks.rs` are internal-only seams reserved for that
+future host.
 
 ---
 

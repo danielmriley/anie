@@ -24,7 +24,6 @@ use std::path::PathBuf;
 /// Non-`Builtin` variants are unused today — they'll be constructed
 /// once extensions (plan 10) and prompt/skill loaders land. Kept in
 /// the type now so the registry API is stable.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SlashCommandSource {
     /// Shipped with anie; dispatched via `UiAction`.
@@ -39,7 +38,7 @@ pub(crate) enum SlashCommandSource {
 
 impl SlashCommandSource {
     /// Short human-readable origin label.
-    #[allow(dead_code)] // used once /help lands
+    #[cfg(test)]
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Builtin => "builtin".to_string(),
@@ -51,11 +50,6 @@ impl SlashCommandSource {
 }
 
 /// Metadata for one registered slash command.
-///
-/// `summary` isn't read anywhere today; it'll feed `/help` once
-/// that command lands. Kept in the struct now so the registry API
-/// is stable.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct SlashCommandInfo {
     pub(crate) name: &'static str,
@@ -76,7 +70,7 @@ impl SlashCommandInfo {
 /// All slash commands known to this anie process.
 ///
 /// Populated at startup with `builtin_commands()`; future extension
-/// systems will call `register` to add their own entries.
+/// systems will add their own entries.
 pub(crate) struct CommandRegistry {
     commands: Vec<SlashCommandInfo>,
 }
@@ -89,9 +83,71 @@ impl CommandRegistry {
         }
     }
 
+    /// Look up a command by exact name.
+    #[cfg(test)]
+    pub(crate) fn lookup(&self, name: &str) -> Option<&SlashCommandInfo> {
+        self.commands.iter().find(|c| c.name == name)
+    }
+
+    /// All registered commands, in registration order.
+    pub(crate) fn all(&self) -> &[SlashCommandInfo] {
+        &self.commands
+    }
+
+    /// Group registered commands by source. Order within each group
+    /// is the original registration order.
+    pub(crate) fn grouped_by_source(&self) -> Vec<(SourceKey, Vec<&SlashCommandInfo>)> {
+        let source_order = [
+            SlashCommandSource::Builtin,
+            SlashCommandSource::Extension {
+                extension_name: String::new(),
+            },
+            SlashCommandSource::Prompt {
+                template_path: PathBuf::new(),
+            },
+            SlashCommandSource::Skill {
+                skill_name: String::new(),
+            },
+        ];
+
+        source_order
+            .iter()
+            .filter_map(|source| {
+                let key = SourceKey::from(source);
+                let entries = self
+                    .commands
+                    .iter()
+                    .filter(|command| SourceKey::from(&command.source) == key)
+                    .collect::<Vec<_>>();
+                if entries.is_empty() {
+                    None
+                } else {
+                    Some((key, entries))
+                }
+            })
+            .collect()
+    }
+
+    /// Render the `/help` output grouped by command source.
+    pub(crate) fn format_help(&self) -> String {
+        let mut out = String::from("Commands:\n");
+        if self.all().is_empty() {
+            return out;
+        }
+        for (key, entries) in self.grouped_by_source() {
+            out.push_str("  ");
+            out.push_str(group_heading(key));
+            out.push_str(":\n");
+            for info in entries {
+                out.push_str(&format!("    /{:<12} {}\n", info.name, info.summary));
+            }
+        }
+        out
+    }
+
     /// Register a command. Duplicates (by name) are rejected — the
     /// first registration wins, matching pi's behavior.
-    #[allow(dead_code)] // used by future extension / prompt / skill registration
+    #[cfg(test)]
     pub(crate) fn register(&mut self, command: SlashCommandInfo) -> Result<(), DuplicateCommand> {
         if self.commands.iter().any(|c| c.name == command.name) {
             return Err(DuplicateCommand {
@@ -101,33 +157,14 @@ impl CommandRegistry {
         self.commands.push(command);
         Ok(())
     }
+}
 
-    /// Look up a command by exact name.
-    #[allow(dead_code)] // used once /help lands
-    pub(crate) fn lookup(&self, name: &str) -> Option<&SlashCommandInfo> {
-        self.commands.iter().find(|c| c.name == name)
-    }
-
-    /// All registered commands, in registration order.
-    #[allow(dead_code)] // used once /help lands
-    pub(crate) fn all(&self) -> &[SlashCommandInfo] {
-        &self.commands
-    }
-
-    /// Group registered commands by source. Order within each group
-    /// is the original registration order.
-    #[allow(dead_code)] // used once /help lands
-    pub(crate) fn grouped_by_source(&self) -> Vec<(SourceKey, Vec<&SlashCommandInfo>)> {
-        let mut groups: Vec<(SourceKey, Vec<&SlashCommandInfo>)> = Vec::new();
-        for command in &self.commands {
-            let key = SourceKey::from(&command.source);
-            if let Some((_, entries)) = groups.iter_mut().find(|(k, _)| k == &key) {
-                entries.push(command);
-            } else {
-                groups.push((key, vec![command]));
-            }
-        }
-        groups
+fn group_heading(key: SourceKey) -> &'static str {
+    match key {
+        SourceKey::Builtin => "Builtin",
+        SourceKey::Extension => "Extensions",
+        SourceKey::Prompt => "Prompts",
+        SourceKey::Skill => "Skills",
     }
 }
 
@@ -135,7 +172,6 @@ impl CommandRegistry {
 /// kind but drops per-origin fields so all builtins group together,
 /// all extensions group together, etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // used once /help lands
 pub(crate) enum SourceKey {
     Builtin,
     Extension,
@@ -156,20 +192,29 @@ impl From<&SlashCommandSource> for SourceKey {
 
 /// Error returned when attempting to register a command whose name
 /// is already taken.
+#[cfg(test)]
 #[derive(Debug)]
-#[allow(dead_code)] // used by future extension registration
 pub(crate) struct DuplicateCommand {
     pub name: String,
 }
 
 /// The builtin anie slash-command catalog.
 ///
-/// Keep this in sync with the `UiAction` dispatch in
-/// `controller::InteractiveController::handle_action`. Adding a new
-/// builtin means:
-///   1. Adding a `UiAction` variant in `anie-tui::app`.
-///   2. Handling it in `handle_action`.
-///   3. Adding a new entry here so `/help` picks it up.
+/// Keep this in sync with the slash-command handling split across:
+/// - `anie-tui::app::handle_slash_command`
+/// - `anie-tui::app::UiAction`
+/// - `controller::InteractiveController::handle_action`
+///
+/// The test `registry_covers_every_dispatched_slash_command` enforces
+/// the coupling.
+///
+/// Adding a builtin:
+///   1. Add the parsing rule in `anie-tui::app::handle_slash_command`.
+///   2. Add or reuse the `UiAction` variant in `anie-tui::app`.
+///   3. Handle it in `InteractiveController::handle_action` if it is
+///      controller-owned.
+///   4. Add a `SlashCommandInfo::builtin(...)` entry here.
+///   5. Add the name to the `dispatched` list in the coverage test.
 fn builtin_commands() -> Vec<SlashCommandInfo> {
     vec![
         SlashCommandInfo::builtin("model", "Select model (opens picker on no args)"),
@@ -296,5 +341,75 @@ mod tests {
         assert_eq!(groups[0].0, SourceKey::Builtin);
         assert_eq!(groups[1].0, SourceKey::Extension);
         assert_eq!(groups[1].1.len(), 2);
+    }
+
+    #[test]
+    fn format_help_starts_with_commands_heading() {
+        let registry = CommandRegistry::with_builtins();
+        assert!(registry.format_help().starts_with("Commands:\n"));
+    }
+
+    #[test]
+    fn format_help_includes_every_builtin_name() {
+        let registry = CommandRegistry::with_builtins();
+        let help = registry.format_help();
+        for command in registry.all() {
+            assert!(help.contains(&format!("/{}", command.name)));
+        }
+    }
+
+    #[test]
+    fn format_help_renders_extensions_section_when_registered() {
+        let mut registry = CommandRegistry::with_builtins();
+        registry
+            .register(SlashCommandInfo {
+                name: "ext-help",
+                summary: "Extension help",
+                source: SlashCommandSource::Extension {
+                    extension_name: "demo".into(),
+                },
+            })
+            .expect("register extension command");
+
+        let help = registry.format_help();
+        assert!(help.contains("  Extensions:\n"));
+        assert!(help.contains("/ext-help"));
+    }
+
+    #[test]
+    fn format_help_omits_empty_sections() {
+        let registry = CommandRegistry::with_builtins();
+        let help = registry.format_help();
+        assert!(!help.contains("Extensions:"));
+        assert!(!help.contains("Prompts:"));
+        assert!(!help.contains("Skills:"));
+    }
+
+    #[test]
+    fn registry_covers_every_dispatched_slash_command() {
+        let dispatched = [
+            "model",
+            "thinking",
+            "compact",
+            "fork",
+            "diff",
+            "new",
+            "session",
+            "tools",
+            "onboard",
+            "providers",
+            "clear",
+            "reload",
+            "copy",
+            "help",
+            "quit",
+        ];
+        let registry = CommandRegistry::with_builtins();
+        for name in dispatched {
+            assert!(
+                registry.lookup(name).is_some(),
+                "registry missing builtin '{name}' — update builtin_commands() when adding a slash command"
+            );
+        }
     }
 }

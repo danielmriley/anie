@@ -212,13 +212,7 @@ async fn mock_provider_can_emit_mid_stream_errors() {
 }
 
 #[test]
-fn provider_error_retry_classification_is_stable() {
-    assert!(
-        ProviderError::RateLimited {
-            retry_after_ms: Some(500)
-        }
-        .is_retryable()
-    );
+fn provider_error_retry_after_accessor_is_stable() {
     assert_eq!(
         ProviderError::RateLimited {
             retry_after_ms: Some(500)
@@ -226,25 +220,18 @@ fn provider_error_retry_classification_is_stable() {
         .retry_after_ms(),
         Some(500)
     );
-    assert!(
+    assert_eq!(
+        ProviderError::Transport("dns".into()).retry_after_ms(),
+        None
+    );
+    assert_eq!(
         ProviderError::Http {
             status: 503,
             body: "down".into()
         }
-        .is_retryable()
+        .retry_after_ms(),
+        None
     );
-    // Transient stream flaws should still retry.
-    assert!(ProviderError::EmptyAssistantResponse.is_retryable());
-    assert!(ProviderError::InvalidStreamJson("garbled".into()).is_retryable());
-    assert!(ProviderError::MalformedStreamEvent("socket dropped".into()).is_retryable());
-    assert!(ProviderError::Transport("dns".into()).is_retryable());
-
-    // Terminal / model-output failures should not retry at this level.
-    assert!(!ProviderError::Auth("bad key".into()).is_retryable());
-    assert!(!ProviderError::ContextOverflow("too many tokens".into()).is_retryable());
-    assert!(!ProviderError::RequestBuild("bad body".into()).is_retryable());
-    assert!(!ProviderError::ToolCallMalformed("bad json".into()).is_retryable());
-    assert!(!ProviderError::NativeReasoningUnsupported("body".into()).is_retryable());
 }
 
 #[test]

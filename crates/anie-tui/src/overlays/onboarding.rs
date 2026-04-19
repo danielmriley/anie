@@ -103,6 +103,10 @@ enum OnboardingState {
         message: String,
         return_to: Box<OnboardingState>,
     },
+    /// Sentinel state used during take-and-replace transitions.
+    ///
+    /// This should never survive past the current event-handler call.
+    Transient,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +226,19 @@ impl OnboardingScreen {
 
     /// Handle a key press.
     pub fn handle_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        if matches!(self.state, OnboardingState::Transient) {
+            debug_assert!(false, "Transient state leaked into handle_key");
+            return OnboardingAction::Continue;
+        }
+        if matches!(self.state, OnboardingState::Success { .. }) {
+            self.state = OnboardingState::MainMenu { selected: 0 };
+            return OnboardingAction::Continue;
+        }
+        if matches!(self.state, OnboardingState::Error { .. }) {
+            self.restore_return_state();
+            return OnboardingAction::Continue;
+        }
+
         match &mut self.state {
             OnboardingState::MainMenu { .. } => self.handle_main_menu_key(key),
             OnboardingState::ManagingProviders => self.handle_provider_management_key(key),
@@ -234,19 +251,19 @@ impl OnboardingScreen {
             OnboardingState::Busy { .. } => self.handle_busy_key(key),
             OnboardingState::DiscoveringModels { .. } => self.handle_busy_key(key),
             OnboardingState::PickingModel { .. } => self.handle_model_picker_key(key),
-            OnboardingState::Success { .. } => {
-                self.state = OnboardingState::MainMenu { selected: 0 };
-                OnboardingAction::Continue
-            }
-            OnboardingState::Error { return_to, .. } => {
-                self.state = (**return_to).clone();
-                OnboardingAction::Continue
-            }
+            OnboardingState::Success { .. }
+            | OnboardingState::Error { .. }
+            | OnboardingState::Transient => OnboardingAction::Continue,
         }
     }
 
     /// Poll background workers and update screen state.
     pub fn handle_tick(&mut self) -> OnboardingAction {
+        if matches!(self.state, OnboardingState::Transient) {
+            debug_assert!(false, "Transient state leaked into handle_tick");
+            return OnboardingAction::Continue;
+        }
+
         if matches!(self.state, OnboardingState::ManagingProviders)
             && let Some(screen) = &mut self.provider_management
         {
@@ -290,10 +307,11 @@ impl OnboardingScreen {
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
-        let state = self.state.clone();
         let spinner_frame = self.spinner.tick().to_string();
-        match state {
-            OnboardingState::MainMenu { selected } => self.render_main_menu(frame, inner, selected),
+        match &self.state {
+            OnboardingState::MainMenu { selected } => {
+                self.render_main_menu(frame, inner, *selected)
+            }
             OnboardingState::ManagingProviders => {
                 if let Some(screen) = &mut self.provider_management {
                     screen.render(frame, frame.area());
@@ -307,7 +325,7 @@ impl OnboardingScreen {
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::LocalServerSelect { selected } => {
-                self.render_local_server_select(frame, inner, selected, &spinner_frame)
+                self.render_local_server_select(frame, inner, *selected, &spinner_frame)
             }
             OnboardingState::NoLocalServers => self.render_busy_panel(
                 frame,
@@ -317,19 +335,19 @@ impl OnboardingScreen {
                 footer_line("[Esc] Back   [Enter] Custom Endpoint"),
             ),
             OnboardingState::ProviderPresetList { selected } => {
-                self.render_provider_presets(frame, inner, selected)
+                self.render_provider_presets(frame, inner, *selected)
             }
             OnboardingState::ApiKeyInput {
                 preset_index,
                 input,
-            } => self.render_api_key_input(frame, inner, preset_index, &input),
+            } => self.render_api_key_input(frame, inner, *preset_index, input),
             OnboardingState::CustomEndpoint { form } => {
-                self.render_custom_endpoint(frame, inner, &form)
+                self.render_custom_endpoint(frame, inner, form)
             }
             OnboardingState::Busy { title, message, .. } => self.render_busy_panel(
                 frame,
                 inner,
-                &title,
+                title,
                 &format!("{spinner_frame} {message}"),
                 footer_line("[Esc] Back"),
             ),
@@ -341,13 +359,13 @@ impl OnboardingScreen {
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::PickingModel { picker, .. } => {
-                self.render_model_picker(frame, inner, &picker, &spinner_frame)
+                self.render_model_picker(frame, inner, picker, &spinner_frame)
             }
             OnboardingState::Success { message } => self.render_status_panel(
                 frame,
                 inner,
                 "Success",
-                &message,
+                message,
                 Color::Green,
                 footer_line("[Any key] Continue"),
             ),
@@ -355,10 +373,13 @@ impl OnboardingScreen {
                 frame,
                 inner,
                 "Error",
-                &message,
+                message,
                 Color::Red,
                 footer_line("[Any key] Back"),
             ),
+            OnboardingState::Transient => {
+                debug_assert!(false, "Transient state leaked into render");
+            }
         }
     }
 
@@ -384,6 +405,29 @@ impl OnboardingScreen {
         let mut screen = Self::new_for_tests();
         screen.local_detection = LocalDetectionState::Ready(servers);
         screen
+    }
+
+    fn take_state_for_return_to(&mut self) -> Box<OnboardingState> {
+        Box::new(std::mem::replace(
+            &mut self.state,
+            OnboardingState::Transient,
+        ))
+    }
+
+    fn restore_return_state(&mut self) {
+        let state = std::mem::replace(&mut self.state, OnboardingState::Transient);
+        match state {
+            OnboardingState::Busy { return_to, .. } | OnboardingState::Error { return_to, .. } => {
+                self.state = *return_to;
+            }
+            other => {
+                debug_assert!(
+                    false,
+                    "restore_return_state called outside Busy/Error: {other:?}"
+                );
+                self.state = other;
+            }
+        }
     }
 
     fn start_local_detection(&mut self) {
@@ -664,9 +708,10 @@ impl OnboardingScreen {
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 if api_key_snapshot.is_empty() {
+                    let return_to = self.take_state_for_return_to();
                     self.state = OnboardingState::Error {
                         message: "API key cannot be empty.".to_string(),
-                        return_to: Box::new(self.state.clone()),
+                        return_to,
                     };
                     return OnboardingAction::Continue;
                 }
@@ -674,11 +719,11 @@ impl OnboardingScreen {
                     .get(preset_index)
                     .cloned()
                     .unwrap_or_else(default_openai_preset);
-                let return_to = self.state.clone();
+                let return_to = self.take_state_for_return_to();
                 self.state = OnboardingState::Busy {
                     title: preset.display_name.to_string(),
                     message: "Verifying API key…".to_string(),
-                    return_to: Box::new(return_to),
+                    return_to,
                 };
                 self.spawn_preset_validation_worker(ModelPickerContext::ApiPreset {
                     preset_index,
@@ -739,18 +784,19 @@ impl OnboardingScreen {
                 let api_key = form_snapshot.api_key.trimmed();
 
                 if base_url.is_empty() {
+                    let return_to = self.take_state_for_return_to();
                     self.state = OnboardingState::Error {
                         message: "Base URL is required.".to_string(),
-                        return_to: Box::new(self.state.clone()),
+                        return_to,
                     };
                     return OnboardingAction::Continue;
                 }
 
-                let return_to = self.state.clone();
+                let return_to = self.take_state_for_return_to();
                 self.state = OnboardingState::Busy {
                     title: "Custom Endpoint".to_string(),
                     message: "Testing endpoint…".to_string(),
-                    return_to: Box::new(return_to),
+                    return_to,
                 };
                 self.spawn_custom_validation_worker(ModelPickerContext::CustomEndpoint {
                     form_snapshot,
@@ -773,9 +819,8 @@ impl OnboardingScreen {
     fn handle_busy_key(&mut self, key: KeyEvent) -> OnboardingAction {
         if let (KeyModifiers::NONE, KeyCode::Esc) = (key.modifiers, key.code) {
             match &self.state {
-                OnboardingState::Busy { return_to, .. }
-                | OnboardingState::Error { return_to, .. } => {
-                    self.state = (**return_to).clone();
+                OnboardingState::Busy { .. } | OnboardingState::Error { .. } => {
+                    self.restore_return_state();
                 }
                 OnboardingState::DiscoveringModels { context, .. } => {
                     self.state = self.return_state_for_context(context);
@@ -1130,7 +1175,7 @@ impl OnboardingScreen {
             || !self.credential_store.list_providers().is_empty()
     }
 
-    fn render_main_menu(&mut self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
+    fn render_main_menu(&self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
         let items = self
             .main_menu_items()
             .into_iter()
@@ -1167,14 +1212,13 @@ impl OnboardingScreen {
     }
 
     fn render_local_server_select(
-        &mut self,
+        &self,
         frame: &mut Frame<'_>,
         area: Rect,
         selected: usize,
         spinner_frame: &str,
     ) {
-        let local_detection = self.local_detection.clone();
-        let LocalDetectionState::Ready(servers) = local_detection else {
+        let LocalDetectionState::Ready(servers) = &self.local_detection else {
             self.render_busy_panel(
                 frame,
                 area,
@@ -1226,7 +1270,7 @@ impl OnboardingScreen {
         .render(chunks[1], frame.buffer_mut());
     }
 
-    fn render_provider_presets(&mut self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
+    fn render_provider_presets(&self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
         let presets = provider_presets();
         let items = presets
             .iter()
@@ -1258,7 +1302,7 @@ impl OnboardingScreen {
     }
 
     fn render_api_key_input(
-        &mut self,
+        &self,
         frame: &mut Frame<'_>,
         area: Rect,
         preset_index: usize,
@@ -1308,12 +1352,7 @@ impl OnboardingScreen {
         .render(chunks[3], frame.buffer_mut());
     }
 
-    fn render_custom_endpoint(
-        &mut self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        form: &CustomEndpointForm,
-    ) {
+    fn render_custom_endpoint(&self, frame: &mut Frame<'_>, area: Rect, form: &CustomEndpointForm) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1400,7 +1439,7 @@ impl OnboardingScreen {
     }
 
     fn render_model_picker(
-        &mut self,
+        &self,
         frame: &mut Frame<'_>,
         area: Rect,
         picker: &ModelPickerPane,
@@ -2102,7 +2141,12 @@ mod tests {
             kind: ConfiguredProviderKind::BuiltinHosted,
             is_default: true,
         });
-        screen.state = OnboardingState::MainMenu { selected: 3 };
+        // "Done" is always the last menu item; its index shifts when
+        // "Manage Existing" is conditionally inserted.
+        let done_index = screen.main_menu_items().len() - 1;
+        screen.state = OnboardingState::MainMenu {
+            selected: done_index,
+        };
 
         let action = screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let OnboardingAction::Complete(completion) = action else {
@@ -2270,6 +2314,47 @@ mod tests {
         assert!(matches!(
             screen.state,
             OnboardingState::MainMenu { selected: 1 }
+        ));
+    }
+
+    #[test]
+    fn render_does_not_mutate_state() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::ApiKeyInput {
+            preset_index: 0,
+            input: TextField::masked_with_value("sk-test"),
+        };
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 20)).expect("terminal");
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .expect("draw onboarding");
+
+        assert!(matches!(
+            &screen.state,
+            OnboardingState::ApiKeyInput { preset_index, input }
+                if *preset_index == 0 && input.trimmed() == "sk-test"
+        ));
+    }
+
+    #[test]
+    fn busy_transition_restores_previous_state_on_escape() {
+        let mut screen = OnboardingScreen::new_for_tests();
+        screen.state = OnboardingState::ApiKeyInput {
+            preset_index: 0,
+            input: TextField::masked_with_value("sk-test"),
+        };
+
+        let action = screen.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, OnboardingAction::Continue);
+        assert!(matches!(screen.state, OnboardingState::Busy { .. }));
+
+        screen.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            &screen.state,
+            OnboardingState::ApiKeyInput { preset_index, input }
+                if *preset_index == 0 && input.trimmed() == "sk-test"
         ));
     }
 

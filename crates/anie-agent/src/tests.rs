@@ -22,10 +22,10 @@ use anie_provider::{
     mock::{MockProvider, MockStreamScript},
 };
 
-use crate::{
-    AfterToolCallHook, AgentLoop, AgentLoopConfig, BeforeToolCallHook, BeforeToolCallResult, Tool,
-    ToolError, ToolExecutionMode, ToolRegistry, ToolResultOverride,
+use crate::hooks::{
+    AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride,
 };
+use crate::{AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionMode, ToolRegistry};
 
 fn sample_model() -> Model {
     Model {
@@ -328,19 +328,16 @@ fn agent_with_provider(
     AgentLoop::new(
         Arc::new(provider_registry),
         tool_registry,
-        AgentLoopConfig {
-            model: sample_model(),
-            system_prompt: "You are a test agent".into(),
-            thinking: ThinkingLevel::Off,
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
             tool_execution,
-            request_options_resolver: Arc::new(StaticResolver {
+            Arc::new(StaticResolver {
                 result: Ok(ResolvedRequestOptions::default()),
             }),
-            get_steering_messages: None,
-            get_follow_up_messages: None,
-            before_tool_call_hook: before_hook,
-            after_tool_call_hook: after_hook,
-        },
+        )
+        .with_hooks(before_hook, after_hook),
     )
 }
 

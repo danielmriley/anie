@@ -9,6 +9,12 @@
 > responses whose body looks like native-reasoning rejection to
 > `NativeReasoningUnsupported`. Test assertions use `matches!` on
 > variants rather than `.contains(...)` on messages.
+>
+> **Status (post-fix-03b):** retry *decisions* now live in
+> `crates/anie-cli/src/retry_policy.rs` via `RetryPolicy::decide`.
+> `ProviderError::is_retryable()` was removed; the remaining
+> `retry_after_ms()` accessor is a pure readback of server-provided
+> `Retry-After` data.
 
 ## Motivation
 
@@ -38,9 +44,11 @@ pick a variant by feel.
 
 1. **Variants describe cause, not stringified detail.** If callers
    need to distinguish two situations, they should be two variants.
-2. **Retryability is not in the error type.** It's a property
-   derived by `RetryPolicy` (plan 03, phase 4). Errors stay
-   descriptive; retry decisions stay in one place.
+2. **Retry *decisions* are not in the error type.** The decision
+   (retry? compact? give up?) is derived by `RetryPolicy::decide`
+   in `crates/anie-cli/src/retry_policy.rs`. Retry-relevant fields
+   (server-sent `Retry-After`) remain on the error type and are
+   read back via the trivial `retry_after_ms()` accessor.
 3. **HTTP errors carry status + body.** Enough to diagnose but not
    so much that tests pin brittle text.
 4. **No `Other`.** If a situation genuinely doesn't fit any variant,

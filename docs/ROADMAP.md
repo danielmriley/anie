@@ -89,23 +89,25 @@ as `/skill:name` commands.
 **What**: Internal benchmark suite, TerminalBench investigation.
 **Details**: [docs/notes/benchmarks_and_evaluation.md](notes/benchmarks_and_evaluation.md)
 
-## Refactors (do opportunistically)
+## Refactors
 
-Detailed plans in [docs/refactor_plans/](refactor_plans/README.md).
-Pick items when they unblock feature work or reduce pain.
+Refactors 00–08 plus the fix-plan follow-ups all landed. See
+[`completed/refactor_plans/`](completed/refactor_plans/) for the
+history. One active refactor remains:
 
 | # | Refactor | When to do it |
 |---|----------|---------------|
-| 00 | CI enforcement | Anytime (10 min) |
-| 01 | openai.rs module split | Before next provider work |
-| 02 | TUI overlay trait | Before adding more overlays |
-| 03 | Controller decomposition | Before command system grows |
-| 06 | Session write locking | Before daemon work |
-| 08 | Small hygiene items | Ongoing |
+| 10 | [Extension system (pi-shaped port)](refactor_plans/10_extension_system_pi_port.md) | Multi-week; blocked on OAuth for phase 7, otherwise ready to start |
 
-## Design Documents (parked)
+## Design documents (parked / proposals)
 
 - [Compat system plan](compat_system_plan.md) — per-model backend flags.
   Parked until real local model problems drive the design.
-- [Reasoning fix plan](reasoning_fix_plan.md) — phases 1–3 implemented.
-  No further phases planned.
+- [Shell escape proposal](shell_escape_proposal.md) — `!cmd` prefix in
+  the TUI input pane.
+- [Post-phase Telegram integration](post_phase_telegram.md) — Telegram
+  bot frontend via teloxide.
+
+The thinking-only completion bug fix plan (phases 1–3, all shipped)
+is archived at
+[`completed/reasoning_fix_plan.md`](completed/reasoning_fix_plan.md).

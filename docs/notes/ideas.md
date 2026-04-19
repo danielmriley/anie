@@ -34,10 +34,9 @@ a summary, current state, action items, and priority.
 
 ## Completed / Addressed
 
-- ~~Thinking Levels for Local Models~~ → addressed in `docs/reasoning_fix_plan.md` (phases 1–3)
-- ~~Onboarding Enhancement~~ → implemented in `docs/onboarding_plans/`
+- ~~Thinking Levels for Local Models~~ → addressed in [`../completed/reasoning_fix_plan.md`](../completed/reasoning_fix_plan.md) (phases 1–3)
+- ~~Onboarding Enhancement~~ → implemented; see [`../completed/onboarding_plans/`](../completed/onboarding_plans/)
 
 ## Design Documents (not yet implemented)
 
 - [Compat System Plan](../compat_system_plan.md) — per-model/per-provider OpenAI-compatible backend flags (set aside for now)
-- [Reasoning Fix Plan](../reasoning_fix_plan.md) — completion validity, replay policy, thinking profiles (phases 1–3 implemented)

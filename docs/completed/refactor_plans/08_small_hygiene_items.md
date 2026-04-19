@@ -9,16 +9,26 @@ coordination. Each phase touches ≤3 files.
 >   Added `anie_dir`, `anie_auth_json_path`, `anie_sessions_dir`,
 >   `anie_logs_dir`, `anie_state_json_path` helpers to
 >   `anie-config`; all callers updated.
-> - **Phase B (HTTP panics):** Not landed — plan 04 phase 1
->   provides the better fix (shared `http::client() ->
->   Result<...>`). The current `#[allow(clippy::expect_used)]`
->   with justification is the interim.
+> - **Phase B (HTTP panics):** Landed in commit `d51672b`.
+>   `local.rs::detect_local_servers` now logs and returns an
+>   empty vec on client-build failure rather than panicking; the
+>   shared `http::shared_http_client()` from plan 04 phase 1
+>   covers the hot path. One `.expect(...)` remains in
+>   `http::create_http_client()` (the cold-path fallback), gated
+>   behind `#[allow(clippy::expect_used)]` with a panic
+>   justification.
 > - **Phase C (`.expect` audit):** The production-code sites
 >   flagged in the review (onboarding.rs:1682, model_picker
 >   tests) were addressed during the plan 00 CI followup —
 >   test-module uses are now covered by the workspace
 >   `cfg_attr(test, allow(clippy::expect_used))`.
-> - **Phase D (event send logging):** Not landed. Queued.
+> - **Phase D (event send logging):** Landed in commit `d51672b`.
+>   The helper shipped as `send_event` (not `send_or_warn`) and
+>   lives in `agent_loop.rs`. It uses a process-global
+>   `AtomicBool` latch (`EVENT_DROP_WARNED`) so we warn exactly
+>   once per process lifetime rather than once per channel. The
+>   direct unit tests for that behavior were backfilled in
+>   `fixes/08_status_hygiene_and_tests.md`.
 > - **Phase E (cached ToolRegistry):** Was already done before
 >   this plan was written — `ControllerState` caches it once at
 >   `prepare_controller_state` time and clones the `Arc` per

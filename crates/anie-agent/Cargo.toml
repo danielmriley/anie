@@ -25,3 +25,4 @@ anie-protocol.workspace = true
 [dev-dependencies]
 async-stream.workspace = true
 anie-provider = { workspace = true, features = ["mock"] }
+tracing-subscriber.workspace = true

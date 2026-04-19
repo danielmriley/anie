@@ -7,6 +7,13 @@ A Rust-based coding agent harness inspired by [pi](https://github.com/badlogic/p
 - `docs/IMPLEMENTATION_ORDER.md` — concrete execution sequence for building the system
 - `docs/notes.md` — planning issue tracker (resolved / open / deferred)
 
+> **Historical note (2026-04-18).** Early versions of this build doc
+> described an in-process extension crate. That crate was removed.
+> Current state: there is no extension crate in the workspace; see
+> `docs/arch/anie-rs_architecture.md` for the live architecture and
+> `docs/refactor_plans/10_extension_system_pi_port.md` for the future
+> out-of-process extension design.
+
 ---
 
 ## Design goals
@@ -36,7 +43,6 @@ anie-rs/
     anie-auth/                API key and OAuth credential storage
     anie-tui/                 Terminal UI (ratatui-based)
     anie-cli/                 CLI entry point, arg parsing, run modes
-    anie-extensions/          Extension loading and hook dispatch
 ```
 
 ### Dependency graph (simplified)
@@ -62,9 +68,6 @@ anie-cli
   │     ├── anie-config
   │     ├── anie-provider
   │     └── anie-protocol
-  └── anie-extensions
-        ├── anie-agent
-        └── anie-protocol
 ```
 
 Each arrow means "depends on." Cycles are impossible by design.
@@ -807,63 +810,11 @@ Enter alternate screen on startup, leave on exit. This keeps the user's terminal
 
 ---
 
-## Crate: `anie-extensions`
+## Extensions (deferred)
 
-Extension loading and hook dispatch. Extensions are compiled Rust plugins loaded at startup.
-
-### v1: Compiled hooks
-
-For v1, extensions are Rust traits implemented in the main binary or linked crates:
-
-```rust
-#[async_trait]
-pub trait Extension: Send + Sync {
-    fn name(&self) -> &str;
-
-    /// Called before the system prompt is finalized for each turn.
-    async fn before_agent_start(
-        &self,
-        system_prompt: &str,
-        context: &[Message],
-    ) -> Option<ExtensionResult> {
-        None
-    }
-
-    /// Called when a new session starts.
-    async fn on_session_start(&self, session_id: &str) {}
-
-    /// Called before a tool executes (can block).
-    async fn before_tool_call(
-        &self,
-        tool_call: &ToolCall,
-        args: &serde_json::Value,
-    ) -> BeforeToolCallResult {
-        BeforeToolCallResult::Allow
-    }
-
-    /// Called after a tool executes (can override result).
-    async fn after_tool_call(
-        &self,
-        tool_call: &ToolCall,
-        result: &ToolResult,
-    ) -> Option<ToolResultOverride> {
-        None
-    }
-}
-
-pub struct ExtensionResult {
-    pub system_prompt: Option<String>,
-    pub inject_messages: Vec<Message>,
-}
-
-pub struct ExtensionRunner {
-    extensions: Vec<Box<dyn Extension>>,
-}
-```
-
-### v2: Dynamic plugins (future)
-
-Load `.so` / `.dylib` plugins from `~/.anie/extensions/` using `libloading`. Each plugin exports a `create_extension() -> Box<dyn Extension>` symbol. This is not required for v1.
+There is no extension crate in the current workspace. The supported
+future design is the out-of-process JSON-RPC system in
+`docs/refactor_plans/10_extension_system_pi_port.md`.
 
 ---
 
@@ -902,8 +853,6 @@ Follows pi's layered approach:
 
 `SYSTEM.md` in `.anie/` or `~/.anie/` replaces the base (items 1-3). `APPEND_SYSTEM.md` appends to the base.
 
-Extensions can modify the final prompt per-turn via `before_agent_start`.
-
 ---
 
 ## Onboarding workflow
@@ -934,7 +883,7 @@ Extensions can modify the final prompt per-turn via `before_agent_start`.
 
 ### Subsequent runs
 
-1. Load config, auth, and extensions.
+1. Load config and auth.
 2. Resolve the default model and verify auth.
 3. Check for `AGENTS.md` in CWD hierarchy and load project context.
 4. If a session ID is passed via `--resume`, load that session. Otherwise start fresh.
@@ -959,8 +908,6 @@ anie-agent: AgentLoop::run(prompts, owned_context, event_tx, cancel)
   ├─► Check auto-compaction (is context near limit?)
   │     If yes: run compaction, persist CompactionEntry
   │
-  ├─► Extensions: before_agent_start (may modify system_prompt)
-  │
   ├─► Convert context to LlmMessage via provider.convert_messages()
   │
   ├─► ProviderRegistry::stream(model, llm_context, options)
@@ -980,7 +927,6 @@ anie-agent: AgentLoop::run(prompts, owned_context, event_tx, cancel)
   ├─► Extract ToolCalls from AssistantMessage
   │     For each tool call:
   │       ├─► Validate args against ToolDef schema
-  │       ├─► Extensions: before_tool_call (can block)
   │       ├─► ToolRegistry::get(name).execute(args)
   │       │     │
   │       │     ▼
@@ -988,7 +934,6 @@ anie-agent: AgentLoop::run(prompts, owned_context, event_tx, cancel)
   │       │     │
   │       │     ▼
   │       │   Return ToolResult
-  │       ├─► Extensions: after_tool_call (can override)
   │       ├─► Emit ToolExecEnd
   │       └─► Push ToolResultMessage to context
   │
@@ -1044,7 +989,8 @@ anie-tui: show idle state, re-focus InputPane
 22. Add onboarding flow (prefer local providers, then hidden API-key prompt).
 23. Add `/model`, `/thinking`, `/compact`, `/clear`, `/help` slash commands.
 24. Add diff rendering for edit results (using `similar` crate output).
-25. **Post-v1.0:** add `anie-extensions` compiled hooks if schedule allows.
+25. **Post-v1.0:** implement the out-of-process extension design from
+    `docs/refactor_plans/10_extension_system_pi_port.md`.
 
 ### Phase 6: Hardening (weeks 11-12)
 

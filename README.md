@@ -267,8 +267,8 @@ see `docs/refactor_plans/10_extension_system_pi_port.md`.
 
 For more detail, see:
 
+- `docs/README.md` — docs tree entry point
 - `docs/arch/anie-rs_architecture.md`
-- `docs/arch/anie-rs_build_doc.md`
 - `docs/arch/credential_resolution.md`
 - `docs/arch/onboarding_flow.md`
 - `docs/completed/phased_plan_v1-0-1/README.md`

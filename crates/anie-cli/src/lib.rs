@@ -1,13 +1,17 @@
 //! CLI entry points for interactive, print, and RPC modes.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+mod bootstrap;
 mod commands;
 mod compaction;
 mod controller;
+mod interactive_mode;
 mod model_catalog;
 mod models_command;
 mod onboarding;
+mod print_mode;
 mod retry_policy;
+mod rpc;
 mod runtime;
 mod runtime_state;
 
@@ -119,7 +123,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     } else if cli.print || !cli.prompt.is_empty() {
         controller::run_print_mode(cli).await
     } else {
-        controller::run_interactive_mode(cli).await
+        interactive_mode::run_interactive_mode(cli).await
     }
 }
 

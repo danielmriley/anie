@@ -221,3 +221,207 @@ pub(super) fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String
                 .map(str::to_string)
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use anie_provider::{CostPerMillion, ReasoningControlMode, ThinkingRequestMode};
+
+    use super::*;
+    use crate::OpenAIProvider;
+
+    fn sample_model() -> Model {
+        Model {
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+            provider: "openai".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://api.openai.com/v1".into(),
+            context_window: 128_000,
+            max_tokens: 8_192,
+            supports_reasoning: true,
+            reasoning_capabilities: None,
+            supports_images: true,
+            cost_per_million: CostPerMillion::zero(),
+        }
+    }
+
+    fn sample_heuristic_local_model(provider: &str, base_url: &str, id: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: id.into(),
+            provider: provider.into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: base_url.into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_maps_from_thinking_level() {
+        assert_eq!(reasoning_effort(ThinkingLevel::Off), None);
+        assert_eq!(reasoning_effort(ThinkingLevel::Low), Some("low"));
+        assert_eq!(reasoning_effort(ThinkingLevel::Medium), Some("medium"));
+        assert_eq!(reasoning_effort(ThinkingLevel::High), Some("high"));
+    }
+
+    #[test]
+    fn is_native_reasoning_compatibility_error_only_matches_typed_variant() {
+        assert!(is_native_reasoning_compatibility_error(
+            &ProviderError::NativeReasoningUnsupported("unknown field reasoning".into()),
+        ));
+        assert!(!is_native_reasoning_compatibility_error(
+            &ProviderError::Http {
+                status: 400,
+                body: "unknown field reasoning_effort".into(),
+            }
+        ));
+        assert!(!is_native_reasoning_compatibility_error(
+            &ProviderError::Auth("bad key".into(),)
+        ));
+        assert!(!is_native_reasoning_compatibility_error(
+            &ProviderError::ContextOverflow("too many tokens".into())
+        ));
+        assert!(!is_native_reasoning_compatibility_error(
+            &ProviderError::RateLimited {
+                retry_after_ms: Some(500)
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_openai_http_error_upgrades_reasoning_compat_bodies() {
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "unknown field reasoning_effort",
+            None,
+        );
+        assert!(matches!(err, ProviderError::NativeReasoningUnsupported(_)));
+
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "bad request: extra inputs are not permitted for reasoning",
+            None,
+        );
+        assert!(matches!(err, ProviderError::NativeReasoningUnsupported(_)));
+
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "missing required field messages",
+            None,
+        );
+        assert!(matches!(err, ProviderError::Http { .. }));
+
+        let err = classify_openai_http_error(reqwest::StatusCode::UNAUTHORIZED, "nope", None);
+        assert!(matches!(err, ProviderError::Auth(_)));
+    }
+
+    #[test]
+    fn backend_defaults_resolve_conservatively_for_local_models() {
+        let provider = OpenAIProvider::new();
+        let options = StreamOptions {
+            thinking: ThinkingLevel::High,
+            max_tokens: Some(8_192),
+            ..StreamOptions::default()
+        };
+        let ollama =
+            sample_heuristic_local_model("ollama", "http://localhost:11434/v1", "qwen3:32b");
+        let lmstudio =
+            sample_heuristic_local_model("lmstudio", "http://localhost:1234/v1", "qwen3:32b");
+        let vllm = sample_heuristic_local_model("vllm", "http://localhost:8000/v1", "qwen3:32b");
+        let unknown =
+            sample_heuristic_local_model("custom", "http://localhost:8080/v1", "unknown-model");
+
+        assert_eq!(
+            provider.native_reasoning_request_strategies(&ollama, &options),
+            vec![
+                NativeReasoningRequestStrategy::TopLevelReasoningEffort,
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ]
+        );
+        assert_eq!(
+            provider.native_reasoning_request_strategies(&lmstudio, &options),
+            vec![
+                NativeReasoningRequestStrategy::LmStudioNestedReasoning,
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ]
+        );
+        assert_eq!(
+            provider.native_reasoning_request_strategies(&vllm, &options),
+            vec![
+                NativeReasoningRequestStrategy::TopLevelReasoningEffort,
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ]
+        );
+        assert_eq!(
+            effective_reasoning_capabilities(&unknown),
+            Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Prompt),
+                output: None,
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::PromptSteering),
+            })
+        );
+        assert_eq!(
+            provider.native_reasoning_request_strategies(&unknown, &options),
+            vec![NativeReasoningRequestStrategy::NoNativeFields]
+        );
+    }
+
+    #[test]
+    fn local_reasoning_token_headroom_changes_predictably_with_thinking_level() {
+        let model =
+            sample_heuristic_local_model("ollama", "http://localhost:11434/v1", "qwen3:32b");
+
+        let off = effective_max_tokens(
+            &model,
+            &StreamOptions {
+                thinking: ThinkingLevel::Off,
+                max_tokens: Some(8_192),
+                ..StreamOptions::default()
+            },
+        );
+        let low = effective_max_tokens(
+            &model,
+            &StreamOptions {
+                thinking: ThinkingLevel::Low,
+                max_tokens: Some(8_192),
+                ..StreamOptions::default()
+            },
+        );
+        let medium = effective_max_tokens(
+            &model,
+            &StreamOptions {
+                thinking: ThinkingLevel::Medium,
+                max_tokens: Some(8_192),
+                ..StreamOptions::default()
+            },
+        );
+        let high = effective_max_tokens(
+            &model,
+            &StreamOptions {
+                thinking: ThinkingLevel::High,
+                max_tokens: Some(8_192),
+                ..StreamOptions::default()
+            },
+        );
+        let hosted = effective_max_tokens(
+            &sample_model(),
+            &StreamOptions {
+                thinking: ThinkingLevel::High,
+                max_tokens: Some(8_192),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(off, Some(8_192));
+        assert_eq!(low, Some(7_245));
+        assert_eq!(medium, Some(6_298));
+        assert_eq!(high, Some(5_632));
+        assert_eq!(hosted, Some(8_192));
+    }
+}

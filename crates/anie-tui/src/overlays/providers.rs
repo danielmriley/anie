@@ -100,6 +100,7 @@ enum ProviderManagementMode {
 #[derive(Debug)]
 enum WorkerEvent {
     TestCompleted {
+        row_index: usize,
         provider: String,
         result: TestResult,
     },
@@ -130,7 +131,7 @@ pub struct ProviderManagementScreen {
     selected: usize,
     mode: ProviderManagementMode,
     credential_store: CredentialStore,
-    test_results: HashMap<String, TestResult>,
+    test_results: HashMap<usize, TestResult>,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
     worker_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     spinner: Spinner,
@@ -230,12 +231,11 @@ impl ProviderManagementScreen {
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
-        let mode = self.mode.clone();
         let spinner_frame = self.spinner.tick().to_string();
-        match mode {
+        match &self.mode {
             ProviderManagementMode::Table => self.render_table(frame, inner),
             ProviderManagementMode::ActionMenu { selected } => {
-                self.render_action_menu(frame, inner, selected)
+                self.render_action_menu(frame, inner, *selected)
             }
             ProviderManagementMode::ConfirmDelete => self.render_status_panel(
                 frame,
@@ -249,7 +249,7 @@ impl ProviderManagementScreen {
                 footer_line("[y] Delete   [n/Esc] Cancel"),
             ),
             ProviderManagementMode::EditApiKey { input } => {
-                self.render_edit_api_key(frame, inner, &input)
+                self.render_edit_api_key(frame, inner, input)
             }
             ProviderManagementMode::Busy { message } => self.render_status_panel(
                 frame,
@@ -260,14 +260,14 @@ impl ProviderManagementScreen {
                 footer_line("[Esc] Back"),
             ),
             ProviderManagementMode::PickingModel { picker, .. } => {
-                self.render_model_picker(frame, inner, &picker, &spinner_frame)
+                self.render_model_picker(frame, inner, picker, &spinner_frame)
             }
             ProviderManagementMode::Status { message, is_error } => self.render_status_panel(
                 frame,
                 inner,
-                if is_error { "Error" } else { "Done" },
-                &message,
-                if is_error { Color::Red } else { Color::Green },
+                if *is_error { "Error" } else { "Done" },
+                message,
+                if *is_error { Color::Red } else { Color::Green },
                 footer_line("[Any key] Continue"),
             ),
         }
@@ -304,8 +304,12 @@ impl ProviderManagementScreen {
 
     fn handle_worker_event(&mut self, event: WorkerEvent) -> ProviderManagementAction {
         match event {
-            WorkerEvent::TestCompleted { provider, result } => {
-                self.test_results.insert(provider.clone(), result.clone());
+            WorkerEvent::TestCompleted {
+                row_index,
+                provider,
+                result,
+            } => {
+                self.test_results.insert(row_index, result.clone());
                 self.mode = match result {
                     TestResult::Success { latency_ms } => ProviderManagementMode::Status {
                         message: format!("Provider '{provider}' is healthy ({latency_ms}ms)."),
@@ -327,7 +331,9 @@ impl ProviderManagementScreen {
                     {
                         entry.has_credential = true;
                     }
-                    self.test_results.remove(&provider);
+                    if let Some(index) = self.provider_index(&provider) {
+                        self.test_results.remove(&index);
+                    }
                     self.mode = ProviderManagementMode::Status {
                         message: format!("Saved a new API key for '{provider}'."),
                         is_error: false,
@@ -566,7 +572,7 @@ impl ProviderManagementScreen {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                let status = match self.test_results.get(&entry.name) {
+                let status = match self.test_results.get(&index) {
                     Some(TestResult::Pending) => "testing…".to_string(),
                     Some(TestResult::Success { latency_ms }) => format!("ok ({latency_ms}ms)"),
                     Some(TestResult::Failed { error }) => truncate_text(error, 16),
@@ -742,12 +748,24 @@ impl ProviderManagementScreen {
         self.providers.get(self.selected)
     }
 
+    fn provider_index(&self, provider: &str) -> Option<usize> {
+        self.providers
+            .iter()
+            .position(|entry| entry.name == provider)
+    }
+
+    fn replace_provider_entries(&mut self, providers: Vec<ProviderEntry>) {
+        self.providers = providers;
+        self.selected = self.selected.min(self.providers.len().saturating_sub(1));
+        self.test_results.clear();
+    }
+
     fn spawn_test_for_selected(&mut self) {
+        let row_index = self.selected;
         let Some(entry) = self.selected_entry().cloned() else {
             return;
         };
-        self.test_results
-            .insert(entry.name.clone(), TestResult::Pending);
+        self.test_results.insert(row_index, TestResult::Pending);
         self.mode = ProviderManagementMode::Busy {
             message: format!("Testing '{}'…", entry.name),
         };
@@ -756,6 +774,7 @@ impl ProviderManagementScreen {
         let credential_store = self.credential_store.clone();
         if tokio::runtime::Handle::try_current().is_err() {
             let _ = tx.send(WorkerEvent::TestCompleted {
+                row_index,
                 provider: entry.name,
                 result: TestResult::Failed {
                     error: "provider testing requires an async runtime".to_string(),
@@ -767,6 +786,7 @@ impl ProviderManagementScreen {
         tokio::spawn(async move {
             let result = test_provider(entry.clone(), credential_store).await;
             let _ = tx.send(WorkerEvent::TestCompleted {
+                row_index,
                 provider: entry.name,
                 result,
             });
@@ -908,10 +928,13 @@ impl ProviderManagementScreen {
             mutator.remove_provider(&entry.name);
             mutator.save()?;
 
-            self.providers
-                .retain(|provider| provider.name != entry.name);
-            self.selected = self.selected.min(self.providers.len().saturating_sub(1));
-            self.test_results.remove(&entry.name);
+            let remaining = self
+                .providers
+                .iter()
+                .filter(|provider| provider.name != entry.name)
+                .cloned()
+                .collect::<Vec<_>>();
+            self.replace_provider_entries(remaining);
 
             if let Some(new_default) = self.providers.first().cloned() {
                 let (provider, model) =
@@ -1307,10 +1330,19 @@ mod tests {
     fn test_action_marks_provider_pending() {
         let mut screen = ProviderManagementScreen::new_for_tests(vec![entry("openai", true)]);
         screen.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert_eq!(
-            screen.test_results.get("openai"),
-            Some(&TestResult::Pending)
-        );
+        assert_eq!(screen.test_results.get(&0), Some(&TestResult::Pending));
+    }
+
+    #[test]
+    fn test_result_keyed_by_row_index() {
+        let mut screen = ProviderManagementScreen::new_for_tests(vec![
+            entry("openai", true),
+            entry("anthropic", false),
+        ]);
+        screen.selected = 1;
+        screen.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(screen.test_results.get(&1), Some(&TestResult::Pending));
+        assert!(!screen.test_results.contains_key(&0));
     }
 
     #[test]
@@ -1355,10 +1387,7 @@ mod tests {
         let mut screen = ProviderManagementScreen::new_for_tests(vec![entry("openai", true)]);
         screen.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert!(matches!(screen.mode, ProviderManagementMode::Busy { .. }));
-        assert_eq!(
-            screen.test_results.get("openai"),
-            Some(&TestResult::Pending)
-        );
+        assert_eq!(screen.test_results.get(&0), Some(&TestResult::Pending));
 
         // Outside a tokio runtime, spawn_test_for_selected synchronously
         // sends a TestCompleted(Failed) event; handle_tick processes it.
@@ -1369,9 +1398,17 @@ mod tests {
             ProviderManagementMode::Status { is_error: true, .. }
         ));
         assert!(matches!(
-            screen.test_results.get("openai"),
+            screen.test_results.get(&0),
             Some(TestResult::Failed { .. })
         ));
+    }
+
+    #[test]
+    fn list_reload_clears_test_results() {
+        let mut screen = ProviderManagementScreen::new_for_tests(vec![entry("openai", true)]);
+        screen.test_results.insert(0, TestResult::Pending);
+        screen.replace_provider_entries(vec![entry("anthropic", false)]);
+        assert!(screen.test_results.is_empty());
     }
 
     #[test]
@@ -1397,6 +1434,28 @@ mod tests {
         ));
         assert_eq!(screen.providers.len(), 1);
         assert_eq!(screen.providers[0].name, "anthropic");
+    }
+
+    #[test]
+    fn deleting_a_row_clears_test_results() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let write_target = tempdir.path().join("config.toml");
+        let json_fallback = tempdir.path().join("auth.json");
+        let credential_store =
+            CredentialStore::with_config("anie-test", Some(json_fallback)).without_native_keyring();
+        let mut screen = ProviderManagementScreen::new_for_tests_with(
+            vec![entry("openai", true), entry("anthropic", false)],
+            credential_store,
+            write_target,
+        );
+        screen
+            .test_results
+            .insert(1, TestResult::Success { latency_ms: 12 });
+
+        screen.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let _ = screen.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(screen.test_results.is_empty());
     }
 
     #[tokio::test]

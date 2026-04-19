@@ -25,9 +25,14 @@ use crate::overlays::providers::ProviderManagementAction;
 /// outcome is consumed immediately by `App::apply_overlay_outcome`
 /// and never stored or cloned.
 #[allow(clippy::large_enum_variant)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum OverlayOutcome {
     Onboarding(OnboardingAction),
     ProviderManagement(ProviderManagementAction),
+    /// Close the active overlay without a screen-specific action.
+    Dismiss,
+    /// No action; keep the overlay open.
+    Idle,
 }
 
 /// Behavioural contract for full-screen overlays.

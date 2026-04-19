@@ -3,5 +3,5 @@
 pub(crate) mod panel;
 pub(crate) mod text_field;
 
-pub(crate) use panel::{centered_rect, footer_line};
+pub(crate) use panel::{centered_rect, footer_line, render_placeholder_panel};
 pub(crate) use text_field::TextField;

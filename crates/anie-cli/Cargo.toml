@@ -42,3 +42,4 @@ anie-tui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+anie-provider = { workspace = true, features = ["mock"] }

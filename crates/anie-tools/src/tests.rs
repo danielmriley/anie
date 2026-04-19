@@ -519,17 +519,13 @@ async fn agent_loop_and_tools_support_end_to_end_read_write_flow() {
     let agent = AgentLoop::new(
         Arc::new(providers),
         Arc::new(tools),
-        AgentLoopConfig {
-            model: sample_model(),
-            system_prompt: "You are a test agent".into(),
-            thinking: ThinkingLevel::Off,
-            tool_execution: ToolExecutionMode::Sequential,
-            request_options_resolver: Arc::new(StaticResolver),
-            get_steering_messages: None,
-            get_follow_up_messages: None,
-            before_tool_call_hook: None,
-            after_tool_call_hook: None,
-        },
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver),
+        ),
     );
 
     let (event_tx, _event_rx) = mpsc::channel(64);

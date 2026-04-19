@@ -60,17 +60,13 @@ pub fn build_agent(provider: MockProvider, tool_registry: Arc<ToolRegistry>) -> 
     AgentLoop::new(
         Arc::new(provider_registry),
         tool_registry,
-        AgentLoopConfig {
-            model: sample_model(),
-            system_prompt: "You are a test agent.".into(),
-            thinking: ThinkingLevel::Off,
-            tool_execution: ToolExecutionMode::Parallel,
-            request_options_resolver: static_resolver(),
-            get_steering_messages: None,
-            get_follow_up_messages: None,
-            before_tool_call_hook: None,
-            after_tool_call_hook: None,
-        },
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent.".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Parallel,
+            static_resolver(),
+        ),
     )
 }
 

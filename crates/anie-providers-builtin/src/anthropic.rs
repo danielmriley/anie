@@ -40,10 +40,14 @@ impl AnthropicProvider {
     ) -> serde_json::Value {
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(model.id));
-        body.insert(
-            "max_tokens".into(),
-            json!(options.max_tokens.unwrap_or(model.max_tokens)),
-        );
+        let base_max = options.max_tokens.unwrap_or(model.max_tokens);
+        if let Some((effective_max, thinking)) = thinking_config(options, model) {
+            body.insert("max_tokens".into(), json!(effective_max));
+            body.insert("thinking".into(), thinking);
+            body.insert("temperature".into(), json!(1.0));
+        } else {
+            body.insert("max_tokens".into(), json!(base_max));
+        }
         body.insert("stream".into(), serde_json::Value::Bool(true));
         body.insert(
             "messages".into(),
@@ -77,13 +81,11 @@ impl AnthropicProvider {
         if let Some(temperature) = options.temperature {
             body.insert("temperature".into(), json!(temperature));
         }
-        if let Some(thinking) = thinking_config(
-            options.thinking,
-            options.max_tokens.unwrap_or(model.max_tokens),
-        ) {
-            body.insert("thinking".into(), thinking);
+        if let Some(thinking) = thinking_config(options, model) {
+            body.insert("thinking".into(), thinking.1);
             body.insert("temperature".into(), json!(1.0));
         }
+
         serde_json::Value::Object(body)
     }
 }
@@ -192,15 +194,25 @@ impl Provider for AnthropicProvider {
     }
 
     fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
+        let last = tools.len().saturating_sub(1);
         tools
             .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.parameters,
-                    "cache_control": { "type": "ephemeral" },
-                })
+            .enumerate()
+            .map(|(i, tool)| {
+                if !tools.is_empty() && i == last {
+                    json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                        "cache_control": { "type": "ephemeral" },
+                    })
+                } else {
+                    json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                    })
+                }
             })
             .collect()
     }
@@ -275,22 +287,37 @@ fn anthropic_tool_result_content(content: &[ContentBlock]) -> serde_json::Value 
     serde_json::Value::Array(content_blocks_to_anthropic(content))
 }
 
-fn thinking_config(thinking: ThinkingLevel, max_tokens: u64) -> Option<serde_json::Value> {
-    match thinking {
-        ThinkingLevel::Off => None,
-        ThinkingLevel::Low => Some(json!({
-            "type": "enabled",
-            "budget_tokens": (max_tokens / 4).max(1_024),
-        })),
-        ThinkingLevel::Medium => Some(json!({
-            "type": "enabled",
-            "budget_tokens": (max_tokens / 2).max(2_048),
-        })),
-        ThinkingLevel::High => Some(json!({
-            "type": "enabled",
-            "budget_tokens": max_tokens.max(4_096),
-        })),
-    }
+fn thinking_config(options: &StreamOptions, model: &Model) -> Option<(u64, serde_json::Value)> {
+    /// Minimum output tokens to reserve alongside the thinking budget.
+    const MIN_OUTPUT_TOKENS: u64 = 1_024;
+
+    // Fixed absolute budgets per level — not percentages of max_tokens.
+    // Mirrors the pi-mono approach: budget is a constant, and max_tokens is
+    // expanded to accommodate it rather than the budget being capped by it.
+    let budget = match options.thinking {
+        ThinkingLevel::Off => return None,
+        ThinkingLevel::Low => 2_048,
+        ThinkingLevel::Medium => 8_192,
+        ThinkingLevel::High => 16_384,
+    };
+
+    // Expand max_tokens to fit both the thinking budget and some output,
+    // then cap at the model's ceiling.
+    let base = options.max_tokens.unwrap_or(model.max_tokens);
+    let effective_max = (base + budget).min(model.max_tokens);
+
+    // If the model cap is too tight to fit the budget plus the minimum
+    // output reserve, shrink the budget to what remains.
+    let budget = if effective_max <= budget + MIN_OUTPUT_TOKENS {
+        effective_max.saturating_sub(MIN_OUTPUT_TOKENS)
+    } else {
+        budget
+    };
+
+    Some((
+        effective_max,
+        json!({ "type": "enabled", "budget_tokens": budget }),
+    ))
 }
 
 struct AnthropicStreamState {
@@ -590,16 +617,60 @@ mod tests {
     }
 
     #[test]
-    fn convert_tools_adds_cache_control() {
+    fn convert_tools_adds_cache_control_only_to_last_tool() {
         let provider = AnthropicProvider::new();
-        let tools = provider.convert_tools(&[ToolDef {
+
+        // Single tool: cache_control is on the only (last) entry.
+        let single = provider.convert_tools(&[ToolDef {
             name: "read".into(),
             description: "Read".into(),
             parameters: json!({"type": "object"}),
         }]);
+        assert_eq!(single[0]["cache_control"]["type"], json!("ephemeral"));
 
-        assert_eq!(tools[0]["cache_control"]["type"], json!("ephemeral"));
-        assert_eq!(tools[0]["input_schema"]["type"], json!("object"));
+        // Multiple tools: only the last one carries cache_control.
+        let multi = provider.convert_tools(&[
+            ToolDef {
+                name: "read".into(),
+                description: "Read".into(),
+                parameters: json!({}),
+            },
+            ToolDef {
+                name: "write".into(),
+                description: "Write".into(),
+                parameters: json!({}),
+            },
+            ToolDef {
+                name: "edit".into(),
+                description: "Edit".into(),
+                parameters: json!({}),
+            },
+            ToolDef {
+                name: "bash".into(),
+                description: "Bash".into(),
+                parameters: json!({}),
+            },
+        ]);
+        assert!(
+            multi[0].get("cache_control").is_none(),
+            "first tool must not have cache_control"
+        );
+        assert!(
+            multi[1].get("cache_control").is_none(),
+            "middle tools must not have cache_control"
+        );
+        assert!(
+            multi[2].get("cache_control").is_none(),
+            "middle tools must not have cache_control"
+        );
+        assert_eq!(
+            multi[3]["cache_control"]["type"],
+            json!("ephemeral"),
+            "last tool must have cache_control"
+        );
+
+        // Empty list: no panic.
+        assert!(provider.convert_tools(&[]).is_empty());
     }
 
     #[test]
@@ -678,18 +749,48 @@ mod tests {
 
     #[test]
     fn thinking_config_maps_levels() {
-        assert_eq!(thinking_config(ThinkingLevel::Off, 8_192), None);
-        assert_eq!(
-            thinking_config(ThinkingLevel::Low, 8_192).expect("low thinking")["budget_tokens"],
-            json!(2_048)
-        );
-        assert_eq!(
-            thinking_config(ThinkingLevel::Medium, 8_192).expect("medium thinking")["budget_tokens"],
-            json!(4_096)
-        );
-        assert_eq!(
-            thinking_config(ThinkingLevel::High, 8_192).expect("high thinking")["budget_tokens"],
-            json!(8_192)
-        );
+        fn opts(level: ThinkingLevel) -> StreamOptions {
+            StreamOptions {
+                thinking: level,
+                ..Default::default()
+            }
+        }
+        fn model_with(max_tokens: u64) -> Model {
+            Model {
+                id: "claude-haiku-4-5-20251001".into(),
+                name: "Haiku".into(),
+                provider: "anthropic".into(),
+                api: anie_provider::ApiKind::AnthropicMessages,
+                base_url: "https://api.anthropic.com".into(),
+                context_window: 200_000,
+                max_tokens,
+                supports_reasoning: true,
+                reasoning_capabilities: None,
+                supports_images: true,
+                cost_per_million: anie_provider::CostPerMillion::zero(),
+            }
+        }
+
+        // Off ⇒ no thinking block
+        assert!(thinking_config(&opts(ThinkingLevel::Off), &model_with(64_000)).is_none());
+
+        // With a large model (64 k), budgets are the fixed absolute values.
+        let model = model_with(64_000);
+        let (_, low) = thinking_config(&opts(ThinkingLevel::Low), &model).unwrap();
+        let (_, med) = thinking_config(&opts(ThinkingLevel::Medium), &model).unwrap();
+        let (eff_max, high) = thinking_config(&opts(ThinkingLevel::High), &model).unwrap();
+        assert_eq!(low["budget_tokens"], json!(2_048));
+        assert_eq!(med["budget_tokens"], json!(8_192));
+        assert_eq!(high["budget_tokens"], json!(16_384));
+        // budget must always be strictly less than effective_max_tokens
+        assert!(high["budget_tokens"].as_u64().unwrap() < eff_max);
+
+        // With a small model (max_tokens = 8 192), the budget is capped so
+        // that at least MIN_OUTPUT_TOKENS (1 024) remain for the response.
+        let small = model_with(8_192);
+        let (eff, high_small) = thinking_config(&opts(ThinkingLevel::High), &small).unwrap();
+        assert_eq!(eff, 8_192);
+        assert!(high_small["budget_tokens"].as_u64().unwrap() < eff);
+        assert_eq!(high_small["budget_tokens"], json!(8_192 - 1_024));
     }
 }

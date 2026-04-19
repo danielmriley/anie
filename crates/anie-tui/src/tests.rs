@@ -974,17 +974,10 @@ fn slash_commands_route_actions_and_render_help() {
         KeyModifiers::NONE,
     )))
     .expect("submit help command");
-
-    let mut terminal = Terminal::new(TestBackend::new(60, 30)).expect("test terminal");
-    terminal
-        .draw(|frame| app.render(frame))
-        .expect("draw frame");
-    let screen = render_to_string(terminal.backend());
-    assert!(screen.contains("/onboard"), "screen was:\n{screen}");
-    assert!(screen.contains("/providers"), "screen was:\n{screen}");
-    assert!(screen.contains("/copy"), "screen was:\n{screen}");
-    assert!(screen.contains("/new"), "screen was:\n{screen}");
-    assert!(screen.contains("/reload"), "screen was:\n{screen}");
+    assert!(matches!(
+        action_rx.try_recv().expect("help action"),
+        crate::UiAction::ShowHelp
+    ));
 }
 
 #[test]

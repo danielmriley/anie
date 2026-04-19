@@ -274,3 +274,372 @@ struct OpenAiToolCallState {
     started: bool,
     ended: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use anie_protocol::{AssistantMessage, ContentBlock, ToolCall};
+    use anie_provider::{ApiKind, CostPerMillion, Model, ProviderError, ProviderEvent};
+
+    use super::*;
+
+    fn sample_model() -> Model {
+        Model {
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+            provider: "openai".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://api.openai.com/v1".into(),
+            context_window: 128_000,
+            max_tokens: 8_192,
+            supports_reasoning: true,
+            reasoning_capabilities: None,
+            supports_images: true,
+            cost_per_million: CostPerMillion::zero(),
+        }
+    }
+
+    fn sample_local_model() -> Model {
+        Model {
+            id: "qwen3:32b".into(),
+            name: "qwen3:32b".into(),
+            provider: "ollama".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "http://localhost:11434/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+        }
+    }
+
+    fn assistant_text(message: &AssistantMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn assistant_thinking(message: &AssistantMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn final_message(events: &[ProviderEvent]) -> AssistantMessage {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::Done(message) => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done event")
+    }
+
+    #[test]
+    fn accumulates_argument_fragments_into_tool_calls() {
+        let mut state = OpenAiStreamState::new(&sample_model());
+        let first = state
+            .process_event(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"pa"}}]}}]}"#)
+            .expect("first chunk");
+        let second = state
+            .process_event(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"src/main.rs\"}"}}],"content":""},"finish_reason":"tool_calls"}]}"#)
+            .expect("second chunk");
+
+        assert!(matches!(
+            first.first(),
+            Some(ProviderEvent::ToolCallStart(_))
+        ));
+        assert!(matches!(
+            second.last(),
+            Some(ProviderEvent::ToolCallEnd { .. })
+        ));
+
+        let message = state.into_message();
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolCall(ToolCall { arguments, .. }) if arguments == &json!({ "path": "src/main.rs" })
+        ));
+    }
+
+    #[test]
+    fn handles_missing_usage_fields() {
+        let mut state = OpenAiStreamState::new(&sample_model());
+        let events = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("events");
+        assert!(matches!(events.first(), Some(ProviderEvent::TextDelta(text)) if text == "hello"));
+        let message = state.into_message();
+        assert_eq!(message.usage.input_tokens, 0);
+        assert_eq!(message.usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn parses_native_reasoning_fields_into_thinking_deltas() {
+        for (field, value) in [
+            ("reasoning", "plan"),
+            ("reasoning_content", "legacy-plan"),
+            ("thinking", "older-plan"),
+        ] {
+            let mut state = OpenAiStreamState::new(&sample_local_model());
+            let events = state
+                .process_event(
+                    &json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": { field: value },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .expect("events");
+            let message = state.into_message();
+
+            assert_eq!(events, vec![ProviderEvent::ThinkingDelta(value.into())]);
+            assert_eq!(assistant_thinking(&message), value);
+            assert_eq!(assistant_text(&message), "");
+        }
+    }
+
+    #[test]
+    fn reasoning_only_stream_without_visible_content_is_an_error() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let events = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"","reasoning":"hello from reasoning"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("events");
+        let error = state
+            .finish_stream()
+            .expect_err("finish stream should fail");
+
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ThinkingDelta("hello from reasoning".into())]
+        );
+        assert!(matches!(error, ProviderError::EmptyAssistantResponse));
+    }
+
+    #[test]
+    fn reasoning_with_visible_text_still_succeeds() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"reasoning":"plan","content":"answer"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("events");
+
+        let finished = state.finish_stream().expect("finish stream");
+        let message = final_message(&finished);
+
+        assert_eq!(assistant_thinking(&message), "plan");
+        assert_eq!(assistant_text(&message), "answer");
+    }
+
+    #[test]
+    fn same_event_native_reasoning_and_text_are_both_preserved() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let events = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"reasoning":"plan","content":"answer"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("events");
+        let message = state.into_message();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ThinkingDelta("plan".into()),
+                ProviderEvent::TextDelta("answer".into()),
+            ]
+        );
+        assert_eq!(assistant_thinking(&message), "plan");
+        assert_eq!(assistant_text(&message), "answer");
+    }
+
+    #[test]
+    fn tagged_parsing_remains_a_fallback_when_native_reasoning_fields_are_absent() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let events = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"<think>plan</think>answer"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("events");
+        let message = state.into_message();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ThinkingDelta("plan".into()),
+                ProviderEvent::TextDelta("answer".into()),
+            ]
+        );
+        assert_eq!(assistant_thinking(&message), "plan");
+        assert_eq!(assistant_text(&message), "answer");
+    }
+
+    #[test]
+    fn parses_tagged_reasoning_when_opening_tag_is_split_across_chunks() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let first = state
+            .process_event(r#"{"choices":[{"index":0,"delta":{"content":"Before<thi"}}]}"#)
+            .expect("first chunk");
+        let second = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"nk>plan</think> after"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("second chunk");
+        let finished = state.finish_stream().expect("finish stream");
+        let message = final_message(&finished);
+
+        assert_eq!(first, vec![ProviderEvent::TextDelta("Before".into())]);
+        assert_eq!(
+            second,
+            vec![
+                ProviderEvent::ThinkingDelta("plan".into()),
+                ProviderEvent::TextDelta(" after".into()),
+            ]
+        );
+        assert_eq!(assistant_text(&message), "Before after");
+        assert_eq!(assistant_thinking(&message), "plan");
+        assert!(!assistant_text(&message).contains("<think>"));
+    }
+
+    #[test]
+    fn parses_tagged_reasoning_when_closing_tag_is_split_across_chunks() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let first = state
+            .process_event(r#"{"choices":[{"index":0,"delta":{"content":"<think>plan</thi"}}]}"#)
+            .expect("first chunk");
+        let second = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"nk> answer"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("second chunk");
+        let message = state.into_message();
+
+        assert_eq!(first, vec![ProviderEvent::ThinkingDelta("plan".into())]);
+        assert_eq!(second, vec![ProviderEvent::TextDelta(" answer".into())]);
+        assert_eq!(assistant_text(&message), " answer");
+        assert_eq!(assistant_thinking(&message), "plan");
+    }
+
+    #[test]
+    fn parses_multiple_tagged_reasoning_spans_in_one_response() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let events = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"A<think>X</think>B<reasoning>Y</reasoning>C"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("events");
+        let message = state.into_message();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::TextDelta("A".into()),
+                ProviderEvent::ThinkingDelta("X".into()),
+                ProviderEvent::TextDelta("B".into()),
+                ProviderEvent::ThinkingDelta("Y".into()),
+                ProviderEvent::TextDelta("C".into()),
+            ]
+        );
+        assert_eq!(assistant_text(&message), "ABC");
+        assert_eq!(assistant_thinking(&message), "XY");
+    }
+
+    #[test]
+    fn tagged_reasoning_aliases_all_emit_thinking() {
+        for (content, expected) in [
+            ("<think>alpha</think>", "alpha"),
+            ("<thinking>beta</thinking>", "beta"),
+            ("<reasoning>gamma</reasoning>", "gamma"),
+        ] {
+            let mut state = OpenAiStreamState::new(&sample_local_model());
+            let events = state
+                .process_event(
+                    &json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "content": content },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .expect("events");
+            let message = state.into_message();
+
+            assert_eq!(events, vec![ProviderEvent::ThinkingDelta(expected.into())]);
+            assert_eq!(assistant_text(&message), "");
+            assert_eq!(assistant_thinking(&message), expected);
+        }
+    }
+
+    #[test]
+    fn malformed_or_unclosed_tag_sequences_do_not_lose_content() {
+        let mut malformed = OpenAiStreamState::new(&sample_local_model());
+        let first = malformed
+            .process_event(r#"{"choices":[{"index":0,"delta":{"content":"hello <thi"}}]}"#)
+            .expect("malformed first chunk");
+        let finished = malformed.finish_stream().expect("finish stream");
+        let malformed_message = final_message(&finished);
+
+        assert_eq!(first, vec![ProviderEvent::TextDelta("hello ".into())]);
+        assert!(matches!(
+            finished.first(),
+            Some(ProviderEvent::TextDelta(text)) if text == "<thi"
+        ));
+        assert_eq!(assistant_text(&malformed_message), "hello <thi");
+        assert_eq!(assistant_thinking(&malformed_message), "");
+
+        let mut unclosed = OpenAiStreamState::new(&sample_local_model());
+        let events = unclosed
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"start<think>plan"},"finish_reason":"stop"}]}"#,
+            )
+            .expect("unclosed events");
+        let unclosed_message = unclosed.into_message();
+
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::TextDelta("start".into()),
+                ProviderEvent::ThinkingDelta("plan".into()),
+            ]
+        );
+        assert_eq!(assistant_text(&unclosed_message), "start");
+        assert_eq!(assistant_thinking(&unclosed_message), "plan");
+    }
+
+    #[test]
+    fn truly_empty_successful_stop_becomes_stream_error() {
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let events = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}"#,
+            )
+            .expect("events");
+        let error = state
+            .finish_stream()
+            .expect_err("empty response should error");
+
+        assert!(events.is_empty());
+        assert!(matches!(error, ProviderError::EmptyAssistantResponse));
+    }
+}
