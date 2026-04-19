@@ -77,6 +77,34 @@ pub struct ReasoningCapabilities {
     pub request_mode: Option<ThinkingRequestMode>,
 }
 
+/// Round-trip / replay requirements that vary per model (not per
+/// provider). Populated in the model catalog for known models; `None`
+/// on `Model` means "no special replay requirements" (the default
+/// for OpenAI chat-completions, local models, etc.).
+///
+/// See docs/api_integrity_plans/03c_replay_capabilities.md.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayCapabilities {
+    /// The provider requires every replayed thinking block to carry
+    /// the cryptographic `signature` the API issued originally.
+    /// Set on Anthropic Claude models with extended thinking support.
+    #[serde(default)]
+    pub requires_thinking_signature: bool,
+
+    /// The provider can emit `redacted_thinking` blocks (opaque
+    /// encrypted reasoning) that must be replayed verbatim. Used by
+    /// plan 02.
+    #[serde(default)]
+    pub supports_redacted_thinking: bool,
+
+    /// The provider's response contains an opaque
+    /// `encrypted_content` that must be replayed to continue the
+    /// reasoning chain. Reserved for future OpenAI Responses API
+    /// support; currently false everywhere.
+    #[serde(default)]
+    pub supports_encrypted_reasoning: bool,
+}
+
 /// A model discovered from a provider endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelInfo {
@@ -120,6 +148,20 @@ pub struct Model {
     pub supports_images: bool,
     /// Pricing metadata.
     pub cost_per_million: CostPerMillion,
+    /// Round-trip / replay requirements. `None` = no special
+    /// requirements. See `ReplayCapabilities`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_capabilities: Option<ReplayCapabilities>,
+}
+
+impl Model {
+    /// Return the effective replay capabilities for this model,
+    /// falling back to `ReplayCapabilities::default()` (all false)
+    /// when nothing is declared.
+    #[must_use]
+    pub fn effective_replay_capabilities(&self) -> ReplayCapabilities {
+        self.replay_capabilities.clone().unwrap_or_default()
+    }
 }
 
 impl ModelInfo {
@@ -138,6 +180,7 @@ impl ModelInfo {
             reasoning_capabilities: None,
             supports_images: self.supports_images.unwrap_or(false),
             cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
         }
     }
 }

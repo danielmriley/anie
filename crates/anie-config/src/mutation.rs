@@ -227,6 +227,7 @@ mod tests {
             }),
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
         }
     }
 

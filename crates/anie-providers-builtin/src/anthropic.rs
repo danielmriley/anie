@@ -235,10 +235,6 @@ impl Provider for AnthropicProvider {
         true
     }
 
-    fn requires_thinking_signature(&self) -> bool {
-        true
-    }
-
     fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
         let last = tools.len().saturating_sub(1);
         tools
@@ -493,9 +489,7 @@ impl AnthropicStreamState {
                     // spot new API features in logs before they cause
                     // downstream trouble.
                     Some(other) => {
-                        eprintln!(
-                            "anthropic: unknown content_block type {other:?} (ignoring)"
-                        );
+                        eprintln!("anthropic: unknown content_block type {other:?} (ignoring)");
                     }
                     None => {}
                 }
@@ -712,6 +706,7 @@ mod tests {
             reasoning_capabilities: None,
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
         }
     }
 
@@ -917,10 +912,7 @@ mod tests {
             .process_event("content_block_stop", r#"{"index":0}"#)
             .expect("block stop");
         state
-            .process_event(
-                "message_delta",
-                r#"{"delta":{"stop_reason":"end_turn"}}"#,
-            )
+            .process_event("message_delta", r#"{"delta":{"stop_reason":"end_turn"}}"#)
             .expect("message delta");
         let done = state
             .process_event("message_stop", "{}")
@@ -1035,9 +1027,19 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_provider_requires_thinking_signature() {
-        let provider = AnthropicProvider::new();
-        assert!(provider.requires_thinking_signature());
+    fn builtin_anthropic_models_declare_thinking_signature_requirement() {
+        // The catalog entry for each Claude model must declare
+        // requires_thinking_signature=true via ReplayCapabilities —
+        // that's what drives the sanitizer.
+        use crate::builtin_models;
+        let models = builtin_models();
+        let claude_sonnet = models
+            .iter()
+            .find(|m| m.id == "claude-sonnet-4-6")
+            .expect("sonnet model");
+        let caps = claude_sonnet.effective_replay_capabilities();
+        assert!(caps.requires_thinking_signature);
+        assert!(caps.supports_redacted_thinking);
     }
 
     #[test]
@@ -1161,9 +1163,7 @@ mod tests {
                 let in_children: usize = map.values().map(count_cache_control_markers).sum();
                 here + in_children
             }
-            serde_json::Value::Array(items) => {
-                items.iter().map(count_cache_control_markers).sum()
-            }
+            serde_json::Value::Array(items) => items.iter().map(count_cache_control_markers).sum(),
             _ => 0,
         }
     }
@@ -1191,7 +1191,10 @@ mod tests {
         assert!(
             message.content.iter().any(|block| matches!(
                 block,
-                ContentBlock::Thinking { signature: None, .. }
+                ContentBlock::Thinking {
+                    signature: None,
+                    ..
+                }
             )),
             "expected unsigned thinking to yield None signature"
         );
@@ -1218,6 +1221,7 @@ mod tests {
                 reasoning_capabilities: None,
                 supports_images: true,
                 cost_per_million: anie_provider::CostPerMillion::zero(),
+                replay_capabilities: None,
             }
         }
 

@@ -1,6 +1,6 @@
 use anie_provider::{
     ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
-    ReasoningOutputMode,
+    ReasoningOutputMode, ReplayCapabilities,
 };
 
 fn native_separated_reasoning() -> Option<ReasoningCapabilities> {
@@ -9,6 +9,14 @@ fn native_separated_reasoning() -> Option<ReasoningCapabilities> {
         output: Some(ReasoningOutputMode::Separated),
         tags: None,
         request_mode: None,
+    })
+}
+
+fn anthropic_replay_capabilities() -> Option<ReplayCapabilities> {
+    Some(ReplayCapabilities {
+        requires_thinking_signature: true,
+        supports_redacted_thinking: true,
+        supports_encrypted_reasoning: false,
     })
 }
 
@@ -33,6 +41,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_read: 0.3,
                 cache_write: 3.75,
             },
+            replay_capabilities: anthropic_replay_capabilities(),
         },
         Model {
             id: "claude-opus-4-6".into(),
@@ -51,6 +60,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_read: 1.5,
                 cache_write: 18.75,
             },
+            replay_capabilities: anthropic_replay_capabilities(),
         },
         Model {
             id: "claude-haiku-4-5-20251001".into(),
@@ -69,6 +79,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_read: 0.08,
                 cache_write: 1.0,
             },
+            replay_capabilities: anthropic_replay_capabilities(),
         },
         Model {
             id: "gpt-4o".into(),
@@ -87,6 +98,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_read: 1.25,
                 cache_write: 0.0,
             },
+            replay_capabilities: None,
         },
         Model {
             id: "o4-mini".into(),
@@ -105,6 +117,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_read: 0.0,
                 cache_write: 0.0,
             },
+            replay_capabilities: None,
         },
     ]
 }

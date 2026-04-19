@@ -23,6 +23,7 @@ fn sample_models() -> Vec<Model> {
         reasoning_capabilities: None,
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
+        replay_capabilities: None,
     }]
 }
 

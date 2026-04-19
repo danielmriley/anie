@@ -154,6 +154,7 @@ pub async fn probe_openai_compatible(
                 reasoning_capabilities: default_local_reasoning_capabilities(name, base_url, id),
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),
+                replay_capabilities: None,
             })
         })
         .collect::<Vec<_>>();

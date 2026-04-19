@@ -412,6 +412,7 @@ mod tests {
             reasoning_capabilities: None,
             supports_images: true,
             cost_per_million: anie_provider::CostPerMillion::zero(),
+            replay_capabilities: None,
         }
     }
 
@@ -428,6 +429,7 @@ mod tests {
             reasoning_capabilities: None,
             supports_images: false,
             cost_per_million: anie_provider::CostPerMillion::zero(),
+            replay_capabilities: None,
         }
     }
 
@@ -457,6 +459,7 @@ mod tests {
             }),
             supports_images: false,
             cost_per_million: anie_provider::CostPerMillion::zero(),
+            replay_capabilities: None,
         }
     }
 
@@ -467,9 +470,17 @@ mod tests {
     }
 
     #[test]
-    fn openai_provider_does_not_require_thinking_signature() {
-        let provider = OpenAIProvider::new();
-        assert!(!provider.requires_thinking_signature());
+    fn builtin_openai_models_do_not_require_thinking_signature() {
+        // OpenAI chat-completions does not round-trip opaque
+        // signatures; the catalog must not declare the requirement.
+        use crate::builtin_models;
+        let models = builtin_models();
+        let gpt_4o = models
+            .iter()
+            .find(|m| m.id == "gpt-4o")
+            .expect("gpt-4o model");
+        let caps = gpt_4o.effective_replay_capabilities();
+        assert!(!caps.requires_thinking_signature);
     }
 
     #[test]

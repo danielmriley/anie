@@ -292,6 +292,7 @@ pub fn configured_models(config: &AnieConfig) -> Vec<Model> {
                 reasoning_capabilities: custom_model_reasoning_capabilities(model),
                 supports_images: model.supports_images,
                 cost_per_million: CostPerMillion::zero(),
+                replay_capabilities: None,
             });
         }
     }

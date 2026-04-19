@@ -1118,6 +1118,7 @@ impl OnboardingScreen {
                             reasoning_capabilities: None,
                             supports_images: false,
                             cost_per_million: CostPerMillion::zero(),
+                            replay_capabilities: None,
                         },
                         kind: ConfiguredProviderKind::ConfigBacked,
                         is_default: true,
@@ -1831,6 +1832,7 @@ fn provider_presets() -> Vec<ProviderPreset> {
             reasoning_capabilities: None,
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
         });
     let anthropic = builtin_models()
         .into_iter()
@@ -1847,6 +1849,7 @@ fn provider_presets() -> Vec<ProviderPreset> {
             reasoning_capabilities: None,
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
         });
 
     vec![
@@ -1921,6 +1924,7 @@ fn custom_openai_preset(
             reasoning_capabilities: None,
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
         },
     }
 }
@@ -1962,6 +1966,7 @@ mod tests {
                 }),
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),
+                replay_capabilities: None,
             }],
         }
     }

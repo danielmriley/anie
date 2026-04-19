@@ -262,10 +262,6 @@ impl Provider for SignatureRequiringSpy {
         true
     }
 
-    fn requires_thinking_signature(&self) -> bool {
-        true
-    }
-
     fn convert_tools(&self, _tools: &[ToolDef]) -> Vec<serde_json::Value> {
         Vec::new()
     }
@@ -316,10 +312,15 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
     // Sanity: the reopened unsigned thinking block survived the roundtrip.
     let has_unsigned = prior_context.iter().any(|m| {
         if let Message::Assistant(a) = m {
-            a.content.iter().any(|b| matches!(
-                b,
-                ContentBlock::Thinking { signature: None, .. }
-            ))
+            a.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::Thinking {
+                        signature: None,
+                        ..
+                    }
+                )
+            })
         } else {
             false
         }
@@ -356,6 +357,14 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
         reasoning_capabilities: None,
         supports_images: true,
         cost_per_million: anie_provider::CostPerMillion::zero(),
+        // Declare signature requirement on the model — the sanitizer
+        // reads the flag from here now (plan 03c moved it off the
+        // Provider trait).
+        replay_capabilities: Some(anie_provider::ReplayCapabilities {
+            requires_thinking_signature: true,
+            supports_redacted_thinking: true,
+            supports_encrypted_reasoning: false,
+        }),
     };
     let agent = AgentLoop::new(
         Arc::new(registry),
@@ -395,7 +404,10 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
     // thinking block. The sanitizer dropped the unsigned one before
     // it reached the provider's wire-format conversion.
     let calls = captured.lock().unwrap();
-    assert!(!calls.is_empty(), "spy should have been called at least once");
+    assert!(
+        !calls.is_empty(),
+        "spy should have been called at least once"
+    );
     for call in calls.iter() {
         for message in call {
             if let Message::Assistant(assistant) = message {

@@ -1139,6 +1139,7 @@ fn model_for_entry(entry: &ProviderEntry) -> Model {
         reasoning_capabilities: None,
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
+        replay_capabilities: None,
     }
 }
 

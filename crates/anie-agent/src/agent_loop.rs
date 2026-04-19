@@ -399,10 +399,11 @@ impl AgentLoop {
                 model.base_url = base_url_override;
             }
 
+            let replay = model.effective_replay_capabilities();
             let sanitized_context = sanitize_context_for_request(
                 &context,
                 provider.includes_thinking_in_replay(),
-                provider.requires_thinking_signature(),
+                replay.requires_thinking_signature,
             );
             let llm_context = LlmContext {
                 system_prompt: self.config.system_prompt.clone(),
@@ -1467,8 +1468,8 @@ mod tests {
             1,
         );
         // includes_thinking_in_replay=true, requires_sig=true (Anthropic)
-        let sanitized = sanitize_assistant_for_request(&assistant, true, true)
-            .expect("assistant survives");
+        let sanitized =
+            sanitize_assistant_for_request(&assistant, true, true).expect("assistant survives");
         assert_eq!(sanitized.content.len(), 2);
         assert!(matches!(
             &sanitized.content[0],

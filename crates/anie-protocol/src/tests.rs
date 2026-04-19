@@ -168,9 +168,7 @@ fn redacted_thinking_content_block_roundtrip() {
 
 #[test]
 fn redacted_thinking_uses_camelcase_wire_tag() {
-    let block = ContentBlock::RedactedThinking {
-        data: "x".into(),
-    };
+    let block = ContentBlock::RedactedThinking { data: "x".into() };
     let serialized = serde_json::to_string(&block).unwrap();
     assert!(serialized.contains(r#""type":"redactedThinking""#));
     assert!(serialized.contains(r#""data":"x""#));
