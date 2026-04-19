@@ -22,6 +22,15 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    /// Encrypted reasoning block returned when the provider refuses to
+    /// expose the internal chain-of-thought. The `data` field is
+    /// opaque to this client and must be replayed verbatim on
+    /// subsequent turns (Anthropic's `redacted_thinking`).
+    ///
+    /// Never rendered to the user as prose; UIs should display a
+    /// placeholder ("[reasoning redacted]" or equivalent).
+    #[serde(rename = "redactedThinking")]
+    RedactedThinking { data: String },
     /// A structured tool invocation proposed by the assistant.
     #[serde(rename = "toolCall")]
     ToolCall(ToolCall),

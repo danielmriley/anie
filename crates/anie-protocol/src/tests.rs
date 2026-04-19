@@ -160,6 +160,23 @@ fn thinking_content_block_with_signature_emits_signature_field() {
 }
 
 #[test]
+fn redacted_thinking_content_block_roundtrip() {
+    roundtrip(&ContentBlock::RedactedThinking {
+        data: "opaque-base64-payload".into(),
+    });
+}
+
+#[test]
+fn redacted_thinking_uses_camelcase_wire_tag() {
+    let block = ContentBlock::RedactedThinking {
+        data: "x".into(),
+    };
+    let serialized = serde_json::to_string(&block).unwrap();
+    assert!(serialized.contains(r#""type":"redactedThinking""#));
+    assert!(serialized.contains(r#""data":"x""#));
+}
+
+#[test]
 fn tool_call_content_block_roundtrip() {
     roundtrip(&ContentBlock::ToolCall(sample_tool_call()));
 }

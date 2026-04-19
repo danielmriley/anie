@@ -116,6 +116,10 @@ pub(super) fn join_text_content(content: &[ContentBlock]) -> String {
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.clone()),
             ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
+            // OpenAI chat-completions does not round-trip reasoning
+            // as assistant content, so redacted blocks can't be sent
+            // back verbatim the way Anthropic requires. Drop them.
+            ContentBlock::RedactedThinking { .. } => None,
             ContentBlock::Image { media_type, data } => {
                 Some(format!("[image:{media_type};base64,{data}]"))
             }

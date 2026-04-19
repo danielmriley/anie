@@ -956,14 +956,22 @@ fn sanitize_assistant_for_request(
             ContentBlock::Thinking {
                 signature: None, ..
             } if requires_thinking_signature => None,
+            // Redacted thinking is the encrypted-reasoning analog of
+            // a signed thinking block: only Anthropic understands it,
+            // so it's dropped for providers that can't replay
+            // thinking. See docs/api_integrity_plans/02.
+            ContentBlock::RedactedThinking { .. } if !includes_thinking_in_replay => None,
             _ => Some(block.clone()),
         })
         .collect::<Vec<_>>();
 
     if content.is_empty()
-        || !content
-            .iter()
-            .any(|block| !matches!(block, ContentBlock::Thinking { .. }))
+        || !content.iter().any(|block| {
+            !matches!(
+                block,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        })
     {
         return None;
     }
@@ -1419,6 +1427,52 @@ mod tests {
         assert!(matches!(
             &sanitized.content[0],
             ContentBlock::Thinking { signature: Some(sig), .. } if sig == "SIG_abc"
+        ));
+    }
+
+    #[test]
+    fn sanitize_drops_redacted_thinking_for_non_anthropic_replay() {
+        let assistant = assistant_message(
+            vec![
+                ContentBlock::RedactedThinking {
+                    data: "ENCRYPTED".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            StopReason::Stop,
+            1,
+        );
+        // includes_thinking_in_replay=false (OpenAI-style) — the
+        // redacted block has no wire representation there.
+        let sanitized = sanitize_assistant_for_request(&assistant, false, false)
+            .expect("assistant with text survives");
+        assert_eq!(sanitized.content.len(), 1);
+        assert!(matches!(sanitized.content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn sanitize_keeps_redacted_thinking_for_anthropic_replay() {
+        let assistant = assistant_message(
+            vec![
+                ContentBlock::RedactedThinking {
+                    data: "ENCRYPTED".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            StopReason::Stop,
+            1,
+        );
+        // includes_thinking_in_replay=true, requires_sig=true (Anthropic)
+        let sanitized = sanitize_assistant_for_request(&assistant, true, true)
+            .expect("assistant survives");
+        assert_eq!(sanitized.content.len(), 2);
+        assert!(matches!(
+            &sanitized.content[0],
+            ContentBlock::RedactedThinking { .. }
         ));
     }
 

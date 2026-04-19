@@ -1302,6 +1302,9 @@ fn extract_thinking(content: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+            // Redacted thinking is encrypted; the UI shows a placeholder
+            // rather than the opaque base64 payload.
+            ContentBlock::RedactedThinking { .. } => Some("[reasoning redacted]"),
             _ => None,
         })
         .collect::<Vec<_>>()

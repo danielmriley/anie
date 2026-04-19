@@ -286,6 +286,10 @@ fn content_blocks_to_anthropic(content: &[ContentBlock]) -> Vec<serde_json::Valu
                 }
                 serde_json::Value::Object(block)
             }
+            ContentBlock::RedactedThinking { data } => json!({
+                "type": "redacted_thinking",
+                "data": data,
+            }),
             ContentBlock::ToolCall(tool_call) => json!({
                 "type": "tool_use",
                 "id": tool_call.id,
@@ -403,6 +407,18 @@ impl AnthropicStreamState {
                                 signature,
                             }),
                         );
+                    }
+                    Some("redacted_thinking") => {
+                        // Encrypted reasoning payload. Opaque to us;
+                        // must be replayed verbatim on subsequent
+                        // turns. See docs/api_integrity_plans/02.
+                        let data = block
+                            .get("data")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        self.blocks
+                            .insert(index, AnthropicBlockState::RedactedThinking(data));
                     }
                     Some("tool_use") => {
                         let id = block["id"].as_str().unwrap_or_default().to_string();
@@ -553,6 +569,7 @@ impl AnthropicStreamState {
 enum AnthropicBlockState {
     Text(String),
     Thinking(AnthropicThinkingState),
+    RedactedThinking(String),
     ToolUse(AnthropicToolUseState),
 }
 
@@ -569,6 +586,7 @@ impl AnthropicBlockState {
                 thinking: state.thinking.clone(),
                 signature: (!state.signature.is_empty()).then(|| state.signature.clone()),
             },
+            Self::RedactedThinking(data) => ContentBlock::RedactedThinking { data: data.clone() },
             Self::ToolUse(tool_use) => ContentBlock::ToolCall(ToolCall {
                 id: tool_use.id.clone(),
                 name: tool_use.name.clone(),
@@ -957,6 +975,38 @@ mod tests {
     fn anthropic_provider_requires_thinking_signature() {
         let provider = AnthropicProvider::new();
         assert!(provider.requires_thinking_signature());
+    }
+
+    #[test]
+    fn captures_redacted_thinking_block() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"redacted_thinking","data":"ENCRYPTED_DATA"}}"#,
+            )
+            .expect("redacted block start");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+
+        let message = state.into_message();
+        assert!(
+            message.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::RedactedThinking { data } if data == "ENCRYPTED_DATA"
+            )),
+            "expected redacted thinking block captured verbatim"
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_serializes_to_anthropic_wire_shape() {
+        let serialized = content_blocks_to_anthropic(&[ContentBlock::RedactedThinking {
+            data: "PAYLOAD".into(),
+        }]);
+        assert_eq!(serialized[0]["type"], json!("redacted_thinking"));
+        assert_eq!(serialized[0]["data"], json!("PAYLOAD"));
     }
 
     #[test]

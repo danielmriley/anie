@@ -916,6 +916,9 @@ pub fn build_compaction_prompt(messages: &[Message], existing_summary: Option<&s
                             prompt.push_str(&format!("[Called tool: {}]", tool_call.name));
                         }
                         ContentBlock::Thinking { thinking, .. } => prompt.push_str(thinking),
+                        ContentBlock::RedactedThinking { .. } => {
+                            prompt.push_str("[redacted reasoning]");
+                        }
                         ContentBlock::Image { .. } => prompt.push_str("[Image omitted]"),
                     }
                 }
@@ -1009,6 +1012,7 @@ fn content_tokens(blocks: &[ContentBlock]) -> u64 {
             ContentBlock::Text { text } => (text.len() as u64) / 4,
             ContentBlock::Image { .. } => 1_200,
             ContentBlock::Thinking { thinking, .. } => (thinking.len() as u64) / 4,
+            ContentBlock::RedactedThinking { data } => (data.len() as u64) / 4,
             ContentBlock::ToolCall(tool_call) => {
                 let args_len = serde_json::to_string(&tool_call.arguments)
                     .map(|value| value.len())
