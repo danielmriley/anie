@@ -56,6 +56,7 @@ async fn thinking_blocks_survive_session_roundtrip_into_agent_context() {
         content: vec![
             ContentBlock::Thinking {
                 thinking: "Let me reason about this.".into(),
+                signature: None,
             },
             ContentBlock::Text {
                 text: "The answer is 42.".into(),
@@ -86,7 +87,7 @@ async fn thinking_blocks_survive_session_roundtrip_into_agent_context() {
     assert_eq!(assistant_msg.content.len(), 2);
     assert!(matches!(
         &assistant_msg.content[0],
-        ContentBlock::Thinking { thinking } if thinking == "Let me reason about this."
+        ContentBlock::Thinking { thinking, .. } if thinking == "Let me reason about this."
     ));
     assert!(matches!(
         &assistant_msg.content[1],

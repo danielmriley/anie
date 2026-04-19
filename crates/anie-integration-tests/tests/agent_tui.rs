@@ -81,6 +81,7 @@ async fn agent_thinking_events_render_thinking_section_above_answer() {
         content: vec![
             ContentBlock::Thinking {
                 thinking: thinking_text.into(),
+                signature: None,
             },
             ContentBlock::Text {
                 text: answer_text.into(),
@@ -206,6 +207,7 @@ async fn multi_turn_with_thinking_keeps_thinking_in_gutter() {
         content: vec![
             ContentBlock::Thinking {
                 thinking: "plan step one".into(),
+                signature: None,
             },
             ContentBlock::Text {
                 text: "Here is my answer.".into(),

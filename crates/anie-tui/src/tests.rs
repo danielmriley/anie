@@ -104,6 +104,7 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
         content: vec![
             ContentBlock::Thinking {
                 thinking: "plan first".into(),
+                signature: None,
             },
             ContentBlock::Text {
                 text: "final answer".into(),
@@ -1279,6 +1280,7 @@ fn thinking_text_never_leaks_into_visible_answer_streamed() {
             content: vec![
                 ContentBlock::Thinking {
                     thinking: "secret plan".into(),
+                    signature: None,
                 },
                 ContentBlock::Text {
                     text: "final answer".into(),
@@ -1317,6 +1319,7 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
             content: vec![
                 ContentBlock::Thinking {
                     thinking: "first plan".into(),
+                    signature: None,
                 },
                 ContentBlock::Text {
                     text: "first answer".into(),
@@ -1339,6 +1342,7 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
             content: vec![
                 ContentBlock::Thinking {
                     thinking: "second plan".into(),
+                    signature: None,
                 },
                 ContentBlock::Text {
                     text: "second answer".into(),

@@ -11,8 +11,17 @@ pub enum ContentBlock {
     #[serde(rename = "image")]
     Image { media_type: String, data: String },
     /// Model thinking / reasoning content.
+    ///
+    /// `signature` carries provider-minted opaque state required on
+    /// replay (Anthropic extended thinking). `None` on sessions
+    /// written before signature capture landed, and on providers that
+    /// don't emit a signature.
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     /// A structured tool invocation proposed by the assistant.
     #[serde(rename = "toolCall")]
     ToolCall(ToolCall),

@@ -226,6 +226,7 @@ impl OpenAiStreamState {
         if !self.thinking.is_empty() {
             content.push(ContentBlock::Thinking {
                 thinking: std::mem::take(&mut self.thinking),
+                signature: None,
             });
         }
         if !self.text.is_empty() {
@@ -331,7 +332,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()

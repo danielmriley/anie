@@ -939,7 +939,7 @@ fn sanitize_assistant_for_request(
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } if text.trim().is_empty() => None,
-            ContentBlock::Thinking { thinking } if thinking.trim().is_empty() => None,
+            ContentBlock::Thinking { thinking, .. } if thinking.trim().is_empty() => None,
             ContentBlock::Thinking { .. } if !includes_thinking_in_replay => None,
             _ => Some(block.clone()),
         })
@@ -1120,7 +1120,7 @@ impl AssistantMessageBuilder {
             .map(BuilderContent::into_content_block)
             .filter(|block| match block {
                 ContentBlock::Text { text } => !text.trim().is_empty(),
-                ContentBlock::Thinking { thinking } => !thinking.trim().is_empty(),
+                ContentBlock::Thinking { thinking, .. } => !thinking.trim().is_empty(),
                 _ => true,
             })
             .collect();
@@ -1160,7 +1160,10 @@ impl BuilderContent {
     fn into_content_block(self) -> ContentBlock {
         match self {
             Self::Text(text) => ContentBlock::Text { text },
-            Self::Thinking(thinking) => ContentBlock::Thinking { thinking },
+            Self::Thinking(thinking) => ContentBlock::Thinking {
+                thinking,
+                signature: None,
+            },
             Self::ToolCall(tool_call) => ContentBlock::ToolCall(tool_call.into_tool_call()),
         }
     }
@@ -1291,6 +1294,7 @@ mod tests {
             vec![
                 ContentBlock::Thinking {
                     thinking: "plan first".into(),
+                    signature: None,
                 },
                 ContentBlock::Text { text: "   ".into() },
             ],
@@ -1309,6 +1313,7 @@ mod tests {
             vec![
                 ContentBlock::Thinking {
                     thinking: "plan first".into(),
+                    signature: None,
                 },
                 ContentBlock::Text {
                     text: "final answer".into(),
@@ -1335,6 +1340,7 @@ mod tests {
             vec![
                 ContentBlock::Thinking {
                     thinking: "inspect file".into(),
+                    signature: None,
                 },
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_1".into(),

@@ -258,7 +258,7 @@ fn content_blocks_to_anthropic(content: &[ContentBlock]) -> Vec<serde_json::Valu
                     "data": data,
                 }
             }),
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 json!({ "type": "thinking", "thinking": thinking })
             }
             ContentBlock::ToolCall(tool_call) => json!({
@@ -510,6 +510,7 @@ impl AnthropicBlockState {
             Self::Text(text) => ContentBlock::Text { text: text.clone() },
             Self::Thinking(thinking) => ContentBlock::Thinking {
                 thinking: thinking.clone(),
+                signature: None,
             },
             Self::ToolUse(tool_use) => ContentBlock::ToolCall(ToolCall {
                 id: tool_use.id.clone(),

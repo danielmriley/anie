@@ -1301,7 +1301,7 @@ fn extract_thinking(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Thinking { thinking } => Some(thinking.as_str()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

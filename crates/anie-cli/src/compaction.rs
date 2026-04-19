@@ -124,7 +124,7 @@ fn join_assistant_text(message: &AssistantMessage) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.clone()),
-            ContentBlock::Thinking { thinking } => Some(thinking.clone()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()

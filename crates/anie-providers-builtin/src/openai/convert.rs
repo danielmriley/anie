@@ -115,7 +115,7 @@ pub(super) fn join_text_content(content: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.clone()),
-            ContentBlock::Thinking { thinking } => Some(thinking.clone()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
             ContentBlock::Image { media_type, data } => {
                 Some(format!("[image:{media_type};base64,{data}]"))
             }
@@ -214,6 +214,7 @@ mod tests {
         let messages = provider.convert_messages(&[Message::Assistant(AssistantMessage {
             content: vec![ContentBlock::Thinking {
                 thinking: "plan first".into(),
+                signature: None,
             }],
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -233,6 +234,7 @@ mod tests {
             content: vec![
                 ContentBlock::Thinking {
                     thinking: "plan first".into(),
+                    signature: None,
                 },
                 ContentBlock::Text {
                     text: "final answer".into(),

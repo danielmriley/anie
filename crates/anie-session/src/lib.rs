@@ -915,7 +915,7 @@ pub fn build_compaction_prompt(messages: &[Message], existing_summary: Option<&s
                         ContentBlock::ToolCall(tool_call) => {
                             prompt.push_str(&format!("[Called tool: {}]", tool_call.name));
                         }
-                        ContentBlock::Thinking { thinking } => prompt.push_str(thinking),
+                        ContentBlock::Thinking { thinking, .. } => prompt.push_str(thinking),
                         ContentBlock::Image { .. } => prompt.push_str("[Image omitted]"),
                     }
                 }
@@ -1008,7 +1008,7 @@ fn content_tokens(blocks: &[ContentBlock]) -> u64 {
         .map(|block| match block {
             ContentBlock::Text { text } => (text.len() as u64) / 4,
             ContentBlock::Image { .. } => 1_200,
-            ContentBlock::Thinking { thinking } => (thinking.len() as u64) / 4,
+            ContentBlock::Thinking { thinking, .. } => (thinking.len() as u64) / 4,
             ContentBlock::ToolCall(tool_call) => {
                 let args_len = serde_json::to_string(&tool_call.arguments)
                     .map(|value| value.len())
@@ -1103,6 +1103,7 @@ mod tests {
             content: vec![
                 ContentBlock::Thinking {
                     thinking: thinking.to_string(),
+                    signature: None,
                 },
                 ContentBlock::Text {
                     text: text.to_string(),
@@ -1179,7 +1180,7 @@ mod tests {
         assert!(matches!(
             &context.messages[1].message,
             Message::Assistant(AssistantMessage { content, .. })
-                if content.iter().any(|block| matches!(block, ContentBlock::Thinking { thinking } if thinking == "plan first"))
+                if content.iter().any(|block| matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "plan first"))
                     && content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "done"))
         ));
     }

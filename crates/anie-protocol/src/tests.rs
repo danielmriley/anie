@@ -114,7 +114,49 @@ fn image_content_block_roundtrip() {
 fn thinking_content_block_roundtrip() {
     roundtrip(&ContentBlock::Thinking {
         thinking: "let me think".into(),
+        signature: None,
     });
+}
+
+#[test]
+fn thinking_content_block_with_signature_roundtrip() {
+    roundtrip(&ContentBlock::Thinking {
+        thinking: "let me think".into(),
+        signature: Some("SIG_abc123".into()),
+    });
+}
+
+#[test]
+fn thinking_content_block_deserializes_without_signature_field() {
+    let old_json = r#"{"type":"thinking","thinking":"hmm"}"#;
+    let block: ContentBlock = serde_json::from_str(old_json).unwrap();
+    assert!(matches!(
+        &block,
+        ContentBlock::Thinking { thinking, signature: None } if thinking == "hmm"
+    ));
+}
+
+#[test]
+fn thinking_content_block_without_signature_reserializes_cleanly() {
+    let block = ContentBlock::Thinking {
+        thinking: "hmm".into(),
+        signature: None,
+    };
+    let serialized = serde_json::to_string(&block).unwrap();
+    assert_eq!(serialized, r#"{"type":"thinking","thinking":"hmm"}"#);
+    assert!(!serialized.contains("signature"));
+}
+
+#[test]
+fn thinking_content_block_with_signature_emits_signature_field() {
+    let block = ContentBlock::Thinking {
+        thinking: "hmm".into(),
+        signature: Some("SIG".into()),
+    };
+    let serialized = serde_json::to_string(&block).unwrap();
+    assert!(serialized.contains(r#""signature":"SIG""#));
+    let parsed: ContentBlock = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(parsed, block);
 }
 
 #[test]
