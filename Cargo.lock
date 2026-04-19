@@ -135,6 +135,7 @@ dependencies = [
  "anie-tui",
  "anyhow",
  "async-trait",
+ "futures",
  "ratatui",
  "serde_json",
  "temp-env",

@@ -17,6 +17,7 @@ anie-tui.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 temp-env.workspace = true
