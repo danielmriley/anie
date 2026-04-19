@@ -66,6 +66,18 @@ fn try_acquire_session_lock(file: &File, path: &Path) -> Result<bool, SessionErr
 use anie_protocol::{ContentBlock, Message, UserMessage};
 use anie_provider::ThinkingLevel;
 
+/// Current session-file schema version. Bump every time a change is
+/// made that affects how older binaries should interpret the file, and
+/// update the table in docs/api_integrity_plans/05_session_schema_migration.md.
+///
+/// | Version | Change                                               |
+/// |---------|------------------------------------------------------|
+/// | 1       | Baseline.                                            |
+/// | 2       | `ContentBlock::Thinking.signature` optional field    |
+/// |         | + `ContentBlock::RedactedThinking` variant. Both     |
+/// |         | forward- and backward-compatible via serde defaults. |
+pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 2;
+
 /// Session-file header. Always the first line in a session JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionHeader {
@@ -314,7 +326,7 @@ impl SessionManager {
         let path = sessions_dir.join(format!("{session_id}.jsonl"));
         let header = SessionHeader {
             entry_type: "session".into(),
-            version: 1,
+            version: CURRENT_SESSION_SCHEMA_VERSION,
             id: session_id,
             timestamp: now_iso8601()?,
             cwd: cwd.display().to_string(),
@@ -354,6 +366,25 @@ impl SessionManager {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read session file {}", path.display()))?;
         let (header, entries) = parse_session_file(&content)?;
+
+        // Forward-compatibility gate: older binaries must not
+        // silently load sessions written by newer ones — that would
+        // either lose state (new fields serde-ignored) or panic on
+        // unknown variant tags. Bail with a clear error instead.
+        // Older-version files (< CURRENT) load normally; serde
+        // defaults cover any fields they lack.
+        if header.version > CURRENT_SESSION_SCHEMA_VERSION {
+            anyhow::bail!(
+                "session file {} was written with schema version {} \
+                 but this binary only supports up to version {} — \
+                 upgrade anie to continue. See \
+                 docs/api_integrity_plans/05_session_schema_migration.md.",
+                path.display(),
+                header.version,
+                CURRENT_SESSION_SCHEMA_VERSION,
+            );
+        }
+
         let mut by_id = HashMap::new();
         let mut id_set = HashSet::new();
         let mut leaf_id = None;
@@ -1341,6 +1372,99 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].first_message, "beta");
         assert_eq!(sessions[1].first_message, "alpha");
+    }
+
+    #[test]
+    fn new_session_writes_current_schema_version() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let session =
+            SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
+        assert_eq!(session.header.version, CURRENT_SESSION_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn open_session_accepts_older_schema_versions() {
+        // Simulate a session file written by a pre-fix binary:
+        // schema_version = 1, thinking block with no `signature` key.
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("legacy.jsonl");
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 1,
+            "id": "legacy01",
+            "timestamp": "2026-04-14T00:00:00Z",
+            "cwd": "/tmp",
+        });
+        let entry = serde_json::json!({
+            "type": "message",
+            "id": "11111111",
+            "parentId": null,
+            "timestamp": "2026-04-14T00:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "old reasoning"},
+                    {"type": "text", "text": "answer"}
+                ],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cost": {
+                        "input": 0.0,
+                        "output": 0.0,
+                        "cache_read": 0.0,
+                        "cache_write": 0.0,
+                        "total": 0.0
+                    }
+                },
+                "stop_reason": "Stop",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "timestamp": 1,
+            }
+        });
+        fs::write(&path, format!("{header}\n{entry}\n")).expect("write");
+
+        let session = SessionManager::open_session(&path).expect("load v1 session");
+        assert_eq!(session.header.version, 1);
+        assert_eq!(session.entries.len(), 1);
+        // Verify the legacy thinking block round-trips as
+        // Thinking { signature: None }.
+        let SessionEntry::Message { message, .. } = &session.entries[0] else {
+            panic!("expected message");
+        };
+        let Message::Assistant(a) = message else {
+            panic!("expected assistant");
+        };
+        assert!(a.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::Thinking { signature: None, thinking } if thinking == "old reasoning"
+        )));
+    }
+
+    #[test]
+    fn open_session_rejects_future_schema_versions() {
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("future.jsonl");
+        let header = serde_json::json!({
+            "type": "session",
+            "version": CURRENT_SESSION_SCHEMA_VERSION + 5,
+            "id": "future01",
+            "timestamp": "2026-04-14T00:00:00Z",
+            "cwd": "/tmp",
+        });
+        fs::write(&path, format!("{header}\n")).expect("write");
+
+        let Err(err) = SessionManager::open_session(&path) else {
+            panic!("must reject future schema");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("schema version"), "error was: {msg}");
+        assert!(msg.contains("upgrade anie"), "error was: {msg}");
     }
 
     #[test]
