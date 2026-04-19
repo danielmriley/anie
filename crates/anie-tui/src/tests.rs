@@ -1036,6 +1036,13 @@ fn copy_command_without_messages_shows_error() {
 }
 
 #[test]
+fn truncate_text_handles_unicode_without_panicking() {
+    let text = "🙂".repeat(70);
+
+    assert_eq!(crate::app::truncate_text(&text, 5), "🙂🙂🙂🙂…");
+}
+
+#[test]
 fn output_pane_last_assistant_text_skips_thinking_only_messages() {
     let mut pane = OutputPane::new();
     pane.add_block(RenderedBlock::AssistantMessage {

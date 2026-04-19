@@ -54,6 +54,7 @@ pub struct App {
     last_ctrl_c: Option<Instant>,
     overlay: Option<Box<dyn OverlayScreen>>,
     known_models: Vec<Model>,
+    clipboard: Option<arboard::Clipboard>,
     discovery_cache: Arc<Mutex<ModelDiscoveryCache>>,
     worker_tx: mpsc::UnboundedSender<AppWorkerEvent>,
     worker_rx: mpsc::UnboundedReceiver<AppWorkerEvent>,
@@ -232,6 +233,7 @@ impl App {
             last_ctrl_c: None,
             overlay: None,
             known_models: initial_models,
+            clipboard: None,
             discovery_cache: Arc::new(Mutex::new(ModelDiscoveryCache::new(Duration::from_secs(
                 300,
             )))),
@@ -653,13 +655,27 @@ impl App {
             return;
         };
         let text = text.to_string();
-        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(clipboard) => self.clipboard = Some(clipboard),
+                Err(error) => {
+                    self.output_pane
+                        .add_system_message(format!("Clipboard error: {error}"));
+                    return;
+                }
+            }
+        }
+
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            self.output_pane
+                .add_system_message("Clipboard error: clipboard unavailable".into());
+            return;
+        };
+
+        match clipboard.set_text(&text) {
             Ok(()) => {
-                let preview = if text.len() > 60 {
-                    format!("{}...", &text[..57])
-                } else {
-                    text
-                };
+                let preview = truncate_text(&text, 60);
                 self.output_pane
                     .add_system_message(format!("Copied to clipboard: {preview}"));
             }
@@ -1277,11 +1293,7 @@ fn format_tool_args(args: &serde_json::Value) -> String {
         return path.to_string();
     }
     if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
-        return if command.len() > 60 {
-            format!("{}...", &command[..57])
-        } else {
-            command.to_string()
-        };
+        return truncate_text(command, 60);
     }
     serde_json::to_string(args).unwrap_or_default()
 }
@@ -1337,17 +1349,27 @@ fn tool_result_args_display(result: &ToolResultMessage) -> String {
         .get("command")
         .and_then(serde_json::Value::as_str)
     {
-        return if command.len() > 60 {
-            format!("{}...", &command[..57])
-        } else {
-            command.to_string()
-        };
+        return truncate_text(command, 60);
     }
     String::new()
 }
 
 fn tool_result_elapsed(result: &ToolResultMessage) -> Option<std::time::Duration> {
     tool_result_elapsed_from_details(&result.details)
+}
+
+pub(crate) fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else if max_chars <= 1 {
+        "…".to_string()
+    } else {
+        let truncated = text
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        format!("{truncated}…")
+    }
 }
 
 fn tool_result_elapsed_from_details(details: &serde_json::Value) -> Option<std::time::Duration> {
