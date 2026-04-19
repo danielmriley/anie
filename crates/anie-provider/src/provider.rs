@@ -48,6 +48,16 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Whether the provider's wire format requires an opaque signature
+    /// on every replayed thinking block. When `true`, the sanitizer
+    /// drops thinking blocks that carry no signature rather than
+    /// sending invalid payloads (Anthropic returns a 400 otherwise).
+    ///
+    /// See docs/api_integrity_plans/01c_serializer_and_sanitizer.md.
+    fn requires_thinking_signature(&self) -> bool {
+        false
+    }
+
     /// Convert registered tools into the provider-native format.
     fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value>;
 }

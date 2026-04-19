@@ -193,6 +193,10 @@ impl Provider for AnthropicProvider {
         true
     }
 
+    fn requires_thinking_signature(&self) -> bool {
+        true
+    }
+
     fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
         let last = tools.len().saturating_sub(1);
         tools
@@ -258,8 +262,17 @@ fn content_blocks_to_anthropic(content: &[ContentBlock]) -> Vec<serde_json::Valu
                     "data": data,
                 }
             }),
-            ContentBlock::Thinking { thinking, .. } => {
-                json!({ "type": "thinking", "thinking": thinking })
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                let mut block = serde_json::Map::new();
+                block.insert("type".into(), json!("thinking"));
+                block.insert("thinking".into(), json!(thinking));
+                if let Some(signature) = signature {
+                    block.insert("signature".into(), json!(signature));
+                }
+                serde_json::Value::Object(block)
             }
             ContentBlock::ToolCall(tool_call) => json!({
                 "type": "tool_use",
@@ -901,6 +914,37 @@ mod tests {
             )),
             "expected seeded signature"
         );
+    }
+
+    #[test]
+    fn thinking_block_serialization_includes_signature_when_present() {
+        let signed = content_blocks_to_anthropic(&[ContentBlock::Thinking {
+            thinking: "r".into(),
+            signature: Some("SIG".into()),
+        }]);
+        assert_eq!(signed[0]["type"], json!("thinking"));
+        assert_eq!(signed[0]["thinking"], json!("r"));
+        assert_eq!(signed[0]["signature"], json!("SIG"));
+    }
+
+    #[test]
+    fn thinking_block_serialization_omits_signature_when_absent() {
+        let unsigned = content_blocks_to_anthropic(&[ContentBlock::Thinking {
+            thinking: "r".into(),
+            signature: None,
+        }]);
+        assert_eq!(unsigned[0]["type"], json!("thinking"));
+        assert_eq!(unsigned[0]["thinking"], json!("r"));
+        assert!(
+            unsigned[0].get("signature").is_none(),
+            "unsigned thinking must omit the signature key"
+        );
+    }
+
+    #[test]
+    fn anthropic_provider_requires_thinking_signature() {
+        let provider = AnthropicProvider::new();
+        assert!(provider.requires_thinking_signature());
     }
 
     #[test]

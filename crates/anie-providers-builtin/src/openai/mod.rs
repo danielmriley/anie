@@ -467,6 +467,12 @@ mod tests {
     }
 
     #[test]
+    fn openai_provider_does_not_require_thinking_signature() {
+        let provider = OpenAIProvider::new();
+        assert!(!provider.requires_thinking_signature());
+    }
+
+    #[test]
     fn request_body_prepends_system_prompt_and_preserves_message_order() {
         let provider = OpenAIProvider::new();
         let model = sample_model();

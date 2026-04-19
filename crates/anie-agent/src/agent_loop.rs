@@ -399,8 +399,11 @@ impl AgentLoop {
                 model.base_url = base_url_override;
             }
 
-            let sanitized_context =
-                sanitize_context_for_request(&context, provider.includes_thinking_in_replay());
+            let sanitized_context = sanitize_context_for_request(
+                &context,
+                provider.includes_thinking_in_replay(),
+                provider.requires_thinking_signature(),
+            );
             let llm_context = LlmContext {
                 system_prompt: self.config.system_prompt.clone(),
                 messages: provider.convert_messages(&sanitized_context),
@@ -910,14 +913,17 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
 fn sanitize_context_for_request(
     messages: &[Message],
     includes_thinking_in_replay: bool,
+    requires_thinking_signature: bool,
 ) -> Vec<Message> {
     messages
         .iter()
         .filter_map(|message| match message {
-            Message::Assistant(assistant) => {
-                sanitize_assistant_for_request(assistant, includes_thinking_in_replay)
-                    .map(Message::Assistant)
-            }
+            Message::Assistant(assistant) => sanitize_assistant_for_request(
+                assistant,
+                includes_thinking_in_replay,
+                requires_thinking_signature,
+            )
+            .map(Message::Assistant),
             _ => Some(message.clone()),
         })
         .collect()
@@ -926,6 +932,7 @@ fn sanitize_context_for_request(
 fn sanitize_assistant_for_request(
     assistant: &AssistantMessage,
     includes_thinking_in_replay: bool,
+    requires_thinking_signature: bool,
 ) -> Option<AssistantMessage> {
     if matches!(
         assistant.stop_reason,
@@ -941,6 +948,14 @@ fn sanitize_assistant_for_request(
             ContentBlock::Text { text } if text.trim().is_empty() => None,
             ContentBlock::Thinking { thinking, .. } if thinking.trim().is_empty() => None,
             ContentBlock::Thinking { .. } if !includes_thinking_in_replay => None,
+            // Provider requires a signature on every replayed thinking
+            // block (Anthropic). Unsigned blocks either came from
+            // pre-capture sessions or would be rejected with 400.
+            // Drop them rather than send invalid payloads.
+            // See docs/api_integrity_plans/01c_serializer_and_sanitizer.md.
+            ContentBlock::Thinking {
+                signature: None, ..
+            } if requires_thinking_signature => None,
             _ => Some(block.clone()),
         })
         .collect::<Vec<_>>();
@@ -1275,7 +1290,7 @@ mod tests {
             user_message("second", 6),
         ];
 
-        let sanitized = sanitize_context_for_request(&context, false);
+        let sanitized = sanitize_context_for_request(&context, false, false);
 
         assert_eq!(sanitized.len(), 3);
         assert!(matches!(sanitized[0], Message::User(_)));
@@ -1302,7 +1317,7 @@ mod tests {
             1,
         );
 
-        let sanitized = sanitize_assistant_for_request(&assistant, true);
+        let sanitized = sanitize_assistant_for_request(&assistant, true, false);
 
         assert!(sanitized.is_none());
     }
@@ -1323,7 +1338,7 @@ mod tests {
             1,
         );
 
-        let sanitized = sanitize_assistant_for_request(&assistant, false)
+        let sanitized = sanitize_assistant_for_request(&assistant, false, false)
             .expect("assistant with text should survive");
 
         assert_eq!(
@@ -1352,9 +1367,74 @@ mod tests {
             2,
         );
 
-        let sanitized =
-            sanitize_assistant_for_request(&assistant, true).expect("tool assistant survives");
+        let sanitized = sanitize_assistant_for_request(&assistant, true, false)
+            .expect("tool assistant survives");
 
         assert_eq!(sanitized.content, assistant.content);
+    }
+
+    #[test]
+    fn sanitize_drops_unsigned_thinking_when_signature_required() {
+        let assistant = assistant_message(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "unsigned reasoning".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            StopReason::Stop,
+            1,
+        );
+
+        let sanitized = sanitize_assistant_for_request(&assistant, true, true)
+            .expect("assistant with text should survive");
+
+        assert_eq!(sanitized.content.len(), 1);
+        assert!(matches!(sanitized.content[0], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn sanitize_keeps_signed_thinking_when_signature_required() {
+        let assistant = assistant_message(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "signed reasoning".into(),
+                    signature: Some("SIG_abc".into()),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            StopReason::Stop,
+            1,
+        );
+
+        let sanitized = sanitize_assistant_for_request(&assistant, true, true)
+            .expect("assistant with text should survive");
+
+        assert_eq!(sanitized.content.len(), 2);
+        assert!(matches!(
+            &sanitized.content[0],
+            ContentBlock::Thinking { signature: Some(sig), .. } if sig == "SIG_abc"
+        ));
+    }
+
+    #[test]
+    fn sanitize_drops_assistant_when_only_unsigned_thinking_remains() {
+        let assistant = assistant_message(
+            vec![ContentBlock::Thinking {
+                thinking: "unsigned".into(),
+                signature: None,
+            }],
+            StopReason::Stop,
+            1,
+        );
+
+        let sanitized = sanitize_assistant_for_request(&assistant, true, true);
+
+        assert!(sanitized.is_none());
     }
 }
