@@ -81,7 +81,9 @@ impl<'a> RetryPolicy<'a> {
             | ProviderError::RequestBuild(_)
             | ProviderError::ToolCallMalformed(_)
             | ProviderError::NativeReasoningUnsupported(_)
-            | ProviderError::UnsupportedStreamFeature(_) => RetryDecision::GiveUp {
+            | ProviderError::UnsupportedStreamFeature(_)
+            | ProviderError::ReplayFidelity { .. }
+            | ProviderError::FeatureUnsupported(_) => RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             },
             ProviderError::RateLimited { .. }
@@ -183,6 +185,39 @@ mod tests {
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
             policy.decide(&ProviderError::Auth("bad key".into()), 0, false),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn replay_fidelity_gives_up_immediately() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::ReplayFidelity {
+                    provider_hint: "anthropic",
+                    detail: "thinking.signature".into(),
+                },
+                0,
+                false,
+            ),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn feature_unsupported_gives_up_immediately() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::FeatureUnsupported("x".into()),
+                0,
+                false,
+            ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }

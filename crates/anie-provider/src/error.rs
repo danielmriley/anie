@@ -90,6 +90,27 @@ pub enum ProviderError {
     /// See docs/api_integrity_plans/03b_unsupported_block_rejection.md.
     #[error("Unsupported provider stream feature: {0}")]
     UnsupportedStreamFeature(String),
+
+    /// A 400 whose body indicates that the request carried a message
+    /// or content block that's structurally invalid *for replay*
+    /// (e.g. a thinking block missing its `signature`). Not
+    /// retryable; the session should be restarted. Distinct from a
+    /// generic `Http { status: 400, body }` so UI layers can show
+    /// an actionable message and logs can filter on variant.
+    ///
+    /// See docs/api_integrity_plans/04_replay_error_taxonomy.md.
+    #[error("Replay fidelity error ({provider_hint}): {detail}")]
+    ReplayFidelity {
+        provider_hint: &'static str,
+        detail: String,
+    },
+
+    /// A 400 whose body indicates a feature the request referenced
+    /// is not supported by this deployment (model, region, account
+    /// tier). Not retryable; distinct from `NativeReasoningUnsupported`,
+    /// which has a specific fallback path.
+    #[error("Feature not supported by provider: {0}")]
+    FeatureUnsupported(String),
 }
 
 impl ProviderError {

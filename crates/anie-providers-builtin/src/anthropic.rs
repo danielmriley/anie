@@ -45,6 +45,39 @@ use anie_provider::{
 
 use crate::{classify_http_error, http::shared_http_client, parse_retry_after, sse_stream};
 
+/// Classify an Anthropic non-success HTTP response, upgrading 400s
+/// whose body indicates a replay-fidelity failure (thinking signature
+/// missing, redacted_thinking required, etc.) into the typed
+/// `ReplayFidelity` variant. Falls through to the generic classifier
+/// for every other case.
+///
+/// Body-string detection is confined to this function.
+/// See docs/api_integrity_plans/04_replay_error_taxonomy.md.
+pub(crate) fn classify_anthropic_http_error(
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after_ms: Option<u64>,
+) -> ProviderError {
+    if status.as_u16() == 400 && looks_like_replay_fidelity(body) {
+        return ProviderError::ReplayFidelity {
+            provider_hint: "anthropic",
+            detail: body.chars().take(500).collect(),
+        };
+    }
+    classify_http_error(status, body, retry_after_ms)
+}
+
+fn looks_like_replay_fidelity(body: &str) -> bool {
+    // Anthropic error messages for this class include phrases like:
+    //   "messages.1.content.0.thinking.signature: Field required"
+    //   "redacted_thinking: Field required"
+    //   "thinking.signature"
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("thinking") && lower.contains("signature"))
+        || lower.contains("redacted_thinking")
+        || (lower.contains("messages.") && lower.contains(".thinking"))
+}
+
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -177,7 +210,7 @@ impl Provider for AnthropicProvider {
                 let status = response.status();
                 let retry_after = parse_retry_after(&response);
                 let body = response.text().await.unwrap_or_default();
-                Err(classify_http_error(status, &body, retry_after))?
+                Err(classify_anthropic_http_error(status, &body, retry_after))?
             };
 
             let mut events = sse_stream(response);
@@ -1111,6 +1144,66 @@ mod tests {
             )
             .expect("soft ignore");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn classifies_replay_fidelity_400_on_thinking_signature() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.thinking.signature: Field required"}}"#;
+        let err = classify_anthropic_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            None,
+        );
+        assert!(matches!(
+            err,
+            ProviderError::ReplayFidelity {
+                provider_hint: "anthropic",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classifies_replay_fidelity_400_on_redacted_thinking() {
+        let body = r#"{"error":{"message":"redacted_thinking required"}}"#;
+        let err = classify_anthropic_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            None,
+        );
+        assert!(matches!(err, ProviderError::ReplayFidelity { .. }));
+    }
+
+    #[test]
+    fn generic_400_falls_through_to_http() {
+        let body = "missing required field messages";
+        let err = classify_anthropic_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            None,
+        );
+        assert!(matches!(err, ProviderError::Http { status: 400, .. }));
+    }
+
+    #[test]
+    fn auth_401_still_classified_as_auth() {
+        let err = classify_anthropic_http_error(reqwest::StatusCode::UNAUTHORIZED, "bad key", None);
+        assert!(matches!(err, ProviderError::Auth(_)));
+    }
+
+    #[test]
+    fn replay_fidelity_detail_is_truncated() {
+        let body = "messages.0.content.0.thinking.signature: Field required. ".repeat(50);
+        let err = classify_anthropic_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            &body,
+            None,
+        );
+        if let ProviderError::ReplayFidelity { detail, .. } = err {
+            assert!(detail.len() <= 500);
+        } else {
+            panic!("expected ReplayFidelity");
+        }
     }
 
     #[test]
