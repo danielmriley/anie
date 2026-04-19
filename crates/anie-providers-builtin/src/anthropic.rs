@@ -32,6 +32,18 @@ impl AnthropicProvider {
         }
     }
 
+    // Test-visible so plan 03d / plan 06 fixture tests can assert on
+    // outbound request shape without hitting the network.
+    #[cfg(test)]
+    pub(crate) fn build_request_body_for_test(
+        &self,
+        model: &Model,
+        context: &LlmContext,
+        options: &StreamOptions,
+    ) -> serde_json::Value {
+        self.build_request_body(model, context, options)
+    }
+
     fn build_request_body(
         &self,
         model: &Model,
@@ -945,6 +957,54 @@ mod tests {
     fn anthropic_provider_requires_thinking_signature() {
         let provider = AnthropicProvider::new();
         assert!(provider.requires_thinking_signature());
+    }
+
+    #[test]
+    fn cache_control_marker_count_stays_bounded_with_many_tools() {
+        // Regression guard for an earlier production 400: when every
+        // tool carried `cache_control`, 5+ tools tripped Anthropic's
+        // "max 4 blocks" limit. Only the last tool should carry
+        // cache_control; system prompt carries one more. Total <= 2,
+        // well under the API limit of 4.
+        let provider = AnthropicProvider::new();
+        let tools: Vec<ToolDef> = (0..10)
+            .map(|i| ToolDef {
+                name: format!("tool_{i}"),
+                description: format!("tool {i}"),
+                parameters: json!({"type": "object"}),
+            })
+            .collect();
+        let context = LlmContext {
+            system_prompt: "hello".into(),
+            messages: Vec::new(),
+            tools,
+        };
+        let options = StreamOptions::default();
+        let body = provider.build_request_body_for_test(&sample_model(), &context, &options);
+
+        let count = count_cache_control_markers(&body);
+        assert!(
+            count <= 4,
+            "cache_control marker count must stay <= 4 (got {count}): {body}"
+        );
+        assert_eq!(
+            count, 2,
+            "expected exactly one marker on system and one on the last tool"
+        );
+    }
+
+    fn count_cache_control_markers(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(map) => {
+                let here = usize::from(map.contains_key("cache_control"));
+                let in_children: usize = map.values().map(count_cache_control_markers).sum();
+                here + in_children
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().map(count_cache_control_markers).sum()
+            }
+            _ => 0,
+        }
     }
 
     #[test]
