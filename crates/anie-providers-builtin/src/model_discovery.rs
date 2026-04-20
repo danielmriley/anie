@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anie_provider::{ApiKind, ModelInfo, ProviderError};
+use anie_provider::{ApiKind, ModelInfo, ModelPricing, ProviderError};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 
@@ -152,6 +152,59 @@ struct OpenAiModelEntry {
     modalities: Option<Vec<String>>,
     #[serde(default)]
     capabilities: Option<ModelCapabilities>,
+    // OpenRouter-only fields. All optional so the OpenAI
+    // `/models` endpoint (and any other OpenAI-compatible
+    // endpoint) keeps parsing.
+    #[serde(default)]
+    pricing: Option<PricingEntry>,
+    #[serde(default)]
+    top_provider: Option<TopProviderEntry>,
+    #[serde(default)]
+    supported_parameters: Option<Vec<String>>,
+    #[serde(default)]
+    architecture: Option<ArchitectureEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PricingEntry {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+    #[serde(default)]
+    request: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+}
+
+impl PricingEntry {
+    fn into_model_pricing(self) -> Option<ModelPricing> {
+        let pricing = ModelPricing {
+            prompt: self.prompt,
+            completion: self.completion,
+            request: self.request,
+            image: self.image,
+        };
+        if pricing == ModelPricing::default() {
+            None
+        } else {
+            Some(pricing)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TopProviderEntry {
+    #[serde(default)]
+    context_length: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchitectureEntry {
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,24 +297,39 @@ async fn discover_openai_compatible_models(
         .data
         .into_iter()
         .filter(|entry| entry.object.as_deref().unwrap_or("model") == "model")
-        .map(|entry| ModelInfo {
-            id: entry.id.clone(),
-            name: entry.name.unwrap_or(entry.id.clone()),
-            provider: request.provider_name.clone(),
-            context_length: entry
-                .context_length
-                .or(entry.context_window)
-                .or(entry.max_context_tokens)
-                .or(entry.input_token_limit),
-            supports_images: infer_openai_images(
+        .map(|entry| {
+            let supports_images = infer_openai_images(
                 entry.modalities.as_deref(),
                 entry.capabilities.as_ref(),
-            ),
-            supports_reasoning: infer_reasoning(
+                entry.architecture.as_ref(),
+            );
+            let supports_reasoning = infer_reasoning(
                 request.provider_name.as_str(),
                 &entry.id,
                 entry.capabilities.as_ref(),
-            ),
+                entry.supported_parameters.as_deref(),
+            );
+            let context_length = entry
+                .context_length
+                .or(entry.context_window)
+                .or(entry.max_context_tokens)
+                .or(entry.input_token_limit)
+                .or_else(|| {
+                    entry
+                        .top_provider
+                        .as_ref()
+                        .and_then(|top| top.context_length)
+                });
+            ModelInfo {
+                id: entry.id.clone(),
+                name: entry.name.unwrap_or(entry.id.clone()),
+                provider: request.provider_name.clone(),
+                context_length,
+                supports_images,
+                supports_reasoning,
+                pricing: entry.pricing.and_then(PricingEntry::into_model_pricing),
+                supported_parameters: entry.supported_parameters,
+            }
         })
         .collect())
 }
@@ -306,6 +374,8 @@ async fn discover_anthropic_models(
                     .and_then(|caps| caps.reasoning)
                     .unwrap_or(true),
             ),
+            pricing: None,
+            supported_parameters: None,
         })
         .collect())
 }
@@ -362,6 +432,8 @@ async fn discover_ollama_tags(
                 context_length,
                 supports_images,
                 supports_reasoning,
+                pricing: None,
+                supported_parameters: None,
             })
         })
         .collect())
@@ -471,15 +543,23 @@ fn normalize_root_base_url(base_url: &str) -> String {
 fn infer_openai_images(
     modalities: Option<&[String]>,
     capabilities: Option<&ModelCapabilities>,
+    architecture: Option<&ArchitectureEntry>,
 ) -> Option<bool> {
+    let modality_has_image = |modalities: &[String]| {
+        modalities.iter().any(|modality| {
+            modality.eq_ignore_ascii_case("image") || modality.eq_ignore_ascii_case("vision")
+        })
+    };
+
     capabilities
         .and_then(|caps| caps.vision.or(caps.images))
+        .or_else(|| modalities.map(modality_has_image))
         .or_else(|| {
-            modalities.map(|modalities| {
-                modalities.iter().any(|modality| {
-                    modality.eq_ignore_ascii_case("image")
-                        || modality.eq_ignore_ascii_case("vision")
-                })
+            architecture.and_then(|arch| {
+                arch.input_modalities
+                    .as_deref()
+                    .map(modality_has_image)
+                    .or_else(|| arch.output_modalities.as_deref().map(modality_has_image))
             })
         })
 }
@@ -488,19 +568,31 @@ fn infer_reasoning(
     provider_name: &str,
     model_id: &str,
     capabilities: Option<&ModelCapabilities>,
+    supported_parameters: Option<&[String]>,
 ) -> Option<bool> {
-    capabilities.and_then(|caps| caps.reasoning).or_else(|| {
-        let provider_name = provider_name.to_ascii_lowercase();
-        let model_id = model_id.to_ascii_lowercase();
-        let reasoning = model_id.contains("reason")
-            || model_id.starts_with('o')
-            || model_id.contains("qwen3")
-            || model_id.contains("qwq")
-            || model_id.contains("deepseek-r1")
-            || model_id.contains("gpt-oss")
-            || provider_name == "anthropic";
-        Some(reasoning)
-    })
+    capabilities
+        .and_then(|caps| caps.reasoning)
+        .or_else(|| {
+            supported_parameters.map(|params| {
+                params.iter().any(|param| {
+                    param.eq_ignore_ascii_case("reasoning")
+                        || param.eq_ignore_ascii_case("reasoning_effort")
+                        || param.eq_ignore_ascii_case("include_reasoning")
+                })
+            })
+        })
+        .or_else(|| {
+            let provider_name = provider_name.to_ascii_lowercase();
+            let model_id = model_id.to_ascii_lowercase();
+            let reasoning = model_id.contains("reason")
+                || model_id.starts_with('o')
+                || model_id.contains("qwen3")
+                || model_id.contains("qwq")
+                || model_id.contains("deepseek-r1")
+                || model_id.contains("gpt-oss")
+                || provider_name == "anthropic";
+            Some(reasoning)
+        })
 }
 
 fn reasoning_family(family: &str) -> bool {
@@ -923,5 +1015,144 @@ mod tests {
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].supports_images, Some(true));
+    }
+
+    /// Realistic slice of an OpenRouter `/api/v1/models` response.
+    /// Covers: richer top-level fields (pricing, architecture,
+    /// supported_parameters, top_provider), mixed reasoning /
+    /// non-reasoning entries, and an entry that relies on
+    /// `top_provider.context_length` because the top-level
+    /// `context_length` is absent.
+    const OPENROUTER_DISCOVERY_FIXTURE: &str = r#"{
+        "data": [
+            {
+                "id": "anthropic/claude-sonnet-4",
+                "name": "Anthropic: Claude Sonnet 4",
+                "context_length": 200000,
+                "pricing": {
+                    "prompt": "0.000003",
+                    "completion": "0.000015",
+                    "request": "0",
+                    "image": "0.0048"
+                },
+                "top_provider": {"context_length": 200000},
+                "supported_parameters": ["tools", "tool_choice", "reasoning"],
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"]
+                }
+            },
+            {
+                "id": "openai/o3",
+                "name": "OpenAI: o3",
+                "pricing": {"prompt": "0.000002", "completion": "0.000008"},
+                "top_provider": {"context_length": 128000},
+                "supported_parameters": ["tools", "reasoning_effort"],
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"]
+                }
+            },
+            {
+                "id": "meta-llama/llama-3.1-8b-instruct",
+                "name": "Llama 3.1 8B Instruct",
+                "context_length": 131072,
+                "pricing": {"prompt": "0.00000002", "completion": "0.00000005"},
+                "supported_parameters": ["tools"],
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"]
+                }
+            }
+        ]
+    }"#;
+
+    #[tokio::test]
+    async fn openrouter_discovery_parses_full_response() {
+        let server = spawn_mock_server(|path, _headers| {
+            assert_eq!(path, "/v1/models");
+            MockResponse::ok_json(OPENROUTER_DISCOVERY_FIXTURE)
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "openrouter",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            Some("sk-or-test"),
+        ))
+        .await
+        .expect("discover openrouter models");
+
+        assert_eq!(models.len(), 3);
+
+        // anthropic/claude-sonnet-4 — richest entry
+        let claude = &models[0];
+        assert_eq!(claude.id, "anthropic/claude-sonnet-4");
+        assert_eq!(claude.name, "Anthropic: Claude Sonnet 4");
+        assert_eq!(claude.provider, "openrouter");
+        assert_eq!(claude.context_length, Some(200_000));
+        assert_eq!(claude.supports_images, Some(true));
+        assert_eq!(claude.supports_reasoning, Some(true));
+        let pricing = claude.pricing.as_ref().expect("claude has pricing");
+        assert_eq!(pricing.prompt.as_deref(), Some("0.000003"));
+        assert_eq!(pricing.completion.as_deref(), Some("0.000015"));
+        assert_eq!(pricing.request.as_deref(), Some("0"));
+        assert_eq!(pricing.image.as_deref(), Some("0.0048"));
+        let params = claude
+            .supported_parameters
+            .as_deref()
+            .expect("supported_parameters preserved");
+        assert!(params.iter().any(|p| p == "tools"));
+        assert!(params.iter().any(|p| p == "reasoning"));
+
+        // openai/o3 — relies on top_provider.context_length
+        let o3 = &models[1];
+        assert_eq!(o3.id, "openai/o3");
+        assert_eq!(
+            o3.context_length,
+            Some(128_000),
+            "should fall back to top_provider.context_length"
+        );
+        assert_eq!(o3.supports_reasoning, Some(true));
+        assert_eq!(o3.supports_images, Some(false));
+
+        // meta-llama — no reasoning, text-only
+        let llama = &models[2];
+        assert_eq!(llama.id, "meta-llama/llama-3.1-8b-instruct");
+        assert_eq!(llama.context_length, Some(131_072));
+        assert_eq!(llama.supports_images, Some(false));
+        assert_eq!(llama.supports_reasoning, Some(false));
+        assert!(
+            llama
+                .supported_parameters
+                .as_deref()
+                .is_some_and(|params| params.iter().any(|p| p == "tools"))
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_discovery_falls_back_when_fetch_fails() {
+        let server = spawn_mock_server(|_path, _headers| {
+            MockResponse::status(401, "invalid api key")
+        })
+        .await;
+
+        let error = discover_models(&request(
+            "openrouter",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            Some("bad-key"),
+        ))
+        .await
+        .expect_err("bad key should fail");
+
+        // Caller (onboarding) preserves the credential and surfaces
+        // this as a recoverable message; the discovery layer just
+        // needs to report the typed error cleanly.
+        assert!(
+            matches!(error, ProviderError::Auth(_)),
+            "expected typed auth error, got {error:?}"
+        );
     }
 }

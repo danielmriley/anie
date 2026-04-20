@@ -546,7 +546,7 @@ impl ProviderManagementScreen {
                     ProviderManagementMode::PickingModel { entry, .. } => entry.clone(),
                     _ => return ProviderManagementAction::Continue,
                 };
-                return self.apply_selected_model(entry, model_info);
+                return self.apply_selected_model(entry, *model_info);
             }
         }
         ProviderManagementAction::Continue
@@ -1520,6 +1520,8 @@ mod tests {
                 context_length: Some(128_000),
                 supports_images: Some(true),
                 supports_reasoning: Some(false),
+                pricing: None,
+                supported_parameters: None,
             }]),
         });
         assert!(matches!(

@@ -12,9 +12,9 @@ mod thinking;
 pub use api_kind::ApiKind;
 pub use error::ProviderError;
 pub use model::{
-    CostPerMillion, Model, ModelCompat, ModelInfo, OpenAICompletionsCompat, OpenRouterRouting,
-    ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode, ReasoningTags,
-    ReplayCapabilities, ThinkingRequestMode,
+    CostPerMillion, Model, ModelCompat, ModelInfo, ModelPricing, OpenAICompletionsCompat,
+    OpenRouterRouting, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
+    ReasoningTags, ReplayCapabilities, ThinkingRequestMode,
 };
 pub use options::{LlmContext, LlmMessage, ResolvedRequestOptions, StreamOptions};
 pub use provider::{Provider, ProviderEvent, ProviderStream, RequestOptionsResolver};

@@ -15,7 +15,7 @@ pub enum ModelPickerAction {
     /// Keep rendering the picker.
     Continue,
     /// User selected a model.
-    Selected(ModelInfo),
+    Selected(Box<ModelInfo>),
     /// User cancelled the picker.
     Cancelled,
     /// User requested a refresh.
@@ -189,7 +189,9 @@ impl ModelPickerPane {
             (KeyModifiers::NONE, KeyCode::Enter) => self
                 .selected_model()
                 .cloned()
-                .map_or(ModelPickerAction::Continue, ModelPickerAction::Selected),
+                .map_or(ModelPickerAction::Continue, |model| {
+                    ModelPickerAction::Selected(Box::new(model))
+                }),
             (KeyModifiers::NONE, KeyCode::Backspace) => {
                 self.search.backspace();
                 self.apply_filter(None);
@@ -515,6 +517,8 @@ mod tests {
                 context_length: Some(32_768),
                 supports_images: Some(false),
                 supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
             },
             ModelInfo {
                 id: "qwen3:8b".into(),
@@ -523,6 +527,8 @@ mod tests {
                 context_length: Some(32_768),
                 supports_images: Some(false),
                 supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
             },
             ModelInfo {
                 id: "gpt-4o".into(),
@@ -531,6 +537,8 @@ mod tests {
                 context_length: Some(128_000),
                 supports_images: Some(true),
                 supports_reasoning: Some(false),
+                pricing: None,
+                supported_parameters: None,
             },
         ]
     }

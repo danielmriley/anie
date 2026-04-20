@@ -198,6 +198,37 @@ pub struct ModelInfo {
     pub supports_images: Option<bool>,
     /// Whether the model supports reasoning features, when known.
     pub supports_reasoning: Option<bool>,
+    /// Per-token pricing reported by the provider (currently
+    /// populated only by OpenRouter; `None` elsewhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+    /// Feature flags reported by the provider (e.g. `"tools"`,
+    /// `"reasoning"`, `"tool_choice"`). Populated by OpenRouter's
+    /// `/models` response; `None` for endpoints that don't report
+    /// this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_parameters: Option<Vec<String>>,
+}
+
+/// Per-token pricing reported by a discovery endpoint. OpenRouter
+/// returns prices as string decimals (per token, not per million),
+/// so fields are kept as `String` to preserve precision and match
+/// the upstream format without lossy conversion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelPricing {
+    /// Input-token price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Output-token price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
+    /// Flat per-request surcharge, when the provider charges one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    /// Per-image surcharge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// Registered model metadata used to route and parameterize provider calls.
@@ -286,6 +317,8 @@ impl From<&Model> for ModelInfo {
             context_length: Some(value.context_window),
             supports_images: Some(value.supports_images),
             supports_reasoning: Some(value.supports_reasoning),
+            pricing: None,
+            supported_parameters: None,
         }
     }
 }
@@ -303,6 +336,8 @@ mod tests {
             context_length: None,
             supports_images: None,
             supports_reasoning: None,
+            pricing: None,
+            supported_parameters: None,
         };
 
         let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");

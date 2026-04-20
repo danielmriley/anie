@@ -1868,6 +1868,12 @@ fn provider_presets() -> Vec<ProviderPreset> {
             kind: ConfiguredProviderKind::BuiltinHosted,
             model: openai,
         },
+        custom_openai_preset(
+            "OpenRouter (discovery, 500+ models)",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            "openai/gpt-4o",
+        ),
         custom_openai_preset("xAI / Grok", "xai", "https://api.x.ai/v1", "grok-2-1212"),
         custom_openai_preset(
             "Groq",
@@ -1977,6 +1983,63 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_preset_registered_and_in_onboarding_shortlist() {
+        let presets = provider_presets();
+        let openrouter = presets
+            .iter()
+            .find(|preset| preset.provider_name == "openrouter")
+            .expect("openrouter preset must appear in the onboarding shortlist");
+
+        assert_eq!(openrouter.model.provider, "openrouter");
+        assert_eq!(openrouter.model.api, ApiKind::OpenAICompletions);
+        assert_eq!(openrouter.model.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(openrouter.kind, ConfiguredProviderKind::ConfigBacked);
+        assert!(
+            openrouter.display_name.contains("OpenRouter"),
+            "display name should call out OpenRouter, got {:?}",
+            openrouter.display_name
+        );
+
+        // Ordering contract: OpenRouter appears within the first
+        // three third-party-API presets the user sees, so the
+        // shortlist keeps it prominent alongside Anthropic/OpenAI.
+        let openrouter_index = presets
+            .iter()
+            .position(|preset| preset.provider_name == "openrouter")
+            .expect("position");
+        assert!(
+            openrouter_index < 4,
+            "openrouter should be near the top of the shortlist, found at index {openrouter_index}"
+        );
+    }
+
+    #[test]
+    fn openrouter_preset_builds_discovery_request_with_expected_fields() {
+        // Mirrors the path taken after the user enters their API
+        // key on the OpenRouter preset: the worker builds a
+        // `ModelDiscoveryRequest` from the `ApiPreset` context and
+        // hands it to `discover_models`. We verify the request is
+        // addressed at OpenRouter's `/v1/models` with the user's
+        // key.
+        let preset = provider_presets()
+            .into_iter()
+            .find(|preset| preset.provider_name == "openrouter")
+            .expect("openrouter preset");
+
+        let context = ModelPickerContext::ApiPreset {
+            preset_index: 0,
+            preset,
+            api_key: "sk-or-example".into(),
+        };
+        let request =
+            discovery_request_for_context(&context).expect("discovery request");
+        assert_eq!(request.provider_name, "openrouter");
+        assert_eq!(request.api, ApiKind::OpenAICompletions);
+        assert_eq!(request.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(request.api_key.as_deref(), Some("sk-or-example"));
+    }
+
+    #[test]
     fn main_menu_navigation_moves_selection() {
         let mut screen = OnboardingScreen::new_for_tests();
         assert!(matches!(
@@ -2049,6 +2112,8 @@ mod tests {
                 context_length: Some(32_768),
                 supports_images: Some(false),
                 supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
             }]),
         });
 
@@ -2112,6 +2177,8 @@ mod tests {
                     context_length: Some(32_768),
                     supports_images: Some(false),
                     supports_reasoning: Some(true),
+                    pricing: None,
+                    supported_parameters: None,
                 }],
                 "ollama".into(),
                 "qwen3:32b".into(),
