@@ -12,6 +12,11 @@ Entry point for the anie-rs docs tree.
 - **[refactor_plans/](refactor_plans/)** — large not-yet-started
   refactors. Currently just the pi-shaped extension system (plan 10)
   plus the pi-mono comparison it's grounded in.
+- **[add_providers/](add_providers/)** — plans for adding new LLM
+  providers (OpenRouter, Gemini, xAI/Groq/Cerebras/Mistral, Azure,
+  Bedrock, OpenAI Responses). Complements the `adding-providers`
+  skill, which covers the mechanical how-to; these plans set
+  priorities, model catalogs, and onboarding integration.
 
 ### If you want to understand how anie works today
 

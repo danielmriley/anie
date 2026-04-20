@@ -1,5 +1,12 @@
 # Provider Expansion and Auth
 
+> **Operational plans moved.** The concrete "how to add OpenRouter
+> / Gemini / xAI / Groq / Cerebras / Mistral / Azure / Bedrock /
+> OpenAI Responses" work is now specified in
+> [`docs/add_providers/`](../add_providers/README.md) with one plan
+> per provider (or batched family). This note is kept as the
+> original brainstorm that seeded those plans.
+
 ## Summary
 
 Expand provider support beyond the current Anthropic/OpenAI/local set,

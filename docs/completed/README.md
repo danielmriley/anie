@@ -19,7 +19,8 @@ description and (where the doc carries one) a reference date.
 
 | Path | What's in it |
 |---|---|
-| [`refactor_plans/`](refactor_plans/) | Plans 00–08 (CI, openai split, TUI overlays, controller decomposition, provider unification, error taxonomy, session locking, extensions stub removal, hygiene) + the `fixes/` follow-ups + the review + the implementation report |
+| [`refactor_plans/`](refactor_plans/) | Plans 00–08 (CI, openai split, TUI overlays, controller decomposition, provider unification, error taxonomy, session locking, extensions stub removal, hygiene), **11 + 12** (graceful slash-command dispatch + inline autocomplete popup), **13 + 14** (controller responsiveness + persistence safety — pre-merge hardening), the `fixes/` follow-ups, the review, and the implementation report |
+| [`api_integrity_plans/`](api_integrity_plans/) | The replay-fidelity and capability-routing work that made the provider layer safe across multi-turn replay. Plans 00 (principles), 01a–e (Anthropic thinking signatures), 02 (redacted thinking), 03/a/b/c/d (round-trip audit, unsupported blocks, `ReplayCapabilities` on `Model`, cross-provider invariants), 04 (error taxonomy), 05 (session schema migration), 06 (multi-turn integration tests). All shipped; prerequisite reading for the `adding-providers` skill. |
 | [`next_steps/`](next_steps/) | Four quick wins: context file hot-reload, `/copy`, `/new`, `/reload`. All shipped. |
 | [`onboarding_plans/`](onboarding_plans/) | Dynamic model menus and inline picker (Phases 1–6). Also contains an earlier `completed/` sub-archive of the v0.1.0 keyring + onboarding phases. |
 | [`testing_phases/`](testing_phases/) | Integration test suite build-out (Phases 0–4). Produced the `anie-integration-tests` crate. |

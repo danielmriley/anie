@@ -20,6 +20,30 @@ ratio — smallest impactful changes first. Check off items as they ship.
       a filterable palette; arg-value completions for
       `Enumerated`/`Subcommands` specs; toggle via
       `ui.slash_command_popup_enabled`
+- [x] Controller responsiveness (plan 13A): Ctrl+C / Abort / Quit
+      drain promptly during transient-retry backoff via
+      non-blocking `PendingRetry::Armed` state in the main
+      `select!` loop
+- [x] Reliable UI-action delivery (plan 13B): unbounded
+      `UiAction` channel; user submit/quit/abort can no longer
+      be silently dropped under controller backpressure
+- [x] Persistence safety (plan 14): `anie_config::atomic_write`
+      helper (temp-file + fsync + rename) for all user-facing
+      writes; corrupt `auth.json` is quarantined to a sibling
+      rather than silently overwritten
+- [x] Long-running generation no longer restarts (commit `f85fdb8`):
+      removed the 300-second whole-request timeout from the shared
+      reqwest client so local-model streams can run to completion
+- [x] TUI state RAII-guarded (commit `4030c64`): terminal is
+      restored via `Drop`, so panics or early returns no longer
+      leave the shell emitting SGR mouse-tracking escape
+      sequences on clicks/scrolls
+- [x] API-integrity suite (plans 00–06 of the api_integrity
+      track, now in [`completed/api_integrity_plans/`](completed/api_integrity_plans/)):
+      Anthropic thinking-signature replay, redacted-thinking
+      support, round-trip audit, `ReplayCapabilities` on `Model`,
+      cross-provider invariants, error taxonomy, session schema
+      migration, multi-turn integration tests
 
 ## Next Up — Small, High-Impact
 
@@ -74,11 +98,17 @@ as `/skill:name` commands.
 **Effort**: Medium-large — TUI overlay, config mutation, persistence.
 **Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
 
-### 12. Provider expansion
-**What**: Additional provider presets (Google Gemini, Mistral, Groq, etc.).
+### 12. Provider expansion — **plans drafted**
+**What**: Built-in support for OpenRouter (top priority), xAI,
+Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI
+Responses API, and Amazon Bedrock.
 **Why**: Broader model access without manual config.
-**Effort**: Medium per provider — most are OpenAI-compatible.
-**Details**: [docs/notes/provider_expansion_and_auth.md](notes/provider_expansion_and_auth.md)
+**Effort**: Ranges from S (OpenRouter) to L (Bedrock). Most are
+OpenAI-compat and add as a preset entry + catalog rows.
+**Details**: [docs/add_providers/README.md](add_providers/README.md)
+lists priorities. Per-provider plans live beside it.
+**Skill**: `.claude/skills/adding-providers/SKILL.md` covers the
+mechanical how-to that every plan cross-references.
 
 ## Long-Term — Architecture
 
