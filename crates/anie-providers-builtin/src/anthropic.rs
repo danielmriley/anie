@@ -752,7 +752,7 @@ fn map_stop_reason(stop_reason: &str) -> StopReason {
 
 #[cfg(test)]
 mod tests {
-    use anie_provider::{ApiKind, CostPerMillion};
+    use anie_provider::{ApiKind, CostPerMillion, ModelCompat};
 
     use super::*;
 
@@ -770,6 +770,7 @@ mod tests {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -1444,6 +1445,7 @@ mod tests {
                 supports_images: true,
                 cost_per_million: anie_provider::CostPerMillion::zero(),
                 replay_capabilities: None,
+                compat: ModelCompat::None,
             }
         }
 

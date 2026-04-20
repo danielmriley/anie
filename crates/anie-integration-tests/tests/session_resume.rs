@@ -365,6 +365,7 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
             supports_redacted_thinking: true,
             supports_encrypted_reasoning: false,
         }),
+        compat: anie_provider::ModelCompat::None,
     };
     let agent = AgentLoop::new(
         Arc::new(registry),

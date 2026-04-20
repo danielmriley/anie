@@ -5,7 +5,7 @@ use crate::bootstrap::build_tool_registry;
 use crate::runtime_state::RuntimeState;
 use anie_protocol::StopReason;
 use anie_provider::{
-    ApiKind, CostPerMillion, ProviderError,
+    ApiKind, CostPerMillion, ModelCompat, ProviderError,
     mock::{MockProvider, MockStreamScript},
 };
 use anie_session::SessionManager;
@@ -25,6 +25,7 @@ fn model(id: &str, provider: &str) -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 

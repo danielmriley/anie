@@ -121,7 +121,7 @@ pub enum UiAction {
     /// Set the active model by ID or `provider:model`.
     SetModel(String),
     /// Set the active model using a fully-resolved model definition.
-    SetResolvedModel(Model),
+    SetResolvedModel(Box<Model>),
     /// Set the active thinking level.
     SetThinking(String),
     /// Clear the output pane.
@@ -898,7 +898,7 @@ impl App {
                 self.close_model_picker();
                 let _ = self
                     .action_tx
-                    .send(UiAction::SetResolvedModel(model.clone()));
+                    .send(UiAction::SetResolvedModel(Box::new(model.clone())));
                 self.output_pane
                     .add_system_message(format!("Model: {}", model.id));
             }
@@ -962,7 +962,7 @@ impl App {
         };
         let _ = self
             .action_tx
-            .send(UiAction::SetResolvedModel(model.clone()));
+            .send(UiAction::SetResolvedModel(Box::new(model.clone())));
         self.output_pane
             .add_system_message(format!("Model: {}", model.id));
         true

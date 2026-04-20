@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use anie_auth::CredentialStore;
 use anie_config::{ConfigMutator, global_config_path};
-use anie_provider::{ApiKind, CostPerMillion, Model, ModelInfo};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
 use anie_providers_builtin::{
     LocalServer, ModelDiscoveryRequest, builtin_models, detect_local_servers, discover_models,
 };
@@ -1119,6 +1119,7 @@ impl OnboardingScreen {
                             supports_images: false,
                             cost_per_million: CostPerMillion::zero(),
                             replay_capabilities: None,
+                            compat: ModelCompat::None,
                         },
                         kind: ConfiguredProviderKind::ConfigBacked,
                         is_default: true,
@@ -1833,6 +1834,7 @@ fn provider_presets() -> Vec<ProviderPreset> {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         });
     let anthropic = builtin_models()
         .into_iter()
@@ -1850,6 +1852,7 @@ fn provider_presets() -> Vec<ProviderPreset> {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         });
 
     vec![
@@ -1925,6 +1928,7 @@ fn custom_openai_preset(
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         },
     }
 }
@@ -1967,6 +1971,7 @@ mod tests {
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),
                 replay_capabilities: None,
+                compat: ModelCompat::None,
             }],
         }
     }

@@ -303,7 +303,7 @@ struct OpenAiToolCallState {
 #[cfg(test)]
 mod tests {
     use anie_protocol::{AssistantMessage, ContentBlock, ToolCall};
-    use anie_provider::{ApiKind, CostPerMillion, Model, ProviderError, ProviderEvent};
+    use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ProviderError, ProviderEvent};
 
     use super::*;
 
@@ -321,6 +321,7 @@ mod tests {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -338,6 +339,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 

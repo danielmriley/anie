@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use anyhow::{Result, anyhow};
 
 use anie_config::{AnieConfig, configured_models};
-use anie_provider::{ApiKind, CostPerMillion, Model, ThinkingLevel};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ThinkingLevel};
 use anie_providers_builtin::{builtin_models, detect_local_servers};
 
 use crate::Cli;
@@ -236,6 +236,7 @@ pub(crate) fn fallback_model_from_provider(
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     })
 }
 
@@ -285,6 +286,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 

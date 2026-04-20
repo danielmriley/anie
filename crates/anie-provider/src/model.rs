@@ -105,6 +105,84 @@ pub struct ReplayCapabilities {
     pub supports_encrypted_reasoning: bool,
 }
 
+/// Provider-family compat knobs attached per model.
+///
+/// Each variant collects the flags that are semantically
+/// meaningful for one `ApiKind` family. Variants are open — the
+/// fields inside a variant are all optional so adding one later
+/// doesn't break serde roundtrips, and deserializing an older
+/// session file without the new field is safe.
+///
+/// This is the anie equivalent of pi's per-model compat blobs
+/// (pi: `packages/ai/src/types.ts:265` `OpenAICompletionsCompat`).
+/// It lets one provider module (the `OpenAICompletions` provider)
+/// cover many vendors — OpenAI, OpenRouter, xAI, Groq, Cerebras,
+/// local llama.cpp, etc. — by flipping flags per catalog entry
+/// instead of growing the `Provider` trait.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ModelCompat {
+    /// No compat knobs applicable for this model.
+    #[default]
+    None,
+    /// Compat knobs for models served by the OpenAI
+    /// Chat-Completions-compatible wire protocol.
+    #[serde(rename = "openai-completions")]
+    OpenAICompletions(OpenAICompletionsCompat),
+}
+
+/// Compat knobs for models on the `OpenAICompletions` wire
+/// protocol. Currently only carries OpenRouter routing
+/// preferences; future plans add fields for xAI, Groq, Azure,
+/// etc., without breaking existing catalog entries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OpenAICompletionsCompat {
+    /// OpenRouter provider-routing preferences. Only meaningful
+    /// when `base_url` resolves to OpenRouter; ignored
+    /// otherwise. When `None`, no `provider` field is emitted
+    /// into the outbound request body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter_routing: Option<OpenRouterRouting>,
+}
+
+/// OpenRouter provider-routing preferences.
+///
+/// Subset of the shape OpenRouter accepts at
+/// <https://openrouter.ai/docs/provider-routing>. Only the
+/// fields we use in v1 are present; additional fields can be
+/// added later without breaking existing serialized values
+/// (every field is `Option<T>` with `skip_serializing_if`).
+///
+/// Consumed by the outbound-request builder when the target
+/// base URL resolves to OpenRouter and the model's compat blob
+/// carries this struct. The whole value serializes as the
+/// top-level `provider` object in the Chat Completions request
+/// body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OpenRouterRouting {
+    /// Whether OpenRouter may fall back to upstreams outside
+    /// `order`/`only` if none of them are healthy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+    /// Ordered upstream provider slugs OpenRouter should try in
+    /// sequence, falling back to the next on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    /// Exclusive upstream allowlist for this request. Any
+    /// upstream not listed is skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+    /// Upstream provider slugs to skip for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+    /// Restrict routing to upstreams that offer Zero-Data-
+    /// Retention endpoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zdr: Option<bool>,
+}
+
 /// A model discovered from a provider endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelInfo {
@@ -152,6 +230,19 @@ pub struct Model {
     /// requirements. See `ReplayCapabilities`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_capabilities: Option<ReplayCapabilities>,
+    /// Per-model provider-family compat knobs. `None` = nothing
+    /// special. See `ModelCompat`.
+    #[serde(default, skip_serializing_if = "is_default_compat")]
+    pub compat: ModelCompat,
+}
+
+/// Helper for `Model::compat`'s `skip_serializing_if` so that
+/// `ModelCompat::None` is written as an omitted field rather than
+/// `{"kind":"none"}`. Keeps existing catalogs and session files
+/// byte-identical on the wire until a non-default compat is
+/// populated.
+fn is_default_compat(compat: &ModelCompat) -> bool {
+    matches!(compat, ModelCompat::None)
 }
 
 impl Model {
@@ -181,6 +272,7 @@ impl ModelInfo {
             supports_images: self.supports_images.unwrap_or(false),
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 }
@@ -225,5 +317,92 @@ mod tests {
         assert!(!model.supports_images);
         assert_eq!(model.cost_per_million, CostPerMillion::zero());
         assert_eq!(model.reasoning_capabilities, None);
+        assert_eq!(model.compat, ModelCompat::None);
+    }
+
+    fn sample_model(compat: ModelCompat) -> Model {
+        Model {
+            id: "m".into(),
+            name: "M".into(),
+            provider: "openrouter".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat,
+        }
+    }
+
+    #[test]
+    fn model_compat_defaults_to_none_and_is_skipped_on_serialize() {
+        let model = sample_model(ModelCompat::None);
+        let json = serde_json::to_string(&model).expect("serialize model");
+        assert!(
+            !json.contains("\"compat\""),
+            "default compat must not appear in serialized form: {json}"
+        );
+
+        let roundtrip: Model = serde_json::from_str(&json).expect("deserialize model");
+        assert_eq!(roundtrip.compat, ModelCompat::None);
+    }
+
+    #[test]
+    fn model_compat_with_openai_completions_roundtrips() {
+        let compat = ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+            openrouter_routing: Some(OpenRouterRouting {
+                allow_fallbacks: Some(true),
+                order: Some(vec!["anthropic".into(), "openai".into()]),
+                only: None,
+                ignore: None,
+                zdr: Some(true),
+            }),
+        });
+        let model = sample_model(compat.clone());
+        let json = serde_json::to_string(&model).expect("serialize model");
+        assert!(json.contains("\"kind\":\"openai-completions\""));
+        assert!(json.contains("\"openrouter_routing\""));
+
+        let roundtrip: Model = serde_json::from_str(&json).expect("deserialize model");
+        assert_eq!(roundtrip.compat, compat);
+    }
+
+    #[test]
+    fn openrouter_routing_default_has_no_preferences() {
+        let routing = OpenRouterRouting::default();
+        assert_eq!(routing.allow_fallbacks, None);
+        assert_eq!(routing.order, None);
+        assert_eq!(routing.only, None);
+        assert_eq!(routing.ignore, None);
+        assert_eq!(routing.zdr, None);
+
+        let json = serde_json::to_string(&routing).expect("serialize routing");
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn openrouter_routing_roundtrips_with_only_populated_fields() {
+        let routing = OpenRouterRouting {
+            allow_fallbacks: None,
+            order: Some(vec!["groq".into()]),
+            only: Some(vec!["groq".into(), "fireworks".into()]),
+            ignore: None,
+            zdr: None,
+        };
+
+        let json = serde_json::to_string(&routing).expect("serialize routing");
+        assert!(!json.contains("allow_fallbacks"));
+        assert!(!json.contains("ignore"));
+        assert!(!json.contains("zdr"));
+        assert!(json.contains("\"order\""));
+        assert!(json.contains("\"only\""));
+
+        let roundtrip: OpenRouterRouting =
+            serde_json::from_str(&json).expect("deserialize routing");
+        assert_eq!(roundtrip, routing);
     }
 }

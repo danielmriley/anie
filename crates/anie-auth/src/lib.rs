@@ -276,7 +276,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use anie_provider::{ApiKind, CostPerMillion};
+    use anie_provider::{ApiKind, CostPerMillion, ModelCompat};
 
     fn sample_model(provider: &str) -> Model {
         Model {
@@ -292,6 +292,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 

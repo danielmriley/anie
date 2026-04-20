@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
+    ApiKind, CostPerMillion, Model, ModelCompat, ReasoningCapabilities, ReasoningControlMode,
     ReasoningOutputMode, ThinkingRequestMode,
 };
 
@@ -155,6 +155,7 @@ pub async fn probe_openai_compatible(
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),
                 replay_capabilities: None,
+                compat: ModelCompat::None,
             })
         })
         .collect::<Vec<_>>();

@@ -190,7 +190,7 @@ impl ConfigState {
 mod tests {
     use super::*;
     use crate::runtime_state::load_runtime_state_from;
-    use anie_provider::{ApiKind, CostPerMillion};
+    use anie_provider::{ApiKind, CostPerMillion, ModelCompat};
 
     fn model(id: &str, provider: &str) -> Model {
         Model {
@@ -206,6 +206,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 

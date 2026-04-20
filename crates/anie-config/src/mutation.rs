@@ -202,8 +202,8 @@ mod tests {
 
     use super::*;
     use anie_provider::{
-        CostPerMillion, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
-        ReasoningTags, ThinkingRequestMode,
+        CostPerMillion, ModelCompat, ReasoningCapabilities, ReasoningControlMode,
+        ReasoningOutputMode, ReasoningTags, ThinkingRequestMode,
     };
 
     fn sample_model() -> Model {
@@ -228,6 +228,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 

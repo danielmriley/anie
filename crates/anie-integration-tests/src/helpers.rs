@@ -11,8 +11,8 @@ use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
 };
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ProviderError, ProviderRegistry, RequestOptionsResolver,
-    ResolvedRequestOptions, ThinkingLevel, mock::MockProvider,
+    ApiKind, CostPerMillion, Model, ModelCompat, ProviderError, ProviderRegistry,
+    RequestOptionsResolver, ResolvedRequestOptions, ThinkingLevel, mock::MockProvider,
 };
 use anie_session::{SessionContext, SessionManager};
 use anie_tools::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
@@ -32,6 +32,7 @@ pub fn sample_model() -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 

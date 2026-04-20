@@ -1,5 +1,5 @@
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
+    ApiKind, CostPerMillion, Model, ModelCompat, ReasoningCapabilities, ReasoningControlMode,
     ReasoningOutputMode, ReplayCapabilities,
 };
 
@@ -42,6 +42,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 3.75,
             },
             replay_capabilities: anthropic_replay_capabilities(),
+            compat: ModelCompat::None,
         },
         Model {
             id: "claude-opus-4-6".into(),
@@ -61,6 +62,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 18.75,
             },
             replay_capabilities: anthropic_replay_capabilities(),
+            compat: ModelCompat::None,
         },
         Model {
             id: "claude-haiku-4-5-20251001".into(),
@@ -80,6 +82,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 1.0,
             },
             replay_capabilities: anthropic_replay_capabilities(),
+            compat: ModelCompat::None,
         },
         Model {
             id: "gpt-4o".into(),
@@ -99,6 +102,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 0.0,
             },
             replay_capabilities: None,
+            compat: ModelCompat::None,
         },
         Model {
             id: "o4-mini".into(),
@@ -118,6 +122,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 0.0,
             },
             replay_capabilities: None,
+            compat: ModelCompat::None,
         },
     ]
 }

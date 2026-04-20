@@ -5,9 +5,9 @@ use anie_protocol::{
 };
 
 use crate::{
-    ApiKind, CostPerMillion, LlmContext, Model, Provider, ProviderError, ProviderEvent,
-    ProviderRegistry, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
-    ReasoningTags, StreamOptions, ThinkingRequestMode,
+    ApiKind, CostPerMillion, LlmContext, Model, ModelCompat, Provider, ProviderError,
+    ProviderEvent, ProviderRegistry, ReasoningCapabilities, ReasoningControlMode,
+    ReasoningOutputMode, ReasoningTags, StreamOptions, ThinkingRequestMode,
     mock::{MockProvider, MockStreamScript},
 };
 
@@ -25,6 +25,7 @@ fn sample_model() -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 

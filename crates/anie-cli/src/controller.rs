@@ -314,7 +314,7 @@ impl InteractiveController {
                     self.send_system_message("Cannot change models while a run is active.")
                         .await;
                 } else {
-                    self.state.set_model_resolved(model).await?;
+                    self.state.set_model_resolved(*model).await?;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                 }
             }

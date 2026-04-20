@@ -6,7 +6,7 @@ use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StreamDelta, Usage, UserMessage,
 };
-use anie_provider::{ApiKind, CostPerMillion, Model};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat};
 
 use crate::{
     AgentUiState, App, OutputPane, RenderedBlock,
@@ -76,6 +76,7 @@ fn sample_models() -> Vec<Model> {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }]
 }
 

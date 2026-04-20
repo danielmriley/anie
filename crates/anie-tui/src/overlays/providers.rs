@@ -22,7 +22,7 @@ use anie_config::{
     CliOverrides, ConfigMutator, find_project_config, global_config_path, load_config_with_paths,
     preferred_write_target,
 };
-use anie_provider::{ApiKind, CostPerMillion, Model, ModelInfo};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
 use anie_providers_builtin::{ModelDiscoveryRequest, builtin_models, discover_models};
 
 use crate::{ModelPickerAction, ModelPickerPane, Spinner};
@@ -1140,6 +1140,7 @@ fn model_for_entry(entry: &ProviderEntry) -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 

@@ -224,7 +224,7 @@ pub(super) fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use anie_provider::{CostPerMillion, ReasoningControlMode, ThinkingRequestMode};
+    use anie_provider::{CostPerMillion, ModelCompat, ReasoningControlMode, ThinkingRequestMode};
 
     use super::*;
     use crate::OpenAIProvider;
@@ -243,6 +243,7 @@ mod tests {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -260,6 +261,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 

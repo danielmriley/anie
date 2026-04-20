@@ -16,9 +16,9 @@ use anie_protocol::{
     ToolResult as ProtocolToolResult, Usage, UserMessage,
 };
 use anie_provider::{
-    ApiKind, CostPerMillion, LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent,
-    ProviderRegistry, ProviderStream, RequestOptionsResolver, ResolvedRequestOptions,
-    StreamOptions, ThinkingLevel,
+    ApiKind, CostPerMillion, LlmContext, LlmMessage, Model, ModelCompat, Provider, ProviderError,
+    ProviderEvent, ProviderRegistry, ProviderStream, RequestOptionsResolver,
+    ResolvedRequestOptions, StreamOptions, ThinkingLevel,
     mock::{MockProvider, MockStreamScript},
 };
 
@@ -41,6 +41,7 @@ fn sample_model() -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 

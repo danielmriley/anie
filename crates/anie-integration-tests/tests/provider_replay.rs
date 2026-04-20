@@ -13,7 +13,8 @@ use anie_protocol::{
     UserMessage,
 };
 use anie_provider::{
-    ApiKind, CostPerMillion, LlmContext, Model, Provider, ReplayCapabilities, StreamOptions,
+    ApiKind, CostPerMillion, LlmContext, Model, ModelCompat, Provider, ReplayCapabilities,
+    StreamOptions,
 };
 use anie_providers_builtin::{AnthropicProvider, OpenAIProvider};
 use serde_json::json;
@@ -85,6 +86,7 @@ fn anthropic_model() -> Model {
             supports_redacted_thinking: true,
             supports_encrypted_reasoning: false,
         }),
+        compat: ModelCompat::None,
     }
 }
 
@@ -102,6 +104,7 @@ fn openai_model() -> Model {
         supports_images: true,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 

@@ -382,6 +382,7 @@ pub fn configured_models(config: &AnieConfig) -> Vec<Model> {
                 supports_images: model.supports_images,
                 cost_per_million: CostPerMillion::zero(),
                 replay_capabilities: None,
+                compat: anie_provider::ModelCompat::None,
             });
         }
     }
