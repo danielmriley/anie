@@ -69,6 +69,19 @@ Every plan in this folder depends on:
 Land 00 first, then the provider plans can ship independently in
 any order (respecting their dependency notes).
 
+## Execution sequencing
+
+The specs above describe **what** to build. The
+[`execution/`](execution/README.md) folder sequences the work
+across PRs and tracks cross-plan dependencies — including a
+dedicated "Milestone 0 foundation" for the scaffolding several
+plans share (compat blob on `Model`,
+`ThinkingRequestMode::NestedReasoning`,
+`ContentBlock::Thinking.thought_signature`).
+
+Start with [`execution/README.md`](execution/README.md) for the
+master milestone sequence.
+
 ## Conventions used in these plans
 
 Each per-provider plan follows this structure:
