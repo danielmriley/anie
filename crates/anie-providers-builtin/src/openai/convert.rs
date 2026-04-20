@@ -60,6 +60,20 @@ pub(super) fn assistant_message_to_openai_llm_message(
     if !tool_calls.is_empty() {
         payload.insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
     }
+    if let Some(details) = assistant_message.reasoning_details.as_ref()
+        && !details.is_empty()
+    {
+        // Round-trip OpenRouter's encrypted reasoning wrapper so
+        // the upstream's chain-of-thought stays connected across
+        // turns. Only populated on models whose catalog entry
+        // declared `supports_reasoning_details_replay`; the
+        // streaming layer drops it everywhere else so this branch
+        // is a no-op for non-opt-in providers.
+        payload.insert(
+            "reasoning_details".into(),
+            serde_json::Value::Array(details.clone()),
+        );
+    }
 
     Some(LlmMessage {
         role: "assistant".into(),
@@ -85,6 +99,9 @@ pub(super) fn llm_message_to_openai_message(message: &LlmMessage) -> serde_json:
                 );
                 if let Some(tool_calls) = content.get("tool_calls") {
                     payload.insert("tool_calls".into(), tool_calls.clone());
+                }
+                if let Some(details) = content.get("reasoning_details") {
+                    payload.insert("reasoning_details".into(), details.clone());
                 }
                 serde_json::Value::Object(payload)
             } else {
@@ -136,6 +153,7 @@ mod tests {
     use anie_protocol::{AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage};
     use anie_provider::Provider;
 
+    use super::{assistant_message_to_openai_llm_message, llm_message_to_openai_message};
     use crate::OpenAIProvider;
 
     #[test]
@@ -160,6 +178,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 timestamp: 2,
+                reasoning_details: None,
             }),
             Message::ToolResult(anie_protocol::ToolResultMessage {
                 tool_call_id: "call_1".into(),
@@ -199,6 +218,7 @@ mod tests {
                 provider: "ollama".into(),
                 model: "qwen3.5:9b".into(),
                 timestamp: 2,
+                reasoning_details: None,
             }),
             Message::User(anie_protocol::UserMessage {
                 content: vec![ContentBlock::Text {
@@ -226,6 +246,7 @@ mod tests {
             provider: "ollama".into(),
             model: "qwen3:32b".into(),
             timestamp: 1,
+            reasoning_details: None,
         })]);
 
         assert!(messages.is_empty());
@@ -255,6 +276,7 @@ mod tests {
             provider: "ollama".into(),
             model: "qwen3:32b".into(),
             timestamp: 1,
+            reasoning_details: None,
         })]);
 
         assert_eq!(messages.len(), 1);
@@ -266,5 +288,56 @@ mod tests {
             json!("read")
         );
         assert!(!messages[0].content.to_string().contains("plan first"));
+    }
+
+    #[test]
+    fn assistant_message_reasoning_details_round_trip_via_llm_message() {
+        use anie_protocol::{StopReason, Usage};
+        let details = vec![json!({
+            "type": "reasoning.encrypted",
+            "id": "call_abc",
+            "data": "OPAQUE",
+        })];
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "hi".into(),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "openrouter".into(),
+            model: "openai/o3".into(),
+            timestamp: 1,
+            reasoning_details: Some(details.clone()),
+        };
+
+        let llm = assistant_message_to_openai_llm_message(&assistant).expect("llm message");
+        assert_eq!(llm.content["reasoning_details"], json!(details));
+
+        // Now flatten through the outbound converter: the replayed
+        // wire message should carry the reasoning_details array
+        // alongside content / tool_calls.
+        let wire = llm_message_to_openai_message(&llm);
+        assert_eq!(wire["role"], "assistant");
+        assert_eq!(wire["reasoning_details"], json!(details));
+    }
+
+    #[test]
+    fn assistant_message_without_reasoning_details_omits_field() {
+        use anie_protocol::{StopReason, Usage};
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "hi".into(),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        };
+        let llm = assistant_message_to_openai_llm_message(&assistant).expect("llm message");
+        assert!(llm.content.get("reasoning_details").is_none());
     }
 }

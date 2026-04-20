@@ -47,6 +47,16 @@ pub struct AssistantMessage {
     pub model: String,
     /// Milliseconds since the Unix epoch.
     pub timestamp: u64,
+    /// Provider-emitted reasoning artifacts that must be replayed
+    /// verbatim on the next turn to preserve reasoning context.
+    /// Currently populated only by OpenRouter for upstream models
+    /// that flag `supports_reasoning_details_replay` (openai/o*,
+    /// openai/gpt-5*). The payload is stored as opaque JSON so
+    /// schema changes from the upstream don't require a migration.
+    /// `None` on every other provider; default on load for
+    /// forward-compat with older session files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 /// A tool result message.

@@ -40,6 +40,7 @@ fn assistant_message(text: &str) -> anie_protocol::AssistantMessage {
         provider: "openai".into(),
         model: "gpt-4o".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 

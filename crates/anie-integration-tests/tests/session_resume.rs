@@ -80,6 +80,7 @@ async fn thinking_blocks_survive_session_roundtrip_into_agent_context() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     });
     session
         .append_messages(&[assistant])
@@ -295,6 +296,7 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             timestamp: 1,
+            reasoning_details: None,
         })])
         .expect("persist assistant");
 
@@ -339,6 +341,7 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
         provider: "spy".into(),
         model: "claude-sonnet-4-6".into(),
         timestamp: now_millis(),
+        reasoning_details: None,
     };
     let (spy, captured) = SignatureRequiringSpy::new(response);
 

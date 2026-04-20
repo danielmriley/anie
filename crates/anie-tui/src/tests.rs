@@ -170,6 +170,7 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     })]);
 
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
@@ -206,6 +207,7 @@ fn streaming_assistant_renders_thinking_above_visible_response() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("assistant start");
@@ -296,6 +298,7 @@ fn event_to_render_streaming_and_tool_lifecycle() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("assistant start");
@@ -636,6 +639,7 @@ fn single_long_wrapped_assistant_message_is_navigable() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     })]);
 
     let mut terminal = Terminal::new(TestBackend::new(20, 8)).expect("test terminal");
@@ -1405,6 +1409,7 @@ fn thinking_text_never_leaks_into_visible_answer_streamed() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("assistant start");
@@ -1433,6 +1438,7 @@ fn thinking_text_never_leaks_into_visible_answer_streamed() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("message end");
@@ -1472,6 +1478,7 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
         Message::User(anie_protocol::UserMessage {
             content: vec![ContentBlock::Text {
@@ -1495,6 +1502,7 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 3,
+            reasoning_details: None,
         }),
     ]);
 

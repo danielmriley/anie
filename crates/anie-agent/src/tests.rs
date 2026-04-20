@@ -56,6 +56,7 @@ fn final_assistant(text: &str) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 
@@ -73,6 +74,7 @@ fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 

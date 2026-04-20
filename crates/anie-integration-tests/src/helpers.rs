@@ -158,6 +158,7 @@ pub fn final_assistant(text: &str) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 
@@ -171,6 +172,7 @@ pub fn final_assistant_at(text: &str, timestamp: u64) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp,
+        reasoning_details: None,
     }
 }
 
@@ -185,6 +187,7 @@ pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> AssistantMessage 
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 

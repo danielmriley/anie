@@ -70,13 +70,17 @@ use anie_provider::ThinkingLevel;
 /// made that affects how older binaries should interpret the file, and
 /// update the table in docs/api_integrity_plans/05_session_schema_migration.md.
 ///
-/// | Version | Change                                               |
-/// |---------|------------------------------------------------------|
-/// | 1       | Baseline.                                            |
-/// | 2       | `ContentBlock::Thinking.signature` optional field    |
-/// |         | + `ContentBlock::RedactedThinking` variant. Both     |
-/// |         | forward- and backward-compatible via serde defaults. |
-pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 2;
+/// | Version | Change                                                |
+/// |---------|-------------------------------------------------------|
+/// | 1       | Baseline.                                             |
+/// | 2       | `ContentBlock::Thinking.signature` optional field     |
+/// |         | + `ContentBlock::RedactedThinking` variant. Both      |
+/// |         | forward- and backward-compatible via serde defaults.  |
+/// | 3       | `AssistantMessage.reasoning_details` optional field   |
+/// |         | for OpenRouter encrypted-reasoning replay. Stored as  |
+/// |         | opaque JSON; forward- and backward-compatible via     |
+/// |         | serde defaults.                                       |
+pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 3;
 
 /// Session-file header. Always the first line in a session JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1130,6 +1134,7 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp,
+            reasoning_details: None,
         })
     }
 
@@ -1150,6 +1155,7 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp,
+            reasoning_details: None,
         })
     }
 
@@ -1218,6 +1224,103 @@ mod tests {
                 if content.iter().any(|block| matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "plan first"))
                     && content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "done"))
         ));
+    }
+
+    #[test]
+    fn session_roundtrip_preserves_reasoning_details_after_reopen() {
+        let tempdir = tempdir().expect("tempdir");
+        let sessions_dir = tempdir.path().join("sessions");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+
+        let assistant = Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "openrouter".into(),
+            model: "openai/o3".into(),
+            timestamp: 2,
+            reasoning_details: Some(vec![serde_json::json!({
+                "type": "reasoning.encrypted",
+                "id": "call_abc",
+                "data": "OPAQUE_PAYLOAD",
+            })]),
+        });
+
+        let mut session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
+        session
+            .append_message(&user_message("hello", 1))
+            .expect("append user");
+        session.append_message(&assistant).expect("append assistant");
+        drop(session);
+
+        let session_path = sessions_dir
+            .read_dir()
+            .expect("read dir")
+            .next()
+            .expect("session file")
+            .expect("dir entry")
+            .path();
+        let reopened = SessionManager::open_session(&session_path).expect("open session");
+        let context = reopened.build_context();
+
+        let Message::Assistant(replayed) = &context.messages[1].message else {
+            panic!("expected assistant message");
+        };
+        let details = replayed
+            .reasoning_details
+            .as_ref()
+            .expect("reasoning_details survived reopen");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["data"], "OPAQUE_PAYLOAD");
+    }
+
+    #[test]
+    fn session_reopen_tolerates_pre_v3_files_without_reasoning_details() {
+        // A schema v2 session line (no `reasoning_details` key) must
+        // still deserialize — the field defaults to `None`.
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("legacy-v2.jsonl");
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 2,
+            "id": "legacy-v2",
+            "timestamp": "2026-04-14T00:00:00Z",
+            "cwd": "/tmp",
+        });
+        let entry = serde_json::json!({
+            "type": "message",
+            "id": "11111111",
+            "parentId": null,
+            "timestamp": "2026-04-14T00:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0
+                },
+                "stop_reason": "Stop",
+                "provider": "openrouter",
+                "model": "openai/o3",
+                "timestamp": 1
+            }
+        });
+        fs::write(&path, format!("{header}\n{entry}\n")).expect("write");
+
+        let session = SessionManager::open_session(&path).expect("open v2 session");
+        let SessionEntry::Message { message, .. } = &session.entries[0] else {
+            panic!("expected message");
+        };
+        let Message::Assistant(assistant) = message else {
+            panic!("expected assistant");
+        };
+        assert!(assistant.reasoning_details.is_none());
     }
 
     #[test]

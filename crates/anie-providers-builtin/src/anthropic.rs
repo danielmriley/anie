@@ -682,6 +682,7 @@ impl AnthropicStreamState {
             provider: self.model.provider.clone(),
             model: self.model.id.clone(),
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 }

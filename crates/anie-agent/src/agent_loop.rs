@@ -896,6 +896,7 @@ impl AgentLoop {
             provider: self.config.model.provider.clone(),
             model: self.config.model.id.clone(),
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 }
@@ -1096,6 +1097,7 @@ impl AssistantMessageBuilder {
             provider: self.provider.clone(),
             model: self.model.clone(),
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 
@@ -1163,6 +1165,7 @@ impl AssistantMessageBuilder {
             provider: self.provider,
             model: self.model,
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 
@@ -1264,6 +1267,7 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp,
+            reasoning_details: None,
         }
     }
 

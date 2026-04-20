@@ -93,6 +93,7 @@ async fn agent_thinking_events_render_thinking_section_above_answer() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     };
 
     let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![
@@ -219,6 +220,7 @@ async fn multi_turn_with_thinking_keeps_thinking_in_gutter() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     };
 
     let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![

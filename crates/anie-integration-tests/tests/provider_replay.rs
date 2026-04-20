@@ -50,6 +50,7 @@ fn signed_thinking_fixture() -> Vec<Message> {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             timestamp: 2,
+            reasoning_details: None,
         }),
         Message::ToolResult(ToolResultMessage {
             tool_call_id: "call_xyz".into(),

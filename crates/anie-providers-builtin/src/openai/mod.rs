@@ -561,6 +561,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 timestamp: 2,
+                reasoning_details: None,
             }),
             Message::ToolResult(anie_protocol::ToolResultMessage {
                 tool_call_id: "call_1".into(),

@@ -52,6 +52,7 @@ fn final_message() -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 
