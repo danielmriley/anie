@@ -8,7 +8,59 @@ use anie_protocol::{
 };
 use anie_provider::{ApiKind, CostPerMillion, Model};
 
-use crate::{AgentUiState, App, OutputPane, RenderedBlock};
+use crate::{
+    AgentUiState, App, OutputPane, RenderedBlock,
+    commands::{ArgumentSpec, SlashCommandInfo},
+};
+
+/// A test-only catalog that mirrors the `anie-cli` builtins so
+/// tests which dispatch real slash commands have a valid shape to
+/// validate against. Tests that don't exercise `/command` input
+/// can safely pass `Vec::new()`.
+///
+/// Kept deliberately duplicated — the CLI crate can't be imported
+/// from inside `anie-tui` tests, and the coupling is exercised by
+/// `registry_covers_every_dispatched_slash_command` in
+/// `anie-cli/src/commands.rs`.
+fn default_test_commands() -> Vec<SlashCommandInfo> {
+    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const SESSION_SUBS: &[&str] = &["list"];
+    vec![
+        SlashCommandInfo::builtin_with_args(
+            "model",
+            "Select model",
+            ArgumentSpec::FreeForm { required: false },
+            Some("[<provider:id>|<id>]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "thinking",
+            "Set reasoning effort",
+            ArgumentSpec::Enumerated {
+                values: LEVELS,
+                required: false,
+            },
+            Some("[off|low|medium|high]"),
+        ),
+        SlashCommandInfo::builtin("compact", "Manually compact"),
+        SlashCommandInfo::builtin("fork", "Fork session"),
+        SlashCommandInfo::builtin("diff", "Show diff"),
+        SlashCommandInfo::builtin("new", "New session"),
+        SlashCommandInfo::builtin_with_args(
+            "session",
+            "Session info",
+            ArgumentSpec::Subcommands { known: SESSION_SUBS },
+            Some("[list|<id>]"),
+        ),
+        SlashCommandInfo::builtin("tools", "List tools"),
+        SlashCommandInfo::builtin("onboard", "Onboarding"),
+        SlashCommandInfo::builtin("providers", "Manage providers"),
+        SlashCommandInfo::builtin("clear", "Clear output"),
+        SlashCommandInfo::builtin("reload", "Reload config"),
+        SlashCommandInfo::builtin("copy", "Copy last assistant"),
+        SlashCommandInfo::builtin("help", "Show help"),
+        SlashCommandInfo::builtin("quit", "Quit anie"),
+    ]
+}
 
 fn sample_models() -> Vec<Model> {
     vec![Model {
@@ -31,7 +83,7 @@ fn sample_models() -> Vec<Model> {
 fn static_layout_renders_output_status_and_input() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     {
         let status = app.status_bar_mut();
         status.provider_name = "anthropic".into();
@@ -77,7 +129,7 @@ fn shift_modified_characters_are_inserted() {
 fn wrapped_input_snapshot_is_stable() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for ch in "This is a very long line that should wrap inside the input pane".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
             KeyCode::Char(ch),
@@ -100,7 +152,7 @@ fn wrapped_input_snapshot_is_stable() {
 fn replayed_assistant_renders_thinking_above_visible_response() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.load_transcript(&[Message::Assistant(AssistantMessage {
         content: vec![
             ContentBlock::Thinking {
@@ -140,7 +192,7 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
 fn streaming_assistant_renders_thinking_above_visible_response() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
@@ -230,7 +282,7 @@ fn empty_streaming_assistant_uses_generic_status() {
 fn event_to_render_streaming_and_tool_lifecycle() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
@@ -285,7 +337,7 @@ fn event_to_render_streaming_and_tool_lifecycle() {
 fn ctrl_c_marks_abort_while_active() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
     app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -301,7 +353,7 @@ fn ctrl_c_marks_abort_while_active() {
 fn second_ctrl_c_while_active_quits() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
     app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -328,7 +380,7 @@ fn second_ctrl_c_while_active_quits() {
 fn ctrl_c_while_idle_quits_immediately() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_terminal_event(Event::Key(KeyEvent::new(
         KeyCode::Char('c'),
         KeyModifiers::CONTROL,
@@ -344,7 +396,7 @@ fn ctrl_c_while_idle_quits_immediately() {
 fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..12 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -431,7 +483,7 @@ fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
 fn home_and_end_navigate_transcript_when_input_is_empty() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -473,7 +525,7 @@ fn home_and_end_navigate_transcript_when_input_is_empty() {
 fn home_and_end_preserve_input_editing_when_draft_is_present() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -513,7 +565,7 @@ fn home_and_end_preserve_input_editing_when_draft_is_present() {
 fn mouse_wheel_scrolls_transcript_history() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -572,7 +624,7 @@ fn mouse_wheel_scrolls_transcript_history() {
 fn single_long_wrapped_assistant_message_is_navigable() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.load_transcript(&[Message::Assistant(AssistantMessage {
         content: vec![ContentBlock::Text {
             text: format!("BEGIN-{}-FINAL-SUFFIX", "abcdefghij".repeat(20)),
@@ -616,7 +668,7 @@ fn single_long_wrapped_assistant_message_is_navigable() {
 fn transcript_replace_resets_scroll_state_sanely() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..12 {
         app.handle_agent_event(AgentEvent::MessageStart {
             message: Message::User(UserMessage {
@@ -689,7 +741,7 @@ fn alt_arrow_word_movement_and_bash_title_render() {
 
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::ToolExecStart {
         call_id: "call_bash".into(),
         tool_name: "bash".into(),
@@ -721,7 +773,7 @@ fn alt_arrow_word_movement_and_bash_title_render() {
 fn replayed_tool_results_restore_titles_from_details() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.load_transcript(&[
         Message::ToolResult(anie_protocol::ToolResultMessage {
             tool_call_id: "call_read".into(),
@@ -758,7 +810,7 @@ fn replayed_tool_results_restore_titles_from_details() {
 fn diff_rendering_shows_added_and_removed_lines() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::ToolExecStart {
         call_id: "call_edit".into(),
         tool_name: "edit".into(),
@@ -793,7 +845,7 @@ fn diff_rendering_shows_added_and_removed_lines() {
 fn model_command_opens_picker_in_bottom_pane_and_keeps_transcript_visible() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, sample_models());
+    let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
     app.handle_agent_event(AgentEvent::MessageStart {
@@ -837,7 +889,7 @@ fn model_command_opens_picker_in_bottom_pane_and_keeps_transcript_visible() {
 fn ctrl_o_opens_picker_and_escape_restores_editor_content() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, sample_models());
+    let mut app = App::new(event_rx, action_tx, sample_models(), Vec::new());
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
 
@@ -869,7 +921,7 @@ fn ctrl_o_opens_picker_and_escape_restores_editor_content() {
 fn picker_selection_sends_resolved_model_action() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, sample_models());
+    let mut app = App::new(event_rx, action_tx, sample_models(), Vec::new());
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
 
@@ -894,7 +946,7 @@ fn picker_selection_sends_resolved_model_action() {
 fn slash_commands_route_actions_and_render_help() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, sample_models());
+    let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
 
     for ch in "/model qwen3:32b".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -986,7 +1038,7 @@ fn slash_commands_route_actions_and_render_help() {
 fn new_command_sends_new_session_action() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     submit_command(&mut app, "/new");
     assert!(matches!(
@@ -999,7 +1051,7 @@ fn new_command_sends_new_session_action() {
 fn reload_command_sends_reload_config_action() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     submit_command(&mut app, "/reload");
     assert!(matches!(
@@ -1015,7 +1067,7 @@ fn reload_command_sends_reload_config_action() {
 fn copy_command_without_messages_shows_error() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     submit_command(&mut app, "/copy");
 
@@ -1060,7 +1112,7 @@ fn output_pane_last_assistant_text_skips_thinking_only_messages() {
 fn onboarding_slash_command_opens_overlay_locally() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     for ch in "/onboard".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -1095,7 +1147,7 @@ fn onboarding_slash_command_opens_overlay_locally() {
 fn providers_slash_command_opens_provider_management_overlay() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     for ch in "/providers".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -1130,7 +1182,7 @@ fn providers_slash_command_opens_provider_management_overlay() {
 fn app_transitions_back_to_idle_after_agent_end() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
     app.handle_agent_event(AgentEvent::AgentEnd { messages: vec![] })
@@ -1251,7 +1303,7 @@ fn thinking_text_never_leaks_into_visible_answer_replayed() {
 fn thinking_text_never_leaks_into_visible_answer_streamed() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     // Simulate streaming: thinking first, then text, then done
     app.handle_agent_event(AgentEvent::AgentStart)
@@ -1312,7 +1364,7 @@ fn thinking_text_never_leaks_into_visible_answer_streamed() {
 fn multi_turn_thinking_stays_contained_in_each_message() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, _action_rx) = mpsc::channel(8);
-    let mut app = App::new(event_rx, action_tx, Vec::new());
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     // Load two assistant messages, each with thinking + text
     app.load_transcript(&[
@@ -1401,4 +1453,388 @@ fn long_thinking_does_not_bleed_past_gutter_boundary() {
             );
         }
     }
+}
+
+// =============================================================================
+// Plan 11 phase C — TUI-side pre-dispatch validation.
+// =============================================================================
+
+/// Minimal catalog covering the commands exercised in Phase C
+/// regression tests. Mirrors the shape produced by the CLI's
+/// `builtin_commands()` without pulling in the full list.
+fn phase_c_catalog() -> Vec<SlashCommandInfo> {
+    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    vec![
+        SlashCommandInfo::builtin_with_args(
+            "thinking",
+            "Set reasoning effort",
+            ArgumentSpec::Enumerated {
+                values: LEVELS,
+                required: false,
+            },
+            Some("[off|low|medium|high]"),
+        ),
+        SlashCommandInfo::builtin("compact", "Manually compact"),
+        SlashCommandInfo::builtin("help", "Show help"),
+    ]
+}
+
+fn submit_line(app: &mut App, line: &str) {
+    for ch in line.chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
+            .expect("type char");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+        .expect("submit");
+}
+
+fn last_system_message(app: &App) -> Option<String> {
+    app.output_blocks().iter().rev().find_map(|block| match block {
+        RenderedBlock::SystemMessage { text } => Some(text.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn slash_thinking_invalid_emits_error_and_no_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/thinking bogus");
+
+    let msg = last_system_message(&app).expect("expected rejection message");
+    assert!(msg.contains("bogus"), "{msg}");
+    assert!(msg.contains("off") && msg.contains("high"), "{msg}");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "no UiAction should be dispatched for an invalid argument"
+    );
+}
+
+#[test]
+fn slash_thinking_valid_dispatches_set_thinking() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/thinking high");
+
+    let action = action_rx.try_recv().expect("valid command must dispatch");
+    assert!(matches!(action, crate::UiAction::SetThinking(level) if level == "high"));
+}
+
+#[test]
+fn slash_compact_with_arg_is_rejected_locally() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/compact foo");
+
+    let msg = last_system_message(&app).expect("expected rejection");
+    assert!(msg.contains("/compact"), "{msg}");
+    assert!(msg.contains("no arguments"), "{msg}");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "no UiAction should be dispatched for /compact with trailing arg"
+    );
+}
+
+#[test]
+fn slash_unknown_command_reported_without_dispatch() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/does-not-exist");
+
+    let msg = last_system_message(&app).expect("expected unknown-command message");
+    assert!(msg.contains("Unknown command"), "{msg}");
+    assert!(msg.contains("/does-not-exist"), "{msg}");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "no UiAction should be dispatched for an unknown command"
+    );
+}
+
+// =============================================================================
+// Plan 12 phase D — editor integration (popup triggers + apply).
+// =============================================================================
+
+fn type_chars(app: &mut App, s: &str) {
+    for ch in s.chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
+            .expect("type");
+    }
+}
+
+fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle_terminal_event(Event::Key(KeyEvent::new(code, modifiers)))
+        .expect("press");
+}
+
+#[test]
+fn typing_slash_opens_autocomplete_popup() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/");
+
+    assert!(
+        app.input_pane_is_popup_open(),
+        "expected popup to open after typing '/'"
+    );
+}
+
+#[test]
+fn typing_filter_narrows_popup_contents() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/th");
+
+    // Render to a frame and assert the narrowed popup shows `thinking`.
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+    assert!(screen.contains("thinking"), "{screen}");
+    assert!(!screen.contains("providers"), "{screen}");
+}
+
+#[test]
+fn enter_on_command_name_inserts_slash_and_trailing_space() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/th");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    // After applying, the input should read "/thinking " and no
+    // UiAction should have been dispatched yet.
+    assert_eq!(app.input_pane_contents(), "/thinking ");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "Enter on popup must not submit"
+    );
+}
+
+#[test]
+fn typing_slash_thinking_space_opens_enumerated_popup() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/thinking ");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+    assert!(screen.contains("/thinking values"), "{screen}");
+    for level in ["off", "low", "medium", "high"] {
+        assert!(screen.contains(level), "level {level} missing:\n{screen}");
+    }
+}
+
+#[test]
+fn enter_on_enumerated_value_applies_without_trailing_space() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/thinking m");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(app.input_pane_contents(), "/thinking medium");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "Enter on argument popup must not submit"
+    );
+}
+
+#[test]
+fn second_enter_submits_fully_typed_command() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/thinking m");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // applies "medium"
+
+    // After applying, the input is "/thinking medium". The popup
+    // may re-open on the exact match, but the second Enter then
+    // short-circuits to submit because the suggestion is a no-op.
+    assert_eq!(app.input_pane_contents(), "/thinking medium");
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let action = action_rx.try_recv().expect("second Enter dispatches");
+    assert!(matches!(action, crate::UiAction::SetThinking(level) if level == "medium"));
+}
+
+#[test]
+fn escape_dismisses_popup_without_modifying_buffer() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/th");
+    assert!(app.input_pane_is_popup_open());
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.input_pane_is_popup_open());
+    assert_eq!(app.input_pane_contents(), "/th");
+}
+
+#[test]
+fn arrow_keys_navigate_popup_and_skip_history_while_open() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    // Submit a history entry so Up/Down would normally recall it.
+    type_chars(&mut app, "prior message");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let _ = action_rx.try_recv(); // drain the SubmitPrompt
+
+    type_chars(&mut app, "/th");
+    let before = app.input_pane_contents().to_string();
+    // Up would normally load history; here it should just navigate
+    // the popup (no buffer change).
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(app.input_pane_contents(), before);
+    assert!(app.input_pane_is_popup_open());
+}
+
+#[test]
+fn backspace_reopens_popup_with_updated_filter() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/thz");
+    // "thz" matches nothing → popup closed.
+    assert!(!app.input_pane_is_popup_open());
+
+    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    // Back to "/th" → popup re-opens.
+    assert!(app.input_pane_is_popup_open());
+}
+
+#[test]
+fn popup_does_not_open_for_non_slash_input() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "hello world");
+    assert!(!app.input_pane_is_popup_open());
+}
+
+#[test]
+fn popup_does_not_open_when_slash_is_not_at_line_start() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "hello /th");
+    assert!(!app.input_pane_is_popup_open());
+}
+
+#[test]
+fn tab_also_applies_suggestion() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/th");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+    assert_eq!(app.input_pane_contents(), "/thinking ");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "Tab on popup must never submit"
+    );
+}
+
+// =============================================================================
+// Plan 12 phase E — extensibility + toggle.
+// =============================================================================
+
+#[test]
+fn disabled_autocomplete_does_not_open_popup_but_keeps_validation() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands())
+        .with_autocomplete_enabled(false);
+
+    type_chars(&mut app, "/th");
+    assert!(!app.input_pane_is_popup_open());
+
+    // Validation is still applied on submit (plan 11).
+    type_chars(&mut app, "inking bogus");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        action_rx.try_recv().is_err(),
+        "invalid arg must still be rejected locally"
+    );
+    let last = last_system_message(&app).expect("rejection");
+    assert!(last.contains("bogus"), "{last}");
+}
+
+#[test]
+fn extension_registered_command_appears_in_popup() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+
+    let mut catalog = default_test_commands();
+    catalog.push(SlashCommandInfo {
+        name: "ext-foo",
+        summary: "Test extension command",
+        source: crate::commands::SlashCommandSource::Extension {
+            extension_name: "demo".into(),
+        },
+        arguments: ArgumentSpec::None,
+        argument_hint: None,
+    });
+
+    let mut app = App::new(event_rx, action_tx, Vec::new(), catalog);
+    type_chars(&mut app, "/ext-");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+    assert!(screen.contains("ext-foo"), "{screen}");
+}
+
+#[test]
+fn popup_description_exposes_same_argument_hint_as_help() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::channel(8);
+    let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
+
+    type_chars(&mut app, "/th");
+    let mut terminal = Terminal::new(TestBackend::new(72, 16)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+    assert!(
+        screen.contains("[off|low|medium|high]"),
+        "popup description should expose the argument hint:\n{screen}"
+    );
+}
+
+#[test]
+fn slash_exit_alias_still_quits_even_without_catalog_entry() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::channel(8);
+    // Empty catalog — /exit must still be honored as a /quit alias.
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    submit_line(&mut app, "/exit");
+
+    let action = action_rx.try_recv().expect("exit must dispatch Quit");
+    assert!(matches!(action, crate::UiAction::Quit));
+    assert!(app.should_quit());
 }

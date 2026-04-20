@@ -27,11 +27,14 @@ pub(crate) async fn run_interactive_mode(cli: Cli) -> Result<()> {
     spawn_shutdown_signal_forwarder(ui_action_tx.clone());
 
     let initial_models = state.model_catalog().to_vec();
+    let initial_commands = state.command_registry.all().to_vec();
+    let popup_enabled = state.config.anie_config().ui.slash_command_popup_enabled;
     let controller =
         crate::controller::InteractiveController::new(state, ui_action_rx, agent_event_tx, false);
     let controller_task = tokio::spawn(async move { controller.run().await });
 
-    let mut app = App::new(agent_event_rx, ui_action_tx, initial_models);
+    let mut app = App::new(agent_event_rx, ui_action_tx, initial_models, initial_commands)
+        .with_autocomplete_enabled(popup_enabled);
     apply_status_event(app.status_bar_mut(), &initial_status);
     app.load_transcript(&transcript);
 

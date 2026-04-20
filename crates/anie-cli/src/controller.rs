@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +26,7 @@ use crate::{
     compaction::CompactionStrategy,
     model_catalog::{resolve_requested_model, upsert_model},
     runtime::{ConfigState, SessionHandle, SystemPromptCache},
+    user_error::{HandleError, UserCommandError},
 };
 
 const DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day]");
@@ -171,7 +172,29 @@ impl InteractiveController {
         Ok(())
     }
 
+    /// Dispatch a `UiAction` and classify any resulting error.
+    ///
+    /// User-input errors (unknown model, invalid thinking level,
+    /// unknown session) surface as system messages and return
+    /// `Ok(())`. Anything else propagates and terminates the run
+    /// loop, as before.
+    ///
+    /// Keeping classification in the wrapper — rather than
+    /// inlining it at each call site — means every new slash
+    /// command that funnels through `UiAction` gets the same
+    /// containment for free.
     async fn handle_action(&mut self, action: UiAction) -> Result<()> {
+        match self.try_handle_action(action).await {
+            Ok(()) => Ok(()),
+            Err(HandleError::User(user_err)) => {
+                self.send_system_message(&user_err.to_string()).await;
+                Ok(())
+            }
+            Err(HandleError::Fatal(error)) => Err(error),
+        }
+    }
+
+    async fn try_handle_action(&mut self, action: UiAction) -> Result<(), HandleError> {
         match action {
             UiAction::SubmitPrompt(text) => {
                 if self.current_run.is_some() {
@@ -203,6 +226,12 @@ impl InteractiveController {
                 } else {
                     self.state.set_model(&requested).await?;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    self.send_system_message(&format!(
+                        "Model set to {}:{}",
+                        self.state.config.current_model().provider,
+                        self.state.config.current_model().id,
+                    ))
+                    .await;
                 }
             }
             UiAction::SetResolvedModel(model) => {
@@ -221,6 +250,11 @@ impl InteractiveController {
                 } else {
                     self.state.set_thinking(&level).await?;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    self.send_system_message(&format!(
+                        "Thinking level set to {}",
+                        format_thinking(self.state.config.current_thinking()),
+                    ))
+                    .await;
                 }
             }
             UiAction::Compact => {
@@ -487,7 +521,8 @@ impl ControllerState {
             requested,
             &self.config.current_model().provider,
             &self.model_catalog,
-        )?;
+        )
+        .map_err(|_| UserCommandError::UnknownModel(requested.to_string()))?;
         self.set_model_resolved(model).await
     }
 
@@ -503,8 +538,9 @@ impl ControllerState {
     }
 
     async fn set_thinking(&mut self, requested: &str) -> Result<()> {
-        self.config
-            .set_thinking(parse_thinking_level(requested).map_err(|error| anyhow!(error))?);
+        let level = parse_thinking_level(requested)
+            .map_err(|_| UserCommandError::InvalidThinkingLevel(requested.to_string()))?;
+        self.config.set_thinking(level);
         self.session
             .inner_mut()
             .append_thinking_change(self.config.current_thinking())?;
@@ -601,7 +637,9 @@ impl ControllerState {
     }
 
     async fn switch_session(&mut self, session_id: &str) -> Result<()> {
-        self.session.switch_to(session_id)?;
+        self.session
+            .switch_to(session_id)
+            .map_err(|_| UserCommandError::UnknownSession(session_id.to_string()))?;
         self.apply_session_overrides();
         self.config.persist_runtime_state(self.session.id());
         Ok(())

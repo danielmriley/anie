@@ -1,76 +1,37 @@
-//! Slash-command registry with pi-style source tagging.
+//! Slash-command registry — the CLI-side container that owns
+//! ordering, dispatch coupling, and `/help` rendering.
 //!
-//! Builtin commands, plus future extension / prompt-template /
-//! skill-registered commands, all live in one `CommandRegistry`
-//! so callers like `/help` can render them grouped by source.
+//! The metadata types (`SlashCommandInfo`, `SlashCommandSource`,
+//! `ArgumentSpec`) live in `anie-tui::commands` so the TUI can
+//! read them for validation (plan 11) and inline autocomplete
+//! (plan 12). This module owns the builtin catalog and the
+//! registry that dispatches through `UiAction`.
 //!
-//! **Dispatch is NOT owned by this module.** The actual handling of
-//! a slash command still happens in the controller's `handle_action`
-//! match on `UiAction`. This module is pure metadata: name,
-//! description, and origin. Mirrors pi-mono's `slash-commands.ts`
-//! which takes the same approach.
+//! **Dispatch is still NOT owned by this module.** `UiAction`
+//! handling happens in the controller. This module is pure
+//! catalog + convenience helpers for presentation. Mirrors
+//! pi-mono's split between `slash-commands.ts` (catalog) and
+//! `interactive-mode.ts` (dispatch).
 //!
 //! When extensions (plan 10) arrive, they register their commands
 //! into this registry with `SlashCommandSource::Extension` and
 //! dispatch through the extension host — not through `UiAction`.
 
-use std::path::PathBuf;
+pub(crate) use anie_tui::{ArgumentSpec, SlashCommandInfo, SlashCommandSource};
 
-/// Where a registered slash command came from.
+/// Accepted values for `/thinking`.
 ///
-/// Mirrors pi-mono's `SlashCommandSource` with an added `Builtin`
-/// variant so every command has a uniform source tag.
-///
-/// Non-`Builtin` variants are unused today — they'll be constructed
-/// once extensions (plan 10) and prompt/skill loaders land. Kept in
-/// the type now so the registry API is stable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SlashCommandSource {
-    /// Shipped with anie; dispatched via `UiAction`.
-    Builtin,
-    /// Registered by an extension (plan 10).
-    Extension { extension_name: String },
-    /// Registered by a prompt template (tracked in `docs/ideas.md`).
-    Prompt { template_path: PathBuf },
-    /// Registered by a skill (tracked in `docs/ideas.md`).
-    Skill { skill_name: String },
-}
+/// Shared by the builtin catalog and the autocomplete argument
+/// source (plan 12).
+pub(crate) const THINKING_LEVELS: &[&str] = &["off", "low", "medium", "high"];
 
-impl SlashCommandSource {
-    /// Short human-readable origin label.
-    #[cfg(test)]
-    pub(crate) fn label(&self) -> String {
-        match self {
-            Self::Builtin => "builtin".to_string(),
-            Self::Extension { extension_name } => format!("extension: {extension_name}"),
-            Self::Prompt { template_path } => format!("prompt: {}", template_path.display()),
-            Self::Skill { skill_name } => format!("skill: {skill_name}"),
-        }
-    }
-}
-
-/// Metadata for one registered slash command.
-#[derive(Debug, Clone)]
-pub(crate) struct SlashCommandInfo {
-    pub(crate) name: &'static str,
-    pub(crate) summary: &'static str,
-    pub(crate) source: SlashCommandSource,
-}
-
-impl SlashCommandInfo {
-    pub(crate) const fn builtin(name: &'static str, summary: &'static str) -> Self {
-        Self {
-            name,
-            summary,
-            source: SlashCommandSource::Builtin,
-        }
-    }
-}
+/// Known subcommands for `/session`.
+pub(crate) const SESSION_SUBCOMMANDS: &[&str] = &["list"];
 
 /// All slash commands known to this anie process.
 ///
-/// Populated at startup with `builtin_commands()`; future extension
-/// systems will add their own entries.
+/// Populated at startup with `builtin_commands()`; future
+/// extension systems will add their own entries.
 pub(crate) struct CommandRegistry {
     commands: Vec<SlashCommandInfo>,
 }
@@ -84,7 +45,11 @@ impl CommandRegistry {
     }
 
     /// Look up a command by exact name.
-    #[cfg(test)]
+    ///
+    /// Used by tests today and by plan 12's autocomplete provider
+    /// when it needs to resolve a command name pulled from the
+    /// input buffer.
+    #[allow(dead_code)]
     pub(crate) fn lookup(&self, name: &str) -> Option<&SlashCommandInfo> {
         self.commands.iter().find(|c| c.name == name)
     }
@@ -97,6 +62,7 @@ impl CommandRegistry {
     /// Group registered commands by source. Order within each group
     /// is the original registration order.
     pub(crate) fn grouped_by_source(&self) -> Vec<(SourceKey, Vec<&SlashCommandInfo>)> {
+        use std::path::PathBuf;
         let source_order = [
             SlashCommandSource::Builtin,
             SlashCommandSource::Extension {
@@ -129,17 +95,39 @@ impl CommandRegistry {
     }
 
     /// Render the `/help` output grouped by command source.
+    ///
+    /// Argument-hint column width is computed dynamically from the
+    /// longest hint so short hints don't push the summary column
+    /// out of alignment when rare long hints exist.
     pub(crate) fn format_help(&self) -> String {
         let mut out = String::from("Commands:\n");
         if self.all().is_empty() {
             return out;
         }
+        let hint_width = self
+            .all()
+            .iter()
+            .filter_map(|info| info.argument_hint)
+            .map(|hint| hint.chars().count())
+            .max()
+            .unwrap_or(0);
         for (key, entries) in self.grouped_by_source() {
             out.push_str("  ");
             out.push_str(group_heading(key));
             out.push_str(":\n");
             for info in entries {
-                out.push_str(&format!("    /{:<12} {}\n", info.name, info.summary));
+                let hint = info.argument_hint.unwrap_or("");
+                if hint_width > 0 {
+                    out.push_str(&format!(
+                        "    /{:<12} {:<hint_width$}  {}\n",
+                        info.name,
+                        hint,
+                        info.summary,
+                        hint_width = hint_width,
+                    ));
+                } else {
+                    out.push_str(&format!("    /{:<12} {}\n", info.name, info.summary));
+                }
             }
         }
         out
@@ -205,27 +193,47 @@ pub(crate) struct DuplicateCommand {
 /// - `anie-tui::app::UiAction`
 /// - `controller::InteractiveController::handle_action`
 ///
-/// The test `registry_covers_every_dispatched_slash_command` enforces
-/// the coupling.
+/// The test `registry_covers_every_dispatched_slash_command`
+/// enforces the coupling.
 ///
 /// Adding a builtin:
-///   1. Add the parsing rule in `anie-tui::app::handle_slash_command`.
-///   2. Add or reuse the `UiAction` variant in `anie-tui::app`.
+///   1. Add or reuse the `UiAction` variant in `anie-tui::app`.
+///   2. Add a `SlashCommandInfo::builtin(...)` or
+///      `builtin_with_args(...)` entry here.
 ///   3. Handle it in `InteractiveController::handle_action` if it is
 ///      controller-owned.
-///   4. Add a `SlashCommandInfo::builtin(...)` entry here.
-///   5. Add the name to the `dispatched` list in the coverage test.
+///   4. Add the name to the `dispatched` list in the coverage test.
+///
+/// The TUI reads this catalog (via `App::new`) to validate argument
+/// shapes before dispatch and, later, to render autocomplete.
 fn builtin_commands() -> Vec<SlashCommandInfo> {
     vec![
-        SlashCommandInfo::builtin("model", "Select model (opens picker on no args)"),
-        SlashCommandInfo::builtin("thinking", "Set reasoning effort: off|low|medium|high"),
+        SlashCommandInfo::builtin_with_args(
+            "model",
+            "Select model (opens picker on no args)",
+            ArgumentSpec::FreeForm { required: false },
+            Some("[<provider:id>|<id>]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "thinking",
+            "Set reasoning effort",
+            ArgumentSpec::Enumerated {
+                values: THINKING_LEVELS,
+                required: false,
+            },
+            Some("[off|low|medium|high]"),
+        ),
         SlashCommandInfo::builtin("compact", "Manually compact the session context"),
         SlashCommandInfo::builtin("fork", "Create a child session branched from now"),
         SlashCommandInfo::builtin("diff", "Show file changes made in this session"),
         SlashCommandInfo::builtin("new", "Start a fresh session"),
-        SlashCommandInfo::builtin(
+        SlashCommandInfo::builtin_with_args(
             "session",
-            "Show session info (or `/session list`, `/session <id>`)",
+            "Show session info, list sessions, or switch",
+            ArgumentSpec::Subcommands {
+                known: SESSION_SUBCOMMANDS,
+            },
+            Some("[list|<id>]"),
         ),
         SlashCommandInfo::builtin("tools", "List active tools"),
         SlashCommandInfo::builtin("onboard", "Reopen the onboarding flow"),
@@ -282,36 +290,12 @@ mod tests {
                 source: SlashCommandSource::Extension {
                     extension_name: "my-extension".to_string(),
                 },
+                arguments: ArgumentSpec::None,
+                argument_hint: None,
             })
             .expect("register extension");
         let info = registry.lookup("mycmd").expect("lookup extension");
         assert!(matches!(info.source, SlashCommandSource::Extension { .. }));
-    }
-
-    #[test]
-    fn source_label_formats_each_kind() {
-        assert_eq!(SlashCommandSource::Builtin.label(), "builtin");
-        assert_eq!(
-            SlashCommandSource::Extension {
-                extension_name: "foo".into()
-            }
-            .label(),
-            "extension: foo"
-        );
-        assert_eq!(
-            SlashCommandSource::Prompt {
-                template_path: PathBuf::from("/tmp/p.md")
-            }
-            .label(),
-            "prompt: /tmp/p.md"
-        );
-        assert_eq!(
-            SlashCommandSource::Skill {
-                skill_name: "bar".into()
-            }
-            .label(),
-            "skill: bar"
-        );
     }
 
     #[test]
@@ -324,6 +308,8 @@ mod tests {
                 source: SlashCommandSource::Extension {
                     extension_name: "a".into(),
                 },
+                arguments: ArgumentSpec::None,
+                argument_hint: None,
             })
             .expect("register a");
         registry
@@ -333,6 +319,8 @@ mod tests {
                 source: SlashCommandSource::Extension {
                     extension_name: "b".into(),
                 },
+                arguments: ArgumentSpec::None,
+                argument_hint: None,
             })
             .expect("register b");
 
@@ -368,6 +356,8 @@ mod tests {
                 source: SlashCommandSource::Extension {
                     extension_name: "demo".into(),
                 },
+                arguments: ArgumentSpec::None,
+                argument_hint: None,
             })
             .expect("register extension command");
 
@@ -383,6 +373,24 @@ mod tests {
         assert!(!help.contains("Extensions:"));
         assert!(!help.contains("Prompts:"));
         assert!(!help.contains("Skills:"));
+    }
+
+    #[test]
+    fn format_help_renders_argument_hint_column() {
+        let registry = CommandRegistry::with_builtins();
+        let help = registry.format_help();
+        assert!(
+            help.contains("/thinking") && help.contains("[off|low|medium|high]"),
+            "expected thinking row with hint column, got:\n{help}"
+        );
+        assert!(
+            help.contains("/model") && help.contains("[<provider:id>|<id>]"),
+            "expected model row with hint column, got:\n{help}"
+        );
+        assert!(
+            help.contains("/session") && help.contains("[list|<id>]"),
+            "expected session row with hint column, got:\n{help}"
+        );
     }
 
     #[test]
@@ -409,6 +417,34 @@ mod tests {
             assert!(
                 registry.lookup(name).is_some(),
                 "registry missing builtin '{name}' — update builtin_commands() when adding a slash command"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_catalog_includes_argument_spec_for_every_command() {
+        type SpecCheck = fn(&ArgumentSpec) -> bool;
+        let registry = CommandRegistry::with_builtins();
+        let expected: &[(&str, SpecCheck)] = &[
+            ("thinking", |spec| {
+                matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == THINKING_LEVELS)
+            }),
+            ("model", |spec| {
+                matches!(spec, ArgumentSpec::FreeForm { required: false })
+            }),
+            ("session", |spec| {
+                matches!(spec, ArgumentSpec::Subcommands { known } if *known == SESSION_SUBCOMMANDS)
+            }),
+            ("compact", |spec| matches!(spec, ArgumentSpec::None)),
+            ("help", |spec| matches!(spec, ArgumentSpec::None)),
+            ("quit", |spec| matches!(spec, ArgumentSpec::None)),
+        ];
+        for (name, check) in expected {
+            let info = registry.lookup(name).expect("lookup builtin");
+            assert!(
+                check(&info.arguments),
+                "unexpected ArgumentSpec for /{name}: {:?}",
+                info.arguments
             );
         }
     }

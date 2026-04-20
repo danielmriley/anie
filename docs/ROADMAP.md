@@ -13,6 +13,13 @@ ratio — smallest impactful changes first. Check off items as they ship.
 - [x] `/copy` command (clipboard copy of last assistant response)
 - [x] `/new` command (start fresh session without restart)
 - [x] `/reload` command (hot-reload config and context files)
+- [x] Graceful slash-command dispatch (plan 11): `/thinking bogus`
+      no longer locks the controller; pre-dispatch validation on
+      `SlashCommandInfo::validate`
+- [x] Inline slash-command autocomplete popup (plan 12): `/` opens
+      a filterable palette; arg-value completions for
+      `Enumerated`/`Subcommands` specs; toggle via
+      `ui.slash_command_popup_enabled`
 
 ## Next Up — Small, High-Impact
 
@@ -31,11 +38,13 @@ overflow errors.
 **Effort**: Medium — API queries, config override, caching.
 **Details**: [docs/notes/local_model_support.md](notes/local_model_support.md)
 
-### 7. Slash command autocomplete menu
-**What**: Show a filterable dropdown when the user types `/`.
-**Why**: Discoverability — users shouldn't need to memorize commands.
-**Effort**: Medium — TUI widget, real-time filtering, keyboard navigation.
-**Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
+### 7. Slash command autocomplete menu — **shipped**
+Landed via plans 11 and 12. Typing `/` opens a filterable popup
+that reads from the `SlashCommandInfo` catalog; argument values
+complete for `Enumerated` (e.g. `/thinking`) and `Subcommands`
+(e.g. `/session`) specs. Disable with
+`ui.slash_command_popup_enabled = false` in `~/.anie/config.toml`.
+File-path `@` completion remains a follow-up.
 
 ### 8. Session management commands (`/resume`, `/session`, `/name`)
 **What**: Browse past sessions, show session info, set display names.

@@ -68,6 +68,14 @@ impl OutputPane {
         self.blocks.push(block);
     }
 
+    /// Read-only view of the current block list. Used by tests
+    /// that assert on system-message content and by future UI
+    /// features that need to inspect the transcript.
+    #[must_use]
+    pub fn blocks(&self) -> &[RenderedBlock] {
+        &self.blocks
+    }
+
     /// Add a user message block.
     pub fn add_user_message(&mut self, text: String, timestamp: u64) {
         self.add_block(RenderedBlock::UserMessage { text, timestamp });

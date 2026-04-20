@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Position, Rect},
@@ -5,6 +7,8 @@ use ratatui::{
     text::Line,
     widgets::{Block, Paragraph, Widget},
 };
+
+use crate::autocomplete::{AutocompletePopup, AutocompleteProvider, SuggestionKind};
 
 /// Outcome of processing an input key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +19,16 @@ pub enum InputAction {
     Submit(String),
 }
 
+/// Optional autocomplete runtime attached to an `InputPane`.
+///
+/// Owns the provider and the currently-open popup (if any). The
+/// pane refreshes `popup` after every buffer mutation so the
+/// suggestion list stays in sync with the user's typing.
+struct AutocompleteState {
+    provider: Arc<dyn AutocompleteProvider>,
+    popup: Option<AutocompletePopup>,
+}
+
 /// Multi-line input editor with simple history support.
 pub struct InputPane {
     content: String,
@@ -22,6 +36,7 @@ pub struct InputPane {
     history: Vec<String>,
     history_index: Option<usize>,
     saved_content: Option<String>,
+    autocomplete: Option<AutocompleteState>,
 }
 
 impl InputPane {
@@ -34,7 +49,44 @@ impl InputPane {
             history: Vec::new(),
             history_index: None,
             saved_content: None,
+            autocomplete: None,
         }
+    }
+
+    /// Attach an autocomplete provider. Without this, the pane
+    /// behaves exactly as it did before plan 12 — no popup ever
+    /// opens and history navigation remains on Up/Down.
+    #[must_use]
+    pub(crate) fn with_autocomplete(mut self, provider: Arc<dyn AutocompleteProvider>) -> Self {
+        self.autocomplete = Some(AutocompleteState {
+            provider,
+            popup: None,
+        });
+        self
+    }
+
+    /// Borrow the currently-open autocomplete popup for rendering.
+    ///
+    /// The caller (`App::render`) is responsible for computing
+    /// the popup's rect via `AutocompletePopup::layout_rect` and
+    /// for actually drawing it. Returning a borrow here keeps the
+    /// lifecycle owned by `InputPane` — the popup dies when the
+    /// pane loses it or when the pane itself is dropped.
+    #[must_use]
+    pub(crate) fn autocomplete_popup(&self) -> Option<&AutocompletePopup> {
+        self.autocomplete
+            .as_ref()
+            .and_then(|state| state.popup.as_ref())
+    }
+
+    /// Whether the popup is currently visible. Exists so callers
+    /// can cheaply decide whether to reserve rows without pulling
+    /// the popup borrow.
+    #[must_use]
+    pub fn autocomplete_is_open(&self) -> bool {
+        self.autocomplete
+            .as_ref()
+            .is_some_and(|state| state.popup.is_some())
     }
 
     /// Return the current input contents.
@@ -50,6 +102,75 @@ impl InputPane {
 
     /// Handle a key press while the editor is focused.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        // Popup-open key routing. Keys that don't belong to the
+        // popup fall through to the normal editor and then trigger
+        // a popup refresh.
+        if self.autocomplete_is_open() {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Esc) => {
+                    self.close_autocomplete();
+                    return InputAction::None;
+                }
+                (KeyModifiers::NONE, KeyCode::Up) | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+                    self.move_autocomplete_selection(-1);
+                    return InputAction::None;
+                }
+                (KeyModifiers::NONE, KeyCode::Down)
+                | (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
+                    self.move_autocomplete_selection(1);
+                    return InputAction::None;
+                }
+                (KeyModifiers::NONE, KeyCode::Enter) => {
+                    if self.autocomplete_would_noop_on_apply() {
+                        // User has already typed the selected
+                        // suggestion exactly; close the popup and
+                        // let the submit path run.
+                        self.close_autocomplete();
+                    } else {
+                        self.apply_autocomplete_selection();
+                        return InputAction::None;
+                    }
+                }
+                (KeyModifiers::NONE, KeyCode::Tab) => {
+                    if !self.autocomplete_would_noop_on_apply() {
+                        self.apply_autocomplete_selection();
+                    }
+                    return InputAction::None;
+                }
+                _ => {}
+            }
+        }
+
+        let action = self.dispatch_editor_key(key);
+        self.refresh_autocomplete();
+        action
+    }
+
+    /// Whether applying the highlighted suggestion would be a
+    /// pure no-op (the buffer already contains exactly the
+    /// completion text). Used to distinguish "accept completion"
+    /// from "submit already-complete input" when Enter is pressed
+    /// on an open popup.
+    fn autocomplete_would_noop_on_apply(&self) -> bool {
+        let Some(state) = self.autocomplete.as_ref() else {
+            return false;
+        };
+        let Some(popup) = state.popup.as_ref() else {
+            return false;
+        };
+        let Some(selected) = popup.selected() else {
+            return false;
+        };
+        match popup.kind() {
+            SuggestionKind::CommandName => {
+                let typed_name = popup.prefix().strip_prefix('/').unwrap_or(popup.prefix());
+                typed_name == selected.value
+            }
+            SuggestionKind::ArgumentValue { .. } => popup.prefix() == selected.value.as_str(),
+        }
+    }
+
+    fn dispatch_editor_key(&mut self, key: KeyEvent) -> InputAction {
         if let KeyCode::Char(ch) = key.code
             && is_text_input_modifiers(key.modifiers)
         {
@@ -403,6 +524,108 @@ impl InputPane {
 
         (lines, cursor_visual)
     }
+
+    // =========================================================================
+    // Autocomplete integration (plan 12 phase D).
+    // =========================================================================
+
+    /// Refresh the popup to reflect the current buffer + cursor.
+    ///
+    /// Called after every mutating keypress so the visible list
+    /// stays in sync. A no-op when no provider is installed.
+    fn refresh_autocomplete(&mut self) {
+        let Some(state) = self.autocomplete.as_mut() else {
+            return;
+        };
+        let suggestions = state.provider.suggestions(&self.content, self.cursor);
+        state.popup = suggestions.map(AutocompletePopup::from_suggestions);
+    }
+
+    fn close_autocomplete(&mut self) {
+        if let Some(state) = self.autocomplete.as_mut() {
+            state.popup = None;
+        }
+    }
+
+    fn move_autocomplete_selection(&mut self, delta: isize) {
+        if let Some(state) = self.autocomplete.as_mut()
+            && let Some(popup) = state.popup.as_mut()
+        {
+            popup.move_selection(delta);
+        }
+    }
+
+    /// Apply the highlighted suggestion to the buffer.
+    ///
+    /// Replaces `prefix` with `value`, inserts a trailing space
+    /// when completing a command name (so the next argument can
+    /// be typed immediately), and re-queries the provider so the
+    /// popup flows naturally from command-name mode into
+    /// argument-value mode when appropriate.
+    fn apply_autocomplete_selection(&mut self) {
+        let Some(apply) = self.pending_apply() else {
+            return;
+        };
+        let ApplyPlan {
+            start,
+            end,
+            replacement,
+            trailing_space,
+        } = apply;
+        self.content.replace_range(start..end, &replacement);
+        self.cursor = start + replacement.len();
+        if trailing_space {
+            // Only insert a trailing space when the cursor isn't
+            // already followed by one, so repeated completions
+            // against edited lines don't accumulate whitespace.
+            let already_space = self.content.as_bytes().get(self.cursor).copied() == Some(b' ');
+            if !already_space {
+                self.content.insert(self.cursor, ' ');
+                self.cursor += 1;
+            } else {
+                self.cursor += 1; // skip over the existing space
+            }
+        }
+        self.history_index = None;
+        self.refresh_autocomplete();
+    }
+
+    /// Build the replacement plan for the currently-selected
+    /// suggestion, if the popup and selection are both alive.
+    fn pending_apply(&self) -> Option<ApplyPlan> {
+        let state = self.autocomplete.as_ref()?;
+        let popup = state.popup.as_ref()?;
+        let suggestion = popup.selected()?;
+        let prefix = popup.prefix();
+        let prefix_len = prefix.len();
+        let start = self.cursor.checked_sub(prefix_len)?;
+
+        // For command-name completions, the suggestion's `value`
+        // is the bare command name (e.g. "thinking"). Re-emit the
+        // leading slash so the replacement stays valid input.
+        let (replacement, trailing_space) = match popup.kind() {
+            SuggestionKind::CommandName => (format!("/{}", suggestion.value), true),
+            SuggestionKind::ArgumentValue { .. } => (suggestion.value.clone(), false),
+        };
+
+        Some(ApplyPlan {
+            start,
+            end: self.cursor,
+            replacement,
+            trailing_space,
+        })
+    }
+}
+
+/// Represents the edit an autocomplete acceptance performs on the
+/// buffer. Extracting it into a struct lets us compute the plan
+/// while holding an immutable borrow (`&self.autocomplete`), then
+/// apply it under a mutable borrow without overlapping lifetimes.
+struct ApplyPlan {
+    start: usize,
+    end: usize,
+    replacement: String,
+    trailing_space: bool,
 }
 
 impl Default for InputPane {

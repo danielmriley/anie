@@ -30,6 +30,27 @@ pub struct AnieConfig {
     pub compaction: CompactionConfig,
     /// Project-context discovery limits.
     pub context: ContextConfig,
+    /// Interactive TUI preferences.
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// Interactive-TUI-only preferences. None of these affect the
+/// agent loop, provider behavior, or session storage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UiConfig {
+    /// Whether the inline slash-command autocomplete popup opens
+    /// when the user types `/`. Disable for a minimal experience
+    /// while keeping `/help` and direct dispatch intact.
+    pub slash_command_popup_enabled: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            slash_command_popup_enabled: true,
+        }
+    }
 }
 
 /// Default model selection.

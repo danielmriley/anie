@@ -7,18 +7,30 @@ when the user types `/` in the input editor.
 
 ## Current State
 
-Anie has some slash commands (`/thinking`, `/model`, `/providers`, `/onboard`,
-`/help`). There is no autocomplete menu — the user must know the command name.
+Anie now has graceful slash-command dispatch and an inline
+autocomplete popup. Typing `/` opens a filterable palette of
+registered commands (builtins + future extension/prompt/skill
+entries); typing a space after a command with an `Enumerated` or
+`Subcommands` argument spec shows the valid values. Validation
+against `SlashCommandInfo::validate` happens before the TUI
+dispatches a `UiAction`, so a bad argument never reaches the
+controller.
+
+Commands shipped today: `/model`, `/thinking`, `/compact`,
+`/fork`, `/diff`, `/new`, `/session`, `/tools`, `/onboard`,
+`/providers`, `/clear`, `/reload`, `/copy`, `/help`, `/quit`.
+
+Toggle the popup via `ui.slash_command_popup_enabled = false` in
+`~/.anie/config.toml`; validation still runs when the popup is
+disabled.
 
 ## Action Items
 
-### 1. Inline command autocomplete menu
-When the user types `/`, show a dropdown anchored near the input area:
-- Filter in real-time as the user types
-- Show command name + short description
-- Keyboard navigable (arrows, Enter, Escape)
-- Include all registered commands (built-in, future skills, prompt templates)
-- Configurable max visible items
+### 1. Inline command autocomplete menu — **done** (plan 12)
+Popup opens on `/` at line start; filters in real time; arrow
+keys + Enter/Tab + Escape; sourced from `SlashCommandInfo`
+catalog so extensions, prompts, and skills get the popup for
+free once they land. Max visible items defaults to 5.
 
 ### 2. Additional built-in commands to consider
 

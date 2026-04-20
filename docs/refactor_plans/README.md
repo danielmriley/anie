@@ -15,6 +15,10 @@ Plan 09 is intentionally reserved for a future "tools parity with pi"
 plan (`find`, `grep`, `ls`). Not written yet; deferred because tool
 additions warrant individual careful review.
 
+Plans 11 and 12 (graceful slash-command dispatch + inline
+autocomplete popup) shipped in full; see
+[`../completed/refactor_plans/`](../completed/refactor_plans/).
+
 ## Background
 
 [`pi_mono_comparison.md`](./pi_mono_comparison.md) — detailed mapping
@@ -54,6 +58,16 @@ Summary — full detail is under
 - **08** Small hygiene items (`.anie/` path helper, HTTP-client
   fallback, `send_event` helper with warn-once latch, cached
   `ToolRegistry`, non-cloning context API).
+- **11** Graceful slash-command dispatch — `UserCommandError`
+  classification, `ArgumentSpec` on `SlashCommandInfo`, TUI-side
+  pre-dispatch validation. A bad `/thinking` arg (or any bad
+  user input) now surfaces as a system message instead of
+  killing the controller.
+- **12** Inline slash-command autocomplete popup — reusable
+  `SelectList` widget, `AutocompleteProvider` trait, builtin
+  command completer, popup overlay above/below the input,
+  `ui.slash_command_popup_enabled` toggle, extension-ready
+  contract.
 - **Fix plans** under `../completed/refactor_plans/fixes/` —
   follow-ups that closed out partial exit criteria on plans 01,
   02, 03 (phases 3–5), 06, 07, 08.

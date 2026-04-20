@@ -31,6 +31,8 @@ use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest};
 use crate::{
     InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
     OnboardingScreen, OutputPane, ProviderManagementAction, ProviderManagementScreen,
+    autocomplete::CommandCompletionProvider,
+    commands::SlashCommandInfo,
     input::InputAction,
     output::RenderedBlock,
     overlay::{OverlayOutcome, OverlayScreen},
@@ -58,6 +60,11 @@ pub struct App {
     discovery_cache: Arc<Mutex<ModelDiscoveryCache>>,
     worker_tx: mpsc::UnboundedSender<AppWorkerEvent>,
     worker_rx: mpsc::UnboundedReceiver<AppWorkerEvent>,
+    /// Catalog of slash-command metadata, owned upstream by the
+    /// controller's `CommandRegistry`. Consulted by
+    /// `handle_slash_command` for pre-dispatch validation and, in
+    /// plan 12, by the inline autocomplete popup.
+    commands: Vec<SlashCommandInfo>,
 }
 
 // The ModelPicker variant is intentionally large; the enum holds at most
@@ -215,17 +222,36 @@ impl Default for Spinner {
 
 impl App {
     /// Create a new TUI app.
+    ///
+    /// `commands` is the slash-command metadata catalog used for
+    /// pre-dispatch validation (plan 11) and the inline
+    /// autocomplete popup (plan 12). Pass
+    /// `CommandRegistry::all().to_vec()` or equivalent.
     #[must_use]
     pub fn new(
         event_rx: mpsc::Receiver<AgentEvent>,
         action_tx: mpsc::Sender<UiAction>,
         initial_models: Vec<Model>,
+        commands: Vec<SlashCommandInfo>,
     ) -> Self {
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        // Attach the inline autocomplete provider so typing `/`
+        // pops the command palette. Providers are wired here
+        // rather than in `interactive_mode` because the TUI owns
+        // the popup's lifecycle, and the set of commands is
+        // already plumbed through `App::new` for pre-dispatch
+        // validation.
+        let input_pane = if commands.is_empty() {
+            InputPane::new()
+        } else {
+            InputPane::new().with_autocomplete(Arc::new(CommandCompletionProvider::new(
+                commands.clone(),
+            )))
+        };
         Self {
             output_pane: OutputPane::new(),
             status_bar: StatusBarState::default(),
-            input_pane: InputPane::new(),
+            input_pane,
             bottom_pane: BottomPane::Editor,
             agent_state: AgentUiState::Idle,
             event_rx,
@@ -241,12 +267,51 @@ impl App {
             )))),
             worker_tx,
             worker_rx,
+            commands,
         }
     }
 
     /// Access the status bar state for setup and tests.
     pub fn status_bar_mut(&mut self) -> &mut StatusBarState {
         &mut self.status_bar
+    }
+
+    /// Enable or disable the inline slash-command autocomplete
+    /// popup. When disabled, the input pane falls back to its
+    /// pre-plan-12 behavior: history navigation on Up/Down, no
+    /// popup on `/`. Pre-dispatch validation (plan 11) is
+    /// unaffected — `/help` and command lookup still use the
+    /// catalog.
+    #[must_use]
+    pub fn with_autocomplete_enabled(mut self, enabled: bool) -> Self {
+        if !enabled {
+            // Drop the provider by rebuilding the input pane from
+            // scratch. `InputPane` is cheap to recreate; keeping
+            // history would require copy-out/copy-in and at
+            // startup there is no history yet.
+            self.input_pane = InputPane::new();
+        }
+        self
+    }
+
+    /// Read-only view of the current transcript blocks in the
+    /// output pane.
+    #[must_use]
+    pub fn output_blocks(&self) -> &[RenderedBlock] {
+        self.output_pane.blocks()
+    }
+
+    /// Current input-pane contents. Intended for tests that
+    /// assert on post-completion buffer state.
+    #[must_use]
+    pub fn input_pane_contents(&self) -> &str {
+        self.input_pane.content()
+    }
+
+    /// Whether the inline autocomplete popup is currently open.
+    #[must_use]
+    pub fn input_pane_is_popup_open(&self) -> bool {
+        self.input_pane.autocomplete_is_open()
     }
 
     /// Preload a transcript without routing through streaming events.
@@ -292,6 +357,16 @@ impl App {
             }
         };
         frame.set_cursor_position(cursor);
+
+        // Draw the inline autocomplete popup on top of the
+        // existing layout. Only applies when the editor is active
+        // — the model picker has its own UI.
+        if matches!(self.bottom_pane, BottomPane::Editor)
+            && let Some(popup) = self.input_pane.autocomplete_popup()
+            && let Some(rect) = popup.layout_rect(frame.area(), bottom_area)
+        {
+            popup.render(rect, frame.buffer_mut());
+        }
 
         if let Some(overlay) = &mut self.overlay {
             let area = frame.area();
@@ -570,14 +645,54 @@ impl App {
 
     fn handle_slash_command(&mut self, command: &str) {
         let mut parts = command.splitn(2, char::is_whitespace);
-        let cmd = parts.next().unwrap_or_default();
+        let raw_cmd = parts.next().unwrap_or_default();
         let arg = parts
             .next()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let name = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
 
-        match cmd {
-            "/model" => match arg {
+        // `/exit` is an alias for `/quit` that predates the
+        // catalog; keep it working without adding a duplicate
+        // entry (duplicates would confuse autocomplete in plan 12).
+        if name == "exit" {
+            self.should_quit = true;
+            let _ = self.action_tx.try_send(UiAction::Quit);
+            return;
+        }
+
+        let Some(info) = self
+            .commands
+            .iter()
+            .find(|info| info.name == name)
+            .cloned()
+        else {
+            self.output_pane.add_system_message(format!(
+                "Unknown command: {raw_cmd}. Type /help for available commands."
+            ));
+            return;
+        };
+
+        if let Err(message) = info.validate(arg) {
+            self.output_pane.add_system_message(message);
+            return;
+        }
+
+        self.dispatch_validated_command(&info, arg);
+    }
+
+    /// Dispatch a well-formed slash command.
+    ///
+    /// Preconditions enforced by `handle_slash_command`:
+    /// - `info.name == raw_cmd.strip_prefix('/').unwrap_or(raw_cmd)`
+    /// - `info.validate(arg)` returned `Ok(())`.
+    ///
+    /// If a new builtin is added to `builtin_commands()`, wire it
+    /// here too and update the coverage test in `anie-cli/src/
+    /// commands.rs` (`registry_covers_every_dispatched_slash_command`).
+    fn dispatch_validated_command(&mut self, info: &SlashCommandInfo, arg: Option<&str>) {
+        match info.name {
+            "model" => match arg {
                 None => self.open_model_picker_for_current_provider(None),
                 Some(query) => {
                     if !self.try_exact_model_switch(query) {
@@ -585,7 +700,7 @@ impl App {
                     }
                 }
             },
-            "/thinking" => match arg {
+            "thinking" => match arg {
                 None => self.output_pane.add_system_message(format!(
                     "Current thinking level: {}",
                     self.status_bar.thinking,
@@ -594,24 +709,22 @@ impl App {
                     let _ = self
                         .action_tx
                         .try_send(UiAction::SetThinking(level.to_string()));
-                    self.output_pane
-                        .add_system_message(format!("Requested thinking level: {level}"));
                 }
             },
-            "/compact" => {
+            "compact" => {
                 let _ = self.action_tx.try_send(UiAction::Compact);
             }
-            "/fork" => {
+            "fork" => {
                 let _ = self.action_tx.try_send(UiAction::ForkSession);
             }
-            "/diff" => {
+            "diff" => {
                 let _ = self.action_tx.try_send(UiAction::ShowDiff);
             }
-            "/clear" => {
+            "clear" => {
                 self.output_pane.clear();
                 let _ = self.action_tx.try_send(UiAction::ClearOutput);
             }
-            "/session" => match arg {
+            "session" => match arg {
                 None => {
                     let _ = self.action_tx.try_send(UiAction::GetState);
                 }
@@ -624,31 +737,37 @@ impl App {
                         .try_send(UiAction::SwitchSession(session_id.to_string()));
                 }
             },
-            "/tools" => {
+            "tools" => {
                 let _ = self.action_tx.try_send(UiAction::ShowTools);
             }
-            "/onboard" => self.open_onboarding_overlay(),
-            "/providers" => self.open_provider_management_overlay(),
-            "/copy" => self.copy_last_assistant_to_clipboard(),
-            "/new" => {
+            "onboard" => self.open_onboarding_overlay(),
+            "providers" => self.open_provider_management_overlay(),
+            "copy" => self.copy_last_assistant_to_clipboard(),
+            "new" => {
                 let _ = self.action_tx.try_send(UiAction::NewSession);
             }
-            "/reload" => {
+            "reload" => {
                 let _ = self.action_tx.try_send(UiAction::ReloadConfig {
                     provider: None,
                     model: None,
                 });
             }
-            "/help" => {
+            "help" => {
                 let _ = self.action_tx.try_send(UiAction::ShowHelp);
             }
-            "/quit" | "/exit" => {
+            "quit" => {
                 self.should_quit = true;
                 let _ = self.action_tx.try_send(UiAction::Quit);
             }
-            _ => self.output_pane.add_system_message(format!(
-                "Unknown command: {cmd}. Type /help for available commands."
-            )),
+            other => {
+                // The catalog is authoritative for name lookup, so
+                // reaching this arm means a command was registered
+                // without a matching dispatch case. Surface that
+                // loudly rather than swallow silently.
+                self.output_pane.add_system_message(format!(
+                    "Command /{other} has no handler. This is a bug; please report it."
+                ));
+            }
         }
     }
 

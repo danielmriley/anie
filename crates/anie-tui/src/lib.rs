@@ -2,6 +2,8 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod app;
+mod autocomplete;
+pub mod commands;
 mod input;
 mod output;
 mod overlay;
@@ -10,6 +12,7 @@ mod terminal;
 mod widgets;
 
 pub use app::{AgentUiState, App, Spinner, StatusBarState, ToolCallResult, UiAction, run_tui};
+pub use commands::{ArgumentSpec, SlashCommandInfo, SlashCommandSource};
 pub use input::InputPane;
 pub use output::{OutputPane, RenderedBlock};
 pub use overlays::{
