@@ -555,7 +555,11 @@ impl ProviderManagementScreen {
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(area);
 
         let header = Row::new(vec![
@@ -616,11 +620,18 @@ impl ProviderManagementScreen {
         .column_spacing(1)
         .render(chunks[0], frame.buffer_mut());
 
+        Paragraph::new(Line::from(Span::styled(
+            "To add a new provider, run /onboard.",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .wrap(Wrap { trim: false })
+        .render(chunks[1], frame.buffer_mut());
+
         Paragraph::new(footer_line(
             "[↑↓] Navigate   [Enter] Actions   [t] Test   [e] Edit Key   [s] Set Default   [d] Delete   [q] Close",
         ))
         .wrap(Wrap { trim: false })
-        .render(chunks[1], frame.buffer_mut());
+        .render(chunks[2], frame.buffer_mut());
     }
 
     fn render_action_menu(&self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
