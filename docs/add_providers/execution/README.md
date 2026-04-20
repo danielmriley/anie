@@ -1,135 +1,93 @@
-# Execution plans — add_providers rollout
+# Execution plans — OpenRouter focus
 
-The per-provider specs in `../` describe **what** to build. These
-files sequence the work across PRs and track cross-plan
-dependencies so nothing gets double-done.
+**Current scope.** Only OpenRouter ships this iteration. Other
+provider plans (`../02`–`../06`) stay in place as specs but are
+deferred. The user's hardware access is OpenRouter-only, and
+OpenRouter itself unlocks ~500 models across every frontier
+provider via a single API key.
 
 ## Why a second tier of plans
 
-The provider specs (`../00`–`../06`) are specification-level:
-scope, model catalogs, round-trip contracts, exit criteria.
-Several of them share infrastructure — the per-model compat
-blob, `ThinkingRequestMode::NestedReasoning`, `thought_signature`
-storage on `ContentBlock`, the preset catalog — and that shared
-work has to land once, in one specific order, before any of the
-provider plans can start.
+The spec file [`../01_openrouter.md`](../01_openrouter.md) says
+**what** to build. The docs here sequence **how** the work
+flows across PRs, pull the cross-plan scaffolding into its own
+foundation phase, and set test gates per PR.
 
-These execution docs:
+## OpenRouter-only milestone sequence
 
-- Sequence phases across all seven plans into PR-sized milestones.
-- Pull cross-plan foundation work into its own dedicated phase 0
-  so plans 01 / 02 / 05 aren't each re-litigating the same
-  scaffolding.
-- Break the less-structured plans (01, 02, 05) into explicit
-  phases with test gates; plans 03 / 04 / 06 already have phased
-  breakdowns inside their own spec files so their execution
-  docs cross-reference those.
+| # | Milestone | Doc | PRs |
+|---|---|---|---|
+| 0 | [Foundation: `Model.compat` blob + `NestedReasoning`](00_foundation.md) | — | 2 |
+| 1 | [OpenRouter: preset, discovery, upstream-aware capability mapping](02_openrouter_phases.md) | `../01` | 3 |
 
-## Master milestone sequence
+Total: five PRs. Gemini's foundation (`thought_signature`) is
+deferred until Gemini itself lands — one less foundation PR.
 
-Read top-to-bottom. Every milestone is ≤ 5 files touched and has
-a test gate. Nothing marked "merge" ships until `cargo test
---workspace` is green plus `cargo clippy --workspace
---all-targets` is clean.
+## Deferred milestones
 
-| # | Milestone | Plan | PRs | Unblocks |
-|---|---|---|---|---|
-| 0 | [Foundation: compat blob on Model, NestedReasoning variant, `thought_signature` prep](00_foundation.md) | cross | 3 | 01, 02, 03, 05 |
-| 1 | [Provider selection UX: preset catalog + category picker](01_ux_prerequisite.md) | `../00` | 2 | every provider plan |
-| 2 | [OpenRouter](02_openrouter_phases.md) | `../01` | 2 | nothing (independent) |
-| 3 | [OpenAI-compat batch: Mistral → xAI → Groq → Cerebras](03_openai_compat_phases.md) | `../02` | 4 | nothing (independent) |
-| 4 | [Google Gemini phase A–C](../03_google_gemini.md#implementation-phases) | `../03` | 3 | nothing (independent) |
-| 5 | [OpenAI Responses phase A–E](../04_openai_responses_api.md#implementation-phases) | `../04` | 5 | unblocks Azure+Responses follow-up |
-| 6 | [Azure OpenAI](06_azure_phases.md) | `../05` | 2 | nothing (independent) |
-| 7 | [Amazon Bedrock phase A–D](../06_amazon_bedrock.md#implementation-phases) | `../06` | 4 | nothing (independent) |
+| # | Name | Why deferred | Restart trigger |
+|---|---|---|---|
+| 1b | Provider selection UX (preset catalog) | Only adding one provider; existing onboarding has room | When adding a second provider |
+| 3 | OpenAI-compat batch | User doesn't have keys for xAI/Groq/Cerebras/Mistral yet | Demand |
+| 4 | Google Gemini | Biggest lift (new API kind); no key available | Demand + key |
+| 5 | OpenAI Responses API | Plan 04's encrypted reasoning work is heavy; o3 users can go via OpenRouter in the meantime | Demand |
+| 6 | Azure OpenAI | Enterprise-only need | Demand |
+| 7 | Amazon Bedrock | AWS SDK weight; no key available | Demand |
 
-Total: roughly 25 PRs if everything goes through. Each row is
-one or more PRs; the linked phase doc specifies the split
-inside each.
+Each deferred plan's spec file remains intact — when the time
+comes, restart from where the spec left off.
 
-## Critical dependencies
+## Critical dependency graph (current scope)
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ 0. Foundation                                       │
-│    - Model.compat blob                              │
-│    - ThinkingRequestMode::NestedReasoning           │
-│    - ContentBlock::Thinking.thought_signature prep  │
+│ Milestone 0. Foundation                             │
+│    PR A: Model.compat blob                          │
+│    PR B: ThinkingRequestMode::NestedReasoning       │
 └─────────────────────────────────────────────────────┘
-           │                │
-           ▼                ▼
-┌──────────────────────┐ ┌──────────────────────┐
-│ 1. UX prerequisite   │ │ 4. Gemini            │
-│    ProviderPreset    │ │    (needs            │
-│    + category picker │ │    thought_signature)│
-└──────────────────────┘ └──────────────────────┘
-           │
-    ┌──────┴─────┬──────┬───────────┬──────┐
-    ▼            ▼      ▼           ▼      ▼
-┌─────────┐ ┌─────────┐ ┌─────────┐ ┌──────┐ ┌─────────┐
-│ 2. OR   │ │ 3. Batch│ │ 5. Rsp. │ │ 6.Az │ │ 7.Bedrk │
-└─────────┘ └─────────┘ └─────────┘ └──────┘ └─────────┘
-                                        │
-                        ┌───────────────┘
-                        ▼
-                 (Azure+Responses
-                  follow-up after
-                  both 5 and 6 land)
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│ Milestone 1. OpenRouter                             │
+│    PR A: Preset + onboarding + discovery parser     │
+│    PR B: Upstream-aware capability mapping          │
+│    PR C: Model picker polish (optional, conditional)│
+└─────────────────────────────────────────────────────┘
 ```
-
-Milestones 2–7 are **parallelizable** across multiple engineers
-or agents after milestones 0 and 1 land. On a solo schedule,
-sequential in priority order is the simplest: 0, 1, 2, 3, 4, 5,
-6, 7. Plan 01 (OpenRouter) is the highest-value landing, so
-after milestones 0 and 1 are in, go there next.
-
-## Parallelism boundaries within a milestone
-
-Several milestones have phases that are internally sequential
-(e.g. Gemini phase C depends on phase B's parser existing).
-Others are batch work where sub-providers are independent (xAI
-doesn't need Mistral). The phase docs call out which case each
-is.
 
 ## Per-milestone exit gates
 
 Every milestone ends with:
 
-- [ ] `cargo test --workspace` green
-- [ ] `cargo clippy --workspace --all-targets` clean
+- [ ] `cargo test --workspace` green.
+- [ ] `cargo clippy --workspace --all-targets` clean.
 - [ ] No new `fs::write`, `unwrap()`, or `.expect()` in
-      production code (per CLAUDE.md)
-- [ ] Provider's catalog entries appear in `/providers` add
-      picker's category group
-- [ ] Invariant suite exercises the new provider with one
-      cross-provider fixture
-- [ ] (If API key available) manual two-turn smoke against
-      the real endpoint logged in the PR description
+      production code.
+- [ ] Invariant suite exercises any new/changed code path
+      with one cross-provider fixture.
+- [ ] PR C's manual smoke (two-turn conversation on real
+      OpenRouter) is the final gate for merging OpenRouter to
+      main.
 
-Milestones that ship provider code without a live smoke are
-allowed to merge behind the feature; the smoke result gets
-appended to the PR's comment trail once a user with a key
-verifies.
+## Where to record refinements
 
-## Spec vs execution — where to write changes
+When implementation surfaces something the spec missed, update
+`../01_openrouter.md` — not this file. Execution docs track
+milestones; specs track design. If a phase reveals a new
+foundation dependency, add it to `00_foundation.md` with a
+dated note.
 
-Plan refinements, new out-of-scope items, or corrections
-based on implementation learnings go back into the **spec**
-file under `../`. These execution docs only track milestones
-and cross-plan dependencies. When a phase completes, check it
-off in the corresponding spec file's exit criteria; do not
-duplicate that state here.
+## What happens after OpenRouter ships
 
-If a phase discovers a new shared dependency, it goes in the
-foundation phase (milestone 0) as a late-add with a date and
-reason, and the unblocked milestones adjust.
+Two branches:
 
-## What these docs deliberately don't cover
+1. **If users report usability issues** on search at 500+
+   models, fuzzy scoring + prefix grouping lands as a small
+   follow-up PR. Documented as PR C in `02_openrouter_phases.md`
+   — conditionally landed.
+2. **If a second provider gets prioritized**, first PR is the
+   plan 00 preset-catalog refactor (the "if we're adding two
+   now, might as well build the shared UX first" moment). Then
+   the new provider's own milestone.
 
-- **Timeline estimates.** Effort labels (S/M/L) in the spec
-  files are rough and not claimed to be calendar time.
-- **Code review logistics.** Who reviews what is out of scope
-  here.
-- **Release cadence.** Whether milestones ship as separate
-  minor versions or get bundled is a release-engineering
-  question, not a planning one.
+Neither branch is in scope today.

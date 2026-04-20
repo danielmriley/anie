@@ -1,199 +1,313 @@
 # Plan 01 — OpenRouter
 
-User's top-line provider request. OpenRouter is an
-OpenAI-compatible aggregator: one API key gives access to ~200
-models across Anthropic, OpenAI, Google, Meta, xAI, and dozens
-more. Perfect first "new" provider because the wire protocol is
-already supported — we just add a preset and a model catalog.
+**Sole focus for the add_providers initiative in this iteration.**
+Connect anie to OpenRouter flawlessly, surface the full model
+catalog (not a curated subset), and make search usable at the
+scale OpenRouter exposes.
+
+## Rationale for scope
+
+Earlier drafts of this plan proposed an eight-model curated
+catalog. That's the wrong shape for OpenRouter: its whole value
+is **breadth** — ~500 models across every frontier provider plus
+dozens of open-weight options. A hand-picked eight is almost
+always the wrong eight for any given user.
+
+The right shape is:
+
+1. **Discovery-driven.** Live fetch from
+   `https://openrouter.ai/api/v1/models` on first configure and
+   on user-requested refresh. No hand-authored OpenRouter entries
+   in `builtin_models()`.
+2. **Upstream-aware capabilities.** Each OpenRouter model ID
+   carries the upstream as a prefix (`anthropic/claude-...`,
+   `openai/o3`, `google/gemini-...`). We pattern-match on that
+   prefix to assign the right `ReplayCapabilities` and
+   `ReasoningCapabilities` automatically, rather than
+   hand-authoring per entry.
+3. **Search that scales.** The existing `ModelPickerPane` already
+   has case-insensitive substring search over id + name. Polish
+   it — provider-prefix grouping and fuzzy scoring — only if the
+   substring search turns out to be insufficient on 500+ rows.
+   Ship with the current picker first.
 
 ## User value
 
-- **One key, many models.** Users who don't want to manage
-  separate accounts at Anthropic + OpenAI + Google can route
-  everything through a single OpenRouter account.
-- **Pay-as-you-go access to expensive models.** OpenRouter
-  exposes Claude Opus, GPT-4, Gemini Pro, etc. without a monthly
-  commitment or team plan.
-- **Fallback routing.** OpenRouter routes to the cheapest healthy
-  upstream when the user doesn't pin a provider — useful for
-  redundancy during rate limits.
+- One API key, hundreds of models. No per-provider account
+  management.
+- Claude Opus, GPT-4, o3, Gemini Pro, DeepSeek, Llama 3.3, Qwen,
+  Mistral, and every new model OpenRouter adds — all reachable
+  without updating anie.
+- Pay-as-you-go. No monthly commitment to try a new model.
 
 ## Wire protocol
 
-**Reuses `ApiKind::OpenAICompletions`.** No new provider module
-needed. OpenRouter implements OpenAI Chat Completions with a few
-additions documented below.
-
-Endpoint: `https://openrouter.ai/api/v1/chat/completions`.
+Reuses `ApiKind::OpenAICompletions`. Endpoint:
+`https://openrouter.ai/api/v1/chat/completions`.
 
 ## Auth shape
 
-**API key via `Authorization: Bearer {key}` header.** Standard
-OpenAI-compat pattern. The auth-resolver chain
-(`anie-auth::AuthResolver`) already handles this when the preset
-is registered as `AuthHint::ApiKey { env_var: "OPENROUTER_API_KEY" }`.
+- `Authorization: Bearer {key}`.
+- env var: `OPENROUTER_API_KEY`.
+- Key URL: `https://openrouter.ai/keys`.
 
-API keys come from <https://openrouter.ai/keys>.
+## OpenRouter-specific request behavior
 
-## OpenRouter-specific request quirks
+### Nested `reasoning` object (required for reasoning models)
 
-### Reasoning field shape (required)
+OpenRouter normalizes reasoning across upstreams via
+`reasoning: { effort: "high" }`, not OpenAI's flat
+`reasoning_effort`. pi's
+`packages/ai/src/providers/openai-completions.ts:429` has the
+pattern. Without this, reasoning against OpenRouter reasoning
+models silently no-ops.
 
-OpenRouter normalizes reasoning across upstreams by putting it in
-a **nested** `reasoning: { effort: "high" }` object — not the flat
-`reasoning_effort: "high"` field OpenAI's Chat Completions uses.
-pi's openai-completions provider has explicit branching for this
-via a `thinkingFormat: "openrouter"` compat flag
-(`packages/ai/src/providers/openai-completions.ts:429`). Without
-handling, sending `reasoning_effort: "high"` against OpenRouter
-silently drops the reasoning request and the user gets no
-reasoning from models that should support it.
+Requires a new `ThinkingRequestMode::NestedReasoning` variant
+(foundation work — see `execution/00_foundation.md` PR B). Each
+OpenRouter model identified as reasoning-capable (from the
+discovery response's `supported_parameters`) gets
+`reasoning_capabilities.request_mode = NestedReasoning` set
+automatically during `ModelInfo → Model` conversion.
 
-**Implementation.** Our existing `ReasoningCapabilities` +
-`ThinkingRequestMode` types cover this: add a
-`ThinkingRequestMode::NestedReasoning` variant (if not already
-present) and wire it through `reasoning_strategy.rs`. The
-OpenRouter catalog entries declare
-`reasoning_capabilities.request_mode =
-Some(NestedReasoning)`.
+### Provider routing preferences (optional, via compat blob)
 
-### Provider routing preferences (optional but valuable)
+OpenRouter's request body accepts a top-level `provider` object
+for routing preferences (ordered upstream preferences, ZDR
+filters, price ceilings, quantization filters, etc.). Users can
+configure these per-model via the `ModelCompat::OpenAICompletions
+{ openrouter_routing }` compat blob (foundation work — see
+`execution/00_foundation.md` PR A).
 
-OpenRouter accepts a top-level `provider` field in the request
-body with a rich routing-preferences object — order of upstream
-preferences, fallback behavior, price ceilings, Zero-Data-Retention
-filters, quantization filters, sort-by-throughput, etc. pi models
-the full shape (`OpenRouterRouting` in
-`packages/ai/src/types.ts:307`) so users can pin upstream
-providers or require cheapest-routing per request.
+Not surfaced in the UI for v1 — `config.toml`-editable only. The
+cases where a user actually wants this (pin to Anthropic-only
+upstream for privacy reasons, sort by throughput, require ZDR)
+are advanced-user scenarios.
 
-For **v1** we ship the routing support at the catalog level only:
-a `ReplayCapabilities`-adjacent `openrouter_routing: Option<...>`
-field on `Model` that carries the user's preferences through. The
-plan 00 preset UI doesn't need to expose the routing knobs —
-they're `config.toml`-editable. Follow-up plan can surface them
-in `/providers`.
+### Leaderboard headers — not shipped
 
-### Leaderboard headers (optional, cosmetic)
+`HTTP-Referer` and `X-Title` identify anie on OpenRouter's
+public leaderboard. Pi doesn't set them. Cosmetic-only. Skip.
 
-`HTTP-Referer` and `X-Title` identify anie on OpenRouter's public
-leaderboard. Pi does **not** set these for itself (checked in its
-codebase: zero hits). They're not required by the API and only
-affect OpenRouter's own public stats. **Drop from v1 scope**; add
-later as a `config.toml`-level opt-in if the user wants to show
-up on the leaderboard.
+## Discovery-first catalog
 
-## Model catalog entries
+### Flow
 
-Start with a small curated set. The full 200+ model list is
-overwhelming in a picker; users who want more can add them via
-`/providers` → edit entry → add custom model, or via
-`config.toml`. Discovery fetch is available at
-`https://openrouter.ai/api/v1/models` and can fill in on-demand.
+```
+onboarding: pick "OpenRouter" preset
+  → prompt for API key
+  → save to CredentialStore
+  → immediately fetch https://openrouter.ai/api/v1/models
+  → convert each response entry to Model (see mapping below)
+  → populate OpenRouter's per-provider catalog
+  → user returns to TUI with all models available in /model picker
+```
 
-| Model ID | Display name | Context | Max out | Reasoning | Notes |
-|---|---|---|---|---|---|
-| `anthropic/claude-sonnet-4.6` | Claude Sonnet 4.6 (OpenRouter) | 1M | 128k | native | Anthropic upstream, signatures intact |
-| `anthropic/claude-opus-4.6` | Claude Opus 4.6 (OpenRouter) | 1M | 128k | native | Same caveats |
-| `openai/gpt-4o` | GPT-4o (OpenRouter) | 128k | 16k | none | |
-| `openai/o4-mini` | o4-mini (OpenRouter) | 200k | 100k | native | |
-| `google/gemini-2.0-flash` | Gemini 2.0 Flash (OpenRouter) | 1M | 8k | none | |
-| `meta-llama/llama-3.3-70b-instruct` | Llama 3.3 70B (OpenRouter) | 128k | 8k | none | Good value option |
-| `deepseek/deepseek-v3` | DeepSeek V3 (OpenRouter) | 128k | 8k | none | Cost-effective frontier |
-| `qwen/qwen-2.5-coder-32b-instruct` | Qwen 2.5 Coder 32B (OpenRouter) | 32k | 8k | none | Coding-focused |
+`ModelDiscoveryCache` (from the onboarding plans that shipped)
+already handles the fetch-and-TTL. We extend it with a richer
+parser that captures OpenRouter's extra fields.
 
-**Pricing**: OpenRouter's pricing varies per upstream and changes
-frequently. Leave `cost_per_million` at `zero()` in the catalog
-entry and let users refer to <https://openrouter.ai/models> for
-current numbers. (A future plan can wire live-pricing fetch via
-the `/api/v1/models` endpoint.)
+### Discovery response parsing
 
-**Replay capabilities**: When routing to Anthropic upstream,
-OpenRouter *does* relay thinking-signatures on the wire —
-verified in community docs, needs confirmation with a manual
-smoke test. Mark Anthropic-routed models with
-`requires_thinking_signature: true`; if the smoke test fails, fall
-back to `None` and document the limitation.
+OpenRouter's `/api/v1/models` returns entries with this shape
+(abbreviated):
+
+```json
+{
+  "data": [
+    {
+      "id": "anthropic/claude-sonnet-4.6",
+      "name": "Anthropic: Claude Sonnet 4.6",
+      "context_length": 1000000,
+      "pricing": {
+        "prompt": "0.000003",
+        "completion": "0.000015",
+        "request": "0",
+        "image": "0.0048"
+      },
+      "top_provider": {
+        "context_length": 1000000,
+        "max_completion_tokens": 128000,
+        "is_moderated": true
+      },
+      "supported_parameters": [
+        "tools", "reasoning", "temperature", "top_p", ...
+      ],
+      "architecture": {
+        "modality": "text+image->text",
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"]
+      }
+    }
+  ]
+}
+```
+
+Fields we parse:
+
+| Response field | Destination |
+|---|---|
+| `id` | `Model.id` |
+| `name` | `Model.name` |
+| `context_length` or `top_provider.context_length` | `Model.context_window` |
+| `top_provider.max_completion_tokens` | `Model.max_tokens` |
+| `pricing.prompt` (per-token, string) × 1_000_000 | `Model.cost_per_million.input` |
+| `pricing.completion` × 1_000_000 | `Model.cost_per_million.output` |
+| `architecture.input_modalities` contains `"image"` | `Model.supports_images` |
+| `supported_parameters` contains `"reasoning"` | `Model.supports_reasoning` |
+
+The existing `OpenAiModelsResponse` parser captures most of these
+fields already; this plan extends it with `pricing` +
+`supported_parameters` + a richer `top_provider` sub-object.
+
+### Upstream-aware capability mapping
+
+The OpenRouter model ID's prefix (everything before the first
+`/`) identifies the upstream. Our `ModelInfo → Model` conversion
+for OpenRouter rewrites `replay_capabilities` and
+`reasoning_capabilities` based on this prefix:
+
+| Prefix | `requires_thinking_signature` | `supports_encrypted_reasoning` | `request_mode` |
+|---|---|---|---|
+| `anthropic/*` with reasoning | `true` | `false` | `NestedReasoning` |
+| `openai/o1*`, `openai/o3*`, `openai/gpt-5*` | `false` | `false` (\*) | `NestedReasoning` |
+| `google/*` with reasoning | `false` (\*\*) | `false` | `NestedReasoning` |
+| `meta-llama/*`, `deepseek/*`, `qwen/*`, `mistralai/*` (no reasoning) | `false` | `false` | `None` |
+| Non-reasoning (per `supported_parameters`) | `false` | `false` | `None` |
+
+(\*) OpenRouter proxies OpenAI's Responses API's encrypted reasoning
+back to the caller but we can't actually replay `encrypted_content`
+through Chat Completions — so we mark it `false` for now and
+accept a small continuity loss across multi-turn o3 conversations.
+Plan 04 (direct OpenAI Responses API, deferred) addresses this
+for non-OR direct users.
+
+(\*\*) Gemini's `thoughtSignature` over OpenRouter is unverified
+— the signature may or may not traverse the proxy. Mark `false`
+for v1; revisit if users report broken multi-turn Gemini
+reasoning.
+
+A small `openrouter_capability_mapping` function in
+`anie-providers-builtin` owns this logic, with a unit test per
+row.
 
 ## Onboarding integration
 
-- **Preset name:** `openrouter`
-- **Display name:** `OpenRouter`
-- **Category:** `OpenAICompatible`
-- **Tagline:** `One API key, many models (Anthropic, OpenAI, Google, Meta, …)`
-- **Base URL:** `https://openrouter.ai/api/v1`
-- **API key URL:** `https://openrouter.ai/keys`
-- **env_var:** `OPENROUTER_API_KEY`
+We're not landing the full preset-catalog refactor (plan 00) in
+this iteration — only one new provider is going in, and the
+existing onboarding form can accommodate one more row without
+the refactor.
 
-Include OpenRouter in the onboarding shortlist (per plan 00). It
-belongs there precisely because it lowers the activation energy
-for a new user who hasn't picked a single frontier provider yet.
+Onboarding flow after this plan:
 
-## Model discovery
+1. First-run shortlist becomes: `[Anthropic] [OpenAI] [OpenRouter]
+   [Ollama] [Skip]`.
+2. Picking OpenRouter:
+   - Prompt for API key.
+   - Save via `CredentialStore`.
+   - **Immediately** call `ModelDiscoveryCache::get_or_discover`
+     — a one-time fetch that takes ~1s and populates the local
+     catalog for that provider.
+   - Show a spinner during discovery.
+   - On completion, return to TUI with OpenRouter as the active
+     provider; `/model` opens the picker pre-populated with the
+     full discovered list.
+3. Network error during discovery: keep the key saved, skip the
+   populate, surface a system message ("Models will be
+   discovered on first `/model` usage"). `/model` picker
+   re-attempts discovery.
 
-OpenRouter supports `/api/v1/models` returning a list of all
-available models with their IDs, context windows, and per-token
-pricing. The existing `ModelDiscoveryCache` machinery (from the
-onboarding work) can handle this with the same `OpenAIModelsList`
-shape already used for OpenAI — confirm field names match
-(`id`, `context_length`). If OpenRouter uses different fields
-(e.g., `pricing.prompt` vs `input`), add a small adapter
-function; don't reshape the generic discovery path.
+## Model picker usability at scale
 
-## Capability quirks
+The existing `ModelPickerPane` has:
 
-1. **Rate limiting.** OpenRouter returns `429` with a
-   `retry-after` header; the existing retry-policy path honors
-   `retry_after_ms`. No changes needed.
-2. **Streaming chunk shape.** Standard OpenAI-compat
-   `data: {...}\n\n`. No changes.
-3. **Vision support** varies by upstream model. We already carry
-   a `supports_images: bool` per model entry; populate per-row
-   based on the upstream.
-4. **Tool calling** works for upstreams that support it. No
-   wire changes — OpenRouter transparently forwards OpenAI-style
-   `tool_calls` in the delta.
+- Case-insensitive substring search over `id + name`.
+- Scrollable list with keyboard navigation.
+- Loading state + inline error.
+
+For 500+ models this is sufficient in v1. User types `sonnet`
+→ filters to ~5 rows. Types `opus` → 3 rows. Types `anthropic/`
+→ all Anthropic-upstream models.
+
+### Optional polish (stretch goal)
+
+If substring search feels slow or noisy in practice, two small
+improvements:
+
+1. **Fuzzy scoring.** Replace substring with `fuzzy_filter`
+   (already implemented in `anie-tui/src/widgets/select_list.rs`
+   tests; lift into a shared `fuzzy` utility). Scores matches
+   higher when characters appear contiguously or in word-start
+   positions.
+2. **Provider-prefix grouping.** When the filter is empty, show
+   section headers (`── anthropic ──`, `── openai ──`, etc.).
+   Implemented via list-item-kind extension in
+   `ModelPickerPane`.
+
+Both are out of scope for this plan's merge; ship a follow-up
+if v1 usability shows the need.
 
 ## Test plan
 
 | # | Test |
 |---|---|
-| 1 | `openrouter_preset_registered` — assert the catalog has the entry with the correct category. |
-| 2 | `openrouter_request_uses_nested_reasoning_object` — build a request body for an OpenRouter reasoning model, assert `reasoning.effort` is set as a nested object and `reasoning_effort` is absent. |
-| 3 | `openrouter_model_ids_preserve_provider_prefix` — the `anthropic/claude-sonnet-4.6` form roundtrips without the slash getting eaten by any path parsing. |
-| 4 | `openrouter_model_discovery_parses_models_endpoint` — fixture response from `/api/v1/models`, assert the cache populates at least one model. |
-| 5 | `openrouter_routing_preferences_propagate_when_configured` — per-model `openrouter_routing` with `{ order: ["anthropic"] }` surfaces in the outbound body's `provider` field. |
-| 6 | Manual smoke: configure key, send a prompt to `anthropic/claude-sonnet-4.6`, confirm a second turn replay works (tests the thinking-signature round-trip). |
+| 1 | `openrouter_preset_registered` — the onboarding shortlist includes OpenRouter. |
+| 2 | `openrouter_request_uses_nested_reasoning_object` — outbound body for a reasoning model has `reasoning.effort` and not `reasoning_effort`. |
+| 3 | `openrouter_request_body_without_reasoning_is_unchanged` — non-reasoning models emit plain Chat Completions shape. |
+| 4 | `openrouter_discovery_parses_models_endpoint_full_response` — fixture with the rich OpenRouter response; asserts pricing, context, modalities parse correctly. |
+| 5 | `openrouter_capability_mapping_sets_anthropic_replay_signature` — `anthropic/claude-sonnet-4.6` from discovery gets `requires_thinking_signature: true`. |
+| 6 | `openrouter_capability_mapping_reasoning_model_gets_nested_request_mode` — `openai/o3` gets `request_mode = NestedReasoning`. |
+| 7 | `openrouter_capability_mapping_non_reasoning_model_has_no_reasoning_cap` — `meta-llama/llama-3.3-70b-instruct` has `reasoning_capabilities = None`. |
+| 8 | `openrouter_routing_preferences_propagate_to_body` — with a `compat` carrying `openrouter_routing`, the outbound body includes the `provider` object. |
+| 9 | `openrouter_onboarding_populates_catalog_on_configure` — integration-level TUI test: add OpenRouter → assert catalog has >10 entries after the flow. |
+| 10 | `openrouter_discovery_failure_does_not_lose_credential` — discovery fetch fails, the key is still saved and the flow exits cleanly with a system message. |
+| 11 | Invariant suite: OpenRouter appears in every cross-provider invariant fixture in `provider_replay.rs`. |
 
 ## Exit criteria
 
-- [ ] OpenRouter appears in onboarding's shortlist and
-      `/providers` add picker.
-- [ ] User can configure an API key via the onboarding flow and
-      successfully run a two-turn conversation against
-      `anthropic/claude-sonnet-4.6`.
-- [ ] `ThinkingRequestMode::NestedReasoning` exists and the
-      OpenRouter reasoning catalog entries use it. The outbound
-      request body uses `reasoning.effort` (nested), not
-      `reasoning_effort`.
-- [ ] The initial eight-model catalog entries are present with
-      correct context windows.
-- [ ] Invariant test suite (from completed api_integrity plan 06)
-      exercises the OpenRouter preset at least once.
+- [ ] OpenRouter appears in the onboarding first-run shortlist.
+- [ ] Configuring OpenRouter via onboarding triggers a live
+      catalog discovery and returns with models immediately
+      available in `/model`.
+- [ ] A user with an OpenRouter key can run a two-turn
+      conversation against any upstream (Anthropic, OpenAI,
+      Google, Meta, DeepSeek, Mistral, Qwen) without editing
+      `config.toml`.
+- [ ] Reasoning models use the nested `reasoning.effort` body
+      shape.
+- [ ] Anthropic-upstream reasoning models survive turn-2 replay
+      (thinking signatures captured and echoed).
+- [ ] Invariant suite covers OpenRouter.
+- [ ] Manual smoke: two-turn conversation on
+      `anthropic/claude-sonnet-4.6` with thinking `high`
+      documented in the merge PR.
 
 ## Out of scope
 
-- Live-pricing fetch from `/api/v1/models` (nice-to-have).
-- `HTTP-Referer` / `X-Title` leaderboard headers (cosmetic;
-  revisit post-v1 if a user asks for leaderboard attribution).
-- UI surface for `openrouter_routing` preferences — v1 keeps them
-  `config.toml`-editable only. `/providers` form extension is a
-  follow-up.
-- OpenRouter OAuth flow (they do offer one; API key is the
-  common path).
+- **Curated model catalog.** No hand-authored OpenRouter entries
+  in `builtin_models()` — everything is discovery-driven.
+- **Preset catalog refactor** (plan `00_provider_selection_ux.md`).
+  Deferred to a future round when we're adding multiple
+  providers at once.
+- **Fuzzy search / provider-prefix grouping** in the model
+  picker. Ship with the current substring search; iterate if
+  users report usability issues.
+- **Leaderboard headers** (`HTTP-Referer`, `X-Title`). Cosmetic.
+- **UI surface for `openrouter_routing`**. Config-only in v1.
+- **OpenRouter OAuth flow**. API key is the common path.
+- **Live pricing refresh.** Pricing is captured once at
+  discovery and updated whenever the user triggers refresh.
+- **Encrypted-reasoning replay for o3 via OpenRouter.** Marked
+  false; addressed in plan 04 for users going direct to OpenAI.
+- **Every other provider plan in this folder.** xAI, Groq,
+  Cerebras, Mistral, Gemini, Azure, Bedrock, OpenAI Responses —
+  all deferred. The specs stay in place for when they're
+  prioritized.
 
 ## Dependencies
 
-- Plan 00 (provider selection UX) — provides the preset catalog
-  this plan's entry lands into.
-- None from earlier provider plans (this is plan 01).
+- Milestone 0 (foundation) from
+  [`execution/00_foundation.md`](execution/00_foundation.md):
+  only the two PRs that matter for OpenRouter — the `Model.compat`
+  blob and `ThinkingRequestMode::NestedReasoning`. The third
+  foundation PR (`thought_signature` for Gemini) is not needed
+  and is deferred.

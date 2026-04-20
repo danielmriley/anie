@@ -1,5 +1,16 @@
 # Add providers — planning index
 
+> **Current focus: OpenRouter only.** The user's working key is
+> OpenRouter, and OpenRouter's catalog (~500 models across every
+> frontier provider) covers the practical "I want to try model X"
+> need without adding more direct integrations. The other
+> per-provider plans in this folder stay in place as specs but
+> are **deferred** until there's concrete demand.
+>
+> Start reading at [`01_openrouter.md`](01_openrouter.md) for the
+> spec, then [`execution/README.md`](execution/README.md) for the
+> two-milestone PR sequence.
+
 This folder tracks the work of expanding anie's built-in provider
 set. The mechanical how-to — capability declaration, stream
 parser, error classifier, invariant tests, etc. — lives in
@@ -43,31 +54,30 @@ folder expands into.
 
 ## Priority ordering
 
-Ordered for impact per unit of effort. The ordering also mirrors
-implementation complexity: plan 1 is the most valuable and the
-fastest to land; plan 6 is the most invasive and lowest-priority.
-
-| # | Plan | Why now | Effort |
+| # | Plan | Status | Effort |
 |---|---|---|---|
-| 1 | [OpenRouter](01_openrouter.md) | One API key unlocks ~200 models across providers; the user's top-line request. Pure OpenAI-compat + aggregator-specific headers. | S |
-| 2 | [OpenAI-compatible batch (xAI, Groq, Cerebras, Mistral)](02_openai_compat_batch.md) | Same wire protocol as OpenAI, differ only in base URL, model catalog, and a couple of auth quirks. Batchable into one PR's worth of work. | S-M |
-| 3 | [Google Gemini](03_google_gemini.md) | First non-OpenAI, non-Anthropic native protocol. Unlocks Gemini Flash/Pro for users who already pay for Google AI Studio. Requires `GoogleGenerativeAI` provider module from scratch. | M |
-| 4 | [OpenAI Responses API](04_openai_responses_api.md) | Native path for o1/o3/Codex with encrypted reasoning. Requires extending `ReplayCapabilities` to cover `supports_encrypted_reasoning` and writing a new streaming parser. | M |
-| 5 | [Azure OpenAI](05_azure_openai.md) | Enterprise users. Same wire as OpenAI but with deployment-name routing and different auth headers. | S-M |
-| 6 | [Amazon Bedrock](06_amazon_bedrock.md) | Broad model access on AWS infra. Most complex auth (SigV4) and new streaming shape. | L |
+| 1 | [OpenRouter](01_openrouter.md) | **Active — sole focus** | S |
+| — | [Provider selection UX (preset catalog)](00_provider_selection_ux.md) | **Deferred** — only needed once a second provider ships | S |
+| 2 | [OpenAI-compatible batch (xAI, Groq, Cerebras, Mistral)](02_openai_compat_batch.md) | **Deferred** — reachable via OpenRouter for now | S-M |
+| 3 | [Google Gemini](03_google_gemini.md) | **Deferred** — reachable via OpenRouter | M |
+| 4 | [OpenAI Responses API](04_openai_responses_api.md) | **Deferred** — o3 reachable via OpenRouter | M |
+| 5 | [Azure OpenAI](05_azure_openai.md) | **Deferred** — enterprise-only need | S-M |
+| 6 | [Amazon Bedrock](06_amazon_bedrock.md) | **Deferred** — AWS-only need | L |
+
+Each deferred plan's spec file stays intact. Restart from its
+spec whenever prioritized. `pi_comparison.md` applies to all
+plans and continues to be the source of record for why our
+choices diverged from pi's.
 
 ## Shared prerequisite
 
-Every plan in this folder depends on:
-
-- **[`00_provider_selection_ux.md`](00_provider_selection_ux.md)** —
-  once the built-in set grows past five, the current onboarding
-  "pick a provider" picker and the `/providers` overlay need a
-  search-first presentation. This is the shared UX work that every
-  new provider would otherwise re-litigate.
-
-Land 00 first, then the provider plans can ship independently in
-any order (respecting their dependency notes).
+The preset-catalog UX refactor at
+[`00_provider_selection_ux.md`](00_provider_selection_ux.md) is
+**deferred** along with the other provider plans. Rationale: for
+adding just one new provider (OpenRouter), the existing
+onboarding form has room. The refactor is needed once a second
+new provider starts — that's the natural moment to amortize the
+UX work.
 
 ## Execution sequencing
 
