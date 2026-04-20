@@ -1270,22 +1270,51 @@ impl App {
 }
 
 /// Run the TUI event loop.
+/// Cap redraws at ~30 fps. A terminal UI with no animation
+/// faster than a spinner doesn't benefit from higher, and the
+/// cap bounds the worst-case rendering cost even when upstream
+/// events arrive much faster. Mirrors pi's `MIN_RENDER_INTERVAL_MS`
+/// pattern (pi picks 16 ms because it has per-component caching;
+/// we pick 33 ms pending PR 2's cache).
+const FRAME_BUDGET: Duration = Duration::from_millis(33);
+
+/// Idle poll interval when nothing is dirty. Matches the previous
+/// behavior so background worker polling cadence is unchanged.
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
 pub async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
 ) -> Result<()> {
     let mut term_events = EventStream::new();
-    // Start dirty so the first frame draws. We then only redraw
-    // when something mutated UI state, because `OutputPane::render`
-    // re-wraps every block in the transcript on every call — a
-    // long agent run with thousands of blocks turns each redraw
-    // into a visibly expensive operation.
+    // Request-based rendering: handlers set `dirty` when they
+    // change visible state; the render below actually draws only
+    // once the frame budget has elapsed. Multiple dirty-marks
+    // between draws collapse into one paint. See
+    // docs/tui_responsiveness/01_render_scheduling.md.
     let mut dirty = true;
+    // Pretend the last render happened a full frame ago so the
+    // first real draw fires immediately instead of waiting 33 ms.
+    let mut last_render_at = Instant::now()
+        .checked_sub(FRAME_BUDGET)
+        .unwrap_or_else(Instant::now);
+
     loop {
-        if dirty {
+        if dirty && last_render_at.elapsed() >= FRAME_BUDGET {
             terminal.draw(|frame| app.render(frame))?;
             dirty = false;
+            last_render_at = Instant::now();
         }
+
+        // Wait at most until the next frame opportunity (when
+        // dirty) or until the next idle tick (when clean). The
+        // sleep branch fires either way and the loop re-checks
+        // whether it's time to draw.
+        let timeout = if dirty {
+            FRAME_BUDGET.saturating_sub(last_render_at.elapsed())
+        } else {
+            IDLE_TICK
+        };
 
         tokio::select! {
             Some(Ok(event)) = term_events.next() => {
@@ -1306,7 +1335,7 @@ pub async fn run_tui(
                 }
                 dirty = true;
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            _ = tokio::time::sleep(timeout) => {
                 app.handle_tick()?;
                 // Only mark dirty when the tick actually changed
                 // something visible — during idle there is no
