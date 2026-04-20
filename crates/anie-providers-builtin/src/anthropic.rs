@@ -618,6 +618,18 @@ impl AnthropicStreamState {
                 }
             }
             "message_stop" => {
+                // Guard against a turn that ends with only thinking
+                // content (no visible text, no tool use). Without
+                // this, the user sees a thinking block and then the
+                // prompt returns — no answer. Mirrors the OpenAI
+                // path's `has_meaningful_content` check. The retry
+                // policy already classifies
+                // `EmptyAssistantResponse` as terminal, so the
+                // failure surfaces once and the user can adjust
+                // prompt or model.
+                if !self.has_visible_content() {
+                    return Err(ProviderError::EmptyAssistantResponse);
+                }
                 events.push(ProviderEvent::Done(self.into_message()));
             }
             "error" => {
@@ -634,6 +646,20 @@ impl AnthropicStreamState {
         }
 
         Ok(events)
+    }
+
+    /// Whether the accumulated blocks contain at least one block
+    /// the user can act on — a non-empty `Text` or a `ToolUse`
+    /// with a non-empty id. Thinking and redacted-thinking blocks
+    /// don't count: they don't give the user anything to respond
+    /// to. Mirrors the OpenAI provider's
+    /// `has_meaningful_content` (see `openai/streaming.rs`).
+    fn has_visible_content(&self) -> bool {
+        self.blocks.values().any(|block| match block {
+            AnthropicBlockState::Text(text) => !text.is_empty(),
+            AnthropicBlockState::ToolUse(tool_use) => !tool_use.id.is_empty(),
+            AnthropicBlockState::Thinking(_) | AnthropicBlockState::RedactedThinking(_) => false,
+        })
     }
 
     // Consumes the current state by marking `finished` and taking owned
@@ -920,6 +946,14 @@ mod tests {
 
     #[test]
     fn captures_signature_delta_on_thinking_block() {
+        // Parser-level test: drive a thinking block + signature
+        // and read the resulting message directly via
+        // `into_message`, skipping `message_stop`. The
+        // `message_stop` path now guards against thinking-only
+        // turns (see
+        // `message_stop_without_visible_content_returns_empty_assistant_response`),
+        // and the point of this test is that signature deltas are
+        // captured, not end-to-end stream validation.
         let mut state = AnthropicStreamState::new(sample_model());
         state
             .process_event(
@@ -948,16 +982,8 @@ mod tests {
         state
             .process_event("content_block_stop", r#"{"index":0}"#)
             .expect("block stop");
-        state
-            .process_event("message_delta", r#"{"delta":{"stop_reason":"end_turn"}}"#)
-            .expect("message delta");
-        let done = state
-            .process_event("message_stop", "{}")
-            .expect("message stop");
 
-        let ProviderEvent::Done(message) = done.last().expect("done event") else {
-            panic!("expected done event");
-        };
+        let message = state.into_message();
         assert!(
             message.content.iter().any(|block| matches!(
                 block,
@@ -965,6 +991,105 @@ mod tests {
                     if thinking == "reasoning" && sig == "SIG_abc"
             )),
             "expected thinking block with signature captured"
+        );
+    }
+
+    #[test]
+    fn message_stop_without_visible_content_returns_empty_assistant_response() {
+        // Regression for the "response ended with only a thinking
+        // block and gave the user the turn" bug. Anthropic's
+        // message_stop used to emit Done regardless of the
+        // accumulated content; now it guards against
+        // visible-content-less turns. The error then flows
+        // through the retry policy where
+        // `EmptyAssistantResponse` is terminal, so the user sees
+        // one clean error instead of a silent empty turn.
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"thinking"}}"#,
+            )
+            .expect("thinking start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"reasoning only"}}"#,
+            )
+            .expect("thinking delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+
+        let error = state
+            .process_event("message_stop", "{}")
+            .expect_err("message_stop must reject a thinking-only turn");
+        assert!(
+            matches!(error, ProviderError::EmptyAssistantResponse),
+            "expected EmptyAssistantResponse, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn message_stop_with_text_passes_visible_content_guard() {
+        // Belt-and-braces: happy-path regression to pin that the
+        // new guard doesn't reject normal turns with a text block.
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text"}}"#,
+            )
+            .expect("text start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+            )
+            .expect("text delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+
+        let done = state
+            .process_event("message_stop", "{}")
+            .expect("message_stop succeeds when text is present");
+        assert!(
+            matches!(done.last(), Some(ProviderEvent::Done(_))),
+            "expected a Done event"
+        );
+    }
+
+    #[test]
+    fn message_stop_with_only_tool_use_passes_visible_content_guard() {
+        // Tool-use-only turns are legitimate (tool_use stop
+        // reason). The guard must not reject them.
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"tool_use","id":"call_1","name":"read","input":{}}}"#,
+            )
+            .expect("tool start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}"#,
+            )
+            .expect("tool delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+        state
+            .process_event("message_delta", r#"{"delta":{"stop_reason":"tool_use"}}"#)
+            .expect("message delta");
+
+        let done = state
+            .process_event("message_stop", "{}")
+            .expect("tool-use-only turn passes the guard");
+        assert!(
+            matches!(done.last(), Some(ProviderEvent::Done(_))),
+            "expected a Done event"
         );
     }
 
