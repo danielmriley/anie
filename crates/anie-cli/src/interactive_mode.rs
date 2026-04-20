@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::mpsc;
 
 use anie_protocol::AgentEvent;
-use anie_tui::{App, install_panic_hook, restore_terminal, run_tui, setup_terminal};
+use anie_tui::{App, install_panic_hook, run_tui, setup_terminal};
 
 use crate::{
     Cli,
@@ -42,16 +42,24 @@ pub(crate) async fn run_interactive_mode(cli: Cli) -> Result<()> {
     apply_status_event(app.status_bar_mut(), &initial_status);
     app.load_transcript(&transcript);
 
-    let mut terminal = setup_terminal()?;
-    let result = run_tui(&mut terminal, &mut app).await;
-    restore_terminal(&mut terminal)?;
+    // The guard enters raw mode + alternate screen + mouse
+    // capture. On any exit path — normal return, `?` early
+    // return, or panic unwind — Drop restores the terminal, so
+    // the shell never ends up with leftover SGR mouse-tracking
+    // sequences firing on clicks/scrolls.
+    let mut terminal_guard = setup_terminal()?;
+    let run_result = run_tui(terminal_guard.terminal_mut(), &mut app).await;
+    // Explicit restore to surface any error; the Drop that
+    // follows is a no-op. If this fails (exceedingly rare),
+    // Drop will still swallow a retry best-effort.
+    terminal_guard.restore()?;
 
     match controller_task.await {
         Ok(controller_result) => controller_result?,
         Err(error) => return Err(anyhow!("interactive controller task failed: {error}")),
     }
 
-    result
+    run_result
 }
 
 fn apply_status_event(status_bar: &mut anie_tui::StatusBarState, event: &AgentEvent) {

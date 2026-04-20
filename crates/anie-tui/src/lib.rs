@@ -21,7 +21,7 @@ pub use overlays::{
     ProviderManagementAction, ProviderManagementScreen, ProviderType, TestResult,
     write_configured_providers,
 };
-pub use terminal::{install_panic_hook, restore_terminal, setup_terminal};
+pub use terminal::{TerminalGuard, install_panic_hook, restore_terminal, setup_terminal};
 
 #[cfg(test)]
 mod tests;

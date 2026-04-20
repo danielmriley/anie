@@ -8,8 +8,8 @@ use futures::StreamExt;
 use anie_auth::CredentialStore;
 use anie_config::{global_config_path, preferred_write_target};
 use anie_tui::{
-    OnboardingAction, OnboardingCompletion, OnboardingScreen, install_panic_hook, restore_terminal,
-    setup_terminal, write_configured_providers,
+    OnboardingAction, OnboardingCompletion, OnboardingScreen, install_panic_hook, setup_terminal,
+    write_configured_providers,
 };
 
 /// Detect whether this looks like a first run with no config or saved credentials.
@@ -33,11 +33,13 @@ pub async fn run_onboarding() -> Result<()> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let config_path = preferred_write_target(&cwd).context("home directory is not available")?;
     let mut screen = OnboardingScreen::new(CredentialStore::new());
-    let mut terminal = setup_terminal()?;
+    let mut terminal_guard = setup_terminal()?;
     let mut events = EventStream::new();
 
     let result: Result<Option<OnboardingCompletion>> = loop {
-        terminal.draw(|frame| screen.render(frame, frame.area()))?;
+        terminal_guard
+            .terminal_mut()
+            .draw(|frame| screen.render(frame, frame.area()))?;
 
         tokio::select! {
             Some(Ok(event)) = events.next() => {
@@ -59,7 +61,7 @@ pub async fn run_onboarding() -> Result<()> {
         }
     };
 
-    restore_terminal(&mut terminal)?;
+    terminal_guard.restore()?;
 
     let Some(completion) = result? else {
         println!("Onboarding cancelled.");
