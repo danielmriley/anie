@@ -9,6 +9,8 @@ use ratatui::{
 
 use anie_provider::ModelInfo;
 
+use crate::widgets::fuzzy::fuzzy_score;
+
 /// Outcome of processing a key in the model picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelPickerAction {
@@ -319,20 +321,31 @@ impl ModelPickerPane {
     }
 
     fn apply_filter(&mut self, preferred_id: Option<&str>) {
-        let search = self.search.value().to_ascii_lowercase();
-        self.filtered_indices = self
-            .models
-            .iter()
-            .enumerate()
-            .filter(|(_, model)| {
-                if search.is_empty() {
-                    return true;
-                }
-                model.id.to_ascii_lowercase().contains(&search)
-                    || model.name.to_ascii_lowercase().contains(&search)
-            })
-            .map(|(index, _)| index)
-            .collect();
+        let search = self.search.value();
+        if search.is_empty() {
+            self.filtered_indices = (0..self.models.len()).collect();
+        } else {
+            // Score every model by id and name; keep the better of
+            // the two scores. Sort best-first. Ties fall back to
+            // the original catalog order so the picker is stable
+            // between keystrokes that don't change the ranking.
+            let mut scored: Vec<(u32, usize)> = self
+                .models
+                .iter()
+                .enumerate()
+                .filter_map(|(index, model)| {
+                    let id_score = fuzzy_score(search, &model.id);
+                    let name_score = fuzzy_score(search, &model.name);
+                    id_score
+                        .into_iter()
+                        .chain(name_score)
+                        .max()
+                        .map(|score| (score, index))
+                })
+                .collect();
+            scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+            self.filtered_indices = scored.into_iter().map(|(_, index)| index).collect();
+        }
 
         if self.filtered_indices.is_empty() {
             self.selected = 0;
@@ -686,5 +699,110 @@ mod tests {
             .expect("draw frame");
         let screen = render_to_string(terminal.backend());
         assert!(screen.contains("✓"), "screen was:\n{screen}");
+    }
+
+    fn openrouter_catalog() -> Vec<ModelInfo> {
+        // Mixed catalog slice with ids that share substrings —
+        // useful for asserting fuzzy sort order without mocking a
+        // full 500-entry fixture.
+        let mk = |id: &str| ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            provider: "openrouter".into(),
+            context_length: Some(200_000),
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+        };
+        vec![
+            mk("meta-llama/llama-3.1-8b-instruct"),
+            mk("anthropic/claude-haiku-4-5"),
+            mk("anthropic/claude-sonnet-4"),
+            mk("openai/o3"),
+            mk("openai/gpt-4o"),
+            mk("google/gemini-2.5-pro"),
+            mk("mistralai/mistral-large"),
+            mk("some-vendor/claude-ish-knockoff"),
+        ]
+    }
+
+    #[test]
+    fn fuzzy_filter_orders_prefix_matches_ahead_of_substring_matches() {
+        // Typing "claude" in the OpenRouter picker should float
+        // the `anthropic/claude-*` entries ahead of
+        // `some-vendor/claude-ish-knockoff` (which only contains
+        // "claude" mid-id).
+        let mut picker = ModelPickerPane::new(
+            openrouter_catalog(),
+            "openrouter".into(),
+            "openai/gpt-4o".into(),
+            None,
+        );
+        for ch in "claude".chars() {
+            picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let ordered_ids: Vec<&str> = picker
+            .filtered_indices
+            .iter()
+            .map(|index| picker.models[*index].id.as_str())
+            .collect();
+        assert!(
+            ordered_ids.starts_with(&["anthropic/claude-haiku-4-5", "anthropic/claude-sonnet-4"])
+                || ordered_ids
+                    .starts_with(&["anthropic/claude-sonnet-4", "anthropic/claude-haiku-4-5"]),
+            "expected anthropic/claude-* to lead the results, got {ordered_ids:?}"
+        );
+        assert_eq!(ordered_ids.last(), Some(&"some-vendor/claude-ish-knockoff"));
+    }
+
+    #[test]
+    fn fuzzy_filter_supports_subsequence_across_upstream_prefix() {
+        // Typing "antc" (anthropic / claude via subsequence across
+        // word boundaries) still finds Claude entries even though
+        // no literal "antc" substring exists.
+        let mut picker = ModelPickerPane::new(
+            openrouter_catalog(),
+            "openrouter".into(),
+            "openai/gpt-4o".into(),
+            None,
+        );
+        for ch in "antc".chars() {
+            picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let ordered_ids: Vec<&str> = picker
+            .filtered_indices
+            .iter()
+            .map(|index| picker.models[*index].id.as_str())
+            .collect();
+        assert!(
+            ordered_ids
+                .iter()
+                .any(|id| id.starts_with("anthropic/claude")),
+            "subsequence search should reach anthropic/claude-*, got {ordered_ids:?}"
+        );
+    }
+
+    #[test]
+    fn fuzzy_filter_empty_query_preserves_catalog_order() {
+        let picker = ModelPickerPane::new(
+            openrouter_catalog(),
+            "openrouter".into(),
+            "openai/gpt-4o".into(),
+            None,
+        );
+        // No query → rendering uses the catalog's original order.
+        let ordered_ids: Vec<&str> = picker
+            .filtered_indices
+            .iter()
+            .map(|index| picker.models[*index].id.as_str())
+            .collect();
+        assert_eq!(
+            ordered_ids,
+            openrouter_catalog()
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }
