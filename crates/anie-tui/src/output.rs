@@ -49,9 +49,27 @@ pub struct ToolCallResult {
     pub elapsed: Option<Duration>,
 }
 
+/// Pre-wrapped lines for one block at a specific terminal width.
+/// Adopting pi's `(content, width) -> lines` component cache
+/// (`pi/tui/components/markdown.ts`). We keep the cache parallel
+/// to the block list rather than on each enum variant so the
+/// public `RenderedBlock` shape stays the same and every existing
+/// construction / pattern-match site is untouched.
+#[derive(Debug, Clone)]
+struct LineCache {
+    width: u16,
+    lines: Vec<Line<'static>>,
+}
+
 /// Scrollable output pane.
 pub struct OutputPane {
     blocks: Vec<RenderedBlock>,
+    /// Parallel to `blocks`. `caches[i]` holds the pre-wrapped
+    /// lines for `blocks[i]` at a given width; `None` on cache
+    /// miss. Every `blocks` mutation MUST keep this vector
+    /// aligned and invalidate the affected slot — see the
+    /// `invalidate_*` helpers below.
+    caches: Vec<Option<LineCache>>,
     scroll_offset: u16,
     auto_scroll: bool,
     last_total_lines: u16,
@@ -64,6 +82,7 @@ impl OutputPane {
     pub fn new() -> Self {
         Self {
             blocks: Vec::new(),
+            caches: Vec::new(),
             scroll_offset: 0,
             auto_scroll: true,
             last_total_lines: 0,
@@ -74,6 +93,19 @@ impl OutputPane {
     /// Add a transcript block.
     pub fn add_block(&mut self, block: RenderedBlock) {
         self.blocks.push(block);
+        self.caches.push(None);
+    }
+
+    fn invalidate_last(&mut self) {
+        if let Some(slot) = self.caches.last_mut() {
+            *slot = None;
+        }
+    }
+
+    fn invalidate_at(&mut self, index: usize) {
+        if let Some(slot) = self.caches.get_mut(index) {
+            *slot = None;
+        }
     }
 
     /// Read-only view of the current block list. Used by tests
@@ -113,6 +145,7 @@ impl OutputPane {
         if let Some(RenderedBlock::AssistantMessage { text: content, .. }) = self.blocks.last_mut()
         {
             content.push_str(text);
+            self.invalidate_last();
         }
     }
 
@@ -120,6 +153,7 @@ impl OutputPane {
     pub fn append_thinking_to_last_assistant(&mut self, text: &str) {
         if let Some(RenderedBlock::AssistantMessage { thinking, .. }) = self.blocks.last_mut() {
             thinking.push_str(text);
+            self.invalidate_last();
         }
     }
 
@@ -150,6 +184,7 @@ impl OutputPane {
             *is_streaming = false;
             *current_timestamp = timestamp;
             *current_error = error_message;
+            self.invalidate_last();
         }
     }
 
@@ -172,12 +207,16 @@ impl OutputPane {
         is_error: bool,
         elapsed: Option<Duration>,
     ) {
-        if let Some(RenderedBlock::ToolCall { result, .. }) = self.find_tool_call_mut(call_id) {
+        let Some(index) = self.find_tool_call_index(call_id) else {
+            return;
+        };
+        if let Some(RenderedBlock::ToolCall { result, .. }) = self.blocks.get_mut(index) {
             *result = Some(ToolCallResult {
                 content,
                 is_error,
                 elapsed,
             });
+            self.invalidate_at(index);
         }
     }
 
@@ -189,11 +228,14 @@ impl OutputPane {
         is_error: bool,
         elapsed: Option<Duration>,
     ) {
+        let Some(index) = self.find_tool_call_index(call_id) else {
+            return;
+        };
         if let Some(RenderedBlock::ToolCall {
             result,
             is_executing,
             ..
-        }) = self.find_tool_call_mut(call_id)
+        }) = self.blocks.get_mut(index)
         {
             *result = Some(ToolCallResult {
                 content,
@@ -201,6 +243,7 @@ impl OutputPane {
                 elapsed,
             });
             *is_executing = false;
+            self.invalidate_at(index);
         }
     }
 
@@ -212,6 +255,7 @@ impl OutputPane {
     /// Clear transcript contents.
     pub fn clear(&mut self) {
         self.blocks.clear();
+        self.caches.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.last_total_lines = 0;
@@ -270,7 +314,7 @@ impl OutputPane {
         buf: &mut ratatui::buffer::Buffer,
         spinner_frame: &str,
     ) {
-        let lines = self.to_lines(area.width.max(1), spinner_frame);
+        let lines = self.build_lines(area.width.max(1), spinner_frame);
         self.last_total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         self.last_viewport_height = area.height.max(1);
         let scroll = self.current_scroll();
@@ -280,22 +324,54 @@ impl OutputPane {
             .render(area, buf);
     }
 
-    fn to_lines(&self, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        for block in &self.blocks {
-            if !lines.is_empty() {
-                lines.push(Line::default());
+    fn build_lines(&mut self, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
+        debug_assert_eq!(
+            self.blocks.len(),
+            self.caches.len(),
+            "block and cache vectors must stay parallel",
+        );
+        let mut out = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            if !out.is_empty() {
+                out.push(Line::default());
             }
-            lines.extend(block_lines(block, width, spinner_frame));
+
+            // Spinner-bearing blocks (`is_streaming` /
+            // `is_executing`) change every tick independent of the
+            // block's state, so they skip the cache. Usually only
+            // 1-2 of these exist at a time (the current streaming
+            // assistant and whichever tool is executing), so
+            // recomputing them each frame is cheap relative to the
+            // transcript walk we're collapsing.
+            let hits_cache = !block_has_animated_content(block);
+
+            if hits_cache
+                && let Some(cached) = self.caches.get(index).and_then(Option::as_ref)
+                && cached.width == width
+            {
+                out.extend(cached.lines.iter().cloned());
+                continue;
+            }
+
+            let computed = block_lines(block, width, spinner_frame);
+            if hits_cache
+                && let Some(slot) = self.caches.get_mut(index)
+            {
+                *slot = Some(LineCache {
+                    width,
+                    lines: computed.clone(),
+                });
+            }
+            out.extend(computed);
         }
-        if lines.is_empty() {
-            lines.push(Line::default());
+        if out.is_empty() {
+            out.push(Line::default());
         }
-        lines
+        out
     }
 
-    fn find_tool_call_mut(&mut self, call_id: &str) -> Option<&mut RenderedBlock> {
-        self.blocks.iter_mut().find(|block| {
+    fn find_tool_call_index(&self, call_id: &str) -> Option<usize> {
+        self.blocks.iter().position(|block| {
             matches!(
                 block,
                 RenderedBlock::ToolCall {
@@ -329,6 +405,17 @@ impl OutputPane {
 impl Default for OutputPane {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Whether rendering `block` produces spinner-dependent output
+/// that changes between ticks even when the block's state does
+/// not. Such blocks skip the line cache — see `OutputPane::build_lines`.
+fn block_has_animated_content(block: &RenderedBlock) -> bool {
+    match block {
+        RenderedBlock::AssistantMessage { is_streaming, .. } => *is_streaming,
+        RenderedBlock::ToolCall { is_executing, .. } => *is_executing,
+        RenderedBlock::UserMessage { .. } | RenderedBlock::SystemMessage { .. } => false,
     }
 }
 
@@ -698,5 +785,221 @@ fn format_tool_title(tool_name: &str, args_display: &str) -> String {
             format!("{tool_name} {args_display}")
         }
         _ => tool_name.to_string(),
+    }
+}
+
+#[cfg(test)]
+impl OutputPane {
+    /// Whether `blocks[index]` currently has a cached line set.
+    /// Test-only accessor so cache-behavior tests can assert hit /
+    /// miss / invalidation without peeking at private fields.
+    pub(crate) fn is_cached(&self, index: usize) -> bool {
+        self.caches.get(index).is_some_and(Option::is_some)
+    }
+
+    /// Number of block slots (should always equal `blocks.len()`).
+    pub(crate) fn cache_slot_count(&self) -> usize {
+        self.caches.len()
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn pane_with_settled_history() -> OutputPane {
+        let mut pane = OutputPane::new();
+        pane.add_user_message("first question".into(), 1);
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("an answer");
+        pane.finalize_last_assistant(
+            "an answer".into(),
+            String::new(),
+            2,
+            None,
+        );
+        pane.add_user_message("second question".into(), 3);
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("another answer");
+        pane.finalize_last_assistant(
+            "another answer".into(),
+            String::new(),
+            4,
+            None,
+        );
+        pane
+    }
+
+    #[test]
+    fn cache_starts_empty_and_parallels_blocks() {
+        let pane = pane_with_settled_history();
+        assert_eq!(pane.cache_slot_count(), pane.blocks().len());
+        for index in 0..pane.blocks().len() {
+            assert!(!pane.is_cached(index));
+        }
+    }
+
+    #[test]
+    fn to_lines_populates_cache_for_non_animated_blocks() {
+        let mut pane = pane_with_settled_history();
+        let _ = pane.build_lines(80, ".");
+        for index in 0..pane.blocks().len() {
+            assert!(
+                pane.is_cached(index),
+                "block {index} should cache after first render"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_hit_returns_identical_output_as_fresh_compute() {
+        let mut pane = pane_with_settled_history();
+        let first = pane.build_lines(80, ".");
+        let second = pane.build_lines(80, ".");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn width_change_invalidates_cache_implicitly() {
+        // Use text long enough that wrapping changes noticeably
+        // between the two widths.
+        let long_answer = "one two three four five six seven eight nine ten "
+            .repeat(8);
+        let mut pane = OutputPane::new();
+        pane.add_user_message("prompt".into(), 1);
+        pane.add_streaming_assistant();
+        pane.finalize_last_assistant(long_answer, String::new(), 2, None);
+
+        let wide = pane.build_lines(120, ".");
+        // The cache is at width=120 now. Render at width=20:
+        // different wrapping, different line count.
+        let narrow = pane.build_lines(20, ".");
+        assert_ne!(
+            wide.len(),
+            narrow.len(),
+            "wrapping at different widths must produce different line counts",
+        );
+        // Cache was repopulated at the new width.
+        for index in 0..pane.blocks().len() {
+            assert!(pane.is_cached(index));
+        }
+    }
+
+    #[test]
+    fn append_invalidates_only_the_last_block() {
+        let mut pane = pane_with_settled_history();
+        let _ = pane.build_lines(80, ".");
+        // Start a new streaming block so appends land on it.
+        pane.add_streaming_assistant();
+        let _ = pane.build_lines(80, ".");
+        pane.append_to_last_assistant("new token");
+
+        let last = pane.blocks().len() - 1;
+        assert!(
+            !pane.is_cached(last),
+            "streaming block should be invalidated after append"
+        );
+        for index in 0..last {
+            assert!(
+                pane.is_cached(index),
+                "earlier block {index} should stay cached"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_invalidates_last_and_caches_on_next_render() {
+        let mut pane = pane_with_settled_history();
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("partial");
+        let _ = pane.build_lines(80, ".");
+        // Streaming blocks skip the cache entirely.
+        let last = pane.blocks().len() - 1;
+        assert!(!pane.is_cached(last));
+        pane.finalize_last_assistant(
+            "partial answer".into(),
+            String::new(),
+            5,
+            None,
+        );
+        let _ = pane.build_lines(80, ".");
+        assert!(
+            pane.is_cached(last),
+            "finalized block should cache after next render"
+        );
+    }
+
+    #[test]
+    fn tool_call_update_invalidates_only_that_block() {
+        let mut pane = OutputPane::new();
+        pane.add_user_message("run tool".into(), 1);
+        pane.add_tool_call("call_1".into(), "read".into(), "path.rs".into());
+        pane.finalize_tool_result(
+            "call_1",
+            "contents".into(),
+            false,
+            Some(Duration::from_millis(50)),
+        );
+        pane.add_tool_call("call_2".into(), "bash".into(), "ls".into());
+        pane.finalize_tool_result(
+            "call_2",
+            "output".into(),
+            false,
+            Some(Duration::from_millis(10)),
+        );
+        let _ = pane.build_lines(80, ".");
+        for index in 0..pane.blocks().len() {
+            assert!(pane.is_cached(index));
+        }
+
+        // Mutating call_1's result must only invalidate call_1.
+        pane.finalize_tool_result(
+            "call_1",
+            "updated contents".into(),
+            false,
+            Some(Duration::from_millis(60)),
+        );
+        assert!(!pane.is_cached(1), "call_1 (index 1) should invalidate");
+        assert!(pane.is_cached(2), "call_2 (index 2) should stay cached");
+        assert!(pane.is_cached(0), "user message should stay cached");
+    }
+
+    #[test]
+    fn animated_streaming_block_never_caches() {
+        let mut pane = OutputPane::new();
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("live");
+        let _ = pane.build_lines(80, ".");
+        assert!(
+            !pane.is_cached(0),
+            "streaming assistant must not be cached (spinner animates)"
+        );
+        let _ = pane.build_lines(80, "#");
+        assert!(!pane.is_cached(0));
+    }
+
+    #[test]
+    fn animated_tool_call_never_caches_until_finalized() {
+        let mut pane = OutputPane::new();
+        pane.add_tool_call("call".into(), "bash".into(), "sleep 1".into());
+        let _ = pane.build_lines(80, ".");
+        assert!(!pane.is_cached(0));
+        pane.finalize_tool_result(
+            "call",
+            "done".into(),
+            false,
+            Some(Duration::from_millis(1_000)),
+        );
+        let _ = pane.build_lines(80, ".");
+        assert!(pane.is_cached(0));
+    }
+
+    #[test]
+    fn clear_drops_all_caches() {
+        let mut pane = pane_with_settled_history();
+        let _ = pane.build_lines(80, ".");
+        pane.clear();
+        assert_eq!(pane.cache_slot_count(), 0);
+        assert_eq!(pane.blocks().len(), 0);
     }
 }
