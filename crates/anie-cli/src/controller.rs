@@ -7,7 +7,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{Instant, sleep_until},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -48,6 +52,15 @@ pub(crate) struct InteractiveController {
     ui_action_rx: mpsc::Receiver<UiAction>,
     event_tx: mpsc::Sender<AgentEvent>,
     current_run: Option<CurrentRun>,
+    /// Between-runs state for a pending transient retry. Set when
+    /// the retry policy decides to back off; cleared either when
+    /// the deadline fires (we start the continuation) or when the
+    /// user aborts/quits during the wait. Holding this as state
+    /// instead of an inline `tokio::time::sleep(...)` lets the
+    /// main `select!` keep polling `ui_action_rx` throughout the
+    /// backoff, which is what makes Ctrl+C responsive during
+    /// retries.
+    pending_retry: PendingRetry,
     quitting: bool,
     exit_after_run: bool,
 }
@@ -57,6 +70,25 @@ struct CurrentRun {
     cancel: CancellationToken,
     already_compacted: bool,
     retry_attempt: u32,
+}
+
+/// The between-runs timer for transient-retry backoff.
+///
+/// `Idle` is the default state after a run completes. `Armed`
+/// records the future continuation: its deadline, and the retry
+/// bookkeeping (`attempt`, `already_compacted`) that a fresh
+/// `CurrentRun` would otherwise carry. On deadline fire the
+/// controller starts a continuation run with the captured values;
+/// on user abort/quit the controller clears the state without
+/// starting anything.
+#[derive(Debug, Clone, Copy)]
+enum PendingRetry {
+    Idle,
+    Armed {
+        deadline: Instant,
+        attempt: u32,
+        already_compacted: bool,
+    },
 }
 
 impl InteractiveController {
@@ -71,6 +103,7 @@ impl InteractiveController {
             ui_action_rx,
             event_tx,
             current_run: None,
+            pending_retry: PendingRetry::Idle,
             quitting: false,
             exit_after_run,
         }
@@ -86,6 +119,9 @@ impl InteractiveController {
             .await;
 
         loop {
+            // Three-way state dispatch. Each arm polls
+            // `ui_action_rx` so user actions are never ignored
+            // while a run is in flight or a retry is armed.
             if let Some(current_run) = &mut self.current_run {
                 tokio::select! {
                     maybe_action = self.ui_action_rx.recv() => {
@@ -125,16 +161,22 @@ impl InteractiveController {
                                             }
                                         }
                                         RetryDecision::Retry { attempt, delay_ms } => {
+                                            // Emit RetryScheduled and arm the backoff state.
+                                            // The main loop's PendingRetry arm will fire
+                                            // the continuation when the deadline elapses.
                                             self.state
-                                                .schedule_transient_retry_with_delay(
+                                                .emit_retry_scheduled(
                                                     &self.event_tx,
                                                     error,
                                                     attempt,
                                                     delay_ms,
                                                 )
                                                 .await?;
-                                            self.start_continuation_run(already_compacted, attempt)
-                                                .await?;
+                                            self.pending_retry = PendingRetry::Armed {
+                                                deadline: Instant::now() + Duration::from_millis(delay_ms),
+                                                attempt,
+                                                already_compacted,
+                                            };
                                         }
                                         RetryDecision::GiveUp { reason } => {
                                             info!(?reason, retry_attempt, error = %error, "not retrying provider error");
@@ -151,9 +193,31 @@ impl InteractiveController {
                                 }).await;
                             }
                         }
-                        if self.exit_after_run && self.current_run.is_none() {
+                        if self.exit_after_run
+                            && self.current_run.is_none()
+                            && matches!(self.pending_retry, PendingRetry::Idle)
+                        {
                             self.quitting = true;
                         }
+                    }
+                }
+            } else if let PendingRetry::Armed { deadline, attempt, already_compacted } = self.pending_retry {
+                tokio::select! {
+                    maybe_action = self.ui_action_rx.recv() => {
+                        match maybe_action {
+                            Some(action) => self.handle_action(action).await?,
+                            None => {
+                                // Upstream hung up while backoff
+                                // was armed. Drop the retry and
+                                // fall through to the quit path.
+                                self.pending_retry = PendingRetry::Idle;
+                                self.quitting = true;
+                            }
+                        }
+                    }
+                    _ = sleep_until(deadline) => {
+                        self.pending_retry = PendingRetry::Idle;
+                        self.start_continuation_run(already_compacted, attempt).await?;
                     }
                 }
             } else {
@@ -163,7 +227,10 @@ impl InteractiveController {
                 }
             }
 
-            if self.quitting && self.current_run.is_none() {
+            if self.quitting
+                && self.current_run.is_none()
+                && matches!(self.pending_retry, PendingRetry::Idle)
+            {
                 break;
             }
         }
@@ -211,6 +278,9 @@ impl InteractiveController {
             UiAction::Abort => {
                 if let Some(current_run) = &self.current_run {
                     current_run.cancel.cancel();
+                } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+                    self.pending_retry = PendingRetry::Idle;
+                    self.send_system_message("Retry aborted by user.").await;
                 }
             }
             UiAction::Quit => {
@@ -218,6 +288,11 @@ impl InteractiveController {
                 if let Some(current_run) = &self.current_run {
                     current_run.cancel.cancel();
                 }
+                // A pending retry is in-memory state; clearing it
+                // here ensures the outer quit-check tears the loop
+                // down in the next iteration instead of waiting
+                // for the deadline.
+                self.pending_retry = PendingRetry::Idle;
             }
             UiAction::SetModel(requested) => {
                 if self.current_run.is_some() {
@@ -403,6 +478,14 @@ impl InteractiveController {
             thinking = %format_thinking(self.state.config.current_thinking()),
             "starting interactive run"
         );
+        // A fresh user prompt supersedes any pending retry from
+        // the previous turn — without this, the retry's continuation
+        // would spawn after the new prompt finishes and interleave
+        // on stale context.
+        if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+            info!("cancelling pending retry in favor of new prompt");
+            self.pending_retry = PendingRetry::Idle;
+        }
         self.state.refresh_system_prompt_if_needed();
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],
@@ -665,7 +748,15 @@ impl ControllerState {
         Ok(())
     }
 
-    async fn schedule_transient_retry_with_delay(
+    /// Emit the `RetryScheduled` event and refresh the transcript
+    /// so the UI knows a retry is pending.
+    ///
+    /// No longer sleeps — the backoff is handled by the main
+    /// controller loop via `PendingRetry::Armed`. Keeping the
+    /// function named `emit_retry_scheduled` rather than reusing
+    /// the old name makes it clear at call sites that the sleep
+    /// has moved.
+    async fn emit_retry_scheduled(
         &mut self,
         event_tx: &mpsc::Sender<AgentEvent>,
         error: &ProviderError,
@@ -684,7 +775,6 @@ impl ControllerState {
         .await;
         self.emit_transcript_replace_and_status(event_tx).await;
         info!(retry_attempt, delay_ms, error = %error, "scheduling transient provider retry");
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         Ok(())
     }
 

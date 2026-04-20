@@ -500,3 +500,280 @@ async fn help_command_emits_system_message_with_registry_output() {
         AgentEvent::SystemMessage { text } if text == expected
     ));
 }
+
+// =============================================================================
+// Plan 13 phase A — non-blocking retry backoff.
+//
+// These tests drive a live controller via its ui_action channel
+// so they can inject abort/quit/etc. during the backoff window.
+// They use `tokio::time::pause` where needed so they don't
+// actually wait on wall-clock delays.
+// =============================================================================
+
+/// Build a controller ready to accept user actions. Returns the
+/// action sender, event receiver, and the `JoinHandle` for the
+/// run task so the test can await shutdown.
+fn spawn_live_controller(
+    scripts: Vec<MockStreamScript>,
+    retry_config: RetryConfig,
+) -> (
+    mpsc::Sender<UiAction>,
+    mpsc::Receiver<AgentEvent>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let tempdir = tempdir().expect("tempdir");
+    let cwd = tempdir.path().join("cwd");
+    let sessions_dir = tempdir.path().join("sessions");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+    let mut config = AnieConfig::default();
+    config.compaction.enabled = false;
+    let tool_registry = build_tool_registry(&cwd, true);
+    let prompt_cache =
+        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("prompt cache");
+
+    let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
+
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        ApiKind::OpenAICompletions,
+        Box::new(MockProvider::new(scripts)),
+    );
+
+    let state = ControllerState {
+        config: ConfigState::new(
+            config.clone(),
+            RuntimeState::default(),
+            model("gpt-4o", "openai"),
+            ThinkingLevel::Medium,
+            None,
+        ),
+        session: SessionHandle::from_manager(session, sessions_dir, cwd),
+        model_catalog: vec![model("gpt-4o", "openai")],
+        provider_registry: Arc::new(provider_registry),
+        tool_registry,
+        request_options_resolver: Arc::new(AuthResolver::new(None, config)),
+        prompt_cache,
+        retry_config,
+        command_registry: crate::commands::CommandRegistry::with_builtins(),
+    };
+
+    let (event_tx, event_rx) = mpsc::channel(128);
+    let (ui_action_tx, ui_action_rx) = mpsc::channel(8);
+    let controller = InteractiveController::new(state, ui_action_rx, event_tx, false);
+    let handle = tokio::spawn(async move { controller.run().await });
+
+    (ui_action_tx, event_rx, handle)
+}
+
+/// Drain events from `rx` until `predicate` returns Some. Returns
+/// the matching event along with every event drained up to that
+/// point (inclusive).
+async fn wait_for_event<F>(
+    rx: &mut mpsc::Receiver<AgentEvent>,
+    mut predicate: F,
+) -> (Vec<AgentEvent>, AgentEvent)
+where
+    F: FnMut(&AgentEvent) -> bool,
+{
+    let mut seen = Vec::new();
+    loop {
+        let event = rx.recv().await.expect("event");
+        if predicate(&event) {
+            seen.push(event.clone());
+            return (seen, event);
+        }
+        seen.push(event);
+    }
+}
+
+fn retry_config_for_tests(delay_ms: u64, max_retries: u32) -> RetryConfig {
+    RetryConfig {
+        initial_delay_ms: delay_ms,
+        max_delay_ms: delay_ms,
+        backoff_multiplier: 1.0,
+        max_retries,
+        jitter: false,
+    }
+}
+
+#[tokio::test]
+async fn retry_backoff_polls_ui_actions() {
+    // Regression: during transient-retry backoff, the controller
+    // used to block on `tokio::time::sleep` and ignore
+    // `ui_action_rx`. Any user action submitted during that
+    // window was invisible until the sleep returned. After the
+    // fix, the main `select!` polls actions alongside a
+    // `sleep_until(deadline)` branch.
+    tokio::time::pause();
+
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![
+            MockStreamScript::from_error(ProviderError::Transport("dns".into())),
+            MockStreamScript::from_message(assistant_message("eventually ok")),
+        ],
+        retry_config_for_tests(60_000, 3),
+    );
+
+    ui_tx
+        .send(UiAction::SubmitPrompt("go".into()))
+        .await
+        .expect("submit prompt");
+
+    // Wait for retry to be armed.
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::RetryScheduled { .. })
+    })
+    .await;
+
+    // UI action during the backoff window arrives and is
+    // processed promptly. If this test ever hangs, the
+    // non-blocking backoff isn't in place.
+    ui_tx
+        .send(UiAction::GetState)
+        .await
+        .expect("send GetState");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::SystemMessage { text } if text.contains("Session:"))
+    })
+    .await;
+
+    // Clean up: advance time past the retry deadline so the
+    // continuation runs and the controller drains.
+    tokio::time::advance(Duration::from_millis(60_001)).await;
+    ui_tx.send(UiAction::Quit).await.expect("quit");
+    drop(ui_tx);
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+}
+
+#[tokio::test]
+async fn abort_during_retry_backoff_cancels_retry() {
+    // Regression: `UiAction::Abort` during backoff clears the
+    // pending retry. No continuation run must spawn, even after
+    // the deadline elapses.
+    tokio::time::pause();
+
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![
+            MockStreamScript::from_error(ProviderError::Transport("dns".into())),
+            MockStreamScript::from_message(assistant_message("should never run")),
+        ],
+        retry_config_for_tests(60_000, 3),
+    );
+
+    ui_tx
+        .send(UiAction::SubmitPrompt("go".into()))
+        .await
+        .expect("submit prompt");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::RetryScheduled { .. })
+    })
+    .await;
+
+    ui_tx.send(UiAction::Abort).await.expect("abort");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::SystemMessage { text } if text == "Retry aborted by user.")
+    })
+    .await;
+
+    // Advance past the original retry deadline — the continuation
+    // must not fire because the pending_retry state was cleared.
+    tokio::time::advance(Duration::from_millis(60_001)).await;
+
+    // Close the action channel to let the controller exit.
+    drop(ui_tx);
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+
+    // Assert only the single initial AgentStart was emitted —
+    // no continuation run spawned.
+    let remaining: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    let agent_starts = remaining
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::AgentStart))
+        .count();
+    assert_eq!(
+        agent_starts, 0,
+        "no second AgentStart after abort; drained events: {remaining:#?}"
+    );
+}
+
+#[tokio::test]
+async fn quit_during_retry_backoff_exits_cleanly() {
+    // Regression: `UiAction::Quit` during backoff exits the
+    // controller without waiting for the deadline and without
+    // spawning a continuation.
+    tokio::time::pause();
+
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![
+            MockStreamScript::from_error(ProviderError::Transport("dns".into())),
+            MockStreamScript::from_message(assistant_message("should never run")),
+        ],
+        retry_config_for_tests(60_000, 3),
+    );
+
+    ui_tx
+        .send(UiAction::SubmitPrompt("go".into()))
+        .await
+        .expect("submit prompt");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::RetryScheduled { .. })
+    })
+    .await;
+
+    ui_tx.send(UiAction::Quit).await.expect("quit");
+
+    // Controller must terminate without needing the deadline.
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+}
+
+#[tokio::test]
+async fn retry_fires_continuation_when_deadline_elapses() {
+    // Happy path: without any intervening user action, the
+    // deadline fires and the continuation run starts. This pins
+    // that the refactor didn't break the normal retry path.
+    tokio::time::pause();
+
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![
+            MockStreamScript::from_error(ProviderError::Transport("dns".into())),
+            MockStreamScript::from_message(assistant_message("recovered")),
+        ],
+        retry_config_for_tests(60_000, 3),
+    );
+
+    ui_tx
+        .send(UiAction::SubmitPrompt("go".into()))
+        .await
+        .expect("submit prompt");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::RetryScheduled { .. })
+    })
+    .await;
+
+    // Advance past the deadline — the second run should start.
+    tokio::time::advance(Duration::from_millis(60_001)).await;
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::AgentEnd { messages }
+            if messages.iter().any(|m| matches!(m,
+                Message::Assistant(a) if a.content.iter().any(|b|
+                    matches!(b, ContentBlock::Text { text } if text == "recovered")))))
+    })
+    .await;
+
+    ui_tx.send(UiAction::Quit).await.expect("quit");
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+}
