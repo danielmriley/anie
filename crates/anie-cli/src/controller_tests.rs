@@ -108,13 +108,12 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
-    let (ui_action_tx, ui_action_rx) = mpsc::channel(8);
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     let controller = InteractiveController::new(state, ui_action_rx, event_tx, true);
     let controller_task = tokio::spawn(async move { controller.run().await });
 
     ui_action_tx
         .send(UiAction::SubmitPrompt("retry me".into()))
-        .await
         .expect("submit prompt");
 
     controller_task
@@ -288,7 +287,7 @@ fn build_dispatch_controller(
 ) -> (
     InteractiveController,
     mpsc::Receiver<AgentEvent>,
-    mpsc::Sender<UiAction>,
+    mpsc::UnboundedSender<UiAction>,
 ) {
     let tempdir = tempdir().expect("tempdir");
     let cwd = tempdir.path().join("cwd");
@@ -328,7 +327,7 @@ fn build_dispatch_controller(
         command_registry: crate::commands::CommandRegistry::with_builtins(),
     };
 
-    let (ui_action_tx, ui_action_rx) = mpsc::channel(8);
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::channel(event_capacity);
     let controller = InteractiveController::new(state, ui_action_rx, event_tx, false);
 
@@ -485,7 +484,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         command_registry,
     };
 
-    let (_ui_action_tx, ui_action_rx) = mpsc::channel(1);
+    let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut controller = InteractiveController::new(state, ui_action_rx, event_tx, false);
 
@@ -517,7 +516,7 @@ fn spawn_live_controller(
     scripts: Vec<MockStreamScript>,
     retry_config: RetryConfig,
 ) -> (
-    mpsc::Sender<UiAction>,
+    mpsc::UnboundedSender<UiAction>,
     mpsc::Receiver<AgentEvent>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
@@ -560,7 +559,7 @@ fn spawn_live_controller(
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);
-    let (ui_action_tx, ui_action_rx) = mpsc::channel(8);
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     let controller = InteractiveController::new(state, ui_action_rx, event_tx, false);
     let handle = tokio::spawn(async move { controller.run().await });
 
@@ -618,7 +617,6 @@ async fn retry_backoff_polls_ui_actions() {
 
     ui_tx
         .send(UiAction::SubmitPrompt("go".into()))
-        .await
         .expect("submit prompt");
 
     // Wait for retry to be armed.
@@ -632,7 +630,6 @@ async fn retry_backoff_polls_ui_actions() {
     // non-blocking backoff isn't in place.
     ui_tx
         .send(UiAction::GetState)
-        .await
         .expect("send GetState");
     wait_for_event(&mut event_rx, |event| {
         matches!(event, AgentEvent::SystemMessage { text } if text.contains("Session:"))
@@ -642,7 +639,7 @@ async fn retry_backoff_polls_ui_actions() {
     // Clean up: advance time past the retry deadline so the
     // continuation runs and the controller drains.
     tokio::time::advance(Duration::from_millis(60_001)).await;
-    ui_tx.send(UiAction::Quit).await.expect("quit");
+    ui_tx.send(UiAction::Quit).expect("quit");
     drop(ui_tx);
     handle
         .await
@@ -667,14 +664,13 @@ async fn abort_during_retry_backoff_cancels_retry() {
 
     ui_tx
         .send(UiAction::SubmitPrompt("go".into()))
-        .await
         .expect("submit prompt");
     wait_for_event(&mut event_rx, |event| {
         matches!(event, AgentEvent::RetryScheduled { .. })
     })
     .await;
 
-    ui_tx.send(UiAction::Abort).await.expect("abort");
+    ui_tx.send(UiAction::Abort).expect("abort");
     wait_for_event(&mut event_rx, |event| {
         matches!(event, AgentEvent::SystemMessage { text } if text == "Retry aborted by user.")
     })
@@ -721,14 +717,13 @@ async fn quit_during_retry_backoff_exits_cleanly() {
 
     ui_tx
         .send(UiAction::SubmitPrompt("go".into()))
-        .await
         .expect("submit prompt");
     wait_for_event(&mut event_rx, |event| {
         matches!(event, AgentEvent::RetryScheduled { .. })
     })
     .await;
 
-    ui_tx.send(UiAction::Quit).await.expect("quit");
+    ui_tx.send(UiAction::Quit).expect("quit");
 
     // Controller must terminate without needing the deadline.
     handle
@@ -754,7 +749,6 @@ async fn retry_fires_continuation_when_deadline_elapses() {
 
     ui_tx
         .send(UiAction::SubmitPrompt("go".into()))
-        .await
         .expect("submit prompt");
     wait_for_event(&mut event_rx, |event| {
         matches!(event, AgentEvent::RetryScheduled { .. })
@@ -771,7 +765,125 @@ async fn retry_fires_continuation_when_deadline_elapses() {
     })
     .await;
 
-    ui_tx.send(UiAction::Quit).await.expect("quit");
+    ui_tx.send(UiAction::Quit).expect("quit");
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+}
+
+// =============================================================================
+// Plan 13 phase B — unbounded UiAction channel.
+//
+// Previously `action_tx` was a bounded `mpsc::Sender<UiAction>`
+// sized at 64, and every call site used `try_send` with the
+// `Err` dropped. Combined with the (now-fixed) blocking retry
+// backoff in Phase A, a user could submit actions into a full
+// channel and have them silently discarded. After the switch to
+// `unbounded_channel`, `send` is synchronous and can only fail
+// if the receiver has been dropped — the "channel is full" error
+// no longer exists.
+// =============================================================================
+
+#[tokio::test]
+async fn unbounded_action_channel_accepts_burst_without_drops() {
+    // Enqueue a large number of idempotent actions back-to-back.
+    // With the previous bounded channel (capacity 64) only the
+    // first 64 would have been accepted. With the unbounded
+    // channel every send succeeds and the controller drains the
+    // whole burst.
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![MockStreamScript::from_message(assistant_message("ok"))],
+        retry_config_for_tests(1, 0),
+    );
+
+    const BURST: usize = 1_000;
+    for _ in 0..BURST {
+        ui_tx
+            .send(UiAction::GetState)
+            .expect("unbounded send never fails while receiver is live");
+    }
+
+    // Drain `BURST` status responses. Each GetState emits one
+    // StatusUpdate and one SystemMessage; we count the system
+    // messages since they are the controller-side evidence that
+    // the action was processed.
+    let mut processed = 0;
+    while processed < BURST {
+        let event = event_rx.recv().await.expect("event");
+        if matches!(event, AgentEvent::SystemMessage { ref text } if text.starts_with("Session:"))
+        {
+            processed += 1;
+        }
+    }
+    assert_eq!(processed, BURST);
+
+    ui_tx.send(UiAction::Quit).expect("quit");
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+}
+
+#[tokio::test]
+async fn send_to_closed_action_channel_errors_without_panic() {
+    // When the controller has exited, the receiver is dropped
+    // and any subsequent `send` returns `Err(SendError)`. The
+    // failure must be non-panicking; TUI call sites that use
+    // `let _ = action_tx.send(...)` rely on this.
+    let (ui_tx, _event_rx, handle) = spawn_live_controller(
+        vec![MockStreamScript::from_message(assistant_message("ok"))],
+        retry_config_for_tests(1, 0),
+    );
+
+    // Send Quit, let the controller exit, then try to send
+    // another action.
+    ui_tx.send(UiAction::Quit).expect("quit");
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+
+    let result = ui_tx.send(UiAction::GetState);
+    assert!(
+        result.is_err(),
+        "sending to a closed unbounded channel must return Err"
+    );
+}
+
+#[tokio::test]
+async fn unbounded_channel_preserves_fifo_order_under_burst() {
+    // Regression: user actions must be processed in the order
+    // they were submitted. Bounded `try_send` could drop
+    // whichever action hit a full queue; unbounded send
+    // preserves order deterministically.
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![MockStreamScript::from_message(assistant_message("ok"))],
+        retry_config_for_tests(1, 0),
+    );
+
+    // Submit ShowHelp then GetState and verify the system
+    // messages arrive in that order. Both are fast, idempotent,
+    // and only ever emit a single SystemMessage so the ordering
+    // check is unambiguous.
+    ui_tx.send(UiAction::ShowHelp).expect("help");
+    ui_tx.send(UiAction::GetState).expect("state");
+
+    let mut help_seen = false;
+    let mut state_seen_after_help = false;
+    while !state_seen_after_help {
+        let event = event_rx.recv().await.expect("event");
+        if let AgentEvent::SystemMessage { text } = &event {
+            if text.starts_with("Commands:") {
+                assert!(!state_seen_after_help, "state must come after help");
+                help_seen = true;
+            } else if text.starts_with("Session:") && help_seen {
+                state_seen_after_help = true;
+            }
+        }
+    }
+
+    ui_tx.send(UiAction::Quit).expect("quit");
     handle
         .await
         .expect("controller join")

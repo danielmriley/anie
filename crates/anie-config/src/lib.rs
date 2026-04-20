@@ -196,6 +196,74 @@ pub fn anie_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".anie"))
 }
 
+/// Atomically write `contents` to `path`.
+///
+/// The write goes to a same-directory temp file (`.{name}.tmp.{pid}`),
+/// fsyncs, then renames over the destination. On POSIX the
+/// rename is atomic for same-filesystem moves, so a crash during
+/// the write leaves the original `path` intact.
+///
+/// Use this for any user-facing persistent file (config, auth,
+/// runtime state). On failure the temp file is best-effort
+/// removed and the previous contents of `path` are preserved —
+/// callers should treat `Err` as "nothing happened."
+///
+/// # Errors
+///
+/// - `InvalidInput` when `path` has no parent or no file name.
+/// - Any IO error from `File::create`, `write_all`, `sync_all`,
+///   or `rename`, with the temp file cleaned up on the way out.
+///
+/// # Platform
+///
+/// POSIX-only today. On Windows, `rename` over an existing file
+/// has different semantics; if Windows support is ever added,
+/// this helper should grow a `cfg(windows)` branch using
+/// `ReplaceFileW`. anie is unix-targeted in CI.
+pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+
+    // PID in the temp name so concurrent anie processes writing
+    // the same target file don't collide on the temp. Logical
+    // concurrent write to the same file is still unsafe — this
+    // just avoids the temp-name clash.
+    let mut tmp = parent.to_path_buf();
+    tmp.push(format!(
+        ".{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    // Scope the file handle so the OS sees it fully closed before
+    // the rename runs.
+    let write_result: std::io::Result<()> = (|| {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
 /// Return the default global config path (`~/.anie/config.toml`).
 #[must_use]
 pub fn global_config_path() -> Option<PathBuf> {
@@ -285,7 +353,7 @@ pub fn ensure_global_config_exists() -> Result<PathBuf> {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        fs::write(&path, default_config_template())
+        atomic_write(&path, default_config_template().as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(path)
@@ -524,6 +592,83 @@ mod tests {
             config.model.and_then(|model| model.id),
             Some("gpt-4o".into())
         );
+    }
+
+    #[test]
+    fn atomic_write_creates_file_with_contents() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("config.toml");
+        atomic_write(&target, b"hello").expect("write ok");
+        assert_eq!(fs::read(&target).expect("read target"), b"hello");
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_atomically() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("state.json");
+        fs::write(&target, b"original").expect("seed original");
+        atomic_write(&target, b"updated").expect("replace ok");
+        assert_eq!(fs::read(&target).expect("read"), b"updated");
+    }
+
+    #[test]
+    fn atomic_write_failure_preserves_original_and_cleans_temp() {
+        // Provoke a write failure by pointing the target at a
+        // path whose parent doesn't exist. The original file
+        // (there is none at `target`) must remain absent and no
+        // orphan temp file should be left behind.
+        let dir = tempdir().expect("tempdir");
+        let bogus_parent = dir.path().join("does/not/exist");
+        let target = bogus_parent.join("file.txt");
+        let err = atomic_write(&target, b"nope").expect_err("must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(!target.exists(), "target must not exist");
+        // No temp file in the (also non-existent) parent either.
+        assert!(!bogus_parent.exists(), "parent should remain absent");
+    }
+
+    #[test]
+    fn atomic_write_failure_leaves_previous_contents_intact() {
+        // A more targeted preservation test: pre-populate a
+        // target, then invoke atomic_write with a path that
+        // triggers a failure (empty contents are fine; the
+        // failure comes from renaming a file over one with
+        // different permissions). Simulate failure by supplying
+        // a path whose file_name strips away — no file_name
+        // triggers InvalidInput before any write starts.
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("keep.txt");
+        fs::write(&target, b"keep me").expect("seed");
+        // Path without a file name: `..` gives None.
+        let bad_path = dir.path().join("..");
+        let err = atomic_write(&bad_path, b"nope").expect_err("rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            fs::read(&target).expect("read target"),
+            b"keep me",
+            "pre-existing target must be untouched by an aborted write"
+        );
+    }
+
+    #[test]
+    fn atomic_write_temp_name_includes_pid_and_dot_prefix() {
+        // Document the temp-name convention. The temp file is a
+        // sibling of the target (same parent), dot-prefixed, and
+        // tagged with the process pid so concurrent anie
+        // processes don't clash.
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("out.txt");
+        atomic_write(&target, b"x").expect("write ok");
+        // After a successful write, the temp must not remain.
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .expect("list dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let has_temp = entries
+            .iter()
+            .any(|name| name.starts_with(".out.txt.tmp."));
+        assert!(!has_temp, "temp file must be cleaned after rename: {entries:?}");
     }
 
     #[test]

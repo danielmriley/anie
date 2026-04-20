@@ -141,8 +141,40 @@ pub(crate) fn load_auth_store_at(path: &Path) -> Result<AuthStore> {
         .with_context(|| format!("failed to parse auth file {}", path.display()))
 }
 
+/// Write a credential to `path`, preserving any credentials that
+/// are already stored there.
+///
+/// **Never overwrites a store whose existing contents could not be
+/// parsed.** If `auth.json` is corrupt (truncated, hand-edited
+/// into invalid JSON, etc.), this function quarantines the
+/// original as a sibling `auth.json.corrupt.<unix_secs>` file and
+/// returns an error rather than silently clobbering the other
+/// credentials. Callers can recover by deleting the corrupt file
+/// (to start fresh) or by hand-editing the quarantined copy back
+/// into place.
+///
+/// Absent files are not corruption — they cause a fresh empty
+/// store to be created.
 pub(crate) fn save_api_key_at(path: &Path, provider: &str, key: &str) -> Result<()> {
-    let mut store = load_auth_store_at(path).unwrap_or_default();
+    let mut store = match load_auth_store_at(path) {
+        Ok(store) => store,
+        Err(parse_err) => {
+            // Path exists (load_auth_store_at only errors on a
+            // populated-but-unparseable file) but its contents
+            // can't be interpreted. Quarantine the original so
+            // the user has a path back to their data, then fail
+            // loudly.
+            let backup = quarantine_corrupt_auth_file(path)?;
+            return Err(anyhow::anyhow!(
+                "auth store at {} is unreadable; original quarantined at {}. \
+                 Inspect or repair that file, or delete {} to start fresh. \
+                 (parse error: {parse_err})",
+                path.display(),
+                backup.display(),
+                path.display(),
+            ));
+        }
+    };
     store.providers.insert(
         provider.to_string(),
         AuthCredential::ApiKey {
@@ -157,7 +189,8 @@ pub(crate) fn save_api_key_at(path: &Path, provider: &str, key: &str) -> Result<
 
     let contents =
         serde_json::to_string_pretty(&store).context("failed to serialize auth store")?;
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    anie_config::atomic_write(path, contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
 
     #[cfg(unix)]
     {
@@ -168,6 +201,32 @@ pub(crate) fn save_api_key_at(path: &Path, provider: &str, key: &str) -> Result<
     }
 
     Ok(())
+}
+
+/// Copy the corrupt auth file to a timestamped sibling so the
+/// user retains a recoverable original.
+///
+/// Uses `fs::copy` (not `rename`) so that if a subsequent write
+/// somehow trashes the original path, the backup still exists.
+fn quarantine_corrupt_auth_file(path: &Path) -> Result<PathBuf> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "auth".to_string());
+    let backup = parent.join(format!("{file_name}.corrupt.{timestamp}"));
+    fs::copy(path, &backup).with_context(|| {
+        format!(
+            "failed to quarantine corrupt auth file at {} to {}",
+            path.display(),
+            backup.display()
+        )
+    })?;
+    Ok(backup)
 }
 
 /// Return the default auth.json path.
@@ -338,5 +397,109 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // =========================================================================
+    // Plan 14 phase B — auth-store corruption discipline.
+    //
+    // Regression tests for the silent-clobber bug: previously
+    // `save_api_key_at` used `unwrap_or_default()` on the load
+    // result, which turned a parse failure into an empty store
+    // and then overwrote the target. After the fix, a
+    // parse-failure path quarantines the original and refuses to
+    // write.
+    // =========================================================================
+
+    #[test]
+    fn save_api_key_with_corrupt_store_preserves_existing_file_and_quarantines() {
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        // Write a file that exists but is not valid JSON.
+        fs::write(&auth_path, b"{ not valid json").expect("seed corrupt");
+        let original_bytes = fs::read(&auth_path).expect("read seed");
+
+        let result = save_api_key_at(&auth_path, "openai", "sk-test");
+        assert!(
+            result.is_err(),
+            "save must refuse to run against a corrupt store"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("quarantined"), "error must mention quarantine: {err}");
+
+        // Original must be untouched.
+        assert_eq!(
+            fs::read(&auth_path).expect("read target"),
+            original_bytes,
+            "target must keep its original bytes"
+        );
+
+        // A sibling quarantine file must exist.
+        let entries: Vec<_> = fs::read_dir(tempdir.path())
+            .expect("list dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let has_quarantine = entries
+            .iter()
+            .any(|name| name.starts_with("auth.json.corrupt."));
+        assert!(
+            has_quarantine,
+            "expected a quarantine file; found: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn save_api_key_with_empty_file_is_also_corrupt() {
+        // Zero-byte auth.json is not valid JSON, so it counts as
+        // corrupt and triggers quarantine rather than being
+        // silently replaced.
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        fs::write(&auth_path, b"").expect("seed empty");
+        let result = save_api_key_at(&auth_path, "openai", "sk-test");
+        assert!(result.is_err(), "empty file must be rejected");
+    }
+
+    #[test]
+    fn save_api_key_creates_new_store_when_file_absent() {
+        // Missing is NOT corruption. Creating a fresh store on a
+        // non-existent path is the expected happy path.
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("subdir").join("auth.json");
+        assert!(!auth_path.exists());
+
+        save_api_key_at(&auth_path, "openai", "sk-test").expect("creates new store");
+
+        let store = load_auth_store_at(&auth_path).expect("load after save");
+        assert_eq!(
+            store.providers.get("openai"),
+            Some(&AuthCredential::ApiKey {
+                key: "sk-test".into()
+            })
+        );
+    }
+
+    #[test]
+    fn save_api_key_on_valid_store_still_preserves_existing_credentials() {
+        // Happy-path regression. Saving a new provider into an
+        // existing valid store must preserve all other providers.
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        save_api_key_at(&auth_path, "openai", "sk-one").expect("first save");
+        save_api_key_at(&auth_path, "anthropic", "sk-two").expect("second save");
+
+        let store = load_auth_store_at(&auth_path).expect("reload");
+        assert_eq!(
+            store.providers.get("openai"),
+            Some(&AuthCredential::ApiKey {
+                key: "sk-one".into()
+            })
+        );
+        assert_eq!(
+            store.providers.get("anthropic"),
+            Some(&AuthCredential::ApiKey {
+                key: "sk-two".into()
+            })
+        );
     }
 }

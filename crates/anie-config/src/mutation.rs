@@ -120,7 +120,7 @@ impl ConfigMutator {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        fs::write(&self.path, self.doc.to_string())
+        crate::atomic_write(&self.path, self.doc.to_string().as_bytes())
             .with_context(|| format!("failed to write config file {}", self.path.display()))
     }
 }

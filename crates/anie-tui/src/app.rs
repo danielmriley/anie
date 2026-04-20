@@ -50,7 +50,7 @@ pub struct App {
     bottom_pane: BottomPane,
     agent_state: AgentUiState,
     event_rx: mpsc::Receiver<AgentEvent>,
-    action_tx: mpsc::Sender<UiAction>,
+    action_tx: mpsc::UnboundedSender<UiAction>,
     should_quit: bool,
     spinner: Spinner,
     last_ctrl_c: Option<Instant>,
@@ -230,7 +230,7 @@ impl App {
     #[must_use]
     pub fn new(
         event_rx: mpsc::Receiver<AgentEvent>,
-        action_tx: mpsc::Sender<UiAction>,
+        action_tx: mpsc::UnboundedSender<UiAction>,
         initial_models: Vec<Model>,
         commands: Vec<SlashCommandInfo>,
     ) -> Self {
@@ -567,11 +567,11 @@ impl App {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 self.should_quit = true;
-                let _ = self.action_tx.try_send(UiAction::Quit);
+                let _ = self.action_tx.send(UiAction::Quit);
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                 self.should_quit = true;
-                let _ = self.action_tx.try_send(UiAction::Quit);
+                let _ = self.action_tx.send(UiAction::Quit);
             }
             (KeyModifiers::NONE, KeyCode::PageUp) => self.output_pane.scroll_page_up(),
             (KeyModifiers::NONE, KeyCode::PageDown) => self.output_pane.scroll_page_down(),
@@ -586,7 +586,7 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.output_pane.clear();
-                let _ = self.action_tx.try_send(UiAction::ClearOutput);
+                let _ = self.action_tx.send(UiAction::ClearOutput);
             }
             _ => {
                 if let InputAction::Submit(text) = self.input_pane.handle_key(key) {
@@ -604,17 +604,17 @@ impl App {
                     .is_some_and(|instant| instant.elapsed() <= Duration::from_secs(2))
                 {
                     self.should_quit = true;
-                    let _ = self.action_tx.try_send(UiAction::Quit);
+                    let _ = self.action_tx.send(UiAction::Quit);
                 } else {
                     self.last_ctrl_c = Some(Instant::now());
                     self.output_pane
                         .add_system_message("Aborting... (press Ctrl+C again to quit)".to_string());
-                    let _ = self.action_tx.try_send(UiAction::Abort);
+                    let _ = self.action_tx.send(UiAction::Abort);
                 }
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                 self.should_quit = true;
-                let _ = self.action_tx.try_send(UiAction::Quit);
+                let _ = self.action_tx.send(UiAction::Quit);
             }
             (KeyModifiers::NONE, KeyCode::PageUp) => self.output_pane.scroll_page_up(),
             (KeyModifiers::NONE, KeyCode::PageDown) => self.output_pane.scroll_page_down(),
@@ -640,7 +640,7 @@ impl App {
         if trimmed.starts_with('/') {
             self.handle_slash_command(trimmed);
         } else {
-            let _ = self.action_tx.try_send(UiAction::SubmitPrompt(text));
+            let _ = self.action_tx.send(UiAction::SubmitPrompt(text));
         }
     }
 
@@ -658,7 +658,7 @@ impl App {
         // entry (duplicates would confuse autocomplete in plan 12).
         if name == "exit" {
             self.should_quit = true;
-            let _ = self.action_tx.try_send(UiAction::Quit);
+            let _ = self.action_tx.send(UiAction::Quit);
             return;
         }
 
@@ -709,56 +709,56 @@ impl App {
                 Some(level) => {
                     let _ = self
                         .action_tx
-                        .try_send(UiAction::SetThinking(level.to_string()));
+                        .send(UiAction::SetThinking(level.to_string()));
                 }
             },
             "compact" => {
-                let _ = self.action_tx.try_send(UiAction::Compact);
+                let _ = self.action_tx.send(UiAction::Compact);
             }
             "fork" => {
-                let _ = self.action_tx.try_send(UiAction::ForkSession);
+                let _ = self.action_tx.send(UiAction::ForkSession);
             }
             "diff" => {
-                let _ = self.action_tx.try_send(UiAction::ShowDiff);
+                let _ = self.action_tx.send(UiAction::ShowDiff);
             }
             "clear" => {
                 self.output_pane.clear();
-                let _ = self.action_tx.try_send(UiAction::ClearOutput);
+                let _ = self.action_tx.send(UiAction::ClearOutput);
             }
             "session" => match arg {
                 None => {
-                    let _ = self.action_tx.try_send(UiAction::GetState);
+                    let _ = self.action_tx.send(UiAction::GetState);
                 }
                 Some("list") => {
-                    let _ = self.action_tx.try_send(UiAction::ListSessions);
+                    let _ = self.action_tx.send(UiAction::ListSessions);
                 }
                 Some(session_id) => {
                     let _ = self
                         .action_tx
-                        .try_send(UiAction::SwitchSession(session_id.to_string()));
+                        .send(UiAction::SwitchSession(session_id.to_string()));
                 }
             },
             "tools" => {
-                let _ = self.action_tx.try_send(UiAction::ShowTools);
+                let _ = self.action_tx.send(UiAction::ShowTools);
             }
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
             "copy" => self.copy_last_assistant_to_clipboard(),
             "new" => {
-                let _ = self.action_tx.try_send(UiAction::NewSession);
+                let _ = self.action_tx.send(UiAction::NewSession);
             }
             "reload" => {
-                let _ = self.action_tx.try_send(UiAction::ReloadConfig {
+                let _ = self.action_tx.send(UiAction::ReloadConfig {
                     provider: None,
                     model: None,
                 });
             }
             "help" => {
-                let _ = self.action_tx.try_send(UiAction::ShowHelp);
+                let _ = self.action_tx.send(UiAction::ShowHelp);
             }
             "quit" => {
                 self.should_quit = true;
-                let _ = self.action_tx.try_send(UiAction::Quit);
+                let _ = self.action_tx.send(UiAction::Quit);
             }
             other => {
                 // The catalog is authoritative for name lookup, so
@@ -898,7 +898,7 @@ impl App {
                 self.close_model_picker();
                 let _ = self
                     .action_tx
-                    .try_send(UiAction::SetResolvedModel(model.clone()));
+                    .send(UiAction::SetResolvedModel(model.clone()));
                 self.output_pane
                     .add_system_message(format!("Model: {}", model.id));
             }
@@ -962,7 +962,7 @@ impl App {
         };
         let _ = self
             .action_tx
-            .try_send(UiAction::SetResolvedModel(model.clone()));
+            .send(UiAction::SetResolvedModel(model.clone()));
         self.output_pane
             .add_system_message(format!("Model: {}", model.id));
         true
@@ -1148,7 +1148,7 @@ impl App {
                             );
                             let _ = self
                                 .action_tx
-                                .try_send(UiAction::ReloadConfig { provider, model });
+                                .send(UiAction::ReloadConfig { provider, model });
                         }
                         None => {
                             self.output_pane.add_system_message(
@@ -1173,7 +1173,7 @@ impl App {
                             "Saved configuration to {} ({provider}:{model}).",
                             display_path(&config_path)
                         ));
-                        let _ = self.action_tx.try_send(UiAction::ReloadConfig {
+                        let _ = self.action_tx.send(UiAction::ReloadConfig {
                             provider: Some(provider),
                             model: Some(model),
                         });
@@ -1213,7 +1213,7 @@ impl App {
                 self.output_pane.add_system_message(message);
                 let _ = self
                     .action_tx
-                    .try_send(UiAction::ReloadConfig { provider, model });
+                    .send(UiAction::ReloadConfig { provider, model });
             }
         }
     }

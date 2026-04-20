@@ -82,7 +82,7 @@ fn sample_models() -> Vec<Model> {
 #[test]
 fn static_layout_renders_output_status_and_input() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     {
         let status = app.status_bar_mut();
@@ -128,7 +128,7 @@ fn shift_modified_characters_are_inserted() {
 #[test]
 fn wrapped_input_snapshot_is_stable() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for ch in "This is a very long line that should wrap inside the input pane".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -151,7 +151,7 @@ fn wrapped_input_snapshot_is_stable() {
 #[test]
 fn replayed_assistant_renders_thinking_above_visible_response() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.load_transcript(&[Message::Assistant(AssistantMessage {
         content: vec![
@@ -191,7 +191,7 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
 #[test]
 fn streaming_assistant_renders_thinking_above_visible_response() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     app.handle_agent_event(AgentEvent::AgentStart)
@@ -281,7 +281,7 @@ fn empty_streaming_assistant_uses_generic_status() {
 #[test]
 fn event_to_render_streaming_and_tool_lifecycle() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     app.handle_agent_event(AgentEvent::AgentStart)
@@ -336,7 +336,7 @@ fn event_to_render_streaming_and_tool_lifecycle() {
 #[test]
 fn ctrl_c_marks_abort_while_active() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
@@ -352,7 +352,7 @@ fn ctrl_c_marks_abort_while_active() {
 #[test]
 fn second_ctrl_c_while_active_quits() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
@@ -379,7 +379,7 @@ fn second_ctrl_c_while_active_quits() {
 #[test]
 fn ctrl_c_while_idle_quits_immediately() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_terminal_event(Event::Key(KeyEvent::new(
         KeyCode::Char('c'),
@@ -395,7 +395,7 @@ fn ctrl_c_while_idle_quits_immediately() {
 #[test]
 fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..12 {
         app.handle_agent_event(AgentEvent::MessageStart {
@@ -482,7 +482,7 @@ fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
 #[test]
 fn home_and_end_navigate_transcript_when_input_is_empty() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
@@ -524,7 +524,7 @@ fn home_and_end_navigate_transcript_when_input_is_empty() {
 #[test]
 fn home_and_end_preserve_input_editing_when_draft_is_present() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
@@ -564,7 +564,7 @@ fn home_and_end_preserve_input_editing_when_draft_is_present() {
 #[test]
 fn mouse_wheel_scrolls_transcript_history() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..16 {
         app.handle_agent_event(AgentEvent::MessageStart {
@@ -623,7 +623,7 @@ fn mouse_wheel_scrolls_transcript_history() {
 #[test]
 fn single_long_wrapped_assistant_message_is_navigable() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.load_transcript(&[Message::Assistant(AssistantMessage {
         content: vec![ContentBlock::Text {
@@ -667,7 +667,7 @@ fn single_long_wrapped_assistant_message_is_navigable() {
 #[test]
 fn transcript_replace_resets_scroll_state_sanely() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     for index in 0..12 {
         app.handle_agent_event(AgentEvent::MessageStart {
@@ -740,7 +740,7 @@ fn alt_arrow_word_movement_and_bash_title_render() {
     assert_eq!(input.content(), "oneZ Ytwo Xthree");
 
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::ToolExecStart {
         call_id: "call_bash".into(),
@@ -772,7 +772,7 @@ fn alt_arrow_word_movement_and_bash_title_render() {
 #[test]
 fn replayed_tool_results_restore_titles_from_details() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.load_transcript(&[
         Message::ToolResult(anie_protocol::ToolResultMessage {
@@ -809,7 +809,7 @@ fn replayed_tool_results_restore_titles_from_details() {
 #[test]
 fn diff_rendering_shows_added_and_removed_lines() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::ToolExecStart {
         call_id: "call_edit".into(),
@@ -844,7 +844,7 @@ fn diff_rendering_shows_added_and_removed_lines() {
 #[test]
 fn model_command_opens_picker_in_bottom_pane_and_keeps_transcript_visible() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
@@ -888,7 +888,7 @@ fn model_command_opens_picker_in_bottom_pane_and_keeps_transcript_visible() {
 #[test]
 fn ctrl_o_opens_picker_and_escape_restores_editor_content() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, sample_models(), Vec::new());
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
@@ -920,7 +920,7 @@ fn ctrl_o_opens_picker_and_escape_restores_editor_content() {
 #[test]
 fn picker_selection_sends_resolved_model_action() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, sample_models(), Vec::new());
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
@@ -945,7 +945,7 @@ fn picker_selection_sends_resolved_model_action() {
 #[test]
 fn slash_commands_route_actions_and_render_help() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
 
     for ch in "/model qwen3:32b".chars() {
@@ -1037,7 +1037,7 @@ fn slash_commands_route_actions_and_render_help() {
 #[test]
 fn new_command_sends_new_session_action() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     submit_command(&mut app, "/new");
@@ -1050,7 +1050,7 @@ fn new_command_sends_new_session_action() {
 #[test]
 fn reload_command_sends_reload_config_action() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     submit_command(&mut app, "/reload");
@@ -1066,7 +1066,7 @@ fn reload_command_sends_reload_config_action() {
 #[test]
 fn copy_command_without_messages_shows_error() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     submit_command(&mut app, "/copy");
@@ -1179,7 +1179,7 @@ fn output_pane_last_assistant_text_skips_thinking_only_messages() {
 #[test]
 fn onboarding_slash_command_opens_overlay_locally() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     for ch in "/onboard".chars() {
@@ -1214,7 +1214,7 @@ fn onboarding_slash_command_opens_overlay_locally() {
 #[test]
 fn providers_slash_command_opens_provider_management_overlay() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     for ch in "/providers".chars() {
@@ -1249,7 +1249,7 @@ fn providers_slash_command_opens_provider_management_overlay() {
 #[test]
 fn app_transitions_back_to_idle_after_agent_end() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
     app.handle_agent_event(AgentEvent::AgentStart)
         .expect("agent start");
@@ -1389,7 +1389,7 @@ fn thinking_text_never_leaks_into_visible_answer_replayed() {
 #[test]
 fn thinking_text_never_leaks_into_visible_answer_streamed() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     // Simulate streaming: thinking first, then text, then done
@@ -1450,7 +1450,7 @@ fn thinking_text_never_leaks_into_visible_answer_streamed() {
 #[test]
 fn multi_turn_thinking_stays_contained_in_each_message() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     // Load two assistant messages, each with thinking + text
@@ -1585,7 +1585,7 @@ fn last_system_message(app: &App) -> Option<String> {
 #[test]
 fn slash_thinking_invalid_emits_error_and_no_action() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
 
     submit_line(&mut app, "/thinking bogus");
@@ -1602,7 +1602,7 @@ fn slash_thinking_invalid_emits_error_and_no_action() {
 #[test]
 fn slash_thinking_valid_dispatches_set_thinking() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
 
     submit_line(&mut app, "/thinking high");
@@ -1614,7 +1614,7 @@ fn slash_thinking_valid_dispatches_set_thinking() {
 #[test]
 fn slash_compact_with_arg_is_rejected_locally() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
 
     submit_line(&mut app, "/compact foo");
@@ -1631,7 +1631,7 @@ fn slash_compact_with_arg_is_rejected_locally() {
 #[test]
 fn slash_unknown_command_reported_without_dispatch() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
 
     submit_line(&mut app, "/does-not-exist");
@@ -1664,7 +1664,7 @@ fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
 #[test]
 fn typing_slash_opens_autocomplete_popup() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/");
@@ -1678,7 +1678,7 @@ fn typing_slash_opens_autocomplete_popup() {
 #[test]
 fn typing_filter_narrows_popup_contents() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/th");
@@ -1694,7 +1694,7 @@ fn typing_filter_narrows_popup_contents() {
 #[test]
 fn enter_on_command_name_inserts_slash_and_trailing_space() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/th");
@@ -1712,7 +1712,7 @@ fn enter_on_command_name_inserts_slash_and_trailing_space() {
 #[test]
 fn typing_slash_thinking_space_opens_enumerated_popup() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/thinking ");
@@ -1729,7 +1729,7 @@ fn typing_slash_thinking_space_opens_enumerated_popup() {
 #[test]
 fn enter_on_enumerated_value_applies_without_trailing_space() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/thinking m");
@@ -1745,7 +1745,7 @@ fn enter_on_enumerated_value_applies_without_trailing_space() {
 #[test]
 fn second_enter_submits_fully_typed_command() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/thinking m");
@@ -1764,7 +1764,7 @@ fn second_enter_submits_fully_typed_command() {
 #[test]
 fn escape_dismisses_popup_without_modifying_buffer() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/th");
@@ -1778,7 +1778,7 @@ fn escape_dismisses_popup_without_modifying_buffer() {
 #[test]
 fn arrow_keys_navigate_popup_and_skip_history_while_open() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     // Submit a history entry so Up/Down would normally recall it.
@@ -1798,7 +1798,7 @@ fn arrow_keys_navigate_popup_and_skip_history_while_open() {
 #[test]
 fn backspace_reopens_popup_with_updated_filter() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/thz");
@@ -1813,7 +1813,7 @@ fn backspace_reopens_popup_with_updated_filter() {
 #[test]
 fn popup_does_not_open_for_non_slash_input() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "hello world");
@@ -1823,7 +1823,7 @@ fn popup_does_not_open_for_non_slash_input() {
 #[test]
 fn popup_does_not_open_when_slash_is_not_at_line_start() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "hello /th");
@@ -1833,7 +1833,7 @@ fn popup_does_not_open_when_slash_is_not_at_line_start() {
 #[test]
 fn tab_also_applies_suggestion() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/th");
@@ -1853,7 +1853,7 @@ fn tab_also_applies_suggestion() {
 #[test]
 fn disabled_autocomplete_does_not_open_popup_but_keeps_validation() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands())
         .with_autocomplete_enabled(false);
 
@@ -1874,7 +1874,7 @@ fn disabled_autocomplete_does_not_open_popup_but_keeps_validation() {
 #[test]
 fn extension_registered_command_appears_in_popup() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
 
     let mut catalog = default_test_commands();
     catalog.push(SlashCommandInfo {
@@ -1899,7 +1899,7 @@ fn extension_registered_command_appears_in_popup() {
 #[test]
 fn popup_description_exposes_same_argument_hint_as_help() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
     type_chars(&mut app, "/th");
@@ -1915,7 +1915,7 @@ fn popup_description_exposes_same_argument_hint_as_help() {
 #[test]
 fn slash_exit_alias_still_quits_even_without_catalog_entry() {
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, mut action_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     // Empty catalog — /exit must still be honored as a /quit alias.
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 

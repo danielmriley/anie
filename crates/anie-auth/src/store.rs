@@ -374,7 +374,8 @@ fn write_store_to_path(path: &Path, store: &AuthStore) -> Result<()> {
     }
 
     let contents = serde_json::to_string_pretty(store).context("failed to serialize auth store")?;
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    anie_config::atomic_write(path, contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
 
     #[cfg(unix)]
     {

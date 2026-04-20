@@ -12,7 +12,7 @@ fn replay_events_and_render(events: &[AgentEvent], width: u16, height: u16) -> S
     // App::new requires channel endpoints for construction; we feed events
     // directly via handle_agent_event so neither channel is actually used.
     let (_event_tx, event_rx) = mpsc::channel(8);
-    let (action_tx, _action_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
     for event in events {

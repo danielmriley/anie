@@ -17,19 +17,18 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
 
     let state = prepare_controller_state(&cli).await?;
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel(256);
-    let (ui_action_tx, ui_action_rx) = mpsc::channel(64);
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     let controller = InteractiveController::new(state, ui_action_rx, agent_event_tx, true);
     let controller_task = tokio::spawn(async move { controller.run().await });
 
     let abort_tx = ui_action_tx.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        let _ = abort_tx.send(UiAction::Abort).await;
+        let _ = abort_tx.send(UiAction::Abort);
     });
 
     ui_action_tx
         .send(UiAction::SubmitPrompt(prompt))
-        .await
         .context("failed to start print-mode prompt")?;
 
     let mut streamed_text = false;
@@ -141,7 +140,7 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
             .context("failed to flush stdout")?;
     }
     println!();
-    let _ = ui_action_tx.send(UiAction::Quit).await;
+    let _ = ui_action_tx.send(UiAction::Quit);
     match controller_task.await {
         Ok(result) => result,
         Err(error) => Err(anyhow!("print-mode controller task failed: {error}")),

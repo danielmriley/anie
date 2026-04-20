@@ -23,7 +23,11 @@ pub(crate) async fn run_interactive_mode(cli: Cli) -> Result<()> {
     let initial_status = state.status_event();
 
     let (agent_event_tx, agent_event_rx) = mpsc::channel(256);
-    let (ui_action_tx, ui_action_rx) = mpsc::channel(64);
+    // Unbounded so user actions (submit, quit, abort) can never
+    // be silently dropped when the controller is busy. Producer is
+    // a single TUI task at human-typing speed; memory growth is
+    // not a real risk. See plan 13 phase B.
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     spawn_shutdown_signal_forwarder(ui_action_tx.clone());
 
     let initial_models = state.model_catalog().to_vec();

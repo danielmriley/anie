@@ -118,7 +118,9 @@ pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistr
     Arc::new(tools)
 }
 
-pub(crate) fn spawn_shutdown_signal_forwarder(action_tx: tokio::sync::mpsc::Sender<UiAction>) {
+pub(crate) fn spawn_shutdown_signal_forwarder(
+    action_tx: tokio::sync::mpsc::UnboundedSender<UiAction>,
+) {
     #[cfg(not(unix))]
     let _ = action_tx;
 
@@ -136,10 +138,10 @@ pub(crate) fn spawn_shutdown_signal_forwarder(action_tx: tokio::sync::mpsc::Send
 
             tokio::select! {
                 _ = sigterm.recv() => {
-                    let _ = action_tx.send(UiAction::Quit).await;
+                    let _ = action_tx.send(UiAction::Quit);
                 }
                 _ = sighup.recv() => {
-                    let _ = action_tx.send(UiAction::Quit).await;
+                    let _ = action_tx.send(UiAction::Quit);
                 }
             }
         });

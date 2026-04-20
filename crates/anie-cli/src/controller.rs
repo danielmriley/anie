@@ -49,7 +49,7 @@ pub async fn run_rpc_mode(cli: Cli) -> Result<()> {
 
 pub(crate) struct InteractiveController {
     state: ControllerState,
-    ui_action_rx: mpsc::Receiver<UiAction>,
+    ui_action_rx: mpsc::UnboundedReceiver<UiAction>,
     event_tx: mpsc::Sender<AgentEvent>,
     current_run: Option<CurrentRun>,
     /// Between-runs state for a pending transient retry. Set when
@@ -94,7 +94,7 @@ enum PendingRetry {
 impl InteractiveController {
     pub(crate) fn new(
         state: ControllerState,
-        ui_action_rx: mpsc::Receiver<UiAction>,
+        ui_action_rx: mpsc::UnboundedReceiver<UiAction>,
         event_tx: mpsc::Sender<AgentEvent>,
         exit_after_run: bool,
     ) -> Self {

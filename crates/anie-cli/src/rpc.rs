@@ -14,7 +14,7 @@ use crate::{Cli, bootstrap::prepare_controller_state, controller::InteractiveCon
 pub(crate) async fn run_rpc_mode(cli: Cli) -> Result<()> {
     let state = prepare_controller_state(&cli).await?;
     let (agent_event_tx, agent_event_rx) = mpsc::channel(256);
-    let (ui_action_tx, ui_action_rx) = mpsc::channel(64);
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     let controller = InteractiveController::new(state, ui_action_rx, agent_event_tx, false);
 
     let hello = serde_json::to_string(&RpcEvent::Hello { version: 1 })?;
@@ -52,7 +52,7 @@ pub(crate) async fn run_rpc_mode(cli: Cli) -> Result<()> {
                     ),
                     RpcCommand::SetThinking { level } => UiAction::SetThinking(level),
                 };
-                if ui_action_tx.send(action).await.is_err() {
+                if ui_action_tx.send(action).is_err() {
                     break;
                 }
             }

@@ -62,7 +62,7 @@ pub fn save_runtime_state_to(path: &Path, state: &RuntimeState) -> Result<()> {
     }
     let contents =
         serde_json::to_string_pretty(state).context("failed to serialize runtime state")?;
-    fs::write(path, contents)
+    anie_config::atomic_write(path, contents.as_bytes())
         .with_context(|| format!("failed to write runtime state {}", path.display()))?;
     Ok(())
 }
