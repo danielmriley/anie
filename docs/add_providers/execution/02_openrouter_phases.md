@@ -114,23 +114,41 @@ available in the `/model` picker.
 
 ---
 
-## PR B — Upstream-aware capability mapping + nested reasoning
+## PR B — Upstream-aware capability mapping + OR response quirks
 
 **Goal:** OpenRouter models get the right `ReplayCapabilities`
-and `ReasoningCapabilities` automatically based on the upstream
-prefix, and reasoning requests use the nested
-`reasoning: { effort }` body shape.
+and `ReasoningCapabilities` based on the upstream prefix.
+Reasoning requests use the nested body shape. The four
+OR-specific response behaviors that pi documented all work:
+
+- All three reasoning-field names on the way in
+  (`reasoning_content`, `reasoning`, `reasoning_text`).
+- `reasoning_details` round-trip for o-series encrypted
+  reasoning across turns.
+- Anthropic `cache_control: ephemeral` insertion for
+  `anthropic/*` upstreams.
+- Tool-supporting filter on discovered catalog.
 
 ### Files
-- `crates/anie-providers-builtin/src/openrouter.rs` (new) — or
-  a small module within `provider_presets.rs` — hosts the
-  `openrouter_capability_mapping` function.
-- `crates/anie-providers-builtin/src/lib.rs` — hook the mapping
-  function into the discovery→Model conversion for the
-  OpenRouter provider specifically.
-- Request-building path (provider_presets → openai/mod.rs) —
-  ensure the compat blob's `openrouter_routing` (if set) is
-  emitted into the body as `provider: {...}`.
+- `crates/anie-providers-builtin/src/openrouter.rs` (new) —
+  capability mapping + Anthropic cache-control helper.
+- `crates/anie-providers-builtin/src/openai/reasoning_strategy.rs`
+  — add `reasoning_text` to the reasoning-field lookup.
+- `crates/anie-providers-builtin/src/openai/streaming.rs` — add
+  `reasoning_details` capture into a new per-message state
+  slot.
+- `crates/anie-providers-builtin/src/openai/convert.rs` (or
+  wherever outbound messages are built) — emit
+  `reasoning_details` on assistant replay messages.
+- `crates/anie-protocol/src/content.rs` — add
+  `reasoning_details: Option<Vec<serde_json::Value>>` on
+  `AssistantMessage`, or (cleaner) `thought_signature:
+  Option<String>` on `ContentBlock::ToolCall` to match pi's
+  per-tool-call storage.
+- `crates/anie-providers-builtin/src/model_discovery.rs` —
+  filter discovered entries to models whose
+  `supported_parameters` contains `"tools"`, gated to the
+  OpenRouter provider.
 
 ### Steps
 
@@ -147,7 +165,16 @@ prefix, and reasoning requests use the nested
                requires_thinking_signature: true,
                supports_redacted_thinking: false,
                supports_encrypted_reasoning: false,
+               supports_reasoning_details_replay: false,
            }),
+           (Some("openai"), true)
+               if is_o_series_or_gpt5(model_id) =>
+               Some(ReplayCapabilities {
+                   requires_thinking_signature: false,
+                   supports_redacted_thinking: false,
+                   supports_encrypted_reasoning: false,
+                   supports_reasoning_details_replay: true,
+               }),
            // ... per the spec table
            _ => None,
        };
@@ -165,44 +192,93 @@ prefix, and reasoning requests use the nested
    }
    ```
 
-2. **Wire into the conversion.** When OpenRouter's
-   `ModelDiscoveryCache` yields `Vec<ModelInfo>`, convert each
-   via `to_model` → run through `openrouter_capabilities_for`
-   → merge the returned capabilities into the `Model`.
+   Extend `ReplayCapabilities` with
+   `supports_reasoning_details_replay: bool` (new field, default
+   `false`). Same pattern as `requires_thinking_signature`.
 
-3. **Routing preferences in body.** When building an outbound
-   Chat Completions body for an OpenRouter-configured model
-   whose `compat` has
-   `ModelCompat::OpenAICompletions { openrouter_routing: Some(r) }`,
-   include `body["provider"] = serialize(r)`.
+2. **Wire into discovery conversion.** OR's discovery path
+   converts `ModelInfo` → `Model` and runs
+   `openrouter_capabilities_for` to fill the capability fields.
+
+3. **`reasoning_text` on the way in.** Add `"reasoning_text"`
+   to the reasoning-field lookup list in
+   `reasoning_strategy.rs:214`. Existing callers pick it up
+   automatically.
+
+4. **`reasoning_details` capture.** In `streaming.rs`, parse
+   the delta's `reasoning_details` array. For each element:
+   - If `type == "reasoning.encrypted"` and `id` matches an
+     in-flight tool call, attach the serialized JSON to that
+     tool call's `thought_signature` field (adopts pi's
+     per-tool-call storage).
+   - Else skip for v1 (other detail types we don't understand
+     yet).
+
+5. **`reasoning_details` replay.** In the outbound-message
+   converter, collect every tool call's non-empty
+   `thought_signature`, parse each back to a JSON object, and
+   attach the array to the assistant message as
+   `reasoning_details: [...]`. Only when the model's
+   `supports_reasoning_details_replay` is true.
+
+6. **Anthropic `cache_control` insertion.** In
+   `OpenAIProvider::convert_messages`, when the model's
+   `base_url` contains `openrouter.ai` AND the model's `id`
+   starts with `"anthropic/"`, walk messages back-to-front,
+   find the last text part, and attach
+   `{ "type": "text", "text": "...", "cache_control": { "type": "ephemeral" } }`.
+   No-op for other providers.
+
+7. **Routing preferences in body.** When
+   `ModelCompat::OpenAICompletions { openrouter_routing: Some(r) }`
+   is set, emit `body["provider"] = serialize(r)`.
+
+8. **Tool-supporting filter on discovery.** Extend the
+   OR-branch of `discover_openai_compatible_models` (or add an
+   OR-specific branch) to drop entries whose
+   `supported_parameters` lacks `"tools"`.
 
 ### Test plan
 
 | # | Test |
 |---|---|
-| 5 | `openrouter_capabilities_anthropic_reasoning_sets_signature` — input `anthropic/claude-sonnet-4.6` + `supports_reasoning=true` → `requires_thinking_signature: true, request_mode: NestedReasoning`. |
-| 6 | `openrouter_capabilities_openai_o_series_sets_nested_reasoning` — input `openai/o3` → `request_mode: NestedReasoning`. |
-| 7 | `openrouter_capabilities_google_reasoning_sets_nested_reasoning` — input `google/gemini-2.5-pro` + reasoning true → `request_mode: NestedReasoning`, `requires_thinking_signature: false` (the thoughtSignature-via-OR open question; default false). |
-| 8 | `openrouter_capabilities_non_reasoning_returns_none` — input `meta-llama/llama-3.3-70b-instruct` → capabilities None. |
-| 9 | `openrouter_request_uses_nested_reasoning_object` — build a request body for a reasoning model, assert `reasoning.effort = "high"` and no top-level `reasoning_effort`. |
-| 10 | `openrouter_request_non_reasoning_model_unchanged` — non-reasoning model's body has neither `reasoning` nor `reasoning_effort`. |
-| 11 | `openrouter_routing_preferences_propagate_to_body` — set `openrouter_routing = { order: Some(vec!["anthropic"]), only: None, ... }`, assert outbound body has `provider.order = ["anthropic"]`. |
-| 12 | `openrouter_routing_none_omits_provider_field` — regression: no routing preferences means no `provider` field in body. |
-| 13 | Invariant suite: OpenRouter appears in `provider_replay.rs` with at least three fixtures (Anthropic upstream, OpenAI upstream, non-reasoning upstream). |
+| 5 | `openrouter_capabilities_anthropic_reasoning_sets_signature` |
+| 6 | `openrouter_capabilities_openai_o_series_sets_reasoning_details_replay` |
+| 7 | `openrouter_capabilities_google_reasoning_sets_nested_reasoning` |
+| 8 | `openrouter_capabilities_non_reasoning_returns_none` |
+| 9 | `openrouter_request_uses_nested_reasoning_object` |
+| 10 | `openrouter_request_non_reasoning_model_unchanged` |
+| 11 | `openrouter_routing_preferences_propagate_to_body` |
+| 12 | `openrouter_routing_none_omits_provider_field` |
+| 13 | `openrouter_reasoning_text_field_captured_as_thinking` — fixture where stream delta uses `reasoning_text` instead of `reasoning`. |
+| 14 | `openrouter_reasoning_details_encrypted_attached_to_tool_call` — fixture delta with `reasoning_details: [{type: "reasoning.encrypted", id: "call_abc", data: "…"}]` plus a tool call `call_abc`; assert the tool call's `thought_signature` has the serialized detail. |
+| 15 | `openrouter_reasoning_details_round_trip_on_replay` — captured `thought_signature` on a ToolCall is emitted as `reasoning_details` on the outbound assistant message. |
+| 16 | `openrouter_anthropic_upstream_adds_cache_control_to_last_text` — build a request body for an `anthropic/*` model over OR; assert the last user message's last text part has `cache_control: ephemeral`. |
+| 17 | `openrouter_non_anthropic_upstream_does_not_add_cache_control` — regression for `openai/*` routed through OR. |
+| 18 | `openrouter_discovery_filters_non_tool_models` — fixture with some tool-supporting and some non-tool entries; assert only tool-supporting land in the catalog. |
+| 19 | Invariant suite: OpenRouter appears in `provider_replay.rs` with Anthropic-upstream, OpenAI-o-series-upstream, and non-reasoning-upstream fixtures. |
 
 ### Exit criteria
 
-- [ ] `openrouter_capabilities_for` exists and is unit-tested
-      per the spec's table.
-- [ ] Discovered OpenRouter models land with correct replay +
-      reasoning capabilities.
-- [ ] Reasoning requests use nested `reasoning.effort` shape.
-- [ ] `openrouter_routing` compat flag surfaces in the body
-      when set.
-- [ ] Invariant suite covers OpenRouter.
+- [ ] `openrouter_capabilities_for` unit-tested per the spec
+      table including the revised `openai/o*` →
+      `supports_reasoning_details_replay: true` row.
+- [ ] All three reasoning field names captured on stream-in.
+- [ ] `reasoning_details` round-trips for `openai/o*`
+      upstreams.
+- [ ] Anthropic `cache_control` inserted for `anthropic/*`
+      upstreams only.
+- [ ] Discovered catalog filtered to tool-supporting models.
+- [ ] Reasoning requests use nested body shape.
+- [ ] `openrouter_routing` compat flag surfaces when set.
+- [ ] Invariant suite covers OR with three distinct upstreams.
 - [ ] Manual smoke: two-turn conversation on
       `anthropic/claude-sonnet-4.6` with thinking `high`
       completes without replay errors, documented in PR.
+- [ ] Manual smoke: two-turn conversation on `openai/o3` with
+      thinking `high` preserves reasoning context (the
+      second-turn response acknowledges the first-turn
+      reasoning), documented in PR.
 
 ---
 

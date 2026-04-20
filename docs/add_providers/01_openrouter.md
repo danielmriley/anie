@@ -51,42 +51,168 @@ Reuses `ApiKind::OpenAICompletions`. Endpoint:
 - env var: `OPENROUTER_API_KEY`.
 - Key URL: `https://openrouter.ai/keys`.
 
-## OpenRouter-specific request behavior
+## OpenRouter-specific behavior (verified against pi)
 
-### Nested `reasoning` object (required for reasoning models)
+Auditing pi's `packages/ai/src/providers/openai-completions.ts`
+end-to-end surfaced more OpenRouter-specific handling than the
+earlier draft of this plan captured. Each item below is tied to
+the file + line where pi does the thing, so future drift can be
+re-audited.
 
-OpenRouter normalizes reasoning across upstreams via
-`reasoning: { effort: "high" }`, not OpenAI's flat
-`reasoning_effort`. pi's
-`packages/ai/src/providers/openai-completions.ts:429` has the
-pattern. Without this, reasoning against OpenRouter reasoning
-models silently no-ops.
+### Request side
 
-Requires a new `ThinkingRequestMode::NestedReasoning` variant
-(foundation work — see `execution/00_foundation.md` PR B). Each
-OpenRouter model identified as reasoning-capable (from the
-discovery response's `supported_parameters`) gets
-`reasoning_capabilities.request_mode = NestedReasoning` set
-automatically during `ModelInfo → Model` conversion.
+#### Nested `reasoning` object (required for reasoning models)
 
-### Provider routing preferences (optional, via compat blob)
+pi ref: `openai-completions.ts:429–438` —
+`compat.thinkingFormat === "openrouter"` emits
+`reasoning: { effort: "high" }` (or `"none"` for level Off)
+instead of OpenAI's flat `reasoning_effort`. Without this,
+reasoning silently no-ops.
 
-OpenRouter's request body accepts a top-level `provider` object
-for routing preferences (ordered upstream preferences, ZDR
-filters, price ceilings, quantization filters, etc.). Users can
-configure these per-model via the `ModelCompat::OpenAICompletions
-{ openrouter_routing }` compat blob (foundation work — see
-`execution/00_foundation.md` PR A).
+Requires `ThinkingRequestMode::NestedReasoning` (foundation PR
+B). Each discovered OpenRouter model with `supported_parameters`
+including `"reasoning"` gets `request_mode = NestedReasoning`
+during `ModelInfo → Model` conversion.
 
-Not surfaced in the UI for v1 — `config.toml`-editable only. The
-cases where a user actually wants this (pin to Anthropic-only
-upstream for privacy reasons, sort by throughput, require ZDR)
-are advanced-user scenarios.
+#### Provider routing preferences (optional)
 
-### Leaderboard headers — not shipped
+pi ref: `openai-completions.ts:445–447` — if
+`baseUrl.includes("openrouter.ai") && model.compat?.openRouterRouting`
+is set, emits a top-level `provider` object carrying the
+preferences.
 
-`HTTP-Referer` and `X-Title` identify anie on OpenRouter's
-public leaderboard. Pi doesn't set them. Cosmetic-only. Skip.
+Config-only in v1 via the `ModelCompat::OpenAICompletions`
+compat blob (foundation PR A). UI surface deferred.
+
+#### Anthropic `cache_control` for `anthropic/*` models
+
+pi ref: `openai-completions.ts:470–501`
+(`maybeAddOpenRouterAnthropicCacheControl`) — when the model
+is `anthropic/*` routed through OR, pi walks the messages and
+adds `cache_control: { type: "ephemeral" }` on the last text
+part of the last user/assistant message. OpenRouter does NOT
+insert this for you; Anthropic's prompt caching only kicks in
+when the client marks cache breakpoints.
+
+**Cost impact.** Without this, users on Claude-via-OR pay the
+full input-token rate on every turn. With it, long
+conversations benefit from Anthropic's ~90% cache-hit discount.
+Non-trivial: for a 50-turn coding session on Claude Opus,
+roughly a 5× bill difference at steady state.
+
+Implementation: a small helper runs during
+`OpenAIProvider::convert_messages` when the model's
+`base_url` contains `openrouter.ai` and `model.id.starts_with("anthropic/")`.
+Walk messages back-to-front, find the last text part, attach
+`cache_control: { type: "ephemeral" }`. No-op for other
+upstreams.
+
+#### Leaderboard headers — not shipped
+
+`HTTP-Referer` / `X-Title` — pi doesn't set them. Cosmetic
+only. Skip.
+
+### Response side
+
+#### Reasoning field names (three possible)
+
+pi ref: `openai-completions.ts:186–226` — checks for reasoning
+in three possible delta fields and takes the first non-empty:
+
+1. `reasoning_content` (e.g., llama.cpp servers routed through
+   OR)
+2. `reasoning` (most standard)
+3. `reasoning_text` (some OR upstreams)
+
+We already handle `reasoning` and `reasoning_content`
+(`crates/anie-providers-builtin/src/openai/reasoning_strategy.rs:214`).
+**Missing: `reasoning_text`.** Small add — one string in the
+reasoning-field lookup list.
+
+#### `reasoning_details` — encrypted reasoning passthrough
+
+pi ref: `openai-completions.ts:267–279` + `600–641` — this is
+the mechanism that lets OpenAI's o-series encrypted reasoning
+survive multi-turn conversations through OpenRouter's Chat
+Completions proxy. **Reverses my earlier answer** that said
+we couldn't round-trip encrypted content through OR.
+
+**On receive** (delta handling): each `delta.reasoning_details`
+is an array of `{ type: "reasoning.encrypted", id, data }`
+objects. Pi attaches the whole object (serialized as JSON) to
+the matching ToolCall block's `thoughtSignature` field, keyed by
+the `id` matching the tool call's id.
+
+**On replay** (outgoing assistant message): pi collects the
+`thoughtSignature` values off each ToolCall, parses them back
+to objects, and sets
+`assistant_message.reasoning_details = [...]` on the outgoing
+message. OpenRouter then forwards to the OpenAI upstream which
+uses the encrypted blobs to preserve reasoning context.
+
+**Scope adjustment.** Our `ContentBlock::ToolCall` doesn't have
+a `thought_signature` (or equivalent) field today. This plan
+adds one as a scoped extension. The field is
+`Option<serde_json::Value>` — opaque, pass-through only. Add a
+`reasoning_details: Option<Vec<serde_json::Value>>` field to
+`AssistantMessage` or piggyback on ToolCall's state the way pi
+does. Decide at implementation time based on cleanest diff.
+
+Gated to OpenRouter (and later, direct OpenAI Responses) via
+the same discovery-driven capability routing that already exists
+for Anthropic signatures — catalog entries for
+`openai/o1*`, `openai/o3*`, `openai/gpt-5*` routed through OR
+flip a new `supports_openrouter_reasoning_details` capability or
+equivalent.
+
+#### Ordinary tool_calls, text, finish_reason
+
+All standard OpenAI Chat Completions shape. No divergence.
+
+### Model-discovery specifics
+
+pi ref: `scripts/generate-models.ts:60–108`.
+
+OpenRouter's `/api/v1/models` returns:
+
+| Field | Our use |
+|---|---|
+| `id` | `Model.id` |
+| `name` | `Model.name` |
+| `context_length` | `Model.context_window` |
+| `top_provider.max_completion_tokens` | `Model.max_tokens` |
+| `pricing.prompt` × 1_000_000 | `cost_per_million.input` |
+| `pricing.completion` × 1_000_000 | `cost_per_million.output` |
+| `pricing.input_cache_read` × 1_000_000 | `cost_per_million.cache_read` |
+| `pricing.input_cache_write` × 1_000_000 | `cost_per_million.cache_write` |
+| `architecture.modality` contains `image` | `supports_images: true` |
+| `supported_parameters` contains `reasoning` | `supports_reasoning: true` |
+| `supported_parameters` contains `tools` | used as a filter |
+
+**Filter to tool-supporting models.** Pi filters out models that
+don't advertise `"tools"` in `supported_parameters` — anie is a
+coding agent built on tool use, so non-tool models are mostly
+useless. We adopt the same filter. Users who want a text-only
+model can still configure it by hand.
+
+This makes the catalog size manageable too — filter to
+tool-supporting drops the count from ~500 to ~150, still
+comprehensive but less overwhelming in the picker.
+
+### Summary: what OpenRouter normalizes vs passes through
+
+**OpenRouter normalizes (so clients write once):**
+- reasoning _requests_ via nested `reasoning: { effort }`
+- provider routing via top-level `provider` object
+- encrypted reasoning passthrough via `reasoning_details`
+
+**OpenRouter does NOT normalize (client must handle):**
+- reasoning _response_ field naming — three variants exist
+- Anthropic prompt-caching markers — upstream-specific, client
+  inserts
+- upstream-specific features (Gemini `thoughtSignature`,
+  Anthropic `thinking.signature`) — partial passthrough,
+  verify per upstream
 
 ## Discovery-first catalog
 
@@ -166,25 +292,27 @@ The OpenRouter model ID's prefix (everything before the first
 for OpenRouter rewrites `replay_capabilities` and
 `reasoning_capabilities` based on this prefix:
 
-| Prefix | `requires_thinking_signature` | `supports_encrypted_reasoning` | `request_mode` |
+| Prefix | `requires_thinking_signature` | `supports_reasoning_details_replay` | `request_mode` |
 |---|---|---|---|
 | `anthropic/*` with reasoning | `true` | `false` | `NestedReasoning` |
-| `openai/o1*`, `openai/o3*`, `openai/gpt-5*` | `false` | `false` (\*) | `NestedReasoning` |
+| `openai/o1*`, `openai/o3*`, `openai/gpt-5*` | `false` | `true` (\*) | `NestedReasoning` |
 | `google/*` with reasoning | `false` (\*\*) | `false` | `NestedReasoning` |
 | `meta-llama/*`, `deepseek/*`, `qwen/*`, `mistralai/*` (no reasoning) | `false` | `false` | `None` |
 | Non-reasoning (per `supported_parameters`) | `false` | `false` | `None` |
 
-(\*) OpenRouter proxies OpenAI's Responses API's encrypted reasoning
-back to the caller but we can't actually replay `encrypted_content`
-through Chat Completions — so we mark it `false` for now and
-accept a small continuity loss across multi-turn o3 conversations.
-Plan 04 (direct OpenAI Responses API, deferred) addresses this
-for non-OR direct users.
+(\*) Revised: OpenRouter **does** round-trip encrypted reasoning
+state via the `reasoning_details` field on assistant messages
+(pi ref: `openai-completions.ts:267–279` and `629–641`).
+Multi-turn o-series reasoning works through OR. The capability
+is tracked as `supports_reasoning_details_replay: true` on the
+model's `ReplayCapabilities` (new flag; piggybacks on the
+existing replay-capability plumbing). See "Response side →
+`reasoning_details`" above for the mechanism.
 
 (\*\*) Gemini's `thoughtSignature` over OpenRouter is unverified
 — the signature may or may not traverse the proxy. Mark `false`
-for v1; revisit if users report broken multi-turn Gemini
-reasoning.
+for v1; revisit with a smoke test once a `google/gemini-2.5-pro`
+model is reached through OR.
 
 A small `openrouter_capability_mapping` function in
 `anie-providers-builtin` owns this logic, with a unit test per
