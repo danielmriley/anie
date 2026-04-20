@@ -78,9 +78,13 @@ pub(super) enum NativeReasoningRequestStrategy {
     /// Used by hosted OpenAI, Ollama, vLLM, and most OpenAI-compat
     /// servers.
     TopLevelReasoningEffort,
-    /// Send nested `reasoning: { effort: "..." }`.
-    /// LM Studio's proprietary shape.
-    LmStudioNestedReasoning,
+    /// Send nested `reasoning: { effort: "..." }`. Used by LM
+    /// Studio locally and by hosted OpenRouter (OpenRouter
+    /// normalizes reasoning across upstream providers via this
+    /// nested object). Unlike `TopLevelReasoningEffort`, this
+    /// path emits `{ effort: "none" }` for `ThinkingLevel::Off`
+    /// so the upstream receives an explicit disable signal.
+    NestedReasoning,
 }
 
 /// Identifies which OpenAI-compatible backend shape `model` targets.
@@ -350,7 +354,7 @@ mod tests {
         assert_eq!(
             provider.native_reasoning_request_strategies(&lmstudio, &options),
             vec![
-                NativeReasoningRequestStrategy::LmStudioNestedReasoning,
+                NativeReasoningRequestStrategy::NestedReasoning,
                 NativeReasoningRequestStrategy::NoNativeFields,
             ]
         );

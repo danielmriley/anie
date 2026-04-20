@@ -158,21 +158,28 @@ impl OpenAIProvider {
         if let Some(max_tokens) = effective_max_tokens(model, options) {
             body.insert("max_tokens".into(), json!(max_tokens));
         }
-        if let Some(reasoning_effort) = reasoning_effort(options.thinking) {
-            match native_reasoning_strategy {
-                NativeReasoningRequestStrategy::TopLevelReasoningEffort => {
-                    body.insert("reasoning_effort".into(), json!(reasoning_effort));
+        match native_reasoning_strategy {
+            NativeReasoningRequestStrategy::NestedReasoning => {
+                // Nested-reasoning backends (LM Studio, OpenRouter)
+                // expect an explicit `{effort: "none"}` to disable
+                // reasoning rather than a field omission, matching
+                // pi's OpenRouter mapping.
+                let effort = reasoning_effort(options.thinking).unwrap_or("none");
+                body.insert("reasoning".into(), json!({ "effort": effort }));
+            }
+            NativeReasoningRequestStrategy::TopLevelReasoningEffort => {
+                if let Some(effort) = reasoning_effort(options.thinking) {
+                    body.insert("reasoning_effort".into(), json!(effort));
                 }
-                NativeReasoningRequestStrategy::LmStudioNestedReasoning => {
-                    body.insert("reasoning".into(), json!({ "effort": reasoning_effort }));
-                }
-                NativeReasoningRequestStrategy::NoNativeFields
-                    if model.supports_reasoning && !is_local_openai_compatible_target(model) =>
+            }
+            NativeReasoningRequestStrategy::NoNativeFields => {
+                if let Some(effort) = reasoning_effort(options.thinking)
+                    && model.supports_reasoning
+                    && !is_local_openai_compatible_target(model)
                 {
-                    body.insert("reasoning_effort".into(), json!(reasoning_effort));
+                    body.insert("reasoning_effort".into(), json!(effort));
                     body.insert("reasoning".into(), json!({ "summary": "auto" }));
                 }
-                NativeReasoningRequestStrategy::NoNativeFields => {}
             }
         }
 
@@ -276,11 +283,29 @@ impl OpenAIProvider {
         model: &Model,
         options: &StreamOptions,
     ) -> Vec<NativeReasoningRequestStrategy> {
+        let capabilities = effective_reasoning_capabilities(model);
+
+        // Nested reasoning is used by both LM Studio (local) and
+        // OpenRouter (hosted) and always sends an effort value —
+        // `{effort: "none"}` for `Off`. Honor a declared
+        // `NestedReasoning` mode before applying the local-only
+        // gate so hosted OpenRouter catalog entries can take this
+        // path.
+        if let Some(caps) = capabilities.as_ref()
+            && caps.control == Some(ReasoningControlMode::Native)
+            && caps.request_mode == Some(ThinkingRequestMode::NestedReasoning)
+        {
+            return vec![
+                NativeReasoningRequestStrategy::NestedReasoning,
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ];
+        }
+
         if options.thinking == ThinkingLevel::Off || !is_local_openai_compatible_target(model) {
             return vec![NativeReasoningRequestStrategy::NoNativeFields];
         }
 
-        let Some(capabilities) = effective_reasoning_capabilities(model) else {
+        let Some(capabilities) = capabilities else {
             return vec![NativeReasoningRequestStrategy::NoNativeFields];
         };
         if capabilities.control != Some(ReasoningControlMode::Native) {
@@ -292,12 +317,13 @@ impl OpenAIProvider {
                 Some(NativeReasoningRequestStrategy::TopLevelReasoningEffort)
             }
             Some(ThinkingRequestMode::NestedReasoning) => {
-                Some(NativeReasoningRequestStrategy::LmStudioNestedReasoning)
+                // Handled above; unreachable but kept for completeness.
+                Some(NativeReasoningRequestStrategy::NestedReasoning)
             }
             Some(ThinkingRequestMode::PromptSteering) => None,
             None => match openai_compatible_backend(model) {
                 OpenAiCompatibleBackend::LmStudio => {
-                    Some(NativeReasoningRequestStrategy::LmStudioNestedReasoning)
+                    Some(NativeReasoningRequestStrategy::NestedReasoning)
                 }
                 OpenAiCompatibleBackend::Ollama
                 | OpenAiCompatibleBackend::Vllm
@@ -814,7 +840,7 @@ mod tests {
         assert_eq!(
             provider.native_reasoning_request_strategies(&model, &options),
             vec![
-                NativeReasoningRequestStrategy::LmStudioNestedReasoning,
+                NativeReasoningRequestStrategy::NestedReasoning,
                 NativeReasoningRequestStrategy::NoNativeFields,
             ]
         );
@@ -828,7 +854,7 @@ mod tests {
             },
             &options,
             true,
-            NativeReasoningRequestStrategy::LmStudioNestedReasoning,
+            NativeReasoningRequestStrategy::NestedReasoning,
         );
         assert_eq!(body["reasoning"], json!({ "effort": "high" }));
         assert!(body.get("reasoning_effort").is_none());
@@ -865,5 +891,122 @@ mod tests {
         );
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("reasoning").is_none());
+    }
+
+    /// Hosted model that declares `NestedReasoning` — e.g. an
+    /// OpenRouter catalog entry routed to an upstream that
+    /// normalizes via the nested `reasoning` object.
+    fn sample_nested_hosted_model() -> Model {
+        Model {
+            id: "anthropic/claude-sonnet-4".into(),
+            name: "Claude Sonnet 4 (OpenRouter)".into(),
+            provider: "openrouter".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            context_window: 200_000,
+            max_tokens: 8_192,
+            supports_reasoning: true,
+            reasoning_capabilities: Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::NestedReasoning),
+            }),
+            supports_images: true,
+            cost_per_million: anie_provider::CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        }
+    }
+
+    fn nested_body_for(model: &Model, thinking: ThinkingLevel) -> serde_json::Value {
+        let provider = OpenAIProvider::new();
+        let options = StreamOptions {
+            thinking,
+            ..StreamOptions::default()
+        };
+        let strategies = provider.native_reasoning_request_strategies(model, &options);
+        assert_eq!(
+            strategies[0],
+            NativeReasoningRequestStrategy::NestedReasoning,
+            "nested strategy should lead for declared NestedReasoning models"
+        );
+        provider.build_request_body_with_native_reasoning_strategy(
+            model,
+            &LlmContext {
+                system_prompt: String::new(),
+                messages: vec![],
+                tools: vec![],
+            },
+            &options,
+            true,
+            NativeReasoningRequestStrategy::NestedReasoning,
+        )
+    }
+
+    #[test]
+    fn nested_reasoning_emits_reasoning_object_with_effort() {
+        let model = sample_nested_hosted_model();
+        let body = nested_body_for(&model, ThinkingLevel::High);
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn nested_reasoning_off_level_emits_effort_none() {
+        let model = sample_nested_hosted_model();
+        let body = nested_body_for(&model, ThinkingLevel::Off);
+        assert_eq!(body["reasoning"], json!({ "effort": "none" }));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn nested_reasoning_maps_every_thinking_level() {
+        let model = sample_nested_hosted_model();
+        for (level, expected) in [
+            (ThinkingLevel::Off, "none"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+        ] {
+            let body = nested_body_for(&model, level);
+            assert_eq!(
+                body["reasoning"],
+                json!({ "effort": expected }),
+                "thinking level {level:?} should map to effort {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_reasoning_effort_mode_unchanged_for_hosted_reasoning_models() {
+        let provider = OpenAIProvider::new();
+        let model = sample_model();
+        let options = StreamOptions {
+            thinking: ThinkingLevel::High,
+            ..StreamOptions::default()
+        };
+        let strategies = provider.native_reasoning_request_strategies(&model, &options);
+        let body = provider.build_request_body_with_native_reasoning_strategy(
+            &model,
+            &LlmContext {
+                system_prompt: String::new(),
+                messages: vec![LlmMessage {
+                    role: "user".into(),
+                    content: json!("hello"),
+                }],
+                tools: vec![],
+            },
+            &options,
+            true,
+            strategies[0],
+        );
+
+        assert_eq!(
+            strategies,
+            vec![NativeReasoningRequestStrategy::NoNativeFields]
+        );
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(body["reasoning"], json!({ "summary": "auto" }));
     }
 }
