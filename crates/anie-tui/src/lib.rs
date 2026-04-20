@@ -8,6 +8,7 @@ mod input;
 mod output;
 mod overlay;
 mod overlays;
+mod render_debug;
 mod terminal;
 mod widgets;
 

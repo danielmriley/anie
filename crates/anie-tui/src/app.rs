@@ -1301,7 +1301,9 @@ pub async fn run_tui(
 
     loop {
         if dirty && last_render_at.elapsed() >= FRAME_BUDGET {
-            terminal.draw(|frame| app.render(frame))?;
+            let frame = crate::render_debug::RenderFrame::begin();
+            terminal.draw(|f| app.render(f))?;
+            frame.end(app.output_pane.blocks().len());
             dirty = false;
             last_render_at = Instant::now();
         }
