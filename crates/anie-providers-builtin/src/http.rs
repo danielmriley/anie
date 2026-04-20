@@ -35,9 +35,17 @@ pub fn shared_http_client() -> Result<&'static reqwest::Client, ProviderError> {
 
 /// Build the shared HTTP client. `Err(ClientInitError)` is cached
 /// inside `OnceLock` if construction fails.
+///
+/// **No overall-request timeout is set.** An LLM streaming response
+/// can legitimately run for many minutes — a slow local model on a
+/// large context, a long extended-thinking turn, etc. A total
+/// timeout here would abort a healthy in-flight stream and
+/// trigger a transient-retry cycle (retry policy classifies
+/// `Transport` as retryable). The user controls cancellation via
+/// Ctrl+C. `connect_timeout` still fails fast on an unreachable
+/// server.
 fn build_client() -> Result<reqwest::Client, ClientInitError> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
@@ -52,12 +60,13 @@ fn build_client() -> Result<reqwest::Client, ClientInitError> {
 /// (e.g. `detect_local_servers` uses a 1-second connect timeout).
 /// Prefer `shared_http_client()` for the hot provider path.
 ///
+/// Same no-total-timeout rationale as `build_client`.
+///
 /// Panics if TLS roots cannot be loaded. Only used at startup by
 /// cold-path callers.
 #[allow(clippy::expect_used)]
 pub fn create_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
