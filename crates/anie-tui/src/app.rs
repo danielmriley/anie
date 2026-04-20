@@ -431,6 +431,7 @@ impl App {
                         extract_text(&assistant.content),
                         extract_thinking(&assistant.content),
                         assistant.timestamp,
+                        assistant.error_message.clone(),
                     );
                     if assistant.usage.input_tokens > 0 {
                         self.status_bar.last_known_input_tokens =
@@ -1228,6 +1229,7 @@ impl App {
                     thinking: extract_thinking(&assistant.content),
                     is_streaming: false,
                     timestamp: assistant.timestamp,
+                    error_message: assistant.error_message.clone(),
                 })
             }
             Message::ToolResult(tool_result) => {

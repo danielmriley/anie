@@ -17,6 +17,14 @@ pub enum RenderedBlock {
         thinking: String,
         is_streaming: bool,
         timestamp: u64,
+        /// Provider-reported error attached to the assistant
+        /// turn. Set when the stream ended with a non-terminal
+        /// error (e.g. the model emitted only reasoning with no
+        /// visible text or tool call). `None` on healthy turns.
+        /// The renderer surfaces this as a distinct line after
+        /// the thinking/answer so the user never sees a turn end
+        /// silently.
+        error_message: Option<String>,
     },
     /// A tool execution block.
     ToolCall {
@@ -96,6 +104,7 @@ impl OutputPane {
             thinking: String::new(),
             is_streaming: true,
             timestamp: 0,
+            error_message: None,
         });
     }
 
@@ -115,18 +124,32 @@ impl OutputPane {
     }
 
     /// Finalize the last assistant block.
-    pub fn finalize_last_assistant(&mut self, text: String, thinking: String, timestamp: u64) {
+    ///
+    /// `error_message` surfaces a provider-reported failure that
+    /// accompanied the assistant turn (e.g. the model emitted
+    /// only reasoning and no visible text). Rendering always
+    /// includes a trailing line for this so the user never sees a
+    /// turn end silently on an error.
+    pub fn finalize_last_assistant(
+        &mut self,
+        text: String,
+        thinking: String,
+        timestamp: u64,
+        error_message: Option<String>,
+    ) {
         if let Some(RenderedBlock::AssistantMessage {
             text: current_text,
             thinking: current_thinking,
             is_streaming,
             timestamp: current_timestamp,
+            error_message: current_error,
         }) = self.blocks.last_mut()
         {
             *current_text = text;
             *current_thinking = thinking;
             *is_streaming = false;
             *current_timestamp = timestamp;
+            *current_error = error_message;
         }
     }
 
@@ -327,8 +350,16 @@ fn block_lines(block: &RenderedBlock, width: u16, spinner_frame: &str) -> Vec<Li
             text,
             thinking,
             is_streaming,
+            error_message,
             ..
-        } => assistant_block_lines(text, thinking, *is_streaming, width, spinner_frame),
+        } => assistant_block_lines(
+            text,
+            thinking,
+            *is_streaming,
+            error_message.as_deref(),
+            width,
+            spinner_frame,
+        ),
         RenderedBlock::ToolCall {
             tool_name,
             args_display,
@@ -362,6 +393,7 @@ fn assistant_block_lines(
     text: &str,
     thinking: &str,
     is_streaming: bool,
+    error_message: Option<&str>,
     width: u16,
     spinner_frame: &str,
 ) -> Vec<Line<'static>> {
@@ -388,12 +420,33 @@ fn assistant_block_lines(
             spinner_frame,
         ),
     );
+    // Provider errors land at the bottom of the block so the user
+    // sees the reason a turn produced no visible answer. Without
+    // this, a thinking-only response would leave the user staring
+    // at a thinking block with nothing after it.
+    if let Some(message) = error_message {
+        append_assistant_section(
+            &mut result,
+            assistant_error_lines(message, width),
+        );
+    }
 
     if result.is_empty() {
         vec![Line::default()]
     } else {
         result
     }
+}
+
+fn assistant_error_lines(message: &str, width: u16) -> Vec<Line<'static>> {
+    let prefixed = format!("⚠ {message}");
+    wrap_text(
+        &prefixed,
+        width,
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn append_assistant_section(result: &mut Vec<Line<'static>>, section: Vec<Line<'static>>) {

@@ -1090,6 +1090,72 @@ fn truncate_text_handles_unicode_without_panicking() {
 }
 
 #[test]
+fn finalize_last_assistant_preserves_provider_error_message() {
+    // Regression: a provider error that carries an
+    // `error_message` on the AssistantMessage must survive
+    // `finalize_last_assistant` so the renderer can surface it.
+    // Prior to the fix this argument was dropped, leaving the
+    // user staring at a thinking block with no explanation of
+    // why no text followed.
+    let mut pane = OutputPane::new();
+    pane.add_streaming_assistant();
+    pane.finalize_last_assistant(
+        String::new(),
+        "planning…".into(),
+        10,
+        Some("model returned no visible content".into()),
+    );
+    let block = pane
+        .blocks()
+        .last()
+        .expect("assistant block must exist after finalize");
+    let RenderedBlock::AssistantMessage { error_message, .. } = block else {
+        panic!("expected AssistantMessage, got {block:?}");
+    };
+    assert_eq!(
+        error_message.as_deref(),
+        Some("model returned no visible content")
+    );
+}
+
+#[test]
+fn thinking_only_assistant_block_renders_error_footer() {
+    // Regression: the exact TUI scenario the user reported —
+    // thinking block present, no answer text, and a provider
+    // error attached. The rendered transcript must show the
+    // error so the turn does not appear to end silently.
+    let screen = render_assistant_block_with_error(
+        "",
+        "reasoning chain here",
+        "model returned no visible content (only reasoning)",
+        48,
+        10,
+    );
+    assert!(
+        screen.contains("thinking"),
+        "thinking section should still render:\n{screen}"
+    );
+    assert!(
+        screen.contains("no visible content"),
+        "error footer must be visible after a thinking-only turn:\n{screen}"
+    );
+    // Belt-and-suspenders: the warning glyph is the cue that
+    // this is an error line, not part of the thinking content.
+    assert!(screen.contains('⚠'), "error line should be flagged:\n{screen}");
+}
+
+#[test]
+fn assistant_block_without_error_renders_no_error_footer() {
+    // Happy-path regression: healthy turns render untouched by
+    // the new error-footer path.
+    let screen = render_assistant_block("answer text", "a plan", false, 48, 10);
+    assert!(
+        !screen.contains('⚠'),
+        "no warning glyph should appear on healthy turns:\n{screen}"
+    );
+}
+
+#[test]
 fn output_pane_last_assistant_text_skips_thinking_only_messages() {
     let mut pane = OutputPane::new();
     pane.add_block(RenderedBlock::AssistantMessage {
@@ -1097,12 +1163,14 @@ fn output_pane_last_assistant_text_skips_thinking_only_messages() {
         thinking: "plan only".into(),
         is_streaming: false,
         timestamp: 1,
+        error_message: None,
     });
     pane.add_block(RenderedBlock::AssistantMessage {
         text: "visible answer".into(),
         thinking: "hidden reasoning".into(),
         is_streaming: false,
         timestamp: 2,
+        error_message: None,
     });
 
     assert_eq!(pane.last_assistant_text(), Some("visible answer"));
@@ -1209,6 +1277,25 @@ fn render_assistant_block(
         thinking: thinking.into(),
         is_streaming,
         timestamp: 1,
+        error_message: None,
+    });
+    render_output_pane_to_string(&mut pane, width, height)
+}
+
+fn render_assistant_block_with_error(
+    text: &str,
+    thinking: &str,
+    error_message: &str,
+    width: u16,
+    height: u16,
+) -> String {
+    let mut pane = OutputPane::new();
+    pane.add_block(RenderedBlock::AssistantMessage {
+        text: text.into(),
+        thinking: thinking.into(),
+        is_streaming: false,
+        timestamp: 1,
+        error_message: Some(error_message.into()),
     });
     render_output_pane_to_string(&mut pane, width, height)
 }
