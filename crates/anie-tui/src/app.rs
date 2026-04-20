@@ -554,6 +554,22 @@ impl App {
         self.should_quit
     }
 
+    /// Whether the next periodic tick should trigger a redraw.
+    ///
+    /// The tick is the heartbeat that advances the spinner and
+    /// polls overlay workers. When there is no active run, no
+    /// overlay, and no pending worker output, the tick changes
+    /// nothing visible — redrawing anyway would re-wrap the
+    /// entire transcript 10 times a second for no reason. We
+    /// return `true` only when one of those signals is live.
+    #[must_use]
+    pub fn needs_tick_redraw(&self) -> bool {
+        if self.overlay.is_some() {
+            return true;
+        }
+        !matches!(self.agent_state, AgentUiState::Idle)
+    }
+
     fn handle_key_event(&mut self, key: KeyEvent) {
         match self.agent_state {
             AgentUiState::Idle => self.handle_idle_key(key),
@@ -1259,18 +1275,47 @@ pub async fn run_tui(
     app: &mut App,
 ) -> Result<()> {
     let mut term_events = EventStream::new();
+    // Start dirty so the first frame draws. We then only redraw
+    // when something mutated UI state, because `OutputPane::render`
+    // re-wraps every block in the transcript on every call — a
+    // long agent run with thousands of blocks turns each redraw
+    // into a visibly expensive operation.
+    let mut dirty = true;
     loop {
-        terminal.draw(|frame| app.render(frame))?;
+        if dirty {
+            terminal.draw(|frame| app.render(frame))?;
+            dirty = false;
+        }
 
         tokio::select! {
             Some(Ok(event)) = term_events.next() => {
                 app.handle_terminal_event(event)?;
+                dirty = true;
             }
             Some(event) = app.event_rx.recv() => {
                 app.handle_agent_event(event)?;
+                // Drain any additional agent events that piled up
+                // while we were busy — without this, a burst of
+                // N TextDelta events during fast streaming forces
+                // N full redraws, each walking the entire
+                // transcript. One coalesced redraw per burst
+                // keeps keystroke latency bounded even when the
+                // agent is emitting tokens at hundreds/sec.
+                while let Ok(event) = app.event_rx.try_recv() {
+                    app.handle_agent_event(event)?;
+                }
+                dirty = true;
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 app.handle_tick()?;
+                // Only mark dirty when the tick actually changed
+                // something visible — during idle there is no
+                // spinner and no worker output, so suppressing
+                // these redraws eliminates 10fps background work
+                // that otherwise scales with transcript size.
+                if app.needs_tick_redraw() {
+                    dirty = true;
+                }
             }
         }
 
