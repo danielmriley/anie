@@ -1050,17 +1050,25 @@ impl OnboardingScreen {
                     .first()
                     .map(|model| model.base_url.clone())
                     .unwrap_or_else(|| normalize_openai_base_url(&server.base_url));
+                let mut model = model_info.to_model(api, &base_url);
+                anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
-                    model: model_info.to_model(api, &base_url),
+                    model,
                     kind: ConfiguredProviderKind::ConfigBacked,
                     is_default: true,
                 }
             }
-            ModelPickerContext::ApiPreset { preset, .. } => ConfiguredProvider {
-                model: model_info.to_model(preset.model.api, &preset.model.base_url),
-                kind: preset.kind,
-                is_default: true,
-            },
+            ModelPickerContext::ApiPreset { preset, .. } => {
+                let mut model =
+                    model_info.to_model(preset.model.api, &preset.model.base_url);
+                model.provider = preset.provider_name.to_string();
+                anie_providers_builtin::apply_openrouter_capabilities(&mut model);
+                ConfiguredProvider {
+                    model,
+                    kind: preset.kind,
+                    is_default: true,
+                }
+            }
             ModelPickerContext::CustomEndpoint {
                 base_url,
                 provider_name,
@@ -1068,6 +1076,7 @@ impl OnboardingScreen {
             } => {
                 let mut model = model_info.to_model(ApiKind::OpenAICompletions, base_url);
                 model.provider = provider_name.clone();
+                anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
                     model,
                     kind: ConfiguredProviderKind::ConfigBacked,

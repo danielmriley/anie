@@ -364,6 +364,7 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
             requires_thinking_signature: true,
             supports_redacted_thinking: true,
             supports_encrypted_reasoning: false,
+            supports_reasoning_details_replay: false,
         }),
         compat: anie_provider::ModelCompat::None,
     };

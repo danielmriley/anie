@@ -1148,6 +1148,7 @@ fn model_info_to_provider_model(entry: &ProviderEntry, info: &ModelInfo) -> Mode
     let model = model_for_entry(entry);
     let mut resolved = info.to_model(model.api, &model.base_url);
     resolved.provider = entry.name.clone();
+    anie_providers_builtin::apply_openrouter_capabilities(&mut resolved);
     resolved
 }
 

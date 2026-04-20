@@ -293,10 +293,26 @@ async fn discover_openai_compatible_models(
             ))
         })?;
 
+    let provider_is_openrouter = request.provider_name.eq_ignore_ascii_case("openrouter");
     Ok(body
         .data
         .into_iter()
         .filter(|entry| entry.object.as_deref().unwrap_or("model") == "model")
+        .filter(|entry| {
+            // OpenRouter exposes many non-tool models we can't
+            // drive from a coding agent (completion-only models,
+            // image-gen, etc.). Filter those out for OpenRouter
+            // only so the picker stays useful.
+            if !provider_is_openrouter {
+                return true;
+            }
+            entry
+                .supported_parameters
+                .as_deref()
+                .is_some_and(|params| {
+                    params.iter().any(|param| param.eq_ignore_ascii_case("tools"))
+                })
+        })
         .map(|entry| {
             let supports_images = infer_openai_images(
                 entry.modalities.as_deref(),
@@ -1129,6 +1145,81 @@ mod tests {
                 .as_deref()
                 .is_some_and(|params| params.iter().any(|p| p == "tools"))
         );
+    }
+
+    #[tokio::test]
+    async fn openrouter_discovery_filters_non_tool_models() {
+        // OpenRouter exposes many completion-only / image-gen
+        // models that we can't drive from a coding agent. Only
+        // entries whose `supported_parameters` includes `"tools"`
+        // should survive discovery.
+        let fixture = r#"{
+            "data": [
+                {
+                    "id": "anthropic/claude-sonnet-4",
+                    "supported_parameters": ["tools", "reasoning"]
+                },
+                {
+                    "id": "some/completion-only-model",
+                    "supported_parameters": ["temperature", "top_p"]
+                },
+                {
+                    "id": "image-gen/flux-pro",
+                    "supported_parameters": []
+                },
+                {
+                    "id": "openai/o3",
+                    "supported_parameters": ["tools", "reasoning_effort"]
+                }
+            ]
+        }"#;
+
+        let server = spawn_mock_server(move |path, _headers| {
+            assert_eq!(path, "/v1/models");
+            MockResponse::ok_json(fixture)
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "openrouter",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            Some("sk-or-test"),
+        ))
+        .await
+        .expect("discover openrouter models");
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["anthropic/claude-sonnet-4", "openai/o3"]);
+    }
+
+    #[tokio::test]
+    async fn tool_supporting_filter_does_not_apply_to_non_openrouter_providers() {
+        // Direct OpenAI discovery doesn't return
+        // `supported_parameters` at all; applying the filter
+        // would wipe out the catalog. Guard against that.
+        let fixture = r#"{
+            "data": [
+                {"id": "gpt-4o"},
+                {"id": "o4-mini"}
+            ]
+        }"#;
+
+        let server = spawn_mock_server(move |_path, _headers| {
+            MockResponse::ok_json(fixture)
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "openai",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            Some("sk-test"),
+        ))
+        .await
+        .expect("discover openai models");
+
+        assert_eq!(models.len(), 2);
     }
 
     #[tokio::test]

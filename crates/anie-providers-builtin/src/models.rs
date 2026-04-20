@@ -17,6 +17,7 @@ fn anthropic_replay_capabilities() -> Option<ReplayCapabilities> {
         requires_thinking_signature: true,
         supports_redacted_thinking: true,
         supports_encrypted_reasoning: false,
+        supports_reasoning_details_replay: false,
     })
 }
 

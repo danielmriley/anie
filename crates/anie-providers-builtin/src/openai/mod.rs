@@ -16,10 +16,11 @@ use serde_json::json;
 
 use anie_protocol::{Message, ToolDef};
 use anie_provider::{
-    LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent, ProviderStream,
-    ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
+    LlmContext, LlmMessage, Model, ModelCompat, Provider, ProviderError, ProviderEvent,
+    ProviderStream, ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
 };
 
+use crate::openrouter::{insert_anthropic_cache_control, needs_anthropic_cache_control};
 use crate::{http::shared_http_client, parse_retry_after, sse_stream};
 
 mod convert;
@@ -140,10 +141,11 @@ impl OpenAIProvider {
         let mut body = serde_json::Map::new();
         body.insert("model".into(), serde_json::Value::String(model.id.clone()));
         body.insert("stream".into(), serde_json::Value::Bool(true));
-        body.insert(
-            "messages".into(),
-            serde_json::Value::Array(self.openai_request_messages(model, context, options)),
-        );
+        let mut messages = self.openai_request_messages(model, context, options);
+        if needs_anthropic_cache_control(model) {
+            insert_anthropic_cache_control(&mut messages);
+        }
+        body.insert("messages".into(), serde_json::Value::Array(messages));
 
         let tools = self.convert_tools(&context.tools);
         if !tools.is_empty() {
@@ -158,6 +160,17 @@ impl OpenAIProvider {
         if let Some(max_tokens) = effective_max_tokens(model, options) {
             body.insert("max_tokens".into(), json!(max_tokens));
         }
+        if let ModelCompat::OpenAICompletions(compat) = &model.compat
+            && let Some(routing) = compat.openrouter_routing.as_ref()
+            && let Ok(value) = serde_json::to_value(routing)
+            && value.as_object().is_some_and(|map| !map.is_empty())
+        {
+            // OpenRouter-only: surfaces the user's routing
+            // preferences as the top-level `provider` field.
+            // Ignored by every other OpenAI-compatible backend.
+            body.insert("provider".into(), value);
+        }
+
         match native_reasoning_strategy {
             NativeReasoningRequestStrategy::NestedReasoning => {
                 // Nested-reasoning backends (LM Studio, OpenRouter)
@@ -1008,5 +1021,102 @@ mod tests {
         );
         assert_eq!(body["reasoning_effort"], json!("high"));
         assert_eq!(body["reasoning"], json!({ "summary": "auto" }));
+    }
+
+    /// Build a minimal OpenRouter-targeted model with the given
+    /// upstream-prefixed id. Reasoning is left off so tests can
+    /// layer it via the compat blob / capabilities field.
+    fn openrouter_model(id: &str) -> Model {
+        let mut model = sample_nested_hosted_model();
+        model.id = id.into();
+        model.provider = "openrouter".into();
+        model.base_url = "https://openrouter.ai/api/v1".into();
+        model
+    }
+
+    fn openai_request_body_for(model: &Model, user_text: &str) -> serde_json::Value {
+        let provider = OpenAIProvider::new();
+        let context = LlmContext {
+            system_prompt: String::new(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content: json!(user_text),
+            }],
+            tools: Vec::new(),
+        };
+        provider.build_request_body(model, &context, &StreamOptions::default(), true)
+    }
+
+    #[test]
+    fn openrouter_anthropic_upstream_adds_cache_control_to_last_text() {
+        let model = openrouter_model("anthropic/claude-sonnet-4");
+        let body = openai_request_body_for(&model, "describe this");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        let last = messages.last().expect("last message");
+        let last_part = last["content"].as_array().expect("content array").last()
+            .expect("last content part")
+            .clone();
+        assert_eq!(last_part["type"], "text");
+        assert_eq!(last_part["text"], "describe this");
+        assert_eq!(last_part["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn openrouter_non_anthropic_upstream_does_not_add_cache_control() {
+        let model = openrouter_model("openai/o3");
+        let body = openai_request_body_for(&model, "hi");
+
+        let serialized = serde_json::to_string(&body).expect("serialize body");
+        assert!(
+            !serialized.contains("cache_control"),
+            "cache_control must not appear for non-anthropic upstreams: {serialized}"
+        );
+    }
+
+    #[test]
+    fn openrouter_routing_preferences_propagate_to_body() {
+        use anie_provider::{OpenAICompletionsCompat, OpenRouterRouting};
+        let mut model = openrouter_model("anthropic/claude-sonnet-4");
+        model.compat = ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+            openrouter_routing: Some(OpenRouterRouting {
+                allow_fallbacks: Some(true),
+                order: Some(vec!["anthropic".into()]),
+                only: None,
+                ignore: None,
+                zdr: Some(true),
+            }),
+        });
+        let body = openai_request_body_for(&model, "hi");
+        let provider_field = body["provider"].as_object().expect("provider object");
+        assert_eq!(provider_field["allow_fallbacks"], json!(true));
+        assert_eq!(provider_field["zdr"], json!(true));
+        assert_eq!(provider_field["order"], json!(["anthropic"]));
+        assert!(!provider_field.contains_key("ignore"));
+        assert!(!provider_field.contains_key("only"));
+    }
+
+    #[test]
+    fn openrouter_routing_none_omits_provider_field() {
+        // Default compat (no routing) must not emit a `provider`
+        // field — OpenRouter treats its absence as "use the usual
+        // routing heuristics", which is what we want by default.
+        let model = openrouter_model("anthropic/claude-sonnet-4");
+        let body = openai_request_body_for(&model, "hi");
+        assert!(!body.as_object().expect("body").contains_key("provider"));
+    }
+
+    #[test]
+    fn openrouter_routing_empty_struct_omits_provider_field() {
+        // All-None `OpenRouterRouting` serializes to `{}`. We
+        // explicitly skip emitting the `provider` field in that
+        // case so we don't confuse OpenRouter with an empty object.
+        use anie_provider::{OpenAICompletionsCompat, OpenRouterRouting};
+        let mut model = openrouter_model("openai/o3");
+        model.compat = ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+            openrouter_routing: Some(OpenRouterRouting::default()),
+        });
+        let body = openai_request_body_for(&model, "hi");
+        assert!(!body.as_object().expect("body").contains_key("provider"));
     }
 }

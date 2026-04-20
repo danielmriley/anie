@@ -7,6 +7,7 @@ mod local;
 mod model_discovery;
 mod models;
 mod openai;
+mod openrouter;
 mod sse;
 mod util;
 
@@ -16,6 +17,10 @@ pub use local::{LocalServer, detect_local_servers, probe_openai_compatible};
 pub use model_discovery::{ModelDiscoveryCache, ModelDiscoveryRequest, discover_models};
 pub use models::builtin_models;
 pub use openai::OpenAIProvider;
+pub use openrouter::{
+    apply_openrouter_capabilities, insert_anthropic_cache_control, is_openrouter_target,
+    needs_anthropic_cache_control, openrouter_capabilities_for,
+};
 pub use sse::{SseError, SseEvent, sse_stream};
 pub use util::{classify_http_error, parse_retry_after};
 

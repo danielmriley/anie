@@ -213,9 +213,15 @@ fn looks_like_native_reasoning_compat_body(body: &str) -> bool {
 
 /// Extract a thinking/reasoning delta from a streamed chat-completion
 /// `delta` object. Returns the first non-empty value found in any of
-/// `reasoning`, `reasoning_content`, or `thinking`.
+/// `reasoning`, `reasoning_content`, `reasoning_text`, or `thinking`.
+///
+/// The three `reasoning*` names are all seen in the wild: OpenAI and
+/// most OpenAI-compat servers use `reasoning` or `reasoning_content`;
+/// OpenRouter forwards `reasoning_text` from some upstreams
+/// (DeepSeek's native API among them) without normalizing the field
+/// name.
 pub(super) fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
-    ["reasoning", "reasoning_content", "thinking"]
+    ["reasoning", "reasoning_content", "reasoning_text", "thinking"]
         .iter()
         .find_map(|field| {
             delta
@@ -267,6 +273,25 @@ mod tests {
             replay_capabilities: None,
             compat: ModelCompat::None,
         }
+    }
+
+    #[test]
+    fn native_reasoning_delta_captures_every_known_field_name() {
+        use serde_json::json;
+        for field in ["reasoning", "reasoning_content", "reasoning_text", "thinking"] {
+            let delta = json!({ field: "thinking hard" });
+            assert_eq!(
+                native_reasoning_delta(&delta),
+                Some("thinking hard".to_string()),
+                "field {field:?} should be recognized"
+            );
+        }
+    }
+
+    #[test]
+    fn native_reasoning_delta_returns_none_when_no_recognized_field_present() {
+        let delta = serde_json::json!({ "content": "plain text", "role": "assistant" });
+        assert_eq!(native_reasoning_delta(&delta), None);
     }
 
     #[test]

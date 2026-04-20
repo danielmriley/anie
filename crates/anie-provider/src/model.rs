@@ -103,6 +103,15 @@ pub struct ReplayCapabilities {
     /// support; currently false everywhere.
     #[serde(default)]
     pub supports_encrypted_reasoning: bool,
+
+    /// The provider emits `reasoning_details` (OpenRouter's
+    /// normalized wrapper over encrypted reasoning blobs from
+    /// o-series / GPT-5 upstreams) that must be replayed verbatim
+    /// on subsequent turns or the upstream drops reasoning
+    /// context. Currently set for OpenRouter catalog entries
+    /// whose id matches `openai/o*` or `openai/gpt-5*`.
+    #[serde(default)]
+    pub supports_reasoning_details_replay: bool,
 }
 
 /// Provider-family compat knobs attached per model.
