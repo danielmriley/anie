@@ -37,20 +37,51 @@ API keys come from <https://openrouter.ai/keys>.
 
 ## OpenRouter-specific request quirks
 
-Two optional request-body/header additions OpenRouter uses for
-leaderboards and billing metadata. Neither is required for the
-API to work, but both are idiomatic and we should set them:
+### Reasoning field shape (required)
 
-| Header | Purpose | Value |
-|---|---|---|
-| `HTTP-Referer` | Identifies anie on OpenRouter's leaderboard. | `https://github.com/danielmriley/anie` (configurable in `config.toml`) |
-| `X-Title` | Human-readable app name on the leaderboard. | `anie` (same, configurable) |
+OpenRouter normalizes reasoning across upstreams by putting it in
+a **nested** `reasoning: { effort: "high" }` object — not the flat
+`reasoning_effort: "high"` field OpenAI's Chat Completions uses.
+pi's openai-completions provider has explicit branching for this
+via a `thinkingFormat: "openrouter"` compat flag
+(`packages/ai/src/providers/openai-completions.ts:429`). Without
+handling, sending `reasoning_effort: "high"` against OpenRouter
+silently drops the reasoning request and the user gets no
+reasoning from models that should support it.
 
-**Implementation:** the existing `OpenAIProvider` takes
-`extra_headers` via `ResolvedRequestOptions`. Either extend that
-path (clean) or accept a `model.extra_headers` field on a
-per-catalog-entry basis (also clean). The preset for OpenRouter
-sets these defaults; users can override in config.
+**Implementation.** Our existing `ReasoningCapabilities` +
+`ThinkingRequestMode` types cover this: add a
+`ThinkingRequestMode::NestedReasoning` variant (if not already
+present) and wire it through `reasoning_strategy.rs`. The
+OpenRouter catalog entries declare
+`reasoning_capabilities.request_mode =
+Some(NestedReasoning)`.
+
+### Provider routing preferences (optional but valuable)
+
+OpenRouter accepts a top-level `provider` field in the request
+body with a rich routing-preferences object — order of upstream
+preferences, fallback behavior, price ceilings, Zero-Data-Retention
+filters, quantization filters, sort-by-throughput, etc. pi models
+the full shape (`OpenRouterRouting` in
+`packages/ai/src/types.ts:307`) so users can pin upstream
+providers or require cheapest-routing per request.
+
+For **v1** we ship the routing support at the catalog level only:
+a `ReplayCapabilities`-adjacent `openrouter_routing: Option<...>`
+field on `Model` that carries the user's preferences through. The
+plan 00 preset UI doesn't need to expose the routing knobs —
+they're `config.toml`-editable. Follow-up plan can surface them
+in `/providers`.
+
+### Leaderboard headers (optional, cosmetic)
+
+`HTTP-Referer` and `X-Title` identify anie on OpenRouter's public
+leaderboard. Pi does **not** set these for itself (checked in its
+codebase: zero hits). They're not required by the API and only
+affect OpenRouter's own public stats. **Drop from v1 scope**; add
+later as a `config.toml`-level opt-in if the user wants to show
+up on the leaderboard.
 
 ## Model catalog entries
 
@@ -128,10 +159,11 @@ function; don't reshape the generic discovery path.
 | # | Test |
 |---|---|
 | 1 | `openrouter_preset_registered` — assert the catalog has the entry with the correct category. |
-| 2 | `openrouter_request_includes_http_referer_and_x_title` — build a request body via `OpenAIProvider::build_request_body_for_test` with the OpenRouter preset applied, assert the two headers appear in the outbound options. |
+| 2 | `openrouter_request_uses_nested_reasoning_object` — build a request body for an OpenRouter reasoning model, assert `reasoning.effort` is set as a nested object and `reasoning_effort` is absent. |
 | 3 | `openrouter_model_ids_preserve_provider_prefix` — the `anthropic/claude-sonnet-4.6` form roundtrips without the slash getting eaten by any path parsing. |
 | 4 | `openrouter_model_discovery_parses_models_endpoint` — fixture response from `/api/v1/models`, assert the cache populates at least one model. |
-| 5 | Manual smoke: configure key, send a prompt to `anthropic/claude-sonnet-4.6`, confirm a second turn replay works (tests the thinking-signature round-trip). |
+| 5 | `openrouter_routing_preferences_propagate_when_configured` — per-model `openrouter_routing` with `{ order: ["anthropic"] }` surfaces in the outbound body's `provider` field. |
+| 6 | Manual smoke: configure key, send a prompt to `anthropic/claude-sonnet-4.6`, confirm a second turn replay works (tests the thinking-signature round-trip). |
 
 ## Exit criteria
 
@@ -140,19 +172,23 @@ function; don't reshape the generic discovery path.
 - [ ] User can configure an API key via the onboarding flow and
       successfully run a two-turn conversation against
       `anthropic/claude-sonnet-4.6`.
-- [ ] `HTTP-Referer` and `X-Title` headers are set on outbound
-      requests with overridable defaults.
+- [ ] `ThinkingRequestMode::NestedReasoning` exists and the
+      OpenRouter reasoning catalog entries use it. The outbound
+      request body uses `reasoning.effort` (nested), not
+      `reasoning_effort`.
 - [ ] The initial eight-model catalog entries are present with
       correct context windows.
-- [ ] Invariant test suite (plan 06 integration tests) exercises
-      the OpenRouter preset at least once.
+- [ ] Invariant test suite (from completed api_integrity plan 06)
+      exercises the OpenRouter preset at least once.
 
 ## Out of scope
 
 - Live-pricing fetch from `/api/v1/models` (nice-to-have).
-- OpenRouter's cost-routing headers (e.g. `X-Or-Ignore-Providers`,
-  `X-Or-Order`). Users can set them manually via config if they
-  need fine-grained upstream control.
+- `HTTP-Referer` / `X-Title` leaderboard headers (cosmetic;
+  revisit post-v1 if a user asks for leaderboard attribution).
+- UI surface for `openrouter_routing` preferences — v1 keeps them
+  `config.toml`-editable only. `/providers` form extension is a
+  follow-up.
 - OpenRouter OAuth flow (they do offer one; API key is the
   common path).
 

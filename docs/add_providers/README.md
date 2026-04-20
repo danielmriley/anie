@@ -21,6 +21,12 @@ Background material:
 - **[`docs/arch/pi_summary.md`](../arch/pi_summary.md)** — pi's
   provider set is the reference model. Its `Api` union at
   `packages/ai/src/types.ts` is the breadth target.
+- **[`pi_comparison.md`](pi_comparison.md)** — per-plan
+  comparison of our approach against pi's shipping
+  implementation. Notes the findings from reading pi that
+  updated each plan (OpenRouter reasoning shape, Gemini
+  `thoughtSignature`, Bedrock bearer-token auth, Mistral
+  native-vs-compat tradeoff).
 
 ## Today's built-in set
 

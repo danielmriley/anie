@@ -28,6 +28,29 @@ differences:
 3. The deployment name replaces the model ID in the URL; the
    request body's `"model"` field is **ignored** by Azure.
 
+### Note on pi's approach
+
+Pi ships **only** Azure via the Responses API
+(`packages/ai/src/providers/azure-openai-responses.ts` —
+`api: "azure-openai-responses"`). There is no Azure Chat
+Completions provider in pi. The reasoning: o-series reasoning
+models on Azure require Responses, and pi standardized there.
+
+This plan ships Azure via **Chat Completions first** because:
+
+1. Chat Completions works for the GPT-4 / GPT-4o deployments
+   most Azure users have today.
+2. Plan 04 (OpenAI Responses) may or may not be done by the
+   time this plan lands — we shouldn't block Azure on Responses.
+3. Once plan 04 is in place, adding the
+   `ApiKind::OpenAIResponses` variant for Azure is a simple
+   per-deployment catalog switch — users who have o3 Azure
+   deployments configure them with that ApiKind; GPT-4o
+   deployments stay on Chat Completions.
+
+Document this in the plan's out-of-scope so Azure + Responses
+isn't dropped on the floor.
+
 ## Auth shape
 
 Two mechanisms Azure supports. This plan ships the first; the

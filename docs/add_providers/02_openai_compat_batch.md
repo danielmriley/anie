@@ -6,6 +6,20 @@ bearer-token auth, differ from OpenAI only in base URL, model
 catalog, and minor response-shape quirks. Cheaper to land them
 together than one at a time.
 
+> **Design note on Mistral.** pi (the reference harness at
+> `/home/daniel/Projects/agents/pi`) implements Mistral as a
+> dedicated provider using the official `@mistralai/mistralai`
+> SDK (`packages/ai/src/providers/mistral.ts`) rather than
+> routing it through OpenAI-compat. The reason is Mistral's
+> **magistral** reasoning models, which emit reasoning in a
+> Mistral-specific shape the OpenAI-compat path doesn't surface.
+> This plan ships Mistral via OpenAI-compat for v1 —
+> `mistral-large`, `codestral`, `ministral-8b` work fine — and
+> accepts that `magistral-medium` reasoning will not be
+> captured. A follow-up plan (see "Out of scope") can add a
+> native Mistral provider module mirroring pi's approach if
+> there's demand.
+
 ## User value
 
 | Provider | Niche |
@@ -137,6 +151,12 @@ without a new provider module.
 
 - **Function calling** uses OpenAI-compat `tool_calls` format —
   works with existing parser.
+- **Magistral reasoning** is **not captured** via OpenAI-compat.
+  Mistral's reasoning models expose thinking via a
+  Mistral-specific request/response shape that the OpenAI-compat
+  endpoint does not surface. v1 ships without `magistral-medium`
+  / `magistral-small` catalog entries; add them when (and if) a
+  native Mistral provider plan lands.
 - **Safe prompt flag** (`safe_prompt: bool`) is a Mistral-
   specific request-body field. Not plumbed. Ignore for v1; add
   as an `extra_params` on the preset if a user requests it.
@@ -201,6 +221,11 @@ For the batch as a whole:
 - Groq's Whisper audio endpoints.
 - xAI's image-generation models (different endpoint, not
   `/chat/completions`).
+- **Native Mistral provider** (separate follow-up plan) — a
+  dedicated `mistral-conversations` `ApiKind` and provider
+  module modeled on pi's `packages/ai/src/providers/mistral.ts`.
+  Would unlock `magistral-medium` reasoning. Sequenced after
+  Plan 03 (Gemini) because both involve a new `ApiKind`.
 
 ## Dependencies
 

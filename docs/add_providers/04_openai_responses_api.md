@@ -230,6 +230,15 @@ rely on it.
   no anie equivalent today).
 - Multi-turn tool-use streaming with partial tool results — same
   UX gap that exists for Chat Completions too.
+- **Codex Responses via ChatGPT OAuth.** Pi has a dedicated
+  `openai-codex-responses` provider
+  (`packages/ai/src/providers/openai-codex-responses.ts`) that
+  talks to `chatgpt.com/backend-api` using an OAuth token from
+  ChatGPT Plus/Pro. This plan ships standard Responses via
+  API key only. A follow-up plan can add Codex OAuth after
+  our broader OAuth story lands (tracked under
+  [`docs/notes/provider_expansion_and_auth.md`](../notes/provider_expansion_and_auth.md)
+  §2 "OAuth / subscription support").
 
 ## Dependencies
 

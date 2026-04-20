@@ -32,36 +32,62 @@ single departure from every other provider.
 
 ## Auth shape
 
-**AWS SigV4 request signing.** Requires access to:
+Two auth paths, both supported by pi
+(`packages/ai/src/providers/amazon-bedrock.ts` around the
+`AWS_BEARER_TOKEN_BEDROCK` reference). Ship both; the
+simpler one covers more users.
 
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- Optionally `AWS_SESSION_TOKEN` (for temporary credentials)
-- `AWS_REGION`
+### Bearer token (recommended first)
 
-Plus standard AWS credential-discovery chain (`~/.aws/credentials`,
-IAM instance metadata service, AWS SSO, etc.).
+- Env: `AWS_BEARER_TOKEN_BEDROCK`.
+- Sent as `Authorization: Bearer <token>` — **bypasses SigV4
+  entirely**, which is the whole reason it exists as an auth
+  mode.
+- Requires the `bedrock:CallWithBearerToken` IAM permission on
+  the token's identity, which the token-issuing admin already
+  configured if the token was handed out.
+- **No AWS SDK needed.** We can send the bearer token ourselves
+  over `reqwest` and use our own Event Stream decoder. This path
+  dodges the multi-MB binary size cost of the AWS SDK.
 
-**Use the official `aws-sdk-bedrockruntime` crate.** Rolling our
-own SigV4 + Event Stream decoder is weeks of work and doesn't
-belong in anie. The crate handles signing, credential discovery,
-region failover, and Event Stream framing. Dependency is ~MB on
-binary size — acceptable cost for the AWS targeting.
+### SigV4 signing (full compatibility)
 
-Alternative: hand-roll SigV4 using `aws-sigv4`. Slimmer but
-still requires Event Stream decoding, which only exists as
-pieces in the AWS SDK. Recommend the full SDK.
+- Env: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optionally
+  `AWS_SESSION_TOKEN`, `AWS_REGION`.
+- Full AWS credential-discovery chain (`~/.aws/credentials`,
+  IAM instance metadata service, AWS SSO, etc.).
+- **Use the official `aws-sdk-bedrockruntime` crate.** Rolling
+  our own SigV4 + Event Stream decoder is weeks of work. The
+  crate handles signing, credential discovery, region failover,
+  and Event Stream framing.
+
+### Implementation sequencing
+
+Phase A ships the bearer-token path only — users with an
+`AWS_BEARER_TOKEN_BEDROCK` can use Bedrock without the SDK in
+their binary. SigV4 + credential-chain discovery lands in a
+later phase behind the same `bedrock` feature flag.
+
+The feature flag still gates the AWS SDK dependency — users who
+only ever use bearer tokens don't compile the SDK at all.
 
 ## Dependencies on upstream crates
 
+Feature-gated under `bedrock`:
+
 ```toml
-aws-config = "1"
-aws-sdk-bedrockruntime = "1"
+[features]
+bedrock = []              # bearer-token path only (default when "bedrock" is set)
+bedrock-sigv4 = ["bedrock", "dep:aws-config", "dep:aws-sdk-bedrockruntime"]
+
+[dependencies]
+aws-config = { version = "1", optional = true }
+aws-sdk-bedrockruntime = { version = "1", optional = true }
 ```
 
-Adds to `anie-providers-builtin`. Note: these are large crates;
-consider a feature flag `bedrock` so users who don't need AWS
-can compile anie without pulling them in.
+Splitting into two feature flags lets the bearer-token user
+compile Bedrock support without the AWS SDK. Advanced users with
+full IAM flows enable `bedrock-sigv4`.
 
 ## `ApiKind` extension
 

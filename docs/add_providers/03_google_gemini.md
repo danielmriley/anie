@@ -32,6 +32,20 @@ Protocol summary (Google Generative Language / AI Studio API):
   separated by newlines (needs a distinct line-based SSE parser
   from the one OpenAI/Anthropic share).
 
+### SDK vs raw HTTP
+
+Pi uses the official `@google/genai` TypeScript SDK
+(`packages/ai/src/providers/google.ts`) and lets it handle
+framing, auth, and streaming. **Rust has no official Google
+Generative AI SDK.** Community crates exist (e.g.
+`google-generative-ai-rs`) but none match the official SDK's
+guarantees. Decision: hand-roll against the REST streaming
+endpoint. This is feasible — the line-delimited JSON format is
+simple — but costs us any upstream convenience when Google
+changes their wire format. The round-trip contract doc block
+in our provider module becomes the failsafe: a quarterly re-audit
+catches drift.
+
 ## Auth shape
 
 - **API key** via `?key={key}` (Google AI Studio path, the common
@@ -84,21 +98,55 @@ Intentionally dropped on replay (for this initial landing):
 
 ## Replay capabilities
 
-Gemini's native thinking (`thinking_budget` + `thought=true` on
-content parts) does **not** require a replay signature —
-Gemini's turn 2 accepts the thought blocks without opaque tokens
-the way Anthropic demands. Catalog entry:
+**Gemini emits `thoughtSignature` — analogous to Anthropic's
+`thinking.signature`.** Pi captures and replays it
+(`packages/ai/src/providers/google.ts` + `google-shared.ts`);
+if we don't, we lose reasoning continuity across turns for any
+Gemini reasoning model, and in some scenarios the server-side
+trace replay fails loudly.
+
+Important subtlety documented in
+`packages/ai/src/providers/google-shared.ts:17-27`:
+
+> `thoughtSignature` can appear on ANY part type (text,
+> functionCall, etc.) — it does NOT exclusively live on thought
+> parts.
+
+So our existing `ContentBlock::Thinking.signature` field is
+insufficient: a signature can attach to a `Text` or a `ToolCall`
+block too. Two options:
+
+1. **Lift signature onto a block-wrapper level** — every
+   `ContentBlock` variant gains an optional signature. Large
+   refactor across all providers; avoid for v1.
+2. **Gemini-specific handling**: the provider captures the
+   signature per-part but folds them into the last Thinking
+   block it sees, falling back to a single aggregated signature
+   attached to the assistant message itself via a new field.
+
+v1 ships **option 2** scoped to Gemini. If/when another provider
+shows the same pattern, revisit with option 1.
+
+Catalog entry:
 
 ```rust
 replay_capabilities: Some(ReplayCapabilities {
-    requires_thinking_signature: false,
+    requires_thinking_signature: true,   // for reasoning models
     supports_redacted_thinking: false,
     supports_encrypted_reasoning: false,
 }),
 ```
 
-Keeping the field explicit rather than `None` documents the
-decision.
+Non-reasoning Gemini models (`gemini-2.0-flash` without
+thinking) still get `requires_thinking_signature: false`.
+
+Important second subtlety: pi notes that "some backends only send
+`thoughtSignature` on the first delta for a given part/block;
+later deltas may omit it"
+(`google-shared.ts:34`, `retainThoughtSignature` helper). Our
+streaming state machine must carry forward the first signature
+it sees for each block; it cannot overwrite a captured signature
+with a subsequent empty value.
 
 ## Implementation phases
 
@@ -115,14 +163,20 @@ keep each PR reviewable.
 - Register provider in `init_provider_registry`. Catalog entry
   for `gemini-2.0-flash` only.
 
-### Phase B — Streaming parser + thinking
+### Phase B — Streaming parser + thinking + signatures
 
 - Write the line-delimited JSON parser (distinct from the
   shared SSE parser; see `sse.rs`).
 - Implement `process_event` covering text, function calls, and
   thinking parts.
+- **`thoughtSignature` capture**: implement
+  `retain_thought_signature` helper mirroring pi's (first-wins
+  semantics per block so late empty deltas don't clobber
+  earlier populated signatures). Aggregate per-turn signatures
+  into the AssistantMessage's Thinking block for replay.
 - Add two more catalog entries
-  (`gemini-2.0-flash-thinking-exp`, `gemini-2.5-pro-exp`).
+  (`gemini-2.0-flash-thinking-exp`, `gemini-2.5-pro-exp`) with
+  `requires_thinking_signature: true`.
 - Invariant-suite integration (`provider_replay.rs`).
 
 ### Phase C — Multimodal images
@@ -165,15 +219,17 @@ Per phase:
 | 5 | `gemini_streaming_thought_part_to_thinking_block` |
 | 6 | `gemini_function_call_part_to_tool_call` |
 | 7 | `gemini_finish_reason_maps_to_stop_reason` |
-| 8 | Invariant suite: `gemini_model()` and
+| 8 | `gemini_thought_signature_captured_on_first_delta` — fixture where the first delta carries `thoughtSignature` and later deltas omit it; assert the captured signature is preserved. |
+| 9 | `gemini_turn_two_replay_includes_thought_signature` — two-turn fixture asserting the signature roundtrips in turn 2's `input` parts. |
+| 10 | Invariant suite: `gemini_model()` and
    `build_gemini_body()` helpers added, all cross-provider
-   invariants pass. |
+   invariants pass including the `required_opaque_fields_present_per_model_capabilities` one. |
 
 ### Phase C
 | # | Test |
 |---|---|
-| 9 | `gemini_image_attachment_roundtrips_to_inline_data` |
-| 10 | Manual smoke: two-turn conversation with an image attachment. |
+| 11 | `gemini_image_attachment_roundtrips_to_inline_data` |
+| 12 | Manual smoke: two-turn conversation with an image attachment. |
 
 ## Exit criteria
 
