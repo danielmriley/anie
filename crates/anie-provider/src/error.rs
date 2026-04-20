@@ -51,10 +51,14 @@ pub enum ProviderError {
     // Streaming failures (post-connect, parsing the SSE stream)
     // ---------------------------------------------------------------
     /// The stream completed with no visible assistant text and no
-    /// tool calls — only hidden reasoning or nothing. The existing
-    /// retry loop treats this as transient (the model sometimes
-    /// produces reasoning-only output on the first shot).
-    #[error("empty assistant response")]
+    /// tool calls — typically a local tagged-reasoning model
+    /// (Qwen, DeepSeek) that emits `<think>...</think>` with
+    /// nothing after. Classified as terminal in the retry policy
+    /// because replaying the same context reproduces the same
+    /// thinking block.
+    #[error(
+        "model returned no visible content (only reasoning); rephrase, lower the thinking level, or switch models"
+    )]
     EmptyAssistantResponse,
 
     /// An SSE frame could not be parsed as JSON. Usually a transient

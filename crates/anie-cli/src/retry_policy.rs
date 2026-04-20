@@ -83,12 +83,19 @@ impl<'a> RetryPolicy<'a> {
             | ProviderError::NativeReasoningUnsupported(_)
             | ProviderError::UnsupportedStreamFeature(_)
             | ProviderError::ReplayFidelity { .. }
-            | ProviderError::FeatureUnsupported(_) => RetryDecision::GiveUp {
+            | ProviderError::FeatureUnsupported(_)
+            // `EmptyAssistantResponse` surfaces when the model produced
+            // no text and no tool call (commonly: only tagged reasoning
+            // came back). Retrying against the same context usually
+            // reproduces the same shape — we'd just replay the same
+            // thinking block N times before giving up. Treat it as
+            // terminal so the user sees one clean error and can adjust
+            // the prompt or swap models.
+            | ProviderError::EmptyAssistantResponse => RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             },
             ProviderError::RateLimited { .. }
             | ProviderError::Transport(_)
-            | ProviderError::EmptyAssistantResponse
             | ProviderError::InvalidStreamJson(_)
             | ProviderError::MalformedStreamEvent(_) => {
                 if attempt >= self.config.max_retries {
@@ -329,6 +336,32 @@ mod tests {
                 0,
                 false,
             ),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_assistant_response_gives_up_immediately() {
+        // Regression: qwen3.5:9b and other tagged-reasoning models
+        // emit `<think>...</think>` with no trailing text. That
+        // surfaces as `EmptyAssistantResponse`. Retrying against
+        // the same context reproduces the same thinking block
+        // verbatim, so the user experiences the same output being
+        // re-streamed N times before the retry limit is hit. Treat
+        // this as terminal so the failure is reported once.
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(&ProviderError::EmptyAssistantResponse, 0, false),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::Terminal,
+            }
+        );
+        // Still terminal even after partial retries, in case the
+        // classification was reached via a non-empty path first.
+        assert_eq!(
+            policy.decide(&ProviderError::EmptyAssistantResponse, 2, false),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }
