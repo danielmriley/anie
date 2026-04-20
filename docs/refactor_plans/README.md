@@ -10,22 +10,13 @@ multi-phase pi-parity refactors that shipped (plans 00–08 plus the
 | # | Title | Scope | Status |
 |---|---|---|---|
 | 10 | [Extension system (pi-shaped port)](./10_extension_system_pi_port.md) | New `anie-extensions` from scratch: JSON-RPC subprocesses, 35+ event types, tool/command/shortcut/flag/provider/renderer registration | Not started. Multi-phase (7 phases), ~6 weeks of focused work. |
-| 13 | [Controller responsiveness + reliable action delivery](./13_controller_responsiveness_and_action_delivery.md) | Non-blocking retry backoff (Phase A) + unbounded TUI→controller action channel (Phase B). Unblocks merge-to-main. | Not started. 2 phases. Target: pre-merge. |
-| 14 | [Persistence safety: atomic writes + auth-store discipline](./14_persistence_safety.md) | `atomic_write` utility + migration of seven call sites (Phase A); fail-loud on corrupted auth.json with quarantine backup (Phase B). Unblocks merge-to-main. | Not started. 2 phases. Target: pre-merge. |
 
 Plan 09 is intentionally reserved for a future "tools parity with pi"
 plan (`find`, `grep`, `ls`). Not written yet; deferred because tool
 additions warrant individual careful review.
 
-Plans 11 and 12 (graceful slash-command dispatch + inline
-autocomplete popup) shipped in full; see
+Plans 11–14 shipped; see
 [`../completed/refactor_plans/`](../completed/refactor_plans/).
-
-Plans 13 and 14 are the pre-merge blockers called out in the
-2026-04-19 code-review cluster and the project-status summary.
-They're grouped because #13 and #14 have tightly-related motivations
-(both tightened by the followup review) but touch disjoint code —
-they can be developed and reviewed in parallel.
 
 ## Background
 
@@ -76,6 +67,14 @@ Summary — full detail is under
   command completer, popup overlay above/below the input,
   `ui.slash_command_popup_enabled` toggle, extension-ready
   contract.
+- **13** Controller responsiveness + reliable action delivery —
+  non-blocking retry backoff via `PendingRetry::Armed` state
+  (Ctrl+C during backoff is now prompt), unbounded UiAction
+  channel so user actions can never be silently dropped.
+- **14** Persistence safety — `anie_config::atomic_write` helper
+  (same-directory temp + fsync + rename) for all user-facing
+  writes; `save_api_key_at` quarantines a corrupt auth.json
+  instead of silently overwriting it.
 - **Fix plans** under `../completed/refactor_plans/fixes/` —
   follow-ups that closed out partial exit criteria on plans 01,
   02, 03 (phases 3–5), 06, 07, 08.
