@@ -25,7 +25,7 @@ pub enum ProviderError {
 
     /// Rate-limited response. `retry_after_ms` carries the server's
     /// `Retry-After` hint when present.
-    #[error("Rate limited (retry after {retry_after_ms:?}ms)")]
+    #[error("{}", format_rate_limited(*.retry_after_ms))]
     RateLimited { retry_after_ms: Option<u64> },
 
     /// Context-window overflow. Triggers the compaction-retry path
@@ -125,6 +125,14 @@ impl ProviderError {
             Self::RateLimited { retry_after_ms } => *retry_after_ms,
             _ => None,
         }
+    }
+}
+
+fn format_rate_limited(retry_after_ms: Option<u64>) -> String {
+    match retry_after_ms {
+        Some(ms) if ms >= 1_000 => format!("Rate limited (retry after {}s)", ms / 1_000),
+        Some(ms) => format!("Rate limited (retry after {ms}ms)"),
+        None => "Rate limited (no retry hint from provider)".to_string(),
     }
 }
 

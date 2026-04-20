@@ -18,6 +18,27 @@ pub(crate) struct RetryConfig {
     pub jitter: bool,
 }
 
+/// Maximum retries for `RateLimited` errors specifically. Rate
+/// limits almost always indicate a per-minute-or-longer cool-down
+/// window; retrying 3× with sub-10-second backoff just burns more
+/// of the user's rate budget and speeds up the next lockout. We
+/// cap at one cool-down retry and surface the error if that also
+/// fails, so the user can switch models / wait / top up credits
+/// instead of watching the agent churn.
+const MAX_RATE_LIMIT_RETRIES: u32 = 1;
+
+/// Minimum delay (ms) to wait before retrying a rate-limited
+/// request when the provider did not send a `Retry-After` header.
+/// OpenRouter's `:free` tier and similar gated endpoints drop
+/// 429s without a reset hint; waiting the usual 1 s just returns
+/// another 429 immediately.
+const RATE_LIMIT_FALLBACK_DELAY_MS: u64 = 15_000;
+
+/// Floor (ms) for *any* rate-limit retry delay, including ones
+/// computed from `Retry-After`. Guards against providers that
+/// advertise tiny retry-after values for bursty workloads.
+const RATE_LIMIT_MIN_DELAY_MS: u64 = 2_000;
+
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
@@ -94,8 +115,24 @@ impl<'a> RetryPolicy<'a> {
             | ProviderError::EmptyAssistantResponse => RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             },
-            ProviderError::RateLimited { .. }
-            | ProviderError::Transport(_)
+            ProviderError::RateLimited { .. } => {
+                // Rate limits get a dedicated, stricter cap — see
+                // `MAX_RATE_LIMIT_RETRIES`. Also bounded by the
+                // user-configured `max_retries` so tests / rpc
+                // clients that disable retries entirely still work.
+                let rate_limit_cap = MAX_RATE_LIMIT_RETRIES.min(self.config.max_retries);
+                if attempt >= rate_limit_cap {
+                    RetryDecision::GiveUp {
+                        reason: GiveUpReason::AttemptsExhausted,
+                    }
+                } else {
+                    RetryDecision::Retry {
+                        attempt: attempt + 1,
+                        delay_ms: self.delay_for(error, attempt + 1),
+                    }
+                }
+            }
+            ProviderError::Transport(_)
             | ProviderError::InvalidStreamJson(_)
             | ProviderError::MalformedStreamEvent(_) => {
                 if attempt >= self.config.max_retries {
@@ -148,15 +185,28 @@ pub(crate) fn retry_delay_ms(
     error: &ProviderError,
     retry_attempt: u32,
 ) -> u64 {
-    let base_delay = if let Some(retry_after_ms) = error.retry_after_ms() {
-        retry_after_ms
-    } else {
-        let exponent = retry_attempt.saturating_sub(1);
-        let mut delay = config.initial_delay_ms as f64;
-        for _ in 0..exponent {
-            delay *= config.backoff_multiplier;
+    let base_delay = match error {
+        // Rate-limit errors get a dedicated delay schedule. If the
+        // provider sent `Retry-After`, respect it (but enforce a
+        // floor so tiny values don't trigger immediate re-attempts).
+        // If they didn't — as OpenRouter's `:free` tier does —
+        // assume a minute-scale cool-down and wait 15 s, so a
+        // follow-up retry doesn't just burn more of the budget.
+        ProviderError::RateLimited { retry_after_ms } => retry_after_ms
+            .unwrap_or(RATE_LIMIT_FALLBACK_DELAY_MS)
+            .max(RATE_LIMIT_MIN_DELAY_MS),
+        _ => {
+            if let Some(retry_after_ms) = error.retry_after_ms() {
+                retry_after_ms
+            } else {
+                let exponent = retry_attempt.saturating_sub(1);
+                let mut delay = config.initial_delay_ms as f64;
+                for _ in 0..exponent {
+                    delay *= config.backoff_multiplier;
+                }
+                delay as u64
+            }
         }
-        delay as u64
     };
     let clamped = base_delay.min(config.max_delay_ms);
     if !config.jitter {
@@ -247,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_returns_retry_with_backoff() {
+    fn rate_limit_with_retry_after_waits_the_advertised_delay() {
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
             policy.decide(
@@ -260,6 +310,66 @@ mod tests {
             RetryDecision::Retry {
                 attempt: 1,
                 delay_ms: 7_000,
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limit_without_retry_after_uses_fallback_floor_not_initial_delay() {
+        // Regression: OpenRouter's `:free` tier returns 429 with
+        // no Retry-After. Using the default 1 s initial_delay_ms
+        // just hammers the provider. Verify we fall back to the
+        // rate-limit-specific 15 s delay instead.
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::RateLimited {
+                    retry_after_ms: None,
+                },
+                0,
+                false,
+            ),
+            RetryDecision::Retry {
+                attempt: 1,
+                delay_ms: RATE_LIMIT_FALLBACK_DELAY_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limit_with_tiny_retry_after_is_floored() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::RateLimited {
+                    retry_after_ms: Some(200),
+                },
+                0,
+                false,
+            ),
+            RetryDecision::Retry {
+                attempt: 1,
+                delay_ms: RATE_LIMIT_MIN_DELAY_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limit_gives_up_after_single_cool_down_attempt() {
+        // Regression: retrying 3× on 429 just burns through the
+        // per-minute budget on free-tier endpoints. Cap at a
+        // single cool-down retry.
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::RateLimited {
+                    retry_after_ms: None,
+                },
+                MAX_RATE_LIMIT_RETRIES,
+                false,
+            ),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::AttemptsExhausted,
             }
         );
     }
@@ -431,6 +541,18 @@ mod tests {
             retry_after_ms: Some(7_000),
         };
         assert_eq!(retry_delay_ms(&config, &error, 1), 7_000);
+    }
+
+    #[test]
+    fn retry_delay_for_rate_limit_without_retry_after_uses_fallback() {
+        let config = deterministic_config();
+        let error = ProviderError::RateLimited {
+            retry_after_ms: None,
+        };
+        assert_eq!(
+            retry_delay_ms(&config, &error, 1),
+            RATE_LIMIT_FALLBACK_DELAY_MS,
+        );
     }
 
     #[test]
