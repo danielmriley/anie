@@ -9,9 +9,9 @@ already on `feat/provider-compat-blob`. These PRs stack on top.
 
 | PR | Status | Commit |
 |----|--------|--------|
-| [PR 1 — render scheduling + 30 fps cap](../01_render_scheduling.md) | pending | — |
-| [PR 2 — per-block line cache](../02_output_pane_cache.md) | pending (blocked by PR 1) | — |
-| [PR 3 — debug instrumentation](../03_debug_instrumentation.md) | pending (blocked by PR 2) | — |
+| [PR 1 — render scheduling + 30 fps cap](../01_render_scheduling.md) | landed | `7d26315` |
+| [PR 2 — per-block line cache](../02_output_pane_cache.md) | landed | `bfd2628` |
+| [PR 3 — debug instrumentation](../03_debug_instrumentation.md) | landed | `ced1442` |
 
 ## Ordering
 
