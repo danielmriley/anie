@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use anie_auth::{
-    AnthropicOAuthProvider, AuthCredential, CallbackError, CredentialStore,
+    AnthropicOAuthProvider, AuthCredential, CallbackError, CredentialStore, GeminiCliOAuthProvider,
     GithubCopilotOAuthProvider, GoogleAntigravityOAuthProvider, LoginFlow, OAuthCredentialData,
     OAuthProvider, OpenAICodexOAuthProvider, await_callback_on_path,
 };
@@ -227,10 +227,11 @@ fn build_oauth_provider(provider_name: &str) -> Result<Box<dyn OAuthProvider>> {
         "openai-codex" => Ok(Box::new(OpenAICodexOAuthProvider::new())),
         "github-copilot" => Ok(Box::new(GithubCopilotOAuthProvider::new())),
         "google-antigravity" => Ok(Box::new(GoogleAntigravityOAuthProvider::new())),
+        "google-gemini-cli" => Ok(Box::new(GeminiCliOAuthProvider::new())),
         other => Err(anyhow!(
             "'{other}' does not support OAuth login. \
              Supported providers: anthropic, openai-codex, github-copilot, \
-             google-antigravity."
+             google-antigravity, google-gemini-cli."
         )),
     }
 }
