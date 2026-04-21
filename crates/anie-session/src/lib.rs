@@ -218,6 +218,16 @@ pub struct SessionContext {
     pub thinking_level: Option<ThinkingLevel>,
     /// Most recent persisted model selection `(provider, model_id)`, if any.
     pub model: Option<(String, String)>,
+    /// Structured details from the most recent compaction on
+    /// this branch, if one has run and carried a payload.
+    /// Mirrors the typed `details` field on the corresponding
+    /// `SessionEntry::Compaction` — callers that need
+    /// programmatic access to file-op history (e.g. to seed a
+    /// "recently-touched files" hint on resume) can read it
+    /// without re-walking entries. `None` when the session has
+    /// no compactions or when the most recent compaction had no
+    /// tracked tool calls.
+    pub compaction_details: Option<CompactionDetails>,
 }
 
 impl SessionContext {
@@ -228,6 +238,7 @@ impl SessionContext {
             messages: Vec::new(),
             thinking_level: None,
             model: None,
+            compaction_details: None,
         }
     }
 }
@@ -741,8 +752,9 @@ impl SessionManager {
             SessionEntry::Compaction {
                 summary,
                 first_kept_entry_id,
+                details,
                 ..
-            } => Some((summary.clone(), first_kept_entry_id.clone())),
+            } => Some((summary.clone(), first_kept_entry_id.clone(), details.clone())),
             _ => None,
         });
 
@@ -762,7 +774,7 @@ impl SessionManager {
 
         let mut messages = Vec::new();
         let mut keep_messages = latest_compaction.is_none();
-        if let Some((summary, _)) = &latest_compaction {
+        if let Some((summary, _, _)) = &latest_compaction {
             messages.push(SessionContextMessage {
                 entry_id: format!("summary:{}", self.header.id),
                 message: Message::User(UserMessage {
@@ -775,7 +787,7 @@ impl SessionManager {
         }
 
         for entry in &branch {
-            if let Some((_, first_kept_entry_id)) = &latest_compaction
+            if let Some((_, first_kept_entry_id, _)) = &latest_compaction
                 && !keep_messages
             {
                 if entry.base().id == *first_kept_entry_id {
@@ -797,10 +809,13 @@ impl SessionManager {
             }
         }
 
+        let compaction_details = latest_compaction.and_then(|(_, _, details)| details);
+
         SessionContext {
             messages,
             thinking_level,
             model,
+            compaction_details,
         }
     }
 
@@ -893,6 +908,28 @@ impl SessionManager {
             .rev()
             .find_map(|entry| match entry {
                 SessionEntry::Compaction { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+    }
+
+    /// Return the typed details payload from the most recent
+    /// compaction on the active branch. `None` when the session
+    /// has no compactions or when the most recent compaction
+    /// had no tracked tool calls.
+    ///
+    /// Callers (e.g. resume-time UI, a future system-prompt
+    /// hint generator) read this to show which files the agent
+    /// touched during summarized intervals without re-parsing
+    /// `<read-files>` / `<modified-files>` tag blocks out of
+    /// the summary text.
+    #[must_use]
+    pub fn latest_compaction_details(&self) -> Option<CompactionDetails> {
+        let leaf_id = self.leaf_id()?;
+        self.get_branch(leaf_id)
+            .into_iter()
+            .rev()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { details, .. } => details.clone(),
                 _ => None,
             })
     }
@@ -2687,6 +2724,102 @@ mod tests {
             *idx += 1;
             Ok(response)
         }
+    }
+
+    #[tokio::test]
+    async fn build_context_surfaces_compaction_details_after_compact() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("proj");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
+
+        session
+            .append_message(&user_message(&"a".repeat(3_000), 1))
+            .expect("u1");
+        session
+            .append_message(&assistant_with_tool_calls_and_text(
+                &"x".repeat(3_000),
+                vec![
+                    ("read", serde_json::json!({"path": "src/a.rs"})),
+                    ("edit", serde_json::json!({"path": "src/a.rs"})),
+                ],
+                2,
+            ))
+            .expect("a1");
+        session
+            .append_message(&user_message("recent", 3))
+            .expect("u2");
+
+        let summarizer = RecordingSummarizer::with_summary("prose");
+        session
+            .auto_compact(
+                &CompactionConfig {
+                    context_window: 1_000,
+                    reserve_tokens: 100,
+                    keep_recent_tokens: 100,
+                },
+                &summarizer,
+            )
+            .await
+            .expect("compact")
+            .expect("ran");
+
+        // Via the SessionContext field.
+        let ctx = session.build_context();
+        let via_context = ctx
+            .compaction_details
+            .expect("details surfaced via build_context");
+        assert_eq!(via_context.read_files, vec!["src/a.rs"]);
+        assert_eq!(via_context.modified_files, vec!["src/a.rs"]);
+
+        // Via the direct accessor.
+        let via_helper = session
+            .latest_compaction_details()
+            .expect("details surfaced via helper");
+        assert_eq!(via_helper, via_context);
+    }
+
+    #[test]
+    fn build_context_on_empty_session_has_no_compaction_details() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("proj");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
+        let ctx = session.build_context();
+        assert!(ctx.compaction_details.is_none());
+        assert!(session.latest_compaction_details().is_none());
+    }
+
+    #[test]
+    fn latest_compaction_details_ignores_entries_without_payload() {
+        // Compaction with details=None should yield None from
+        // the helper, not some empty CompactionDetails default.
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("proj");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
+
+        let first = session
+            .append_message(&user_message("u", 1))
+            .expect("u1");
+        session
+            .add_entries(vec![SessionEntry::Compaction {
+                base: EntryBase {
+                    id: session.generate_id(),
+                    parent_id: session.leaf_id().map(str::to_string),
+                    timestamp: now_iso8601().expect("ts"),
+                },
+                summary: "s".into(),
+                tokens_before: 1,
+                first_kept_entry_id: first,
+                details: None,
+            }])
+            .expect("compaction");
+
+        assert!(
+            session.latest_compaction_details().is_none(),
+            "helper should not fabricate empty details"
+        );
     }
 
     #[tokio::test]
