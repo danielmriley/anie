@@ -52,10 +52,23 @@ Status of each plan's PRs. Update inline as work lands.
 
 | # | Plan | PR | Status | Commit |
 |---|------|----|--------|--------|
-| 06 | Compaction fidelity | A (schema v4 + details field) | pending | — |
-| 06 | Compaction fidelity | B (file-op extraction) | pending | — |
-| 06 | Compaction fidelity | C (split-turn summaries) | pending | — |
-| 06 | Compaction fidelity | D (resume exposure, polish) | pending | — |
+| 06 | Compaction fidelity | A (schema v4 + details field) | landed | `d8bf578` |
+| 06 | Compaction fidelity | B (file-op extraction) | landed | `bced0ce` |
+| 06 | Compaction fidelity | C.1 (find_cut_point struct refactor) | landed | `0708b32` |
+| 06 | Compaction fidelity | C.2 (split-turn two-summary join) | landed | `90c9c77` |
+| 06 | Compaction fidelity | D (resume exposure) | landed | `6876d42` |
+
+**Plan 06 notes:**
+- C split into C.1 + C.2 per CLAUDE.md §6 (refactor first, feature
+  second). C.1 is the type-signature change; C.2 populates
+  split_turn + adds the two-summary join.
+- PR D's "system-prompt integration" (injecting a
+  recently-touched-files hint at resume) is deferred per the
+  plan's explicit "optional polish" framing. The accessors
+  land so wiring that later is a one-site edit.
+- Not yet verified: the two manual exit criteria ("30+ message
+  session compacts mid-turn" and "`jq` inspection of a real
+  session") — both need a live provider session.
 | 07 | OAuth | A (Credential tagged enum) | pending | — |
 | 07 | OAuth | B (OAuthProvider trait + Anthropic impl) | pending | — |
 | 07 | OAuth | C (refresh-with-lock) | pending | — |
