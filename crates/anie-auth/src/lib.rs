@@ -4,11 +4,13 @@
 pub mod anthropic_oauth;
 pub mod callback;
 pub mod oauth;
+pub mod openai_codex_oauth;
 pub mod refresh;
 mod store;
 
 pub use anthropic_oauth::AnthropicOAuthProvider;
-pub use callback::{Callback, CallbackError, await_callback};
+pub use openai_codex_oauth::OpenAICodexOAuthProvider;
+pub use callback::{Callback, CallbackError, await_callback, await_callback_on_path};
 pub use oauth::{
     AuthCodeFlow, DeviceCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair,
     generate_pkce, parse_expires_at,
@@ -257,6 +259,7 @@ impl AuthResolver {
 fn oauth_provider_for(provider_name: &str) -> Option<Box<dyn OAuthProvider>> {
     match provider_name {
         "anthropic" => Some(Box::new(AnthropicOAuthProvider::new())),
+        "openai-codex" => Some(Box::new(OpenAICodexOAuthProvider::new())),
         _ => None,
     }
 }

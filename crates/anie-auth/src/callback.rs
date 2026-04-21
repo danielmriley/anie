@@ -93,11 +93,27 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Legacy convenience wrapper — matches the pre-multi-provider
+/// shape where Anthropic's `/callback` path was assumed. New
+/// callers should use `await_callback_on_path`.
+pub async fn await_callback(port: u16, timeout: Duration) -> Result<Callback, CallbackError> {
+    await_callback_on_path(port, "/callback", timeout).await
+}
+
 /// Run a one-shot callback server on `127.0.0.1:port`. Blocks
 /// until either a callback arrives or `timeout` elapses. Only
-/// accepts the first connection to reach `/callback`; other
+/// accepts the first connection to reach `expected_path`; other
 /// paths respond with 404 and the server keeps waiting.
-pub async fn await_callback(port: u16, timeout: Duration) -> Result<Callback, CallbackError> {
+///
+/// Takes the expected path as a parameter because different
+/// providers register different callback routes (Anthropic:
+/// `/callback`, OpenAI Codex: `/auth/callback`, Google:
+/// `/oauth/callback`).
+pub async fn await_callback_on_path(
+    port: u16,
+    expected_path: &str,
+    timeout: Duration,
+) -> Result<Callback, CallbackError> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(CallbackError::Bind)?;
@@ -147,7 +163,7 @@ pub async fn await_callback(port: u16, timeout: Duration) -> Result<Callback, Ca
                 .ok();
             continue;
         };
-        if path != "/callback" {
+        if path != expected_path {
             write_http_response(&mut stream, 404, "Not Found", "text/plain; charset=utf-8", "not found")
                 .await
                 .ok();

@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 
 use anie_auth::{
     AnthropicOAuthProvider, AuthCredential, CallbackError, CredentialStore, LoginFlow,
-    OAuthCredentialData, OAuthProvider, await_callback,
+    OAuthCredentialData, OAuthProvider, OpenAICodexOAuthProvider, await_callback_on_path,
 };
 
 /// Fallback callback port when the provider's redirect URI
@@ -49,13 +49,12 @@ pub async fn run_login(provider_name: &str) -> Result<()> {
             let opened = try_open_browser(&auth_code.authorize_url);
             print_login_prompt(&auth_code.authorize_url, opened, LOGIN_TIMEOUT);
 
-            // Callback port is derived from the redirect_uri
-            // the provider published, so each provider can
-            // listen on its own registered port. We parse the
-            // port out of `http://localhost:<port>/...`.
-            let port = callback_port_from_uri(&auth_code.redirect_uri)
-                .unwrap_or(DEFAULT_CALLBACK_PORT);
-            let callback = await_callback(port, LOGIN_TIMEOUT)
+            // Callback port + path are derived from the
+            // redirect_uri the provider published, so each
+            // provider can listen on its own registered route.
+            let (port, path) = callback_route_from_uri(&auth_code.redirect_uri)
+                .unwrap_or((DEFAULT_CALLBACK_PORT, "/callback".to_string()));
+            let callback = await_callback_on_path(port, &path, LOGIN_TIMEOUT)
                 .await
                 .map_err(translate_callback_error)?;
 
@@ -104,15 +103,21 @@ pub async fn run_login(provider_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pull the port out of `http://localhost:<port>/<path>`. Used
-/// when each OAuth provider publishes a different callback
-/// port (Anthropic 53692, Codex 1455, Antigravity 51121,
-/// Gemini 8085).
-fn callback_port_from_uri(uri: &str) -> Option<u16> {
-    let rest = uri.strip_prefix("http://").or_else(|| uri.strip_prefix("https://"))?;
-    let (host_port, _) = rest.split_once('/').unwrap_or((rest, ""));
+/// Pull the port and path out of `http://localhost:<port>/<path>`.
+/// Used when each OAuth provider publishes a different callback
+/// route — Anthropic /callback:53692, Codex /auth/callback:1455,
+/// Antigravity /:51121, Gemini /oauth2callback:8085.
+fn callback_route_from_uri(uri: &str) -> Option<(u16, String)> {
+    let rest = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))?;
+    let (host_port, path_suffix) = match rest.split_once('/') {
+        Some((hp, p)) => (hp, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
     let (_, port_str) = host_port.rsplit_once(':')?;
-    port_str.parse().ok()
+    let port = port_str.parse().ok()?;
+    Some((port, path_suffix))
 }
 
 fn print_device_prompt(device: &anie_auth::DeviceCodeFlow) {
@@ -218,9 +223,10 @@ fn persist_credential(
 fn build_oauth_provider(provider_name: &str) -> Result<Box<dyn OAuthProvider>> {
     match provider_name {
         "anthropic" => Ok(Box::new(AnthropicOAuthProvider::new())),
+        "openai-codex" => Ok(Box::new(OpenAICodexOAuthProvider::new())),
         other => Err(anyhow!(
             "'{other}' does not support OAuth login. \
-             Supported providers: anthropic."
+             Supported providers: anthropic, openai-codex."
         )),
     }
 }
@@ -261,16 +267,40 @@ mod tests {
     }
 
     #[test]
-    fn build_oauth_provider_supports_anthropic_only_for_now() {
+    fn build_oauth_provider_accepts_registered_providers() {
         assert!(build_oauth_provider("anthropic").is_ok());
+        assert!(build_oauth_provider("openai-codex").is_ok());
+    }
+
+    #[test]
+    fn build_oauth_provider_rejects_unknown_names() {
         // `Box<dyn OAuthProvider>` doesn't impl Debug, so we
         // can't use unwrap_err directly; grab the error via
         // pattern match instead.
-        let err = match build_oauth_provider("openai") {
-            Ok(_) => panic!("openai should not be supported yet"),
+        let err = match build_oauth_provider("made-up") {
+            Ok(_) => panic!("made-up should not be supported"),
             Err(err) => err.to_string(),
         };
         assert!(err.contains("OAuth"), "{err}");
         assert!(err.contains("anthropic"), "{err}");
+        assert!(err.contains("openai-codex"), "{err}");
+    }
+
+    #[test]
+    fn callback_route_from_uri_parses_port_and_path() {
+        assert_eq!(
+            callback_route_from_uri("http://localhost:53692/callback"),
+            Some((53692, "/callback".to_string()))
+        );
+        assert_eq!(
+            callback_route_from_uri("http://localhost:1455/auth/callback"),
+            Some((1455, "/auth/callback".to_string()))
+        );
+    }
+
+    #[test]
+    fn callback_route_from_uri_rejects_non_http_urls() {
+        assert!(callback_route_from_uri("not a url").is_none());
+        assert!(callback_route_from_uri("ftp://host:1234/").is_none());
     }
 }
