@@ -14,11 +14,11 @@ Status of each plan's PRs. Update inline as work lands.
 
 | # | Plan | PR | Status | Commit |
 |---|------|----|--------|--------|
-| 02 | Search tools | A (grep) | pending | — |
-| 02 | Search tools | B (find) | pending | — |
-| 02 | Search tools | C (ls) | pending | — |
-| 02 | Search tools | D (slash commands, optional) | pending | — |
-| 04 | Terminal capabilities | (single PR) | pending | — |
+| 02 | Search tools | A (grep) | landed | `3c5bc0c` |
+| 02 | Search tools | B (find) | landed | `8aacfd8` |
+| 02 | Search tools | C (ls) | landed | `8aacfd8` |
+| 02 | Search tools | D (slash commands, optional) | deferred | — |
+| 04 | Terminal capabilities | (single PR) | landed | `68ee56e` |
 
 ## Tier 3 — structural but scoped
 
