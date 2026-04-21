@@ -1,16 +1,17 @@
 //! Transform a `pulldown-cmark` event stream into ratatui
 //! `Line`s, applying theme styles and wrapping.
 //!
-//! **Scope of PR A + B + C.1 (Plan 05).** This module currently
+//! **Scope of PR A + B + C (Plan 05).** This module currently
 //! handles headings, paragraphs, bold / italic / strikethrough,
 //! inline code, HTML-as-literal-text, horizontal rules, fenced /
 //! indented code blocks with syntect-based highlighting,
-//! unordered and ordered lists (with nesting), and blockquotes.
-//! Tables and links land in later PRs. Unimplemented element
-//! events fall through to a plain-text stringification so
-//! nothing crashes; the quality just improves as more PRs land.
+//! unordered and ordered lists (with nesting), blockquotes, and
+//! GitHub-flavored tables. Links land in PR D. Unimplemented
+//! element events fall through to a plain-text stringification
+//! so nothing crashes; the quality just improves as more PRs
+//! land.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -57,6 +58,21 @@ struct LineBuilder<'a> {
     // a list item while the continuation lines fall back to the
     // default prefix from `continuation_prefix()`.
     pending_first_line_prefix: Option<Vec<Span<'static>>>,
+    // Populated while inside a `| … |` GFM table. Cells are
+    // collected as plain strings (inline styling inside cells is
+    // flattened for PR C; inline-in-cell styling can come later).
+    table: Option<TableState>,
+}
+
+#[derive(Debug, Default)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    header: Option<Vec<String>>,
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_header: bool,
+    in_cell: bool,
 }
 
 struct CodeBlockState {
@@ -85,10 +101,20 @@ impl<'a> LineBuilder<'a> {
             blockquote_depth: 0,
             list_stack: Vec::new(),
             pending_first_line_prefix: None,
+            table: None,
         }
     }
 
     fn consume(&mut self, event: Event<'_>) {
+        // While inside a table, route everything through the
+        // collector so cell content doesn't leak to the main line
+        // buffer. Keep this above the code-block check — pi never
+        // embeds code blocks inside tables, and if it did we'd
+        // want the outer (table) context to win for framing.
+        if self.table.is_some() {
+            self.handle_table_event(event);
+            return;
+        }
         // While inside a code block, every event except raw text
         // and the matching end tag is a no-op — pulldown-cmark
         // only emits Text inside fenced / indented code blocks.
@@ -204,13 +230,23 @@ impl<'a> LineBuilder<'a> {
                 self.flush_line();
                 self.begin_list_item();
             }
+            Tag::Table(alignments) => {
+                self.flush_line();
+                self.table = Some(TableState {
+                    alignments,
+                    ..TableState::default()
+                });
+            }
+            // TableHead / TableRow / TableCell are routed through
+            // `handle_table_event` by the `self.table.is_some()`
+            // early-return in `consume`, so they never reach this
+            // match. The arms exist only to satisfy exhaustiveness
+            // in the unusual case that the parser emits them
+            // without a preceding `Tag::Table`.
+            Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
             // Block elements not yet handled: render their inline
             // content as plain text, ignore their structure.
             Tag::HtmlBlock
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
             | Tag::FootnoteDefinition(_)
             | Tag::Link { .. }
             | Tag::Image { .. }
@@ -274,11 +310,11 @@ impl<'a> LineBuilder<'a> {
             TagEnd::Item => {
                 self.flush_line();
             }
+            TagEnd::Table | TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell => {
+                // Normal flow: handled by `handle_table_event`.
+                // This arm only fires on orphan end tags.
+            }
             TagEnd::HtmlBlock
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::FootnoteDefinition
             | TagEnd::Link
             | TagEnd::Image
@@ -440,6 +476,136 @@ impl<'a> LineBuilder<'a> {
         self.pending_first_line_prefix = Some(prefix);
     }
 
+    /// Route events that land inside a `Tag::Table(_)` to the
+    /// accumulating `TableState`. Inline styling (bold / italic /
+    /// inline code) is flattened to plain cell text in PR C; the
+    /// visual loss is limited to not bolding header labels that
+    /// use `**`, which is an acceptable tradeoff for the
+    /// complexity savings.
+    fn handle_table_event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(Tag::TableHead) => {
+                if let Some(state) = self.table.as_mut() {
+                    state.in_header = true;
+                }
+            }
+            Event::Start(Tag::TableRow) => {
+                if let Some(state) = self.table.as_mut() {
+                    state.current_row.clear();
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                if let Some(state) = self.table.as_mut() {
+                    state.in_cell = true;
+                    state.current_cell.clear();
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some(state) = self.table.as_mut() {
+                    if state.in_cell {
+                        state.current_cell.push_str(&text);
+                    }
+                }
+            }
+            Event::End(TagEnd::TableCell) => {
+                if let Some(state) = self.table.as_mut() {
+                    let cell = std::mem::take(&mut state.current_cell);
+                    state.current_row.push(cell);
+                    state.in_cell = false;
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(state) = self.table.as_mut() {
+                    let row = std::mem::take(&mut state.current_row);
+                    state.header = Some(row);
+                    state.in_header = false;
+                }
+            }
+            Event::End(TagEnd::TableRow) => {
+                if let Some(state) = self.table.as_mut() {
+                    let row = std::mem::take(&mut state.current_row);
+                    state.rows.push(row);
+                }
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(state) = self.table.take() {
+                    self.emit_table(state);
+                }
+            }
+            // Inline formatting / soft breaks inside cells: just
+            // append whitespace or ignore. pulldown-cmark can emit
+            // Start/End(Strong) etc. within cells — style is
+            // flattened for PR C.
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(state) = self.table.as_mut() {
+                    if state.in_cell && !state.current_cell.is_empty() {
+                        state.current_cell.push(' ');
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Render a collected `TableState` as a unicode box-drawing
+    /// table. Columns are auto-sized to the widest cell (with a
+    /// minimum of 1 character). Alignment per column comes from
+    /// the GFM `| :-- | :-: | --: |` separator row, passed in
+    /// via `Tag::Table(alignments)`.
+    fn emit_table(&mut self, state: TableState) {
+        let cols = state.alignments.len();
+        if cols == 0 {
+            return;
+        }
+
+        let mut widths: Vec<usize> = vec![1; cols];
+        if let Some(header) = state.header.as_ref() {
+            for (idx, cell) in header.iter().enumerate() {
+                if idx < cols {
+                    widths[idx] = widths[idx].max(cell.chars().count());
+                }
+            }
+        }
+        for row in &state.rows {
+            for (idx, cell) in row.iter().enumerate() {
+                if idx < cols {
+                    widths[idx] = widths[idx].max(cell.chars().count());
+                }
+            }
+        }
+
+        let border_style = self.theme.table_border;
+        let header_style = self.theme.table_header;
+        let cell_style = self.theme.table_cell;
+
+        self.lines
+            .push(table_border_line(&widths, '┌', '┬', '┐', border_style));
+        if let Some(header) = state.header.as_ref() {
+            self.lines.push(table_data_row(
+                header,
+                &widths,
+                &state.alignments,
+                border_style,
+                header_style,
+            ));
+            self.lines
+                .push(table_border_line(&widths, '├', '┼', '┤', border_style));
+        }
+        for row in &state.rows {
+            self.lines.push(table_data_row(
+                row,
+                &widths,
+                &state.alignments,
+                border_style,
+                cell_style,
+            ));
+        }
+        self.lines
+            .push(table_border_line(&widths, '└', '┴', '┘', border_style));
+        // Spacer after the table, outside the frame.
+        self.lines.push(Line::default());
+    }
+
     /// Render a completed code block as a bordered, syntax-
     /// highlighted box. The box is `self.width` columns wide with
     /// a top border that embeds the language label (if any) and
@@ -500,6 +666,78 @@ impl<'a> LineBuilder<'a> {
 /// for the ASCII + box-drawing chars we use in prefixes.
 fn prefix_span_width(spans: &[Span<'static>]) -> usize {
     spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Build a full-width table border row. Each column reserves
+/// `widths[i] + 2` horizontal glyphs to account for the 1-space
+/// padding on each side of cell content.
+fn table_border_line(
+    widths: &[usize],
+    left: char,
+    sep: char,
+    right: char,
+    style: Style,
+) -> Line<'static> {
+    let mut out = String::new();
+    out.push(left);
+    for (idx, w) in widths.iter().enumerate() {
+        if idx > 0 {
+            out.push(sep);
+        }
+        for _ in 0..(w + 2) {
+            out.push('─');
+        }
+    }
+    out.push(right);
+    Line::from(Span::styled(out, style))
+}
+
+/// Build a single data / header row. Missing trailing cells (a
+/// row with fewer cells than the column count) render as blank
+/// space so the right border still aligns.
+fn table_data_row(
+    cells: &[String],
+    widths: &[usize],
+    alignments: &[Alignment],
+    border_style: Style,
+    cell_style: Style,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled("│".to_string(), border_style));
+    for (idx, w) in widths.iter().enumerate() {
+        let content = cells.get(idx).cloned().unwrap_or_default();
+        let alignment = alignments.get(idx).copied().unwrap_or(Alignment::None);
+        let padded = pad_cell(&content, *w, alignment);
+        spans.push(Span::styled(format!(" {padded} "), cell_style));
+        spans.push(Span::styled("│".to_string(), border_style));
+    }
+    Line::from(spans)
+}
+
+fn pad_cell(content: &str, width: usize, alignment: Alignment) -> String {
+    let content_width = content.chars().count();
+    if content_width >= width {
+        // Long cells overflow the column. A real fix wraps the
+        // cell across multiple rows; that's a notable TUI feature
+        // but out of scope for PR C.2. Truncation would drop data
+        // silently, so we let the row get wider than the nominal
+        // column.
+        return content.to_string();
+    }
+    let padding = width - content_width;
+    match alignment {
+        Alignment::None | Alignment::Left => {
+            format!("{content}{}", " ".repeat(padding))
+        }
+        Alignment::Right => {
+            format!("{}{content}", " ".repeat(padding))
+        }
+        Alignment::Center => {
+            let left = padding / 2;
+            let right = padding - left;
+            format!("{}{content}{}", " ".repeat(left), " ".repeat(right))
+        }
+    }
 }
 
 fn heading_style(level: HeadingLevel, theme: &MarkdownTheme) -> Style {
@@ -937,13 +1175,88 @@ mod tests {
 
     #[test]
     fn unhandled_block_falls_through_to_plain_text() {
-        // Tables aren't styled yet (PR C.2). Verify the text
-        // still surfaces instead of being silently dropped.
-        let md = "| a | b |\n| - | - |\n| 1 | 2 |";
+        // Links aren't styled yet (PR D). Verify the text still
+        // surfaces instead of being silently dropped.
+        let out = render_plain("see [the docs](https://example.com)", 80);
+        let joined = out.join("\n");
+        assert!(joined.contains("the docs"), "{out:?}");
+    }
+
+    #[test]
+    fn table_renders_with_unicode_box_drawing() {
+        let md = "| h1 | h2 |\n| -- | -- |\n| a | b |";
         let out = render_plain(md, 80);
         let joined = out.join("\n");
+        assert!(joined.contains('┌'), "missing top-left corner: {out:?}");
+        assert!(joined.contains('┐'), "missing top-right corner: {out:?}");
+        assert!(joined.contains('└'), "missing bottom-left corner: {out:?}");
+        assert!(joined.contains('┘'), "missing bottom-right corner: {out:?}");
+        assert!(joined.contains('├'), "missing header separator");
+        assert!(joined.contains('┤'));
+        assert!(joined.contains("h1"), "missing header cell");
+        assert!(joined.contains("h2"));
         assert!(joined.contains("a"));
         assert!(joined.contains("b"));
+    }
+
+    #[test]
+    fn table_columns_auto_size_to_widest_cell() {
+        // "loooong" in column 0 forces width >= 7.
+        let md = "| x | y |\n| - | - |\n| loooong | short |";
+        let out = render_plain(md, 80);
+        // Every row's leftmost cell frame should fit "loooong"
+        // with its 1-space padding on each side.
+        let body_rows: Vec<&String> = out
+            .iter()
+            .filter(|l| l.starts_with('│'))
+            .collect();
+        assert!(!body_rows.is_empty());
+        // First data cell in row 0 is "x" padded to 7 chars.
+        let header_row = body_rows[0];
+        assert!(
+            header_row.contains("x      "),
+            "header not padded to longest column: {header_row:?}"
+        );
+    }
+
+    #[test]
+    fn table_alignment_right_aligns_cells() {
+        // Width differs between header ("aa") and body ("x") so
+        // right-alignment is observable: body cell becomes " x"
+        // (one space padding on the left, right against border).
+        let md = "| aa | bb |\n| --: | --: |\n| x | y |";
+        let out = render_plain(md, 80);
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("│  x │"),
+            "expected right-aligned ' x': {out:?}"
+        );
+    }
+
+    #[test]
+    fn table_with_missing_trailing_cells_still_aligns() {
+        // Malformed row with only one cell in a two-column table.
+        let md = "| a | b |\n| - | - |\n| one |";
+        let out = render_plain(md, 80);
+        // The data row must still have the right border.
+        let data_row = out
+            .iter()
+            .rev()
+            .find(|l| l.starts_with('│') && l.contains("one"))
+            .expect("data row");
+        assert!(
+            data_row.ends_with('│'),
+            "right border missing: {data_row:?}"
+        );
+    }
+
+    #[test]
+    fn empty_table_header_still_renders_frame() {
+        // Just header + separator, no body rows.
+        let md = "| h1 | h2 |\n| -- | -- |";
+        let out = render_plain(md, 80);
+        assert!(out.iter().any(|l| l.contains('┌')));
+        assert!(out.iter().any(|l| l.contains('└')));
     }
 
     #[test]
