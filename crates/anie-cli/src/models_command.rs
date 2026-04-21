@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::Result;
 
-use anie_auth::CredentialStore;
+use anie_auth::{AuthCredential, CredentialStore};
 use anie_config::{CliOverrides, load_config};
 use anie_provider::{ApiKind, ModelInfo};
 use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest, detect_local_servers};
@@ -115,6 +115,41 @@ async fn configured_requests(
         }
     }
 
+    // Discover implicit OAuth-backed providers. When a user
+    // runs `anie login github-copilot`, the stored credential
+    // carries a per-user `api_base_url` — that's enough to run
+    // model discovery against the provider without requiring
+    // the user to hand-edit config.toml. The credential's
+    // presence is the registration signal.
+    for provider_name in credential_store.list_providers() {
+        if requests.contains_key(&provider_name) {
+            continue;
+        }
+        let Some(AuthCredential::OAuth {
+            access_token,
+            api_base_url,
+            ..
+        }) = credential_store.get_credential(&provider_name)
+        else {
+            continue;
+        };
+        let Some(base_url) = api_base_url
+            .or_else(|| oauth_provider_default_base_url(&provider_name))
+        else {
+            continue;
+        };
+        requests.insert(
+            provider_name.clone(),
+            ModelDiscoveryRequest {
+                provider_name: provider_name.clone(),
+                api: default_api(&provider_name),
+                base_url,
+                api_key: Some(access_token),
+                headers: oauth_discovery_headers(&provider_name),
+            },
+        );
+    }
+
     for server in detect_local_servers().await {
         let api = server
             .models
@@ -169,6 +204,39 @@ fn default_base_url(provider_name: &str) -> Option<String> {
         "openai" => Some("https://api.openai.com/v1".to_string()),
         _ => None,
     }
+}
+
+/// Fallback base URL for an OAuth-backed provider when its
+/// credential is missing `api_base_url`. GitHub Copilot in
+/// particular only populates `api_base_url` via a successful
+/// Copilot-internal token exchange; if a user somehow stored a
+/// credential without it, this keeps discovery from failing
+/// outright.
+fn oauth_provider_default_base_url(provider_name: &str) -> Option<String> {
+    match provider_name {
+        "github-copilot" => Some("https://api.individual.githubcopilot.com".to_string()),
+        "openai-codex" => Some("https://api.openai.com/v1".to_string()),
+        _ => None,
+    }
+}
+
+/// Provider-specific request headers required by OAuth-backed
+/// model-discovery endpoints. GitHub Copilot's `/models`
+/// endpoint rejects calls without the editor-identifying
+/// headers pi's Copilot flow uses — the same values land on
+/// both the token-exchange and model-list paths.
+fn oauth_discovery_headers(provider_name: &str) -> std::collections::HashMap<String, String> {
+    let mut headers = std::collections::HashMap::new();
+    if provider_name == "github-copilot" {
+        headers.insert("User-Agent".into(), "GitHubCopilotChat/0.35.0".into());
+        headers.insert("Editor-Version".into(), "vscode/1.107.0".into());
+        headers.insert(
+            "Editor-Plugin-Version".into(),
+            "copilot-chat/0.35.0".into(),
+        );
+        headers.insert("Copilot-Integration-Id".into(), "vscode-chat".into());
+    }
+    headers
 }
 
 fn print_models_table(rows: &[(String, ModelInfo)]) {
@@ -226,6 +294,93 @@ fn yes_marker(value: Option<bool>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anie_auth::AuthCredential;
+    use anie_config::AnieConfig;
+    use tempfile::tempdir;
+
+    #[test]
+    fn oauth_discovery_headers_for_copilot_carry_editor_identifiers() {
+        let h = oauth_discovery_headers("github-copilot");
+        assert!(h.contains_key("User-Agent"));
+        assert!(h.contains_key("Editor-Version"));
+        assert!(h.contains_key("Copilot-Integration-Id"));
+    }
+
+    #[test]
+    fn oauth_discovery_headers_empty_for_unknown_provider() {
+        let h = oauth_discovery_headers("some-other-provider");
+        assert!(h.is_empty());
+    }
+
+    #[tokio::test]
+    async fn configured_requests_picks_up_oauth_providers_without_config_entry() {
+        // Seed an auth store with a Copilot OAuth credential
+        // and verify `configured_requests` surfaces it even
+        // though config.toml has nothing under providers.
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        let store = CredentialStore::with_config("anie-test", Some(auth_path))
+            .without_native_keyring();
+        store
+            .set_credential(
+                "github-copilot",
+                AuthCredential::OAuth {
+                    access_token: "copilot-token".into(),
+                    refresh_token: "github-oauth".into(),
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                    account: Some("octocat".into()),
+                    api_base_url: Some("https://api.individual.githubcopilot.com".into()),
+                    project_id: None,
+                },
+            )
+            .expect("save oauth");
+
+        let config = AnieConfig::default();
+        let requests = configured_requests(&config, &store).await;
+        let req = requests
+            .get("github-copilot")
+            .expect("github-copilot surfaces from stored credential");
+        assert_eq!(req.base_url, "https://api.individual.githubcopilot.com");
+        assert_eq!(req.api_key.as_deref(), Some("copilot-token"));
+        assert!(req.headers.contains_key("User-Agent"));
+    }
+
+    #[tokio::test]
+    async fn configured_requests_prefers_config_base_url_over_credential() {
+        // Safety: if someone hand-registers github-copilot in
+        // config.toml with an explicit base_url, the config
+        // entry wins (matches the loop order in
+        // configured_requests).
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        let store = CredentialStore::with_config("anie-test", Some(auth_path))
+            .without_native_keyring();
+        store
+            .set_credential(
+                "github-copilot",
+                AuthCredential::OAuth {
+                    access_token: "copilot-token".into(),
+                    refresh_token: "github-oauth".into(),
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                    account: None,
+                    api_base_url: Some("https://api.individual.githubcopilot.com".into()),
+                    project_id: None,
+                },
+            )
+            .expect("save");
+
+        let mut config = AnieConfig::default();
+        config.providers.insert(
+            "github-copilot".into(),
+            anie_config::ProviderConfig {
+                base_url: Some("https://custom.override".into()),
+                ..Default::default()
+            },
+        );
+        let requests = configured_requests(&config, &store).await;
+        let req = requests.get("github-copilot").expect("req");
+        assert_eq!(req.base_url, "https://custom.override");
+    }
 
     #[test]
     fn formats_context_as_plain_number() {

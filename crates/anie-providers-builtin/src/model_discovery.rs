@@ -289,7 +289,19 @@ async fn discover_openai_compatible_models(
     }
 
     let client = discovery_http_client()?;
-    let url = format!("{}/models", normalize_openai_base_url(&request.base_url));
+    // GitHub Copilot exposes the model list at `<base>/models`
+    // (no `/v1` segment). Its chat endpoint is also at
+    // `<base>/chat/completions`, so the canonical base URL the
+    // agent stores has no `/v1`. Every other OpenAI-compatible
+    // provider normalizes to `<base>/v1/models`.
+    let url = if request.provider_name.eq_ignore_ascii_case("github-copilot") {
+        format!(
+            "{}/models",
+            request.base_url.trim().trim_end_matches('/')
+        )
+    } else {
+        format!("{}/models", normalize_openai_base_url(&request.base_url))
+    };
     let response = send_request(&client, request, url, AuthStyle::Bearer).await?;
     let body = response
         .json::<OpenAiModelsResponse>()

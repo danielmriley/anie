@@ -192,12 +192,19 @@ impl RequestOptionsResolver for AuthResolver {
         // (keyring values are opaque strings — always ApiKey).
         if let Some(credential) = self.credential_store.get_credential(&model.provider) {
             match credential {
-                AuthCredential::OAuth { .. } => {
+                AuthCredential::OAuth { api_base_url, .. } => {
                     let token = self.resolve_oauth_token(&model.provider).await?;
                     return Ok(ResolvedRequestOptions {
                         api_key: Some(token),
                         headers: HashMap::new(),
-                        base_url_override: None,
+                        // OAuth providers may return a per-user
+                        // API base URL at login time (GitHub
+                        // Copilot's `proxy-ep` rewrite is the
+                        // current example). Surfacing it here
+                        // makes the agent route requests to the
+                        // user's endpoint instead of whatever
+                        // static default the model carries.
+                        base_url_override: api_base_url,
                     });
                 }
                 AuthCredential::ApiKey { key } => {
