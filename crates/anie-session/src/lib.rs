@@ -80,7 +80,14 @@ use anie_provider::ThinkingLevel;
 /// |         | for OpenRouter encrypted-reasoning replay. Stored as  |
 /// |         | opaque JSON; forward- and backward-compatible via     |
 /// |         | serde defaults.                                       |
-pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 3;
+/// | 4       | `SessionEntry::Compaction.details` optional field     |
+/// |         | carrying `CompactionDetails` (read / modified file    |
+/// |         | lists, deduplicated). Forward- and backward-          |
+/// |         | compatible via serde defaults. Mirrors pi's           |
+/// |         | `CompactionDetails` shape at                          |
+/// |         | `packages/coding-agent/src/core/compaction/           |
+/// |         | compaction.ts:~33`.                                   |
+pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 4;
 
 /// Session-file header. Always the first line in a session JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +146,12 @@ pub enum SessionEntry {
         /// Entry ID of the first kept verbatim message.
         #[serde(rename = "firstKeptEntryId")]
         first_kept_entry_id: String,
+        /// Optional structured details extracted from the
+        /// discarded interval — read / modified file paths.
+        /// Mirrors pi's `CompactionDetails` shape; `None` on
+        /// pre-v4 sessions or when no tracked tools were called.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<CompactionDetails>,
     },
     /// A persisted model selection change.
     #[serde(rename = "model_change")]
@@ -217,6 +230,30 @@ impl SessionContext {
             model: None,
         }
     }
+}
+
+/// Structured details about a compacted interval.
+///
+/// Mirrors pi's `CompactionDetails` shape at
+/// `packages/coding-agent/src/core/compaction/compaction.ts:~33`
+/// — two string vectors, deliberately minimal. Bash commands,
+/// file sizes, exit codes, etc. are explicitly NOT tracked here;
+/// pi's 2-field shape is what consumers actually need.
+///
+/// **anie-specific (not in pi):** none. Deduplication is
+/// expected from callers — we don't hash or canonicalize paths
+/// on the way in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CompactionDetails {
+    /// Paths read via tracked tool calls during the summarized
+    /// interval. Dropped from serialization when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_files: Vec<String>,
+    /// Paths written or edited via tracked tool calls during
+    /// the summarized interval. Dropped from serialization when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modified_files: Vec<String>,
 }
 
 /// Summary metadata returned after a successful compaction.
@@ -866,6 +903,11 @@ impl SessionManager {
             summary: summary.clone(),
             tokens_before,
             first_kept_entry_id: first_kept_entry_id.clone(),
+            // PR B extracts file-op details here. PR A ships
+            // the field wire-unused so every Compaction entry
+            // serializes without `details` until extraction
+            // lands.
+            details: None,
         };
         self.add_entries(vec![entry])?;
 
@@ -1416,6 +1458,7 @@ mod tests {
                 summary: "summary text".into(),
                 tokens_before: 200,
                 first_kept_entry_id: third.clone(),
+                details: None,
             }])
             .expect("append compaction");
 
@@ -1475,6 +1518,7 @@ mod tests {
                 summary: "rolled-up summary".into(),
                 tokens_before: full_total,
                 first_kept_entry_id: third,
+                details: None,
             }])
             .expect("append compaction");
 
@@ -1760,6 +1804,135 @@ mod tests {
             b,
             ContentBlock::Thinking { signature: None, thinking } if thinking == "old reasoning"
         )));
+    }
+
+    #[test]
+    fn compaction_entry_roundtrips_with_details_payload() {
+        // Regression: v4 compaction entries carrying file-op
+        // details must serialize + deserialize without loss.
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("proj");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session =
+            SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
+
+        let first = session
+            .append_message(&user_message("a", 1))
+            .expect("append user");
+        session
+            .append_message(&assistant_message("b", 2))
+            .expect("append assistant");
+        let second_user = session
+            .append_message(&user_message("c", 3))
+            .expect("append third");
+
+        session
+            .add_entries(vec![SessionEntry::Compaction {
+                base: EntryBase {
+                    id: session.generate_id(),
+                    parent_id: session.leaf_id().map(str::to_string),
+                    timestamp: now_iso8601().expect("ts"),
+                },
+                summary: "rolled up".into(),
+                tokens_before: 400,
+                first_kept_entry_id: second_user,
+                details: Some(CompactionDetails {
+                    read_files: vec!["src/a.rs".into(), "src/b.rs".into()],
+                    modified_files: vec!["src/a.rs".into()],
+                }),
+            }])
+            .expect("append compaction");
+        let session_path = session.path().to_path_buf();
+        drop(session);
+
+        let reopened = SessionManager::open_session(&session_path).expect("reopen");
+        let compaction = reopened
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { details, .. } => Some(details.clone()),
+                _ => None,
+            })
+            .expect("compaction entry");
+        let details = compaction.expect("details present");
+        assert_eq!(details.read_files, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(details.modified_files, vec!["src/a.rs"]);
+        let _ = first;
+    }
+
+    #[test]
+    fn compaction_entry_without_details_omits_field_on_disk() {
+        // Skip-serializing-if: a None `details` must not appear
+        // at all in the JSONL representation, keeping v3-era
+        // readers happy for entries that don't need the field.
+        let entry = SessionEntry::Compaction {
+            base: EntryBase {
+                id: "11111111".into(),
+                parent_id: None,
+                timestamp: "2026-04-21T00:00:00Z".into(),
+            },
+            summary: "s".into(),
+            tokens_before: 1,
+            first_kept_entry_id: "22222222".into(),
+            details: None,
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            !json.contains("\"details\""),
+            "None details leaked into JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn pre_v4_compaction_entry_loads_with_details_defaulting_to_none() {
+        // Forward-compat: a v3-era compaction entry (no details
+        // field) must deserialize cleanly with details = None.
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("v3_compact.jsonl");
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": "v3compact",
+            "timestamp": "2026-04-21T00:00:00Z",
+            "cwd": "/tmp",
+        });
+        let entry = serde_json::json!({
+            "type": "compaction",
+            "id": "11111111",
+            "parentId": null,
+            "timestamp": "2026-04-21T00:00:01Z",
+            "summary": "older summary",
+            "tokens_before": 120,
+            "firstKeptEntryId": "22222222"
+        });
+        fs::write(&path, format!("{header}\n{entry}\n")).expect("write");
+
+        let session = SessionManager::open_session(&path).expect("load v3 session");
+        let details = session
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { details, .. } => Some(details.clone()),
+                _ => None,
+            })
+            .expect("compaction entry");
+        assert!(details.is_none(), "details must default to None on v3");
+    }
+
+    #[test]
+    fn empty_compaction_details_vectors_drop_from_serialization() {
+        // skip_serializing_if keeps the persisted payload small
+        // when only one of read_files / modified_files is set.
+        let details = CompactionDetails {
+            read_files: vec!["src/a.rs".into()],
+            modified_files: Vec::new(),
+        };
+        let json = serde_json::to_string(&details).expect("serialize");
+        assert!(json.contains("read_files"), "{json}");
+        assert!(
+            !json.contains("modified_files"),
+            "empty modified_files leaked: {json}"
+        );
     }
 
     #[test]

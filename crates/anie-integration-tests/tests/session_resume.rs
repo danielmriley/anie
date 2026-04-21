@@ -145,6 +145,7 @@ async fn compacted_session_context_drives_agent_run() {
             summary: "Prior discussion covered questions 0 through 2.".into(),
             first_kept_entry_id: first_kept_id,
             tokens_before: 5000,
+            details: None,
         }])
         .expect("add compaction");
 
