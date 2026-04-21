@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::{
     AuthCredential, AuthStore, default_auth_file_path, load_auth_store_at, save_api_key_at,
+    save_credential_at,
 };
 
 #[derive(Debug, Clone)]
@@ -126,7 +127,14 @@ impl CredentialStore {
         })?;
 
         for (provider, credential) in &store.providers {
-            let AuthCredential::ApiKey { key } = credential;
+            // The native keyring only stores flat-string values;
+            // OAuth credentials carry structured refresh state
+            // and should stay in the JSON store so the lock-and-
+            // refresh path (PR C) can round-trip them. Skip
+            // OAuth entries during native-keyring migration.
+            let AuthCredential::ApiKey { key } = credential else {
+                continue;
+            };
             self.set_in_native_keyring(provider, key).with_context(|| {
                 format!("failed to migrate credential for provider '{provider}'")
             })?;
@@ -178,6 +186,21 @@ impl CredentialStore {
         save_api_key_at(path, provider, key)
     }
 
+    /// Store a structured credential (ApiKey or OAuth) in the
+    /// JSON-backed store. Bypasses the native keyring because
+    /// OAuth credentials carry fields beyond a single bearer
+    /// string — the lock-and-refresh path (PR C) needs
+    /// structured access. ApiKey credentials written here
+    /// still round-trip through `get()` since the JSON store
+    /// is consulted when the keyring returns nothing.
+    pub fn set_credential(&self, provider: &str, credential: AuthCredential) -> Result<()> {
+        let path = self
+            .json_fallback
+            .as_deref()
+            .context("home directory is not available for JSON credential storage")?;
+        save_credential_at(path, provider, credential)
+    }
+
     /// Delete a credential from all supported backends.
     pub fn delete(&self, provider: &str) -> Result<()> {
         let mut first_error = None;
@@ -222,10 +245,26 @@ impl CredentialStore {
 
     fn read_provider_from_path(&self, path: Option<&Path>, provider: &str) -> Option<String> {
         let store = load_store_if_present(path)?;
-        store
-            .providers
-            .get(provider)
-            .map(|AuthCredential::ApiKey { key }| key.clone())
+        // Return the bearer value for either credential type.
+        // OAuth callers that need to check expiry / refresh go
+        // through `get_credential` instead; this path is for
+        // the sync happy-path used by `RequestOptionsResolver`
+        // today (PR A). PR C will thread the refresh branch in
+        // when the resolver is updated.
+        store.providers.get(provider).map(|cred| cred.bearer().to_string())
+    }
+
+    /// Retrieve the structured credential (not just the bearer
+    /// string) for the given provider. Used by the OAuth
+    /// refresh flow (PR C), which needs `expires_at` and
+    /// `refresh_token`. Returns `None` when no JSON-backed
+    /// credential exists — native-keyring entries are plain
+    /// strings and always surface as `AuthCredential::ApiKey`.
+    #[must_use]
+    pub fn get_credential(&self, provider: &str) -> Option<AuthCredential> {
+        let store = load_store_if_present(self.json_fallback.as_deref())
+            .or_else(|| load_store_if_present(self.migrated_fallback_path().as_deref()))?;
+        store.providers.get(provider).cloned()
     }
 
     fn migrated_fallback_path(&self) -> Option<PathBuf> {

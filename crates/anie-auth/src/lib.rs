@@ -28,13 +28,74 @@ pub struct AuthStore {
     pub providers: HashMap<String, AuthCredential>,
 }
 
-/// Supported v1 credential types.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Supported credential types.
+///
+/// Tagged on `type` for forward compatibility when new auth
+/// modalities arrive. pi's shape at
+/// `packages/coding-agent/src/core/auth-storage.ts:~30` uses the
+/// same two-variant split; we mirror its field names (including
+/// `access_token` / `refresh_token` rather than the shorter
+/// `access`/`refresh`) so saved files are portable conceptually.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum AuthCredential {
-    /// API-key credential.
+    /// API-key credential. Long-lived; callers pass `.key` as the
+    /// bearer token verbatim.
     #[serde(rename = "api_key")]
-    ApiKey { key: String },
+    ApiKey {
+        /// The secret API key.
+        key: String,
+    },
+    /// OAuth credential. Access tokens are short-lived; callers
+    /// MUST check `expires_at` before using `access_token` and
+    /// refresh via `OAuthProvider::refresh` (PR C) when expired.
+    /// PR A stores the credential but performs no automatic
+    /// refresh.
+    #[serde(rename = "oauth")]
+    OAuth {
+        /// Current access token, used as the bearer for API
+        /// requests until `expires_at`.
+        access_token: String,
+        /// Refresh token, used to obtain a new access token
+        /// after expiry. Rotated on each refresh per pi's
+        /// implementation.
+        refresh_token: String,
+        /// RFC 3339 UTC timestamp indicating when
+        /// `access_token` expires. We use strings (not epoch
+        /// seconds) to match pi's on-disk format and avoid
+        /// timezone ambiguity.
+        expires_at: String,
+        /// Optional display label for the logged-in account
+        /// (email / username), surfaced in `/providers` and
+        /// in `anie login` output. Not used for auth itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+    },
+}
+
+impl AuthCredential {
+    /// Return the bearer value suitable for the `Authorization`
+    /// header. For `ApiKey`, that's the key. For `OAuth`, that's
+    /// the current `access_token` — callers must handle refresh
+    /// separately (PR C) since this accessor is sync.
+    #[must_use]
+    pub fn bearer(&self) -> &str {
+        match self {
+            Self::ApiKey { key } => key,
+            Self::OAuth { access_token, .. } => access_token,
+        }
+    }
+
+    /// Display label for the credential, used in listings.
+    /// Returns the account name for OAuth; `None` for ApiKey
+    /// (nothing to show beyond the provider name).
+    #[must_use]
+    pub fn account_label(&self) -> Option<&str> {
+        match self {
+            Self::ApiKey { .. } => None,
+            Self::OAuth { account, .. } => account.as_deref(),
+        }
+    }
 }
 
 /// Resolve per-request auth from CLI, persisted credentials, and environment variables.
@@ -156,14 +217,28 @@ pub(crate) fn load_auth_store_at(path: &Path) -> Result<AuthStore> {
 /// Absent files are not corruption — they cause a fresh empty
 /// store to be created.
 pub(crate) fn save_api_key_at(path: &Path, provider: &str, key: &str) -> Result<()> {
+    save_credential_at(
+        path,
+        provider,
+        AuthCredential::ApiKey {
+            key: key.to_string(),
+        },
+    )
+}
+
+/// Persist any `AuthCredential` variant to `path`, merging with
+/// whatever providers are already stored. Shares the corrupt-
+/// store quarantine discipline with `save_api_key_at` — see
+/// that function's docstring for the corruption-handling
+/// guarantees.
+pub(crate) fn save_credential_at(
+    path: &Path,
+    provider: &str,
+    credential: AuthCredential,
+) -> Result<()> {
     let mut store = match load_auth_store_at(path) {
         Ok(store) => store,
         Err(parse_err) => {
-            // Path exists (load_auth_store_at only errors on a
-            // populated-but-unparseable file) but its contents
-            // can't be interpreted. Quarantine the original so
-            // the user has a path back to their data, then fail
-            // loudly.
             let backup = quarantine_corrupt_auth_file(path)?;
             return Err(anyhow::anyhow!(
                 "auth store at {} is unreadable; original quarantined at {}. \
@@ -175,12 +250,7 @@ pub(crate) fn save_api_key_at(path: &Path, provider: &str, key: &str) -> Result<
             ));
         }
     };
-    store.providers.insert(
-        provider.to_string(),
-        AuthCredential::ApiKey {
-            key: key.to_string(),
-        },
-    );
+    store.providers.insert(provider.to_string(), credential);
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -477,6 +547,126 @@ mod tests {
             Some(&AuthCredential::ApiKey {
                 key: "sk-test".into()
             })
+        );
+    }
+
+    // =========================================================================
+    // Plan 07 PR A — OAuth credential type + forward compat.
+    //
+    // Verifies the tagged-enum shape round-trips, ApiKey + OAuth
+    // entries coexist in the same file, and the old single-
+    // variant format still loads without data loss.
+    // =========================================================================
+
+    fn sample_oauth() -> AuthCredential {
+        AuthCredential::OAuth {
+            access_token: "sk-ant-oat01-abc".into(),
+            refresh_token: "sk-ant-ort01-def".into(),
+            expires_at: "2026-04-25T14:00:00Z".into(),
+            account: Some("user@example.com".into()),
+        }
+    }
+
+    #[test]
+    fn oauth_credential_roundtrips_through_json() {
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        save_credential_at(&auth_path, "anthropic", sample_oauth()).expect("save oauth");
+        let store = load_auth_store_at(&auth_path).expect("load");
+        let expected = sample_oauth();
+        assert_eq!(store.providers.get("anthropic"), Some(&expected));
+    }
+
+    #[test]
+    fn oauth_credential_serializes_with_type_tag_and_pi_field_names() {
+        // Guard against drift from pi's on-disk shape. The
+        // tag + field-name combo is load-bearing: a future
+        // reader looking at auth.json alongside pi's should be
+        // able to reason about both without translation.
+        let json = serde_json::to_string(&sample_oauth()).expect("serialize");
+        assert!(json.contains("\"type\":\"oauth\""), "{json}");
+        assert!(json.contains("\"access_token\""), "{json}");
+        assert!(json.contains("\"refresh_token\""), "{json}");
+        assert!(json.contains("\"expires_at\""), "{json}");
+    }
+
+    #[test]
+    fn oauth_without_account_omits_the_field_on_disk() {
+        let cred = AuthCredential::OAuth {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: "2026-04-25T14:00:00Z".into(),
+            account: None,
+        };
+        let json = serde_json::to_string(&cred).expect("serialize");
+        assert!(!json.contains("\"account\""), "None account leaked: {json}");
+    }
+
+    #[test]
+    fn api_key_and_oauth_coexist_in_same_store() {
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        save_api_key_at(&auth_path, "openai", "sk-test").expect("save api key");
+        save_credential_at(&auth_path, "anthropic", sample_oauth()).expect("save oauth");
+
+        let store = load_auth_store_at(&auth_path).expect("load");
+        assert_eq!(
+            store.providers.get("openai"),
+            Some(&AuthCredential::ApiKey {
+                key: "sk-test".into()
+            })
+        );
+        assert_eq!(store.providers.get("anthropic"), Some(&sample_oauth()));
+    }
+
+    #[test]
+    fn bearer_returns_key_for_api_key_and_access_token_for_oauth() {
+        let key_cred = AuthCredential::ApiKey {
+            key: "sk-test".into(),
+        };
+        assert_eq!(key_cred.bearer(), "sk-test");
+        assert_eq!(sample_oauth().bearer(), "sk-ant-oat01-abc");
+    }
+
+    #[test]
+    fn account_label_is_none_for_api_key() {
+        let key_cred = AuthCredential::ApiKey {
+            key: "sk-test".into(),
+        };
+        assert_eq!(key_cred.account_label(), None);
+        assert_eq!(sample_oauth().account_label(), Some("user@example.com"));
+    }
+
+    #[test]
+    fn credential_store_reads_oauth_bearer_via_get() {
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        save_credential_at(&auth_path, "anthropic", sample_oauth()).expect("save");
+
+        let store = CredentialStore::with_config("anie-test", Some(auth_path))
+            .without_native_keyring();
+        assert_eq!(
+            store.get("anthropic").as_deref(),
+            Some("sk-ant-oat01-abc")
+        );
+        assert_eq!(
+            store.get_credential("anthropic"),
+            Some(sample_oauth())
+        );
+    }
+
+    #[test]
+    fn credential_store_set_credential_persists_oauth() {
+        let tempdir = tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        let store = CredentialStore::with_config("anie-test", Some(auth_path))
+            .without_native_keyring();
+        store
+            .set_credential("anthropic", sample_oauth())
+            .expect("set oauth");
+        assert_eq!(
+            store.get_credential("anthropic"),
+            Some(sample_oauth())
         );
     }
 
