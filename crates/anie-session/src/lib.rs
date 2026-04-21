@@ -912,12 +912,70 @@ pub fn estimate_tokens(message: &Message) -> u64 {
 }
 
 /// Estimate token usage for a session context.
+///
+/// Uses a hybrid strategy modeled on pi's
+/// `calculateContextTokens`
+/// (`packages/coding-agent/src/core/compaction/compaction.ts`):
+///
+/// 1. Walk newest → oldest. Stop at the first
+///    `Message::Assistant` whose `usage.total_tokens > 0`.
+/// 2. Use that reading as the running total for every message up
+///    to and including that assistant turn.
+/// 3. Add a chars/4 heuristic estimate for every message *after*
+///    that turn (i.e. the trailing user / tool-result messages
+///    that came in after the last usage-reporting response).
+///
+/// Falls back to a pure heuristic walk when no usage data is
+/// found anywhere in the context.
+///
+/// Matches pi exactly — we don't add a 2× cap or model-switch
+/// reset guard. If provider-reported usage proves unreliable
+/// enough to warrant guardrails, add them as an anie-specific
+/// follow-up (documented in
+/// `docs/pi_adoption_plan/03_token_estimation.md`).
 #[must_use]
 pub fn estimate_context_tokens(messages: &[SessionContextMessage]) -> u64 {
-    messages
+    // Find the newest assistant turn with usage data.
+    let latest_usage = messages
         .iter()
-        .map(|message| estimate_tokens(&message.message))
-        .sum()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| match &entry.message {
+            Message::Assistant(assistant) => {
+                let total = assistant.usage.total_tokens.unwrap_or_else(|| {
+                    // Some providers report component totals
+                    // without a totalTokens field; reconstruct.
+                    let u = &assistant.usage;
+                    u.input_tokens
+                        .saturating_add(u.output_tokens)
+                        .saturating_add(u.cache_read_tokens)
+                        .saturating_add(u.cache_write_tokens)
+                });
+                if total > 0 {
+                    Some((index, total))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        });
+
+    match latest_usage {
+        Some((index, seed)) => {
+            // Everything up to and including `index` is captured
+            // by `seed`. Add the heuristic for the rest.
+            let trailing: u64 = messages
+                .iter()
+                .skip(index + 1)
+                .map(|entry| estimate_tokens(&entry.message))
+                .sum();
+            seed.saturating_add(trailing)
+        }
+        None => messages
+            .iter()
+            .map(|entry| estimate_tokens(&entry.message))
+            .sum(),
+    }
 }
 
 /// Build the LLM prompt used for context compaction.
@@ -1424,6 +1482,161 @@ mod tests {
             session.estimate_context_tokens(),
             estimate_context_tokens(&session.build_context().messages)
         );
+    }
+
+    fn assistant_message_with_usage(
+        text: &str,
+        timestamp: u64,
+        total_tokens: u64,
+    ) -> Message {
+        let usage = Usage {
+            input_tokens: total_tokens / 2,
+            output_tokens: total_tokens - total_tokens / 2,
+            total_tokens: Some(total_tokens),
+            ..Usage::default()
+        };
+        Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp,
+            reasoning_details: None,
+        })
+    }
+
+    fn context_from(messages: Vec<Message>) -> Vec<SessionContextMessage> {
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| SessionContextMessage {
+                entry_id: format!("entry-{index}"),
+                message,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn estimate_context_tokens_falls_back_to_heuristic_without_usage() {
+        let context = context_from(vec![
+            user_message("hello", 1),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hi there".into(),
+                }],
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider: "mock".into(),
+                model: "mock-model".into(),
+                timestamp: 2,
+                reasoning_details: None,
+            }),
+        ]);
+        // "hello" = 5 chars → 1 token via chars/4; "hi there"
+        // = 8 chars → 2 tokens. Both heuristic.
+        let got = estimate_context_tokens(&context);
+        let expected_heuristic: u64 = context
+            .iter()
+            .map(|m| estimate_tokens(&m.message))
+            .sum();
+        assert_eq!(got, expected_heuristic);
+        assert!(got > 0);
+    }
+
+    #[test]
+    fn estimate_context_tokens_seeds_from_latest_assistant_usage() {
+        // One assistant turn with usage reports 5_000 total;
+        // there's no trailing message, so the estimate should
+        // be exactly 5_000 — independent of the heuristic for
+        // the prior user turn.
+        let context = context_from(vec![
+            user_message("a".repeat(10_000).as_str(), 1),
+            assistant_message_with_usage("response", 2, 5_000),
+        ]);
+        assert_eq!(estimate_context_tokens(&context), 5_000);
+    }
+
+    #[test]
+    fn estimate_context_tokens_adds_trailing_heuristic_after_usage() {
+        // Usage = 5_000 reported at step 2; then a user turn
+        // and a tool result come after. Those are approximated
+        // via chars/4 and added on top.
+        let context = context_from(vec![
+            user_message("first", 1),
+            assistant_message_with_usage("response", 2, 5_000),
+            user_message(&"c".repeat(400), 3),
+        ]);
+        let trailing = estimate_tokens(&context[2].message);
+        assert_eq!(estimate_context_tokens(&context), 5_000 + trailing);
+    }
+
+    #[test]
+    fn estimate_context_tokens_prefers_newest_usage_over_older() {
+        // Two assistant turns; usage numbers differ. The newer
+        // reading wins.
+        let context = context_from(vec![
+            user_message("q1", 1),
+            assistant_message_with_usage("a1", 2, 1_000),
+            user_message("q2", 3),
+            assistant_message_with_usage("a2", 4, 4_000),
+        ]);
+        assert_eq!(estimate_context_tokens(&context), 4_000);
+    }
+
+    #[test]
+    fn estimate_context_tokens_ignores_assistant_with_zero_usage() {
+        // An assistant turn with `total_tokens: 0` (possibly an
+        // early error case) shouldn't override the earlier usage.
+        let context = context_from(vec![
+            user_message("q1", 1),
+            assistant_message_with_usage("a1", 2, 3_000),
+            user_message("q2", 3),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text { text: "error".into() }],
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("err".into()),
+                provider: "mock".into(),
+                model: "mock-model".into(),
+                timestamp: 4,
+                reasoning_details: None,
+            }),
+        ]);
+        let trailing = estimate_tokens(&context[2].message)
+            + estimate_tokens(&context[3].message);
+        assert_eq!(estimate_context_tokens(&context), 3_000 + trailing);
+    }
+
+    #[test]
+    fn estimate_context_tokens_reconstructs_total_from_components_when_missing() {
+        // Some providers populate input/output but not
+        // total_tokens. Reconstruct.
+        let usage = Usage {
+            input_tokens: 2_000,
+            output_tokens: 800,
+            cache_read_tokens: 100,
+            cache_write_tokens: 200,
+            ..Usage::default()
+        };
+        let context = context_from(vec![
+            user_message("q", 1),
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text { text: "a".into() }],
+                usage,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider: "mock".into(),
+                model: "mock-model".into(),
+                timestamp: 2,
+                reasoning_details: None,
+            }),
+        ]);
+        assert_eq!(estimate_context_tokens(&context), 3_100);
     }
 
     #[test]
