@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -1278,6 +1278,24 @@ impl App {
 /// we pick 33 ms pending PR 2's cache).
 const FRAME_BUDGET: Duration = Duration::from_millis(33);
 
+/// Whether a terminal event should dirty the render. Mouse moves,
+/// drags, and button press/release are no-ops for us (we only act
+/// on `ScrollUp` / `ScrollDown`), so forcing a redraw for them is
+/// pure waste — and worse, mouse-motion tracking fires at ~100
+/// events/sec while the user moves the cursor, which starves
+/// keystroke processing and makes typing feel laggy. Filter them
+/// at the source.
+fn event_dirties_render(event: &Event) -> bool {
+    match event {
+        Event::Mouse(mouse) => matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ),
+        Event::Key(_) | Event::Resize(_, _) | Event::Paste(_) | Event::FocusGained
+        | Event::FocusLost => true,
+    }
+}
+
 /// Idle poll interval when nothing is dirty. Matches the previous
 /// behavior so background worker polling cadence is unchanged.
 const IDLE_TICK: Duration = Duration::from_millis(100);
@@ -1320,8 +1338,25 @@ pub async fn run_tui(
 
         tokio::select! {
             Some(Ok(event)) = term_events.next() => {
+                let mut affects_render = event_dirties_render(&event);
                 app.handle_terminal_event(event)?;
-                dirty = true;
+                // Drain any terminal events already buffered in
+                // the stream. Mouse-motion tracking fires at
+                // ~100 events/sec while the cursor moves; without
+                // this drain we'd spin the select loop once per
+                // event, starving higher-signal events (keystrokes,
+                // agent deltas) even though we filter the mouse
+                // ones out of the dirty flag.
+                while let Some(Some(next)) = term_events.next().now_or_never() {
+                    let event = next?;
+                    if event_dirties_render(&event) {
+                        affects_render = true;
+                    }
+                    app.handle_terminal_event(event)?;
+                }
+                if affects_render {
+                    dirty = true;
+                }
             }
             Some(event) = app.event_rx.recv() => {
                 app.handle_agent_event(event)?;
