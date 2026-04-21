@@ -1,15 +1,16 @@
 //! Transform a `pulldown-cmark` event stream into ratatui
 //! `Line`s, applying theme styles and wrapping.
 //!
-//! **Scope of PR A (Plan 05).** This module currently handles
+//! **Scope of PR A + B (Plan 05).** This module currently handles
 //! headings, paragraphs, bold / italic / strikethrough, inline
-//! code, and HTML-as-literal-text. Code blocks, lists,
-//! blockquotes, tables, links, and rules are added in later PRs
-//! of the plan. Unimplemented element events fall through to a
-//! plain-text stringification so nothing crashes; the quality
-//! just improves as more PRs land.
+//! code, HTML-as-literal-text, horizontal rules, and fenced /
+//! indented code blocks with syntect-based highlighting. Lists,
+//! blockquotes, tables, and links land in later PRs of the plan.
+//! Unimplemented element events fall through to a plain-text
+//! stringification so nothing crashes; the quality just improves
+//! as more PRs land.
 
-use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -41,6 +42,15 @@ struct LineBuilder<'a> {
     // Depth of unhandled container events so their content falls
     // through as plain text rather than being silently dropped.
     in_unhandled_block: u32,
+    // Populated while inside a fenced / indented code block.
+    // Code block text is captured verbatim here and rendered as
+    // a bordered, syntax-highlighted box on `End(CodeBlock)`.
+    code_block: Option<CodeBlockState>,
+}
+
+struct CodeBlockState {
+    lang: Option<String>,
+    buf: String,
 }
 
 impl<'a> LineBuilder<'a> {
@@ -53,10 +63,30 @@ impl<'a> LineBuilder<'a> {
             current_spans: Vec::new(),
             current_heading: None,
             in_unhandled_block: 0,
+            code_block: None,
         }
     }
 
     fn consume(&mut self, event: Event<'_>) {
+        // While inside a code block, every event except raw text
+        // and the matching end tag is a no-op — pulldown-cmark
+        // only emits Text inside fenced / indented code blocks.
+        if self.code_block.is_some() {
+            match event {
+                Event::Text(text) => {
+                    if let Some(state) = self.code_block.as_mut() {
+                        state.buf.push_str(&text);
+                    }
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    if let Some(state) = self.code_block.take() {
+                        self.emit_code_block(state);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match event {
             Event::Start(tag) => self.on_start(tag),
             Event::End(tag) => self.on_end(tag),
@@ -111,10 +141,36 @@ impl<'a> LineBuilder<'a> {
             Tag::Strong => self.push_style_modifier(Modifier::BOLD),
             Tag::Emphasis => self.push_style_modifier(Modifier::ITALIC),
             Tag::Strikethrough => self.push_style_modifier(Modifier::CROSSED_OUT),
+            Tag::CodeBlock(kind) => {
+                self.flush_line();
+                let lang = match kind {
+                    CodeBlockKind::Fenced(info) => {
+                        let trimmed = info.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            // Info strings can include extra
+                            // attributes ("rust,ignore"); syntect
+                            // only cares about the language token.
+                            Some(
+                                trimmed
+                                    .split([',', ' '])
+                                    .next()
+                                    .unwrap_or(trimmed)
+                                    .to_string(),
+                            )
+                        }
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+                self.code_block = Some(CodeBlockState {
+                    lang,
+                    buf: String::new(),
+                });
+            }
             // Block elements not yet handled: render their inline
             // content as plain text, ignore their structure.
             Tag::BlockQuote(_)
-            | Tag::CodeBlock(_)
             | Tag::HtmlBlock
             | Tag::List(_)
             | Tag::Item
@@ -153,8 +209,14 @@ impl<'a> LineBuilder<'a> {
             TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough => {
                 self.pop_style();
             }
+            TagEnd::CodeBlock => {
+                // Normal flow: consume() intercepts End(CodeBlock)
+                // via the `self.code_block.is_some()` path and
+                // calls emit_code_block. This arm only fires if
+                // the end tag arrives without a matching start,
+                // which pulldown-cmark shouldn't produce.
+            }
             TagEnd::BlockQuote(_)
-            | TagEnd::CodeBlock
             | TagEnd::HtmlBlock
             | TagEnd::List(_)
             | TagEnd::Item
@@ -232,6 +294,44 @@ impl<'a> LineBuilder<'a> {
         for wrapped in wrap_spans(spans, self.width) {
             self.lines.push(wrapped);
         }
+    }
+
+    /// Render a completed code block as a bordered, syntax-
+    /// highlighted box. The box is `self.width` columns wide with
+    /// a top border that embeds the language label (if any) and
+    /// a bottom border matching pi's visual framing conceptually
+    /// (pi uses termimad's code-fence styling — we hand-draw the
+    /// box so we don't take an extra crate dep just for this).
+    fn emit_code_block(&mut self, state: CodeBlockState) {
+        let border_style = self.theme.code_block_border;
+        let lang_style = self.theme.code_block_lang;
+
+        // Minimum width: 4 so "│  │" with at least one inner
+        // column has room. Narrower terminals just get a squished
+        // box — still correct.
+        let width = self.width.max(4) as usize;
+        let inner = width - 4;
+
+        let code = state.buf.trim_end_matches('\n');
+
+        self.lines.push(build_top_border(
+            width,
+            state.lang.as_deref(),
+            border_style,
+            lang_style,
+        ));
+
+        for highlighted in super::syntax::highlight_code(code, state.lang.as_deref()) {
+            self.lines.push(build_code_body_line(
+                highlighted,
+                inner,
+                border_style,
+            ));
+        }
+
+        self.lines.push(build_bottom_border(width, border_style));
+        // Spacer between the block and the following content.
+        self.lines.push(Line::default());
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
@@ -324,6 +424,75 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
         lines.push(cells_to_line(current_cells));
     }
     lines
+}
+
+/// Build the top border of a code-block box. Embeds the language
+/// label when present: `╭─ rust ───────╮`. Bare blocks get a
+/// plain `╭──────╮` row.
+fn build_top_border(
+    width: usize,
+    lang: Option<&str>,
+    border_style: Style,
+    lang_style: Style,
+) -> Line<'static> {
+    if let Some(lang) = lang {
+        let lang_display = lang.chars().count();
+        // Layout: "╭─ {lang} " + dashes + "╮"
+        //          = 1 + 1 + 1 + lang_display + 1 + dashes + 1 = width
+        let used = 5 + lang_display;
+        let dashes = width.saturating_sub(used);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("╭─ ", border_style));
+        spans.push(Span::styled(lang.to_string(), lang_style));
+        spans.push(Span::styled(
+            format!(" {}╮", "─".repeat(dashes)),
+            border_style,
+        ));
+        Line::from(spans)
+    } else {
+        let dashes = width.saturating_sub(2);
+        Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(dashes)),
+            border_style,
+        ))
+    }
+}
+
+fn build_bottom_border(width: usize, border_style: Style) -> Line<'static> {
+    let dashes = width.saturating_sub(2);
+    Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(dashes)),
+        border_style,
+    ))
+}
+
+/// Wrap one syntect-highlighted code line inside `│ … │` with
+/// right-padding so the right border aligns regardless of line
+/// length. If the highlighted content exceeds `inner` columns it
+/// is emitted un-truncated; the right border then ends up on the
+/// next visual row. PR C can add proper horizontal scrolling if
+/// we decide it's worth the complexity — code lines in practice
+/// tend to stay within typical widths.
+fn build_code_body_line(
+    highlighted: Line<'static>,
+    inner: usize,
+    border_style: Style,
+) -> Line<'static> {
+    let body_width: usize = highlighted
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum();
+    let padding = inner.saturating_sub(body_width);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled("│ ", border_style));
+    spans.extend(highlighted.spans);
+    if padding > 0 {
+        spans.push(Span::raw(" ".repeat(padding)));
+    }
+    spans.push(Span::styled(" │", border_style));
+    Line::from(spans)
 }
 
 fn cells_to_line(cells: Vec<(char, Style)>) -> Line<'static> {
@@ -522,6 +691,97 @@ mod tests {
     fn horizontal_rule_emits_full_width_line() {
         let out = render_plain("a\n\n---\n\nb", 10);
         assert!(out.iter().any(|s| s == &"─".repeat(10)), "{out:?}");
+    }
+
+    #[test]
+    fn fenced_code_block_has_top_and_bottom_borders() {
+        let md = "```\ncode\n```";
+        let out = render_plain(md, 20);
+        assert!(
+            out.iter().any(|l| l.starts_with('╭') && l.ends_with('╮')),
+            "missing top border: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with('╰') && l.ends_with('╯')),
+            "missing bottom border: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_embeds_language_label_in_top_border() {
+        let out = render_plain("```rust\nfn main() {}\n```", 30);
+        let top = out
+            .iter()
+            .find(|l| l.starts_with('╭'))
+            .expect("top border");
+        assert!(top.contains("rust"), "top border missing lang: {top}");
+    }
+
+    #[test]
+    fn bare_code_block_omits_language_label() {
+        let out = render_plain("```\nplain\n```", 20);
+        let top = out
+            .iter()
+            .find(|l| l.starts_with('╭'))
+            .expect("top border");
+        // Bare block should be just ╭─…─╮ with no embedded text.
+        assert!(
+            top.chars().skip(1).take(top.chars().count() - 2).all(|c| c == '─'),
+            "bare top should be all dashes between corners: {top:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_emits_one_body_line_per_source_line() {
+        let out = render_plain("```\nline one\nline two\nline three\n```", 30);
+        let body_lines: Vec<_> = out
+            .iter()
+            .filter(|l| l.starts_with('│'))
+            .collect();
+        assert_eq!(body_lines.len(), 3, "body lines: {out:?}");
+    }
+
+    #[test]
+    fn code_block_body_lines_are_padded_to_inner_width() {
+        // width=20 → inner=16. Each body line should be exactly
+        // 20 chars wide including borders (1 + 1 + 16 + 1 + 1 = 20)
+        let out = render_plain("```\nx\n```", 20);
+        let body = out
+            .iter()
+            .find(|l| l.starts_with('│'))
+            .expect("body");
+        assert_eq!(body.chars().count(), 20, "width != 20: {body:?}");
+    }
+
+    #[test]
+    fn indented_code_block_still_renders_as_a_box() {
+        let out = render_plain("    indented\n    more\n", 30);
+        assert!(
+            out.iter().any(|l| l.starts_with('╭')),
+            "indented block missing box: {out:?}"
+        );
+    }
+
+    #[test]
+    fn code_block_info_string_strips_attributes() {
+        // pulldown-cmark passes "rust,ignore" through as-is. We
+        // split on comma/space so syntect still finds the lang.
+        let out = render_plain("```rust,ignore\nfn main() {}\n```", 30);
+        let top = out
+            .iter()
+            .find(|l| l.starts_with('╭'))
+            .expect("top border");
+        assert!(top.contains("rust"), "expected lang=rust: {top}");
+        assert!(!top.contains("ignore"), "attr leaked into label: {top}");
+    }
+
+    #[test]
+    fn code_block_preserves_empty_body() {
+        // Closing fence right after opening — no content. Box
+        // still renders with just borders and no crash.
+        let out = render_plain("```\n```", 20);
+        assert!(out.iter().any(|l| l.starts_with('╭')), "{out:?}");
+        assert!(out.iter().any(|l| l.starts_with('╰')), "{out:?}");
     }
 
     #[test]

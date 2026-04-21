@@ -16,6 +16,7 @@
 
 mod layout;
 mod parser;
+mod syntax;
 mod theme;
 
 // Re-exports for the forthcoming PR E wire-up. `#[allow(unused_imports)]`
