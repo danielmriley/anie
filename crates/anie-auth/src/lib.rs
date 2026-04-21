@@ -4,6 +4,7 @@
 pub mod anthropic_oauth;
 pub mod callback;
 pub mod github_copilot_oauth;
+pub mod google_antigravity_oauth;
 pub mod oauth;
 pub mod openai_codex_oauth;
 pub mod refresh;
@@ -11,6 +12,7 @@ mod store;
 
 pub use anthropic_oauth::AnthropicOAuthProvider;
 pub use github_copilot_oauth::GithubCopilotOAuthProvider;
+pub use google_antigravity_oauth::GoogleAntigravityOAuthProvider;
 pub use openai_codex_oauth::OpenAICodexOAuthProvider;
 pub use callback::{Callback, CallbackError, await_callback, await_callback_on_path};
 pub use oauth::{
@@ -263,6 +265,7 @@ fn oauth_provider_for(provider_name: &str) -> Option<Box<dyn OAuthProvider>> {
         "anthropic" => Some(Box::new(AnthropicOAuthProvider::new())),
         "openai-codex" => Some(Box::new(OpenAICodexOAuthProvider::new())),
         "github-copilot" => Some(Box::new(GithubCopilotOAuthProvider::new())),
+        "google-antigravity" => Some(Box::new(GoogleAntigravityOAuthProvider::new())),
         _ => None,
     }
 }
