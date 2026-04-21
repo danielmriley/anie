@@ -789,6 +789,32 @@ impl App {
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
             "copy" => self.copy_last_assistant_to_clipboard(),
+            "markdown" => match arg {
+                None => {
+                    let state = if self.output_pane.markdown_enabled() {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    self.output_pane
+                        .add_system_message(format!("Markdown rendering is {state}."));
+                }
+                Some("on") => {
+                    self.output_pane.set_markdown_enabled(true);
+                    self.output_pane
+                        .add_system_message("Markdown rendering enabled.".to_string());
+                }
+                Some("off") => {
+                    self.output_pane.set_markdown_enabled(false);
+                    self.output_pane
+                        .add_system_message("Markdown rendering disabled.".to_string());
+                }
+                Some(other) => {
+                    self.output_pane.add_system_message(format!(
+                        "Unknown /markdown argument: {other}. Expected on|off."
+                    ));
+                }
+            },
             "new" => {
                 let _ = self.action_tx.send(UiAction::NewSession);
             }

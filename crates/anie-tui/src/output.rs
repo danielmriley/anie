@@ -135,6 +135,12 @@ impl OutputPane {
         self.invalidate_all_caches();
     }
 
+    /// Whether markdown rendering is currently active.
+    #[must_use]
+    pub fn markdown_enabled(&self) -> bool {
+        self.render_context.markdown_enabled
+    }
+
     /// Record detected terminal capabilities. Today this only
     /// matters for `link.rs` (OSC 8 deferral lives there); in the
     /// future, image protocols + truecolor decisions can read off

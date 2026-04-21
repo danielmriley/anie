@@ -28,6 +28,9 @@ pub(crate) const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium",
 /// Known subcommands for `/session`.
 pub(crate) const SESSION_SUBCOMMANDS: &[&str] = &["list"];
 
+/// Accepted values for `/markdown`.
+pub(crate) const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
+
 /// All slash commands known to this anie process.
 ///
 /// Populated at startup with `builtin_commands()`; future
@@ -241,6 +244,15 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
         SlashCommandInfo::builtin("clear", "Clear the output pane"),
         SlashCommandInfo::builtin("reload", "Hot-reload config and context files"),
         SlashCommandInfo::builtin("copy", "Copy the last assistant message to the clipboard"),
+        SlashCommandInfo::builtin_with_args(
+            "markdown",
+            "Toggle markdown rendering for finalized messages",
+            ArgumentSpec::Enumerated {
+                values: MARKDOWN_SWITCHES,
+                required: false,
+            },
+            Some("[on|off]"),
+        ),
         SlashCommandInfo::builtin("help", "Show this list"),
         SlashCommandInfo::builtin("quit", "Quit anie"),
     ]
@@ -409,6 +421,7 @@ mod tests {
             "clear",
             "reload",
             "copy",
+            "markdown",
             "help",
             "quit",
         ];
@@ -434,6 +447,9 @@ mod tests {
             }),
             ("session", |spec| {
                 matches!(spec, ArgumentSpec::Subcommands { known } if *known == SESSION_SUBCOMMANDS)
+            }),
+            ("markdown", |spec| {
+                matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == MARKDOWN_SWITCHES)
             }),
             ("compact", |spec| matches!(spec, ArgumentSpec::None)),
             ("help", |spec| matches!(spec, ArgumentSpec::None)),

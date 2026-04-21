@@ -1560,6 +1560,7 @@ fn long_thinking_does_not_bleed_past_gutter_boundary() {
 /// `builtin_commands()` without pulling in the full list.
 fn phase_c_catalog() -> Vec<SlashCommandInfo> {
     const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
+    const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
     vec![
         SlashCommandInfo::builtin_with_args(
             "thinking",
@@ -1569,6 +1570,15 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
                 required: false,
             },
             Some("[off|minimal|low|medium|high]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "markdown",
+            "Toggle markdown rendering",
+            ArgumentSpec::Enumerated {
+                values: MARKDOWN_SWITCHES,
+                required: false,
+            },
+            Some("[on|off]"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
         SlashCommandInfo::builtin("help", "Show help"),
@@ -1635,6 +1645,70 @@ fn slash_compact_with_arg_is_rejected_locally() {
         action_rx.try_recv().is_err(),
         "no UiAction should be dispatched for /compact with trailing arg"
     );
+}
+
+#[test]
+fn slash_markdown_no_arg_reports_current_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown");
+
+    let msg = last_system_message(&app).expect("expected status message");
+    assert!(
+        msg.contains("Markdown rendering is"),
+        "{msg}"
+    );
+    // Default is on.
+    assert!(msg.contains("on"), "{msg}");
+}
+
+#[test]
+fn slash_markdown_off_disables_rendering() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown off");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("disabled"), "{msg}");
+    // /markdown is UI-only; no UiAction should reach the controller.
+    assert!(
+        action_rx.try_recv().is_err(),
+        "no UiAction should be dispatched for /markdown"
+    );
+}
+
+#[test]
+fn slash_markdown_on_enables_rendering() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown off");
+    submit_line(&mut app, "/markdown on");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("enabled"), "{msg}");
+}
+
+#[test]
+fn slash_markdown_invalid_arg_is_rejected() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown maybe");
+
+    let msg = last_system_message(&app).expect("expected rejection");
+    // The catalog's enumerated-arg validator rejects at the
+    // pre-dispatch layer, so the message comes from argument
+    // validation (cites the allowed values) rather than from
+    // the /markdown dispatch arm.
+    assert!(msg.contains("maybe"), "{msg}");
+    assert!(msg.contains("on") && msg.contains("off"), "{msg}");
 }
 
 #[test]
