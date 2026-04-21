@@ -982,9 +982,39 @@ impl SessionManager {
             .map(|message| message.message.clone())
             .collect::<Vec<_>>();
         let existing_summary = self.latest_compaction_summary();
-        let prose = summarizer
-            .summarize(&source_messages, existing_summary.as_deref())
-            .await?;
+
+        // Split-turn branch: when the cut lands inside a turn,
+        // run two summarizations in parallel — one over the
+        // main history (everything before the split turn) and
+        // one over the turn prefix. Joined per pi's format so
+        // the resumed context keeps both bands of prose. Clean-
+        // boundary cuts fall through to the single-summary path.
+        let prose = if let Some(split) = &cut_point.split_turn {
+            let (main_messages, prefix_messages) =
+                partition_split_turn(&cut_point.discarded, split);
+            let main_source: Vec<Message> = main_messages
+                .iter()
+                .map(|m| m.message.clone())
+                .collect();
+            let prefix_source: Vec<Message> = prefix_messages
+                .iter()
+                .map(|m| m.message.clone())
+                .collect();
+            // futures::try_join! short-circuits on the first
+            // error; matches pi's Promise.all semantics so one
+            // failed summarization aborts the compaction. We
+            // use futures (not tokio) to keep anie-session
+            // runtime-agnostic.
+            let (main_prose, prefix_prose) = futures::try_join!(
+                summarizer.summarize(&main_source, existing_summary.as_deref()),
+                summarizer.summarize(&prefix_source, None),
+            )?;
+            join_split_turn_prose(&main_prose, &prefix_prose)
+        } else {
+            summarizer
+                .summarize(&source_messages, existing_summary.as_deref())
+                .await?
+        };
 
         // Extract file-op details from the discarded interval
         // and merge into the final summary via
@@ -1258,11 +1288,79 @@ pub fn find_cut_point(
     let discarded = messages[..cut_index].to_vec();
     let kept = messages[cut_index..].to_vec();
     let first_kept_entry_id = kept[0].entry_id.clone();
+    let split_turn = detect_split_turn(messages, cut_index);
     Ok(CutPoint {
         discarded,
         kept,
         first_kept_entry_id,
-        split_turn: None,
+        split_turn,
+    })
+}
+
+/// Split the discarded slice into (main, prefix) relative to a
+/// `SplitTurn`. Prefix entries keep their original order; main
+/// is everything in `discarded` that isn't in the prefix.
+fn partition_split_turn<'a>(
+    discarded: &'a [SessionContextMessage],
+    split: &SplitTurn,
+) -> (Vec<&'a SessionContextMessage>, Vec<&'a SessionContextMessage>) {
+    let prefix_ids: std::collections::HashSet<&str> = split
+        .prefix_entry_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut main: Vec<&SessionContextMessage> = Vec::new();
+    let mut prefix: Vec<&SessionContextMessage> = Vec::new();
+    for entry in discarded {
+        if prefix_ids.contains(entry.entry_id.as_str()) {
+            prefix.push(entry);
+        } else {
+            main.push(entry);
+        }
+    }
+    (main, prefix)
+}
+
+/// Join two prose summaries per pi's split-turn format: main
+/// history first, then a `---` separator, then the prefix under
+/// a labeled heading. See
+/// `packages/coding-agent/src/core/compaction/compaction.ts:715`
+/// for pi's exact string.
+#[must_use]
+pub fn join_split_turn_prose(main_prose: &str, prefix_prose: &str) -> String {
+    format!(
+        "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
+        main_prose.trim_end(),
+        prefix_prose.trim()
+    )
+}
+
+/// Detect whether `cut_index` lands inside a turn (a User
+/// message followed by Assistant responses + tool results).
+/// Returns `Some(SplitTurn)` when the kept side starts with a
+/// non-User message, `None` on clean turn-boundary cuts.
+fn detect_split_turn(
+    messages: &[SessionContextMessage],
+    cut_index: usize,
+) -> Option<SplitTurn> {
+    if cut_index == 0 || cut_index >= messages.len() {
+        return None;
+    }
+    // Clean cut: the kept side starts with a User message.
+    if matches!(messages[cut_index].message, Message::User(_)) {
+        return None;
+    }
+    // Walk back to the User that started the straddling turn.
+    let turn_start_idx = (0..cut_index).rev().find(|idx| {
+        matches!(messages[*idx].message, Message::User(_))
+    })?;
+    let prefix_entry_ids = messages[turn_start_idx..cut_index]
+        .iter()
+        .map(|m| m.entry_id.clone())
+        .collect();
+    Some(SplitTurn {
+        turn_start_entry_id: messages[turn_start_idx].entry_id.clone(),
+        prefix_entry_ids,
     })
 }
 
@@ -2329,6 +2427,91 @@ mod tests {
     }
 
     #[test]
+    fn find_cut_point_surfaces_split_turn_when_cut_lands_in_turn() {
+        // Turn layout:
+        //   [0] user  — old prompt
+        //   [1] asst  — old response (full turn)
+        //   [2] user  — active turn start
+        //   [3] asst  — tool-calling assistant (big, forces cut to land here)
+        //   [4] toolresult
+        //   [5] asst  — completion (kept)
+        let messages = vec![
+            SessionContextMessage {
+                entry_id: "1".into(),
+                message: user_message(&"a".repeat(400), 1),
+            },
+            SessionContextMessage {
+                entry_id: "2".into(),
+                message: assistant_message(&"b".repeat(400), 2),
+            },
+            SessionContextMessage {
+                entry_id: "3".into(),
+                message: user_message(&"c".repeat(400), 3),
+            },
+            SessionContextMessage {
+                entry_id: "4".into(),
+                message: assistant_message(&"d".repeat(400), 4),
+            },
+            SessionContextMessage {
+                entry_id: "5".into(),
+                message: assistant_message(&"e".repeat(400), 5),
+            },
+        ];
+        // 100 tokens per 400-char message; keep = 150 tokens
+        // forces cut past index 4 and into the middle of the
+        // turn started at "3".
+        let cut = find_cut_point(&messages, 150).expect("cut");
+        let split = cut
+            .split_turn
+            .expect("split turn should fire when cut lands mid-turn");
+        assert_eq!(split.turn_start_entry_id, "3");
+        // Prefix ids should include the user that started the
+        // turn plus whatever discarded-side messages belong to
+        // it (up to but not including the first kept).
+        assert_eq!(split.prefix_entry_ids, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn find_cut_point_leaves_split_turn_none_on_clean_boundary() {
+        // 4 messages, 100 tokens each. With keep=250 the loop
+        // walks back through a2, u2, a1 — breaking at a1 sets
+        // cut_index=2 so the kept slice begins on u2 (a User
+        // message = clean boundary).
+        let messages = vec![
+            SessionContextMessage {
+                entry_id: "1".into(),
+                message: user_message(&"a".repeat(400), 1),
+            },
+            SessionContextMessage {
+                entry_id: "2".into(),
+                message: assistant_message(&"b".repeat(400), 2),
+            },
+            SessionContextMessage {
+                entry_id: "3".into(),
+                message: user_message(&"c".repeat(400), 3),
+            },
+            SessionContextMessage {
+                entry_id: "4".into(),
+                message: assistant_message(&"d".repeat(400), 4),
+            },
+        ];
+        let cut = find_cut_point(&messages, 250).expect("cut");
+        assert_eq!(cut.first_kept_entry_id, "3");
+        assert!(cut.split_turn.is_none(), "{:?}", cut.split_turn);
+    }
+
+    #[test]
+    fn join_split_turn_prose_uses_pi_format() {
+        let out = join_split_turn_prose("main body  ", "  prefix body\n");
+        // Verbatim check of the separator + heading line so
+        // any drift from pi's shape surfaces on test diff.
+        assert_eq!(
+            out,
+            "main body\n\n---\n\n**Turn Context (split turn):**\n\nprefix body"
+        );
+    }
+
+    #[test]
     fn cut_point_struct_carries_all_fields() {
         // Regression for the tuple→struct refactor. Ensures all
         // four fields are observable from a single call.
@@ -2466,6 +2649,153 @@ mod tests {
         assert!(summary.contains("<read-files>"), "{summary}");
         assert!(summary.contains("src/a.rs"), "{summary}");
         assert!(summary.contains("<modified-files>"), "{summary}");
+    }
+
+    /// Test-only summarizer that emits different prose for each
+    /// call so we can verify the split-turn join happened.
+    struct PerCallSummarizer {
+        call_index: std::sync::Mutex<usize>,
+        responses: Vec<String>,
+    }
+
+    impl PerCallSummarizer {
+        fn with_responses(responses: Vec<&str>) -> Self {
+            Self {
+                call_index: std::sync::Mutex::new(0),
+                responses: responses.into_iter().map(str::to_string).collect(),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            *self.call_index.lock().expect("call count lock")
+        }
+    }
+
+    #[async_trait]
+    impl MessageSummarizer for PerCallSummarizer {
+        async fn summarize(
+            &self,
+            _messages: &[Message],
+            _existing_summary: Option<&str>,
+        ) -> Result<String> {
+            let mut idx = self.call_index.lock().expect("call index lock");
+            let response = self
+                .responses
+                .get(*idx)
+                .cloned()
+                .unwrap_or_else(|| "[no more responses]".into());
+            *idx += 1;
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_compact_with_split_turn_produces_two_summaries_joined() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("proj");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
+
+        // Build a session where the cut lands mid-turn. Sizes
+        // are chosen so find_cut_point backs off a3 (small)
+        // into the kept slice and leaves u2+a2 on the discarded
+        // side — splitting turn 2 at index 4.
+        //
+        //   [discarded]          [kept]
+        //   u1, a1, u2, a2   →   a3
+        //               ^^ split turn (starts at u2)
+        session
+            .append_message(&user_message(&"a".repeat(3_000), 1))
+            .expect("u1");
+        session
+            .append_message(&assistant_message(&"b".repeat(3_000), 2))
+            .expect("a1");
+        session
+            .append_message(&user_message(&"c".repeat(3_000), 3))
+            .expect("u2");
+        session
+            .append_message(&assistant_message(&"d".repeat(3_000), 4))
+            .expect("a2");
+        session
+            .append_message(&assistant_message("tail", 5))
+            .expect("a3");
+
+        let summarizer = PerCallSummarizer::with_responses(vec![
+            "MAIN_SUMMARY",
+            "PREFIX_SUMMARY",
+        ]);
+
+        session
+            .auto_compact(
+                &CompactionConfig {
+                    context_window: 1_000,
+                    reserve_tokens: 50,
+                    keep_recent_tokens: 100,
+                },
+                &summarizer,
+            )
+            .await
+            .expect("compact ok")
+            .expect("compaction ran");
+
+        assert_eq!(
+            summarizer.call_count(),
+            2,
+            "split-turn path must call summarizer twice"
+        );
+
+        let summary = session
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("summary");
+        assert!(summary.contains("MAIN_SUMMARY"), "{summary}");
+        assert!(summary.contains("PREFIX_SUMMARY"), "{summary}");
+        assert!(summary.contains("---"), "{summary}");
+        assert!(summary.contains("**Turn Context (split turn):**"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn auto_compact_on_clean_boundary_uses_single_summary_path() {
+        // Regression: without a split turn, we must still call
+        // the summarizer exactly once.
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("proj");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
+
+        session
+            .append_message(&user_message(&"a".repeat(3_000), 1))
+            .expect("u1");
+        session
+            .append_message(&assistant_message(&"b".repeat(3_000), 2))
+            .expect("a1");
+        session
+            .append_message(&user_message("short prompt", 3))
+            .expect("u2");
+
+        let summarizer = PerCallSummarizer::with_responses(vec![
+            "ONLY_SUMMARY",
+            "UNEXPECTED_SECOND",
+        ]);
+
+        session
+            .auto_compact(
+                &CompactionConfig {
+                    context_window: 1_000,
+                    reserve_tokens: 50,
+                    keep_recent_tokens: 50,
+                },
+                &summarizer,
+            )
+            .await
+            .expect("compact ok")
+            .expect("compaction ran");
+
+        assert_eq!(summarizer.call_count(), 1);
     }
 
     #[tokio::test]

@@ -196,6 +196,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fs4",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",
