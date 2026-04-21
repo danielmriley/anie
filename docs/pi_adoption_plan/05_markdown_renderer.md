@@ -77,24 +77,52 @@ pub fn render_markdown(
 | Link `[text](url)` | When `capabilities.supports_osc8_hyperlinks`: OSC 8 wrapped `text`. Otherwise `text (url)` or just `text` with underline. |
 | Horizontal rule `---` | Full-width `─` line in DarkGray. |
 | HTML / raw HTML | Render as plain text (don't execute, don't format). |
+| Soft break | Newline → space (CommonMark default). |
+| Hard break (`<br>` / two-space) | Newline → actual `\n`. |
+| Raw ANSI in code blocks | Preserve or strip? Pi preserves — if syntect emits ANSI we need to handle both correctly. Default: strip syntect's ANSI and re-emit via ratatui spans. |
 
-### Caching
+### Caching and streaming
 
-OutputPane's per-block cache already handles this — each
-assistant `AssistantMessage` block invalidates on content change,
-caches the rendered `Vec<Line>` per width. Markdown rendering
-happens inside `block_lines` for `AssistantMessage` and is cached
-as-is. No new caching infrastructure.
+Two categories of block matter here:
+
+1. **Finalized assistant blocks** — the cache from PR 2 of
+   `tui_responsiveness` kicks in: `(content, width) → Vec<Line>`
+   memoized per block. Markdown rendering happens once on
+   `finalize_last_assistant`, cached, then re-used until width
+   changes.
+2. **Streaming assistant blocks** — these are deliberately
+   *excluded* from the cache (`block_has_animated_content`
+   returns true for `is_streaming`). Rendering a streaming
+   block re-parses the content every frame at up to 30 fps.
+
+Parsing markdown every frame during streaming is expensive —
+the whole reason PR 2 existed was to stop doing O(transcript)
+work per frame. So: **streaming blocks render as plain wrapped
+text, not markdown. Finalized blocks render as markdown.** The
+transition happens naturally in `finalize_last_assistant`
+because that's also the cache-invalidation point.
+
+UX implication: during streaming the user sees raw markdown
+tokens (`**bold**` literally) until the block finalizes, at
+which point it "settles" into rendered markdown. Pi has the
+same behavior — its markdown component is a finalized-block
+concern.
 
 ### Integration with existing output
 
 Two modes for assistant text:
 
-1. **Markdown mode (default).** `render_markdown` produces the
-   line vector.
-2. **Plain mode (fallback).** Current `wrap_text` behavior.
-   Toggleable via a config flag or the `/markdown off` slash
-   command.
+1. **Markdown mode (default, finalized blocks only).**
+   `render_markdown` produces the line vector inside
+   `assistant_answer_lines` when `is_streaming == false`.
+2. **Plain mode (fallback and all streaming blocks).** Current
+   `wrap_text` behavior.
+
+Config toggle: `ui.markdown_enabled: bool`. The existing
+`UiConfig` struct in `crates/anie-config/src/lib.rs` already
+uses this pattern (see `slash_command_popup_enabled`), so
+extend rather than create a new `rendering` section. Slash-
+command `/markdown on`/`off` flips the flag at runtime.
 
 Tool-result rendering (inside the boxed tool-call display) stays
 plain — bash output isn't markdown and shouldn't be parsed.
@@ -112,7 +140,7 @@ plain — bash output isn't markdown and shouldn't be parsed.
 | `crates/anie-tui/src/markdown/link.rs` | New. |
 | `crates/anie-tui/src/output.rs` | `assistant_answer_lines` calls into markdown renderer. |
 | `crates/anie-tui/src/lib.rs` | Re-export `MarkdownTheme` if useful to tests. |
-| `crates/anie-config/src/lib.rs` | `AnieConfig::rendering.markdown_enabled: bool` default true. |
+| `crates/anie-config/src/lib.rs` | Extend the existing `UiConfig` with `markdown_enabled: bool` (pattern-match `slash_command_popup_enabled`). |
 | `crates/anie-tui/src/commands.rs` | `/markdown on`/`off` toggle. |
 
 ## Phased PRs
@@ -165,12 +193,21 @@ plain — bash output isn't markdown and shouldn't be parsed.
 
 ### PR E — ship
 
-1. Flip `rendering.markdown_enabled = true` in default config.
-2. `output.rs::assistant_answer_lines` calls `render_markdown`.
-3. Add `/markdown off` slash command for users who don't want it.
-4. Manual smoke: generate a response with headings, code blocks,
-   lists, links, and a table. Visual inspection against pi's
-   rendering of the same.
+1. `UiConfig::markdown_enabled = true` by default; serde defaults
+   preserve forward compat.
+2. `assistant_answer_lines` in `output.rs` branches on
+   `is_streaming`: plain wrap when streaming, markdown when
+   finalized. Invocation threaded through a
+   `RenderContext { capabilities, markdown_enabled, theme }`
+   passed in alongside width.
+3. Add `/markdown on`/`off` slash command that flips the
+   runtime flag.
+4. Document the streaming-vs-finalized rendering difference in
+   the output module's top-of-file comment so future maintainers
+   don't "optimize" by moving markdown into the streaming path.
+5. Manual smoke: generate a response with headings, code blocks,
+   lists, links, and a table. Verify raw markdown during
+   streaming, rendered markdown on finalize.
 
 ## Test plan
 

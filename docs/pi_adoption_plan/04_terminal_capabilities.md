@@ -25,48 +25,65 @@ check before emitting anything advanced.
 
 ## Design
 
-A `TerminalCapabilities` struct populated once at startup:
+Mirror pi's `TerminalCapabilities` struct
+(`packages/tui/src/terminal-image.ts`): three fields, each
+already accounting for multiplexer / env conditions. Over-
+engineering an eight-field struct proved tempting but pi shows
+it isn't needed — the consumer wants yes/no answers, not a
+breakdown of the signals that produced them.
 
 ```rust
 pub struct TerminalCapabilities {
-    /// Terminal emulator family, detected from env vars like
-    /// `TERM_PROGRAM`, `TERM`, `KITTY_WINDOW_ID`, `WEZTERM_EXECUTABLE`.
-    pub emulator: TerminalEmulator,
-    /// Whether we're running under tmux or screen. Those
-    /// multiplexers swallow most OSC sequences unless
-    /// passthrough is enabled — we default to "off" to be safe.
-    pub inside_multiplexer: bool,
-    /// Whether stdout is a TTY. False in pipe / file redirects.
-    pub is_tty: bool,
-    /// Whether the terminal supports OSC 8 hyperlinks.
-    /// Derived: `is_tty && !inside_multiplexer &&
-    /// emulator_supports_osc8`.
-    pub supports_osc8_hyperlinks: bool,
-    /// Whether the terminal supports Kitty image protocol.
-    pub supports_kitty_images: bool,
-    /// Whether the terminal supports iTerm2 image protocol.
-    pub supports_iterm_images: bool,
-    /// Whether truecolor (24-bit) is advertised.
-    pub supports_truecolor: bool,
+    /// Which inline-image protocol is supported, if any.
+    /// `None` also covers "images advertised but we're inside
+    /// tmux/screen without passthrough."
+    pub images: Option<ImageProtocol>,
+    /// 24-bit colour is advertised by the terminal.
+    pub truecolor: bool,
+    /// OSC 8 hyperlinks are safe to emit. False inside
+    /// tmux/screen by default, true in most native terminals.
+    pub hyperlinks: bool,
 }
 
-pub enum TerminalEmulator {
+pub enum ImageProtocol {
     Kitty,
-    Ghostty,
-    WezTerm,
     Iterm2,
-    VsCode,
-    Alacritty,
-    AppleTerminal,
-    Windows,
-    Unknown,
 }
 ```
 
-Detection strategy mirrors pi's approach — env vars first, then
-fallbacks. No dynamic queries (the terminal DA/DA2 query protocol
-is awkward under crossterm's event stream and not worth the
-complexity for capabilities we can infer statically).
+Detection is a pure function of the environment — no dynamic
+DA/DA2 queries (those would interleave awkwardly with crossterm's
+event stream for little payoff).
+
+### Env vars we read
+
+Matching pi's actual probe order:
+
+- `TERM_PROGRAM` — primary signal; values include `iTerm.app`,
+  `vscode`, `WezTerm`, `ghostty`, `Apple_Terminal`.
+- `TERM` — string values starting with `tmux` or `screen` mark
+  multiplexer use.
+- `TMUX` — presence-check for tmux (more reliable than `TERM`).
+- `KITTY_WINDOW_ID` — presence-check for Kitty.
+- `GHOSTTY_RESOURCES_DIR` — presence-check for Ghostty.
+- `ITERM_SESSION_ID` — presence-check for iTerm2.
+- `WEZTERM_PANE` — presence-check for WezTerm.
+- `COLORTERM` — `truecolor` or `24bit` values mean yes.
+
+Multiplexer = `TMUX.is_some() || TERM.starts_with("tmux") ||
+TERM.starts_with("screen")`. Hyperlinks are disabled under
+multiplexers (even if the outer terminal supports them) because
+passthrough isn't the default configuration.
+
+### Override env vars (anie-specific, not in pi)
+
+Documented extensions for users in unusual environments:
+
+- `ANIE_FORCE_OSC8=1` — force hyperlinks on.
+- `ANIE_FORCE_OSC8=0` — force hyperlinks off.
+
+Omitted from MVP unless someone surfaces a concrete need. Pi
+ships without equivalents and has not suffered for it.
 
 ## Files to touch
 

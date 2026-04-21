@@ -41,19 +41,28 @@ smaller summarization overhead per trigger.
 After compaction, the agent often needs to re-read files it
 touched earlier in the session. Without tracking, the summary
 might say "reviewed the retry-policy module" but the specific
-file paths are lost. pi attaches a structured list to the
-compaction entry:
+file paths are lost. pi attaches a minimal list
+(`packages/coding-agent/src/core/compaction/compaction.ts:~33`):
 
 ```ts
-details: {
-    filesRead: [{ path, line_count }],
-    filesModified: [{ path, operations: ["edit" | "write"] }],
-    bashCommands: [{ command, exit_code }]
+interface CompactionDetails {
+    readFiles: string[];
+    modifiedFiles: string[];
 }
 ```
 
-The agent can re-introduce paths into context on demand without
-parsing free-text summaries.
+No line counts. No exit codes. No bash-command history.
+Extraction only pulls from `read`, `write`, `edit` tool calls.
+The path lists are also **appended to the summary text itself**
+in XML-like tags (`<read-files>...</read-files>`,
+`<modified-files>...</modified-files>`) so the summarizer LLM
+sees the paths alongside the prose; the `details` field is a
+structured mirror for programmatic access on resume.
+
+We mirror pi's shape exactly — deliberately minimal. If a
+concrete need for bash-command tracking or file-size metadata
+surfaces later, add a field then. "Might be useful" doesn't
+earn a slot in the schema.
 
 ## Design
 
@@ -82,36 +91,64 @@ When `split_turn.is_some()`, the compaction strategy:
    - *Main-history summary* over the messages before
      `turn_start_entry_id`.
    - *Turn-prefix summary* over messages in `prefix_entry_ids`.
-2. Joins with `\n\n---\n\n` separator.
-3. Uses the joined text as the `summary` field of the
+2. Joins them as pi does: the main summary, then
+   `\n\n---\n\n**Turn Context (split turn):**\n\n`, then the
+   turn-prefix summary.
+3. After that, appends the file-operation lists (see below) in
+   `<read-files>...</read-files>` / `<modified-files>...</modified-files>`
+   blocks.
+4. Uses the assembled text as the `summary` field of the
    `Compaction` entry.
 
 The `find_cut_point` logic already knows when it's in a turn; we
 just surface that info instead of backing off.
 
+**Error-handling note.** Pi uses `Promise.all`, so if one of the
+parallel calls fails, the whole compaction fails. We match —
+`tokio::try_join!` short-circuits on the first error and
+propagates. The retry policy treats this as a compaction failure
+and escalates to the agent loop, same as today's single-summary
+failure.
+
 ### File-op tracking
 
-Add optional `details: Option<serde_json::Value>` to the
-`SessionEntry::Compaction` variant. During compaction, walk the
-entries being summarized and build:
+Add optional typed `details: Option<CompactionDetails>` to the
+`SessionEntry::Compaction` variant. `CompactionDetails` is a
+plain struct (not `serde_json::Value` — we want type safety):
 
-```json
-{
-    "files_read": [{"path": "src/main.rs", "count": 3}],
-    "files_modified": [{"path": "README.md", "operations": ["edit"]}],
-    "bash_commands": [{"command": "cargo test", "exit_code": 0}]
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct CompactionDetails {
+    /// Deduplicated paths read during the summarized interval.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_files: Vec<String>,
+    /// Deduplicated paths written or edited during the
+    /// summarized interval.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modified_files: Vec<String>,
 }
 ```
 
-Extracted from:
-- `files_read`: `ToolCall` with `name == "read"` → `arguments.path`.
-- `files_modified`: `name == "write"` or `name == "edit"` → path.
-- `bash_commands`: `name == "bash"` → arguments.command + the
-  corresponding `ToolResult`'s exit code if present.
+Extraction during compaction:
 
-All fields optional — if the feature is disabled or the agent
-didn't use those tools, `details` serializes as `None` and is
-omitted.
+- `read_files`: walk the discarded tool calls, collect
+  `arguments.path` (or `arguments.file_path`) for every
+  `ContentBlock::ToolCall` with `name == "read"`. Dedupe.
+- `modified_files`: same but `name == "write"` or `"edit"`.
+
+If the field is omitted from an older session file, it
+defaults to `CompactionDetails::default()`. If no tools in
+those categories were called, both vectors are empty and
+serialization drops the field entirely via
+`skip_serializing_if`.
+
+**Also:** the extracted lists are serialized into the
+`summary` text inside `<read-files>...</read-files>` /
+`<modified-files>...</modified-files>` tags before being handed
+to the summarizer LLM. The prompt knows to keep those sections
+intact verbatim. Pi does this so the summarizer has the file
+list as context when producing the prose.
 
 ### Session schema bump
 
@@ -164,19 +201,42 @@ default `details` to `None` (serde `skip_serializing_if`).
 
 ### PR C — split-turn summarization
 
-1. `find_cut_point` detects mid-turn cuts, returns `SplitTurn`
-   info.
-2. Compaction strategy branches on `split_turn`:
+**Signature refactor warning.** The existing `find_cut_point`
+returns a tuple `(Vec<SessionContextMessage>,
+Vec<SessionContextMessage>, String)`. This plan turns it into a
+struct so `split_turn` fits cleanly:
+
+```rust
+pub struct CutPoint {
+    pub discarded: Vec<SessionContextMessage>,
+    pub kept: Vec<SessionContextMessage>,
+    pub first_kept_entry_id: String,
+    pub split_turn: Option<SplitTurn>,
+}
+```
+
+Every caller of `find_cut_point` needs updating (inside
+`anie-session` and the `compaction.rs` strategy). Plan on this
+being a ~50-line refactor with ~10 test sites updated before the
+new split-turn behavior lands. Keep this as a separate commit
+within PR C so the refactor is reviewable on its own.
+
+1. Refactor `find_cut_point` to return `CutPoint` struct.
+2. Update every call site + test.
+3. Populate `split_turn` when the cut would land mid-turn.
+4. Compaction strategy branches on `split_turn`:
    - If `None`: single summary (existing behavior).
-   - If `Some`: two parallel `tokio::try_join!` LLM calls,
-     joined with `---`.
-3. `build_context` unchanged — the compaction entry has a
+   - If `Some`: two parallel calls via `tokio::try_join!`,
+     joined per pi's format.
+5. `build_context` unchanged — the compaction entry has a
    joined summary text, no special handling needed downstream.
-4. Tests:
-   - `compact_mid_turn_produces_two_summaries_joined_with_separator`
+6. Tests:
+   - `find_cut_point_returns_struct_with_all_fields` (regression)
+   - `compact_mid_turn_produces_two_summaries_joined_per_pi_format`
    - `compact_without_mid_turn_produces_single_summary` (regression)
    - `split_turn_summary_preserves_kept_suffix`
    - `find_cut_point_surfaces_turn_prefix_when_cut_lands_in_turn`
+   - `split_turn_error_propagates_to_compaction_caller`
 
 ### PR D — expose details on resume
 

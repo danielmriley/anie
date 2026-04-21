@@ -10,27 +10,34 @@ cost.
 
 ### `maxTokensField`
 
-pi has a compat flag on each model: `maxTokensField: "max_tokens"
-| "max_completion_tokens"` (`packages/ai/src/types.ts:418`). The
-built-in detection (`openai-completions.ts:853`) picks between
-the two based on whether the model is an OpenAI reasoning model —
-o-series / GPT-5 use `max_completion_tokens`, everything else uses
-`max_tokens`.
+pi has a compat flag on each model: `maxTokensField?:
+"max_completion_tokens" | "max_tokens"`
+(`packages/ai/src/types.ts:277`). Pi's auto-detect is **URL-based
+rather than model-id-based** (`openai-completions.ts:~832`): the
+default is `"max_completion_tokens"`, and only specific deployments
+(currently `baseUrl.includes("chutes.ai")`) flip to
+`"max_tokens"`. OpenAI's own `/v1/chat/completions` expects
+`max_completion_tokens` for o-series and GPT-5 post-2024; pi's
+default matches that.
 
 OpenRouter's proxy *normalizes* this for us today — both fields
 work, and OpenRouter translates. But:
 
-- Some direct OpenAI-compatible servers reject the "wrong" name
-  (OpenAI itself 400s on `max_tokens` for o-series since the
-  2024 deprecation).
+- Direct OpenAI endpoints (no proxy) reject `max_tokens` for
+  o-series / GPT-5 since the 2024 field rename.
 - When we send `max_tokens: None` on the main agent path (post
   `32232b2`) the field is absent, so this doesn't bite today.
 - The compaction path (`crates/anie-cli/src/compaction.rs:84`)
-  *does* send it. That path currently uses `max_tokens` verbatim,
-  which will 400 against a direct OpenAI o-series endpoint.
+  *does* send it. That path currently uses the wire name
+  `max_tokens` verbatim, which will 400 against a direct
+  OpenAI o-series endpoint.
 
 The fix is a compat-blob field that the outbound body-builder
-reads and emits under the right name.
+reads and emits under the right name. We match pi's default:
+`"max_completion_tokens"` on OpenAI-compatible endpoints unless
+a catalog entry explicitly opts into `"max_tokens"` (e.g., for
+a proxy that demands the legacy name, or for local servers
+like llama.cpp that haven't adopted the newer field).
 
 ### `"minimal"` thinking level
 
@@ -38,11 +45,20 @@ pi's `ThinkingLevel` is a union of 5 values: `"minimal" | "low" |
 "medium" | "high" | "xhigh"` (`packages/ai/src/types.ts:45`).
 `"minimal"` is a GPT-5-specific effort level — a way to request
 reasoning-capable behavior without spending much token budget on
-reasoning.
+reasoning. We currently model four (`Off`, `Low`, `Medium`,
+`High`); adding `"minimal"` now means we won't retrofit it across
+every reasoning-strategy branch when it becomes load-bearing.
 
-We currently model four (`Off`, `Low`, `Medium`, `High`). Adding
-`"minimal"` now means we won't retrofit it across every
-reasoning-strategy branch when it becomes load-bearing for GPT-5.
+**Scope of effect.** Pi only applies reasoning-effort mapping
+(including `"minimal"`) when a model's compat blob declares
+`supportsReasoningEffort: true`. Providers without that flag —
+Anthropic-over-OpenRouter, Groq, Zai — silently ignore the
+`"minimal"` request. That's the correct behavior and we should
+preserve it: adopting `ThinkingLevel::Minimal` in our enum
+doesn't mean every provider respects it, it means the
+*infrastructure* is in place so providers that do understand
+`"minimal"` can consume it. On providers that don't, we fall
+through to the existing no-native-reasoning path.
 
 ## Files to touch
 

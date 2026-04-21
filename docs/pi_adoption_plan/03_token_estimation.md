@@ -25,19 +25,44 @@ traffic over-estimates, CJK text under-estimates.
 
 ## Design
 
-Replace `estimate_context_tokens` (or its caller) with a
-two-phase walk:
+Two phases (pi's algorithm at
+`packages/coding-agent/src/core/compaction/compaction.ts:~177`):
 
-1. Walk messages newest → oldest.
-2. For each assistant message, check `message.usage.total_tokens`.
-   If populated, use it as the running total for everything
-   preceding that message (no need to walk further back).
-3. Everything from that message forward (toward newest) gets the
-   existing chars/4 heuristic.
+1. **Find the latest usage index.** Walk messages newest →
+   oldest. Stop at the first `Message::Assistant` whose
+   `usage.total_tokens > 0`. Record `(usage_total, index)`.
+   If no such message is found, fall back to the pure heuristic
+   (existing behavior).
+2. **Add trailing heuristic.** Sum the chars/4 estimate for every
+   message at `index + 1 ..= last`.
 
-Net cost: the walk terminates earlier on the common case. Output
-value is a better estimate. No changes to compaction triggering
-logic; only the estimate function changes.
+Total = `usage_total + trailing_sum`. The walk terminates early
+on the common case (usage is almost always present on recent
+assistant turns). The key design constraint: we don't accumulate
+usage across multiple assistant messages — each `total_tokens`
+reading represents the *whole prior context at that turn*, so
+using the newest one IS the whole-history estimate.
+
+Net cost: O(n) in the worst case (no usage anywhere, full
+heuristic), O(k) in the common case where k is the number of
+messages after the latest usage-reporting turn. Output value is
+a better estimate. No changes to compaction triggering logic;
+only the estimate function changes.
+
+**Additions vs. pi.** Pi trusts `totalTokens` unconditionally. We
+consider two guardrails, both deferred to a follow-up unless
+needed:
+
+- A 2× cap: if the reported usage exceeds 2 × the heuristic
+  for the same messages, fall back. Protects against provider
+  bugs.
+- Model-switch reset: a `ModelChange` entry between two
+  assistant turns implies different tokenizers and the seed
+  from the older model may not reflect the new model's view.
+
+Neither is in pi. Ship the hybrid estimator without them; add
+guardrails if we observe wrong-side-of-threshold compaction
+misfires in practice.
 
 ## Files to touch
 

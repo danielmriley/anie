@@ -24,42 +24,70 @@ Three concrete reasons a native grep/find/ls beats `bash`:
 3. **Sandboxing.** `ls` through bash could be a vector for
    arbitrary paths; a native tool with a cwd guard is clearer.
 
-Pi's implementations are pragmatic (their `grep` wraps
-`child_process.spawn("rg", ...)` with argument validation). Anie
-can do the same or pull in `grep-searcher` / `ignore` crates —
-both are rock-solid and widely used.
+Pi's implementations shell out to the external binaries: `rg`
+for grep and `fd` for find. They validate arguments and post-
+process truncation. That works for pi because JS-in-Node ships
+no comparable regex/walk engines, so shelling out is the only
+sane choice.
+
+For anie we have a choice: shell out to `rg`/`fd` (matches pi,
+requires the binaries on PATH) or use the Rust libraries that
+ripgrep itself is built on (`grep-searcher`, `ignore`). The
+library route is what this plan recommends because:
+
+- The deps aren't huge (`grep-searcher` ~25k LoC, `ignore`
+  ~8k LoC, both widely audited).
+- No PATH dependency, no "rg is too old" support matrix, no
+  version skew across platforms.
+- Same algorithmic behavior as ripgrep (because ripgrep's CLI
+  is largely a wrapper over these crates).
+
+If the dep weight turns out to bite us we can swap to shell-out
+later — the Tool-trait surface stays the same.
 
 ## Design
 
 ### `grep` tool
 
-Wraps `ripgrep` functionality (either via shelled-out `rg` or via
-the `grep-searcher` crate). Schema:
+Wraps `grep-searcher` + `ignore` directly. Schema matches pi's
+tool parameters (argument names match pi's so any prompting
+based on pi's tool spec transfers cleanly):
 
 ```json
 {
     "type": "object",
     "properties": {
         "pattern": {"type": "string"},
-        "path": {"type": "string", "description": "File or directory to search"},
+        "path": {"type": "string", "description": "File or directory to search (default: cwd)"},
         "glob": {"type": "string", "description": "Glob filter (*.rs etc.)"},
         "type": {"type": "string", "description": "File-type filter (rg --type)"},
-        "case_insensitive": {"type": "boolean"},
-        "output_mode": {
-            "type": "string",
-            "enum": ["content", "files_with_matches", "count"]
-        },
-        "limit": {"type": "integer"}
+        "ignoreCase": {"type": "boolean", "default": false},
+        "literal": {"type": "boolean", "description": "Treat pattern as literal, not regex", "default": false},
+        "context": {"type": "integer", "description": "Lines of context before/after each match"},
+        "limit": {"type": "integer", "description": "Max matches (default 100)"}
     },
     "required": ["pattern"]
 }
 ```
 
-Output format: for `content` mode, `{path}:{line}:{match_text}`
-lines; for `files_with_matches`, one path per line; for `count`,
-`{path}:{count}` lines. Truncate at `limit` (default 250 lines)
-with a "remaining N lines not shown" footer matching the read-tool
-convention.
+Output format: `{path}:{line}:{match_text}` with optional
+context lines prefixed `-` (before) and `+` (after), matching rg's
+default. Truncate at 100 matches OR 50 KB of text, whichever hits
+first. Footer format matches pi's actionable style:
+
+```
+[Truncated: 100 matches limit reached. Use `limit: 500` for more.]
+```
+
+or
+
+```
+[Truncated: 50 KB byte limit reached. Narrow the pattern or path.]
+```
+
+Only a `content` mode is implemented (matching pi). Callers that
+want files-with-matches can grep for the pattern and inspect
+paths; we can add explicit modes later if the agent benefits.
 
 ### `find` tool (aka `glob`)
 
@@ -71,14 +99,15 @@ Wraps glob-based file finding — not Unix `find`. Schema:
     "properties": {
         "pattern": {"type": "string", "description": "Glob (src/**/*.rs)"},
         "path": {"type": "string", "description": "Search root"},
-        "limit": {"type": "integer"}
+        "limit": {"type": "integer", "description": "Max results (default 1000)"}
     },
     "required": ["pattern"]
 }
 ```
 
 Returns one path per line, respecting `.gitignore` by default
-(same as ripgrep).
+(via the `ignore` crate's walker). Truncation footer same shape
+as grep.
 
 ### `ls` tool
 
@@ -89,7 +118,8 @@ Directory listing. Schema:
     "type": "object",
     "properties": {
         "path": {"type": "string"},
-        "show_hidden": {"type": "boolean"}
+        "show_hidden": {"type": "boolean", "default": false},
+        "limit": {"type": "integer", "description": "Max entries (default 500)"}
     },
     "required": ["path"]
 }
@@ -97,6 +127,21 @@ Directory listing. Schema:
 
 Output: one entry per line, with `/` suffix on directories, `*`
 suffix on executables. Respects the cwd guard like `read` does.
+
+### Read-only vs. mutating tool classification
+
+Pi distinguishes `codingTools` (read, write, edit, bash) from
+`readOnlyTools` (read, grep, find, ls). Useful for:
+
+- Sandboxed modes that only allow read-only tools.
+- UI badging in the transcript (tool icons).
+- Future "preview / confirm" flows for mutating tools.
+
+anie's `ToolRegistry` currently has no such classification.
+Adding a `Tool::side_effect() -> SideEffect` trait method with
+`Read | Write` variants preserves the existing single-registry
+shape while letting callers filter. Can ship alongside the new
+tools or as a follow-up.
 
 ## Files to touch
 

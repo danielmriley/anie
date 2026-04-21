@@ -89,6 +89,49 @@ rendering, pi's sophisticated input editor with undo/kill-ring —
 these are genuinely nice but pi-ahead-of-us isn't a pressing
 signal; they land when we feel them missing).
 
+## Revision history
+
+- **Initial draft** — seven plans written from the comparison
+  doc, committed as `56af476`.
+- **Review pass** — all seven plans re-verified against pi's
+  actual code via parallel codebase survey. Corrections:
+  - **Plan 01** — `maxTokensField` auto-detect is URL-based
+    (not model-id-based). Default matches pi's
+    `max_completion_tokens`. `"minimal"` only fires on providers
+    with `supportsReasoningEffort`; documented scope.
+  - **Plan 02** — parameter names aligned with pi (`ignoreCase`,
+    `literal`, `context`; no `output_mode` enum). Defaults
+    corrected (grep = 100 matches + 50 KB; find = 1000; ls =
+    500). Shell-out-vs-library tradeoff explained (plan still
+    recommends library). Read-only vs. mutating tool
+    classification added.
+  - **Plan 03** — algorithm description corrected: find the
+    latest usage index once, then add trailing heuristic; we
+    don't accumulate across multiple usage readings. Guardrails
+    (2× cap, model-switch reset) documented as anie-specific
+    follow-ups not present in pi.
+  - **Plan 04** — struct simplified from 8 fields to pi's 3
+    (`images`, `truecolor`, `hyperlinks`). `AppleTerminal` /
+    `Windows` enum variants removed. Env-var list corrected
+    (added `COLORTERM`, `GHOSTTY_RESOURCES_DIR`,
+    `ITERM_SESSION_ID`, `WEZTERM_PANE`; removed
+    `WEZTERM_EXECUTABLE`). `is_tty` field dropped.
+  - **Plan 05** — streaming markdown risk addressed: streaming
+    blocks stay plain-text, markdown applies only to finalized
+    blocks. Config flag moved under existing `UiConfig`
+    (matches `slash_command_popup_enabled`). Line-break
+    handling, ANSI-in-code-blocks concern added.
+  - **Plan 06** — `CompactionDetails` schema simplified to
+    match pi's `{ readFiles, modifiedFiles }` exactly (no line
+    counts, no exit codes, no bash history). Separator format
+    corrected to include pi's `**Turn Context (split turn):**`
+    label. `find_cut_point` signature refactor called out as a
+    separable chunk of work within PR C.
+  - **Plan 07** — expiry-margin claim corrected (pi checks at
+    exact expiry, not 60 s before). Locking library swapped
+    from `fs2` to `fs4` to match anie-session. Research phase
+    added to PR B for Claude Code's actual OAuth endpoint.
+
 ## References
 
 - `docs/anie_vs_pi_comparison.md` — the findings this plan is

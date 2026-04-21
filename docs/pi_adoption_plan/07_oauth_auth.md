@@ -91,26 +91,37 @@ Built-in impls:
 
 ### Race-safe refresh
 
-pi uses a per-provider mutex with fs-level locking to prevent two
-agent runs from refreshing the same token simultaneously. Port
-the same idea via `fs2`'s advisory file lock on a per-provider
+pi uses `proper-lockfile` (a Node package for fs-level locking)
+to prevent two agent runs from refreshing the same token
+simultaneously. Rust equivalent: `fs4` (what we already use for
+session locking at `anie-session/src/lib.rs`) over a per-provider
 lock file:
 
 ```
 ~/.anie/auth.lock/<provider>.lock
 ```
 
+Using `fs4` keeps us consistent with the rest of anie — no new
+locking dependency.
+
 Flow:
 
 1. Agent calls `AuthResolver::resolve(provider_name)`.
 2. Resolver reads `auth.json`; finds `type: "oauth"`.
-3. If `expires_at > now + 60s`, return the cached access token.
+3. If `expires_at > now`, return the cached access token.
+   (Pi uses an exact-expiry check; anie can optionally add a
+   small safety margin — e.g., 30 s — to avoid the edge case of
+   the token expiring between the check and the request hitting
+   the network. Not in pi; mark as an anie-specific
+   improvement.)
 4. Else acquire `<provider>.lock` (blocking, with timeout).
 5. Re-read `auth.json` — another process may have already
    refreshed (common with concurrent runs).
 6. If still expired, call `OAuthProvider::refresh`, persist the
    new credential, release lock.
 7. Return the access token.
+
+Refresh is on-demand, not proactive — same as pi.
 
 ### Interactive login flow
 
@@ -146,7 +157,7 @@ anthropic` for clearing credentials.
 | `crates/anie-auth/src/lib.rs` | Extended `Credential` enum (`ApiKey`, `OAuth`), `OAuthProvider` trait, resolver updates. |
 | `crates/anie-auth/src/oauth.rs` | New. Token refresh + file locking. |
 | `crates/anie-auth/src/anthropic_oauth.rs` | New. Anthropic-specific endpoints. |
-| `crates/anie-auth/Cargo.toml` | Add `fs2` (advisory file locking), `url`, `oauth2` or a simpler handwritten client. |
+| `crates/anie-auth/Cargo.toml` | Add `fs4` (match anie-session's locking choice), `url`, handwritten OAuth client (or `oauth2` crate if its footprint is justified). |
 | `crates/anie-cli/src/commands.rs` | `anie login` / `anie logout` subcommands. |
 | `crates/anie-tui/src/overlays/onboarding.rs` | OAuth option alongside API-key option for OAuth-capable providers. |
 | `crates/anie-tui/src/commands/` | `/login` / `/logout` slash commands. |
@@ -169,12 +180,29 @@ anthropic` for clearing credentials.
 
 ### PR B — OAuth provider trait + Anthropic impl
 
-1. `OAuthProvider` trait as above.
-2. `AnthropicOAuthProvider` — hardcoded endpoints, PKCE device
-   flow per Claude Code's published protocol. (Research needed
-   at implementation time — check Anthropic's docs.)
+**Pre-work: research phase.** Pi's OAuth code delegates to
+`@mariozechner/pi-ai` which wraps the provider's endpoints
+but doesn't document them inline. Before writing the Rust
+client:
+
+1. Pull Claude Code's actual OAuth flow from Anthropic's docs
+   — endpoint URL, grant type (device-code vs. authorization-
+   code with PKCE), refresh endpoint, expected request/response
+   shapes, scopes.
+2. If the flow is PKCE device-code, generate code_verifier and
+   code_challenge per RFC 7636. If it's authorization-code with
+   PKCE, spin up a localhost redirect handler during `/login`.
+3. Document findings inline in `anthropic_oauth.rs` with a
+   dated comment (`// Verified against docs: YYYY-MM-DD`).
+
+Then:
+
+1. `OAuthProvider` trait as sketched above.
+2. `AnthropicOAuthProvider` with endpoints from the research.
 3. Unit tests with mocked HTTP endpoints (using `wiremock` or
    `mockito`).
+4. Deserialization tests for Anthropic's expiry format (seconds
+   since epoch? RFC 3339? check).
 
 ### PR C — refresh-with-lock
 
