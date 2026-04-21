@@ -1,17 +1,18 @@
 //! Transform a `pulldown-cmark` event stream into ratatui
 //! `Line`s, applying theme styles and wrapping.
 //!
-//! **Scope of PR A + B + C (Plan 05).** This module currently
-//! handles headings, paragraphs, bold / italic / strikethrough,
-//! inline code, HTML-as-literal-text, horizontal rules, fenced /
+//! **Scope of PR A + B + C + D (Plan 05).** This module handles
+//! headings, paragraphs, bold / italic / strikethrough, inline
+//! code, HTML-as-literal-text, horizontal rules, fenced /
 //! indented code blocks with syntect-based highlighting,
-//! unordered and ordered lists (with nesting), blockquotes, and
-//! GitHub-flavored tables. Links land in PR D. Unimplemented
-//! element events fall through to a plain-text stringification
-//! so nothing crashes; the quality just improves as more PRs
-//! land.
+//! unordered and ordered lists (with nesting), blockquotes,
+//! GitHub-flavored tables, inline / autolink / reference links
+//! (with a visible URL fallback — see `link.rs` for the OSC 8
+//! deferral rationale), and inline images (as `[image: alt]`
+//! placeholders). Unimplemented element events still fall
+//! through to a plain-text stringification.
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -62,6 +63,26 @@ struct LineBuilder<'a> {
     // collected as plain strings (inline styling inside cells is
     // flattened for PR C; inline-in-cell styling can come later).
     table: Option<TableState>,
+    // Populated between Start(Link) and End(Link). Captures the
+    // link type + URL + accumulated text so End(Link) can decide
+    // whether to append ` (url)`.
+    link: Option<LinkState>,
+    // Populated between Start(Image) and End(Image). Alt text is
+    // accumulated here; End(Image) emits `[image: alt]`.
+    image: Option<ImageState>,
+}
+
+#[derive(Debug)]
+struct LinkState {
+    link_type: LinkType,
+    url: String,
+    text_buf: String,
+}
+
+#[derive(Debug)]
+struct ImageState {
+    url: String,
+    alt_buf: String,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +123,8 @@ impl<'a> LineBuilder<'a> {
             list_stack: Vec::new(),
             pending_first_line_prefix: None,
             table: None,
+            link: None,
+            image: None,
         }
     }
 
@@ -113,6 +136,31 @@ impl<'a> LineBuilder<'a> {
         // want the outer (table) context to win for framing.
         if self.table.is_some() {
             self.handle_table_event(event);
+            return;
+        }
+        // While inside an image tag, consume Text events into the
+        // alt buffer and finalize on End(Image). Other events
+        // inside an image (rare: pulldown-cmark can emit inline
+        // formatting inside alt text) are ignored.
+        if self.image.is_some() {
+            match event {
+                Event::Text(text) => {
+                    if let Some(img) = self.image.as_mut() {
+                        img.alt_buf.push_str(&text);
+                    }
+                }
+                Event::End(TagEnd::Image) => {
+                    if let Some(img) = self.image.take() {
+                        let display = if img.alt_buf.is_empty() {
+                            format!("[image: {}]", img.url)
+                        } else {
+                            format!("[image: {}]", img.alt_buf)
+                        };
+                        self.push_styled(&display, self.theme.link_url);
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         // While inside a code block, every event except raw text
@@ -244,12 +292,28 @@ impl<'a> LineBuilder<'a> {
             // in the unusual case that the parser emits them
             // without a preceding `Tag::Table`.
             Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                self.link = Some(LinkState {
+                    link_type,
+                    url: dest_url.to_string(),
+                    text_buf: String::new(),
+                });
+                self.push_style(self.theme.link_text);
+            }
+            Tag::Image { dest_url, .. } => {
+                self.image = Some(ImageState {
+                    url: dest_url.to_string(),
+                    alt_buf: String::new(),
+                });
+            }
             // Block elements not yet handled: render their inline
             // content as plain text, ignore their structure.
             Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
-            | Tag::Link { .. }
-            | Tag::Image { .. }
             | Tag::MetadataBlock(_)
             | Tag::DefinitionList
             | Tag::DefinitionListDefinition
@@ -314,10 +378,26 @@ impl<'a> LineBuilder<'a> {
                 // Normal flow: handled by `handle_table_event`.
                 // This arm only fires on orphan end tags.
             }
+            TagEnd::Link => {
+                self.pop_style();
+                if let Some(link) = self.link.take() {
+                    if super::link::should_show_trailing_url(
+                        link.link_type,
+                        &link.text_buf,
+                        &link.url,
+                    ) {
+                        let suffix = super::link::format_link_suffix(&link.url);
+                        self.push_styled(&suffix, self.theme.link_url);
+                    }
+                }
+            }
+            TagEnd::Image => {
+                // Normal flow: consume() intercepts End(Image)
+                // via the `self.image.is_some()` path. Orphan
+                // end tag — no-op.
+            }
             TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
-            | TagEnd::Link
-            | TagEnd::Image
             | TagEnd::MetadataBlock(_)
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListDefinition
@@ -330,6 +410,12 @@ impl<'a> LineBuilder<'a> {
     fn push_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
+        }
+        // Mirror link text into the active link buffer so End(Link)
+        // can decide whether the trailing ` (url)` is redundant
+        // (skip when the link body already reads as the URL).
+        if let Some(link) = self.link.as_mut() {
+            link.text_buf.push_str(text);
         }
         let style = self.current_style();
         for (index, chunk) in text.split('\n').enumerate() {
@@ -1175,11 +1261,93 @@ mod tests {
 
     #[test]
     fn unhandled_block_falls_through_to_plain_text() {
-        // Links aren't styled yet (PR D). Verify the text still
-        // surfaces instead of being silently dropped.
+        // Footnote definitions are still unhandled. Verify the
+        // body text surfaces instead of being silently dropped.
+        let out = render_plain("Hello[^1].\n\n[^1]: the note", 80);
+        let joined = out.join("\n");
+        assert!(joined.contains("Hello"), "{out:?}");
+    }
+
+    #[test]
+    fn inline_link_emits_text_with_trailing_url() {
         let out = render_plain("see [the docs](https://example.com)", 80);
         let joined = out.join("\n");
-        assert!(joined.contains("the docs"), "{out:?}");
+        assert!(joined.contains("the docs"), "text missing: {out:?}");
+        assert!(
+            joined.contains("(https://example.com)"),
+            "trailing url missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn autolink_skips_redundant_trailing_url() {
+        let out = render_plain("before <https://example.com> after", 80);
+        let joined = out.join("\n");
+        // URL shows once — no "(https://example.com)" appended.
+        let occurrences = joined.matches("https://example.com").count();
+        assert_eq!(occurrences, 1, "expected exactly one URL: {out:?}");
+    }
+
+    #[test]
+    fn link_text_is_styled_with_link_text_theme() {
+        let lines = render(
+            "[doc](https://x.io)",
+            80,
+            &MarkdownTheme::default_dark(),
+        );
+        let text_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "doc")
+            .expect("link text span");
+        assert_eq!(
+            text_span.style,
+            MarkdownTheme::default_dark().link_text
+        );
+    }
+
+    #[test]
+    fn link_trailing_url_is_styled_with_link_url_theme() {
+        let lines = render(
+            "[doc](https://x.io)",
+            80,
+            &MarkdownTheme::default_dark(),
+        );
+        let url_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("(https://x.io)"))
+            .expect("url span");
+        assert_eq!(
+            url_span.style,
+            MarkdownTheme::default_dark().link_url
+        );
+    }
+
+    #[test]
+    fn image_renders_as_alt_text_placeholder() {
+        let out = render_plain("see ![a cat](https://img/cat.png)", 80);
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("[image: a cat]"),
+            "placeholder missing: {out:?}"
+        );
+        // Image URL should NOT leak as literal text once we've
+        // rendered the placeholder.
+        assert!(
+            !joined.contains("https://img/cat.png"),
+            "url leaked: {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_without_alt_falls_back_to_url_in_placeholder() {
+        let out = render_plain("![](https://img/x.png)", 80);
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("[image: https://img/x.png]"),
+            "placeholder missing: {out:?}"
+        );
     }
 
     #[test]

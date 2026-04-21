@@ -15,6 +15,7 @@
 //! block cache captures it cleanly.
 
 mod layout;
+mod link;
 mod parser;
 mod syntax;
 mod theme;
