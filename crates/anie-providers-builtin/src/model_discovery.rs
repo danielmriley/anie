@@ -197,6 +197,13 @@ impl PricingEntry {
 struct TopProviderEntry {
     #[serde(default)]
     context_length: Option<u64>,
+    /// OpenRouter-reported cap on *output* tokens for the routed
+    /// upstream. When present, we honor it as `Model.max_tokens`
+    /// so reasoning models that naturally emit several thousand
+    /// tokens of reasoning before answering don't get clipped by
+    /// anie's 8k default.
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,11 +343,16 @@ async fn discover_openai_compatible_models(
                         .as_ref()
                         .and_then(|top| top.context_length)
                 });
+            let max_output_tokens = entry
+                .top_provider
+                .as_ref()
+                .and_then(|top| top.max_completion_tokens);
             ModelInfo {
                 id: entry.id.clone(),
                 name: entry.name.unwrap_or(entry.id.clone()),
                 provider: request.provider_name.clone(),
                 context_length,
+                max_output_tokens,
                 supports_images,
                 supports_reasoning,
                 pricing: entry.pricing.and_then(PricingEntry::into_model_pricing),
@@ -376,6 +388,7 @@ async fn discover_anthropic_models(
                 .unwrap_or(entry.id.clone()),
             provider: request.provider_name.clone(),
             context_length: entry.context_window.or(entry.input_token_limit),
+            max_output_tokens: None,
             supports_images: Some(
                 entry
                     .capabilities
@@ -446,6 +459,7 @@ async fn discover_ollama_tags(
                 name,
                 provider: request.provider_name.clone(),
                 context_length,
+                max_output_tokens: None,
                 supports_images,
                 supports_reasoning,
                 pricing: None,
@@ -1062,7 +1076,10 @@ mod tests {
                 "id": "openai/o3",
                 "name": "OpenAI: o3",
                 "pricing": {"prompt": "0.000002", "completion": "0.000008"},
-                "top_provider": {"context_length": 128000},
+                "top_provider": {
+                    "context_length": 128000,
+                    "max_completion_tokens": 65536
+                },
                 "supported_parameters": ["tools", "reasoning_effort"],
                 "architecture": {
                     "input_modalities": ["text"],
@@ -1122,13 +1139,20 @@ mod tests {
         assert!(params.iter().any(|p| p == "tools"));
         assert!(params.iter().any(|p| p == "reasoning"));
 
-        // openai/o3 — relies on top_provider.context_length
+        // openai/o3 — relies on top_provider.context_length and
+        // carries top_provider.max_completion_tokens so reasoning
+        // runs don't get clipped by anie's 8 k default.
         let o3 = &models[1];
         assert_eq!(o3.id, "openai/o3");
         assert_eq!(
             o3.context_length,
             Some(128_000),
             "should fall back to top_provider.context_length"
+        );
+        assert_eq!(
+            o3.max_output_tokens,
+            Some(65_536),
+            "should carry top_provider.max_completion_tokens"
         );
         assert_eq!(o3.supports_reasoning, Some(true));
         assert_eq!(o3.supports_images, Some(false));

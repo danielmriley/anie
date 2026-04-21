@@ -203,6 +203,13 @@ pub struct ModelInfo {
     pub provider: String,
     /// Provider-advertised context window, when known.
     pub context_length: Option<u64>,
+    /// Provider-advertised cap on *output* tokens, when known.
+    /// OpenRouter reports this in `top_provider.max_completion_tokens`;
+    /// honoring it prevents `max_tokens` from defaulting to a
+    /// value too small for reasoning models that produce several
+    /// thousand tokens of reasoning before answering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// Whether the model accepts images, when known.
     pub supports_images: Option<bool>,
     /// Whether the model supports reasoning features, when known.
@@ -299,6 +306,21 @@ impl ModelInfo {
     /// Convert a discovered model into a runtime model definition using conservative defaults.
     #[must_use]
     pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
+        // Prefer the provider-advertised output-token cap when we
+        // have one (OpenRouter reports it via
+        // `top_provider.max_completion_tokens`). For reasoning-
+        // capable models without an advertised cap, bump the
+        // default to 32 k — the 8 k default routinely clips
+        // reasoning upstreams mid-thought and surfaces as a
+        // `ResponseTruncated` error. For non-reasoning models
+        // lacking an advertised cap, 8 k stays fine.
+        let max_tokens = self.max_output_tokens.unwrap_or_else(|| {
+            if self.supports_reasoning.unwrap_or(false) {
+                32_768
+            } else {
+                8_192
+            }
+        });
         Model {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -306,7 +328,7 @@ impl ModelInfo {
             api,
             base_url: base_url.to_string(),
             context_window: self.context_length.unwrap_or(32_768),
-            max_tokens: 8_192,
+            max_tokens,
             supports_reasoning: self.supports_reasoning.unwrap_or(false),
             reasoning_capabilities: None,
             supports_images: self.supports_images.unwrap_or(false),
@@ -324,6 +346,7 @@ impl From<&Model> for ModelInfo {
             name: value.name.clone(),
             provider: value.provider.clone(),
             context_length: Some(value.context_window),
+            max_output_tokens: Some(value.max_tokens),
             supports_images: Some(value.supports_images),
             supports_reasoning: Some(value.supports_reasoning),
             pricing: None,
@@ -337,12 +360,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn to_model_honors_advertised_max_output_tokens() {
+        let info = ModelInfo {
+            id: "openai/o3".into(),
+            name: "o3".into(),
+            provider: "openrouter".into(),
+            context_length: Some(128_000),
+            max_output_tokens: Some(65_536),
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+        };
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://openrouter.ai/api/v1",
+        );
+        assert_eq!(model.max_tokens, 65_536);
+    }
+
+    #[test]
+    fn to_model_bumps_default_for_reasoning_models_without_advertised_cap() {
+        // Regression: 8 k default was too small for reasoning
+        // upstreams that emit several thousand tokens of
+        // reasoning before answering — surfaced as
+        // `ResponseTruncated` in the wild. Reasoning-capable
+        // models without an advertised cap now get 32 k.
+        let info = ModelInfo {
+            id: "nvidia/nemotron-3-super-120b-a12b:free".into(),
+            name: "Nemotron".into(),
+            provider: "openrouter".into(),
+            context_length: Some(131_072),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+        };
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://openrouter.ai/api/v1",
+        );
+        assert_eq!(model.max_tokens, 32_768);
+    }
+
+    #[test]
+    fn to_model_keeps_conservative_default_for_non_reasoning_models() {
+        let info = ModelInfo {
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+            provider: "openai".into(),
+            context_length: Some(128_000),
+            max_output_tokens: None,
+            supports_images: Some(true),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+        };
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://api.openai.com/v1",
+        );
+        assert_eq!(model.max_tokens, 8_192);
+    }
+
+    #[test]
     fn model_info_to_model_uses_conservative_defaults() {
         let info = ModelInfo {
             id: "qwen3:32b".into(),
             name: "Qwen 3 32B".into(),
             provider: "ollama".into(),
             context_length: None,
+            max_output_tokens: None,
             supports_images: None,
             supports_reasoning: None,
             pricing: None,

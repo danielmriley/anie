@@ -1530,6 +1530,7 @@ mod tests {
                 name: "GPT-4o".into(),
                 provider: "openai".into(),
                 context_length: Some(128_000),
+                max_output_tokens: None,
                 supports_images: Some(true),
                 supports_reasoning: Some(false),
                 pricing: None,

@@ -236,6 +236,19 @@ impl OpenAiStreamState {
         let mut events = self.finish_tagged_content();
         events.extend(self.finish_tool_calls());
         if !self.has_meaningful_content() {
+            // Distinguish truncation (`finish_reason: "length"`)
+            // from a genuine "model only produced reasoning"
+            // termination. On OpenRouter, reasoning upstreams
+            // (notably free-tier models) routinely emit several
+            // thousand tokens of reasoning before the visible
+            // answer and then hit the output-token cap. That used
+            // to surface as `EmptyAssistantResponse` with advice
+            // to rephrase — the actual fix is a lower thinking
+            // level or a larger `max_tokens`. Route it
+            // separately so the error message is actionable.
+            if self.finish_reason.as_deref() == Some("length") {
+                return Err(ProviderError::ResponseTruncated);
+            }
             return Err(ProviderError::EmptyAssistantResponse);
         }
         events.push(ProviderEvent::Done(self.into_message()));
@@ -498,6 +511,28 @@ mod tests {
             vec![ProviderEvent::ThinkingDelta("hello from reasoning".into())]
         );
         assert!(matches!(error, ProviderError::EmptyAssistantResponse));
+    }
+
+    #[test]
+    fn reasoning_only_stream_with_length_finish_surfaces_truncated_error() {
+        // Regression: on OpenRouter, reasoning upstreams routinely
+        // hit max_tokens mid-reasoning and end with
+        // `finish_reason: "length"` and no visible content. That
+        // used to masquerade as "model returned only reasoning"
+        // — actually a truncation, fix is different.
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let _ = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"","reasoning":"lots of reasoning here"},"finish_reason":"length"}]}"#,
+            )
+            .expect("events");
+        let error = state
+            .finish_stream()
+            .expect_err("finish stream should fail");
+        assert!(
+            matches!(error, ProviderError::ResponseTruncated),
+            "expected ResponseTruncated, got {error:?}"
+        );
     }
 
     #[test]

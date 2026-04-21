@@ -61,6 +61,20 @@ pub enum ProviderError {
     )]
     EmptyAssistantResponse,
 
+    /// The provider signalled `finish_reason: "length"` before the
+    /// model produced any visible text or tool call — i.e. the
+    /// response was truncated *during reasoning* because the total
+    /// output token budget was exhausted. Distinct from
+    /// `EmptyAssistantResponse` because the fix is different: the
+    /// model didn't run out of ideas, it ran out of room. Common
+    /// on OpenRouter when hosted reasoning models emit several
+    /// thousand tokens of reasoning before answering and the
+    /// configured `max_tokens` is too small.
+    #[error(
+        "response truncated before a visible answer was produced (max_tokens reached during reasoning); lower the thinking level, raise the model's max_tokens, or switch to a non-reasoning model"
+    )]
+    ResponseTruncated,
+
     /// An SSE frame could not be parsed as JSON. Usually a transient
     /// upstream issue; retryable.
     #[error("invalid stream JSON: {0}")]

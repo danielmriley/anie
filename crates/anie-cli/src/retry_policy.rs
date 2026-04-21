@@ -112,7 +112,13 @@ impl<'a> RetryPolicy<'a> {
             // thinking block N times before giving up. Treat it as
             // terminal so the user sees one clean error and can adjust
             // the prompt or swap models.
-            | ProviderError::EmptyAssistantResponse => RetryDecision::GiveUp {
+            | ProviderError::EmptyAssistantResponse
+            // `ResponseTruncated` is `finish_reason: "length"` with
+            // nothing visible yet. Same retry logic as
+            // `EmptyAssistantResponse` — the same prompt at the
+            // same `max_tokens` produces the same truncation — but
+            // the error message surfaces a more accurate fix.
+            | ProviderError::ResponseTruncated => RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             },
             ProviderError::RateLimited { .. } => {
@@ -446,6 +452,17 @@ mod tests {
                 0,
                 false,
             ),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn response_truncated_gives_up_immediately() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(&ProviderError::ResponseTruncated, 0, false),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }
