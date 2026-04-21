@@ -17,6 +17,7 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+opener.workspace = true
 dirs.workspace = true
 async-trait.workspace = true
 futures.workspace = true

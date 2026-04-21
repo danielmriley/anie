@@ -43,15 +43,8 @@ pub async fn run_login(provider_name: &str) -> Result<()> {
         .await
         .context("failed to start OAuth login flow")?;
 
-    println!(
-        "Open the following URL in your browser to authorize anie:\n\n  {url}\n",
-        url = flow.authorize_url,
-    );
-    println!(
-        "Waiting for the redirect at {redirect} (timeout: {secs}s)...",
-        redirect = flow.redirect_uri,
-        secs = LOGIN_TIMEOUT.as_secs(),
-    );
+    let opened = try_open_browser(&flow.authorize_url);
+    print_login_prompt(&flow.authorize_url, opened, LOGIN_TIMEOUT);
 
     let callback = await_callback(CALLBACK_PORT, LOGIN_TIMEOUT)
         .await
@@ -100,6 +93,42 @@ pub async fn run_logout(provider_name: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Try to open the authorize URL in the user's default
+/// browser. Returns `true` on success, `false` on headless /
+/// sandboxed environments where no browser handler is
+/// registered — in those cases the caller prints the URL so
+/// the user can paste it into a browser on another machine.
+fn try_open_browser(url: &str) -> bool {
+    match opener::open_browser(url) {
+        Ok(()) => true,
+        Err(err) => {
+            // Don't treat a missing browser as fatal; the
+            // flow still works if the user manually opens the
+            // URL, just less conveniently.
+            tracing::debug!(%err, "could not auto-open browser");
+            false
+        }
+    }
+}
+
+/// Print a compact login banner. When the browser auto-opened
+/// we collapse the URL onto a single "Paste if needed:" line so
+/// the terminal stays readable; headless cases present the URL
+/// prominently on its own line.
+fn print_login_prompt(url: &str, opened: bool, timeout: std::time::Duration) {
+    let secs = timeout.as_secs();
+    if opened {
+        println!("Opening browser for OAuth authorization...");
+        println!("  Paste if needed: {url}");
+        println!("  Waiting for redirect (timeout {secs}s)");
+    } else {
+        println!("OAuth authorization required.");
+        println!("  Open this URL in a browser:");
+        println!("    {url}");
+        println!("  Waiting for redirect (timeout {secs}s)");
+    }
 }
 
 /// Redact a state/verifier string to a short prefix + suffix so

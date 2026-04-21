@@ -46,6 +46,10 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 jsonschema = "0.30"
 keyring = "3"
 nix = { version = "0.30", features = ["signal", "process"] }
+# opener — cross-platform "open this URL in the default
+# browser" for the OAuth login flow. Pure-Rust wrapper around
+# `xdg-open`/`open`/`start`; no heavy transitive deps.
+opener = { version = "0.8", default-features = false }
 rand = "0.9"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
