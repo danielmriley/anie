@@ -1,7 +1,14 @@
 //! API-key storage and async request-option resolution.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod anthropic_oauth;
+pub mod oauth;
 mod store;
+
+pub use anthropic_oauth::AnthropicOAuthProvider;
+pub use oauth::{
+    LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, generate_pkce, parse_expires_at,
+};
 
 use std::{
     collections::HashMap,

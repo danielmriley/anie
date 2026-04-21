@@ -50,13 +50,19 @@ rand = "0.9"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 rpassword = "7"
+# sha2 — needed for PKCE SHA-256 challenge in the OAuth flow.
+# Pure Rust; no C build dep. Stable and pinned widely.
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
+# serde_urlencoded — already transitive through reqwest; we
+# surface it explicitly for the OAuth authorize-URL builder.
+serde_urlencoded = "0.7"
 serde_json = "1"
 similar = "2"
 temp-env = { version = "0.3", features = ["async_closure"] }
 tempfile = "3"
 thiserror = "2"
-time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "0.8"
