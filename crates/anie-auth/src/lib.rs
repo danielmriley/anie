@@ -10,7 +10,8 @@ mod store;
 pub use anthropic_oauth::AnthropicOAuthProvider;
 pub use callback::{Callback, CallbackError, await_callback};
 pub use oauth::{
-    LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, generate_pkce, parse_expires_at,
+    AuthCodeFlow, DeviceCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair,
+    generate_pkce, parse_expires_at,
 };
 pub use refresh::{CredentialPersistence, OAuthRefresher, RefreshError, default_lock_dir};
 
@@ -81,6 +82,18 @@ pub enum AuthCredential {
         /// in `anie login` output. Not used for auth itself.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
+        /// Per-user API base URL, returned by some providers
+        /// during login (e.g. GitHub Copilot's `proxy-ep`
+        /// host). When set, the provider driver must route
+        /// requests to this base instead of any static default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        /// Google Cloud project ID. Required for Gemini CLI /
+        /// Antigravity API calls — discovered during login
+        /// (`loadCodeAssist`) and stored so subsequent runs
+        /// don't repeat the discovery request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
     },
 }
 
@@ -641,6 +654,8 @@ mod tests {
             refresh_token: "sk-ant-ort01-def".into(),
             expires_at: "2026-04-25T14:00:00Z".into(),
             account: Some("user@example.com".into()),
+            api_base_url: None,
+            project_id: None,
         }
     }
 
@@ -674,9 +689,19 @@ mod tests {
             refresh_token: "ref".into(),
             expires_at: "2026-04-25T14:00:00Z".into(),
             account: None,
+            api_base_url: None,
+            project_id: None,
         };
         let json = serde_json::to_string(&cred).expect("serialize");
         assert!(!json.contains("\"account\""), "None account leaked: {json}");
+        assert!(
+            !json.contains("\"api_base_url\""),
+            "None api_base_url leaked: {json}"
+        );
+        assert!(
+            !json.contains("\"project_id\""),
+            "None project_id leaked: {json}"
+        );
     }
 
     #[test]

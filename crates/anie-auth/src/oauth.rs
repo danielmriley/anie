@@ -27,13 +27,52 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Handoff value returned by `OAuthProvider::begin_login`. The
-/// caller shows `authorize_url` to the user (print it, open a
-/// browser, etc.), waits for the code to arrive via the
-/// redirect callback (or manual paste), then calls
-/// `complete_login` with the same `LoginFlow` so PKCE state
-/// stays matched.
+/// enum variant identifies which completion protocol the caller
+/// must run — an auth-code flow opens a browser and waits for a
+/// localhost callback; a device-code flow shows the user a code
+/// to type into another device while the agent polls.
 #[derive(Debug, Clone)]
-pub struct LoginFlow {
+pub enum LoginFlow {
+    /// OAuth 2.0 Authorization Code + PKCE (RFC 7636). Caller
+    /// shows `authorize_url`, catches the redirect on
+    /// `redirect_uri`, extracts the code + state, and calls
+    /// `complete_login(flow, Some(code))`.
+    AuthorizationCode(AuthCodeFlow),
+    /// OAuth 2.0 Device Authorization Grant (RFC 8628). Caller
+    /// shows `user_code` + `verification_uri`; the provider's
+    /// `complete_login(flow, None)` polls the token endpoint
+    /// until the user approves on another device.
+    Device(DeviceCodeFlow),
+}
+
+impl LoginFlow {
+    /// Convenience: extract the AuthCode flow, or None if this
+    /// is a device flow. Used by the CLI driver to decide
+    /// whether to stand up a callback server.
+    #[must_use]
+    pub fn as_auth_code(&self) -> Option<&AuthCodeFlow> {
+        match self {
+            Self::AuthorizationCode(inner) => Some(inner),
+            Self::Device(_) => None,
+        }
+    }
+
+    /// Convenience: extract the Device flow, or None if this
+    /// is an auth-code flow. Used by the CLI driver to decide
+    /// whether to display a user_code.
+    #[must_use]
+    pub fn as_device(&self) -> Option<&DeviceCodeFlow> {
+        match self {
+            Self::Device(inner) => Some(inner),
+            Self::AuthorizationCode(_) => None,
+        }
+    }
+}
+
+/// Auth-code + PKCE flow state carried from `begin_login` to
+/// `complete_login`.
+#[derive(Debug, Clone)]
+pub struct AuthCodeFlow {
     /// URL the user opens to authorize anie. Pre-signed with
     /// client_id + redirect_uri + scope + PKCE challenge.
     pub authorize_url: String,
@@ -50,6 +89,29 @@ pub struct LoginFlow {
     /// to catch the code. `anie login` handles this plumbing;
     /// the provider just publishes the URL.
     pub redirect_uri: String,
+}
+
+/// Device-code flow state carried from `begin_login` to
+/// `complete_login`. Mirrors the fields from RFC 8628 section
+/// 3.2 that callers actually need.
+#[derive(Debug, Clone)]
+pub struct DeviceCodeFlow {
+    /// Short human-facing code the user types in at
+    /// `verification_uri`.
+    pub user_code: String,
+    /// URL the user opens to enter `user_code`.
+    pub verification_uri: String,
+    /// Optional "complete URI" that embeds the user_code so
+    /// the user doesn't have to type it. `None` when the
+    /// provider doesn't advertise one.
+    pub verification_uri_complete: Option<String>,
+    /// Device code — the internal token the agent polls with.
+    /// Not shown to the user.
+    pub device_code: String,
+    /// Minimum poll interval (seconds) per RFC 8628.
+    pub interval: std::time::Duration,
+    /// How long before the device code expires.
+    pub expires_in: std::time::Duration,
 }
 
 /// Protocol-level OAuth credential, independent of how anie
@@ -72,16 +134,47 @@ pub struct OAuthCredentialData {
     /// exists so later UI (e.g. `/providers`) can attribute
     /// credentials to a human-readable identity.
     pub account: Option<String>,
+    /// Per-user API base URL discovered during login. Only
+    /// GitHub Copilot returns this today (via `proxy-ep`); all
+    /// other providers leave it `None`.
+    pub api_base_url: Option<String>,
+    /// Google Cloud project ID for the Gemini CLI /
+    /// Antigravity flows. Set during login (loadCodeAssist);
+    /// preserved across refreshes since project discovery only
+    /// happens once.
+    pub project_id: Option<String>,
+}
+
+impl OAuthCredentialData {
+    /// Minimal constructor: plain token triple, no extras.
+    /// Providers that return `api_base_url` or `project_id`
+    /// build the struct with `..` update syntax from here.
+    #[must_use]
+    pub fn new(access_token: String, refresh_token: String, expires_at: String) -> Self {
+        Self {
+            access_token,
+            refresh_token,
+            expires_at,
+            account: None,
+            api_base_url: None,
+            project_id: None,
+        }
+    }
 }
 
 /// Shared contract every OAuth provider implements.
 ///
-/// Split into three steps because browser-based OAuth has a
-/// mandatory async-with-user phase in the middle that can't be
-/// collapsed into one call:
-/// 1. `begin_login` — produce a URL, keep PKCE state locally.
-/// 2. (Caller: open browser / wait for callback / collect code.)
-/// 3. `complete_login` — exchange code for access + refresh.
+/// Split into steps because browser-based OAuth has an
+/// async-with-user phase that can't be collapsed into one call:
+///
+/// 1. `begin_login` — produce a flow (either auth-code URL or
+///    device-code pair).
+/// 2. (Caller: open browser for auth-code / display user_code
+///    for device; for auth-code, catch the redirect and extract
+///    the `code` parameter.)
+/// 3. `complete_login` — for auth-code, exchange code for token.
+///    For device, poll the token endpoint until the user
+///    approves. Both paths return the same `OAuthCredentialData`.
 /// 4. Later, `refresh` — mint a new access token without user
 ///    interaction.
 #[async_trait]
@@ -89,24 +182,30 @@ pub trait OAuthProvider: Send + Sync {
     /// Human-readable provider identifier (e.g. `"anthropic"`).
     fn name(&self) -> &'static str;
 
-    /// Start an authorization-code + PKCE flow. The returned
-    /// `LoginFlow` carries everything needed to finish it.
+    /// Start a login flow. The returned `LoginFlow` variant
+    /// tells the caller whether to expect an auth-code callback
+    /// or a device-code poll.
     async fn begin_login(&self) -> Result<LoginFlow>;
 
-    /// Exchange the authorization code for a credential pair.
-    /// `state` comes from the redirect callback and must match
-    /// `flow.state` — callers should check this *before*
-    /// calling this method. Implementations MAY also verify
-    /// defensively.
+    /// Complete a login flow started by `begin_login`.
+    ///
+    /// - For `LoginFlow::AuthorizationCode`, `code` must be
+    ///   `Some(<authorization code>)` from the redirect
+    ///   callback. The `state` is presumed verified by the
+    ///   caller; implementations MAY also verify defensively.
+    /// - For `LoginFlow::Device`, `code` is ignored. The
+    ///   implementation polls the token endpoint at the flow's
+    ///   `interval` until the user approves or the flow
+    ///   expires.
     async fn complete_login(
         &self,
         flow: &LoginFlow,
-        code: &str,
+        code: Option<&str>,
     ) -> Result<OAuthCredentialData>;
 
     /// Mint a new access + refresh pair from an existing
     /// refresh token. Called by the refresh-with-lock path
-    /// (PR C) when the cached token is near expiry.
+    /// when the cached token is near expiry.
     async fn refresh(&self, credential: &OAuthCredentialData) -> Result<OAuthCredentialData>;
 }
 

@@ -206,6 +206,8 @@ impl<'a> OAuthRefresher<'a> {
             refresh_token: refreshed.refresh_token,
             expires_at: refreshed.expires_at,
             account: refreshed.account,
+            api_base_url: refreshed.api_base_url,
+            project_id: refreshed.project_id,
         };
         self.persistence
             .save(provider_name, credential)
@@ -224,11 +226,15 @@ impl<'a> OAuthRefresher<'a> {
                 refresh_token,
                 expires_at,
                 account,
+                api_base_url,
+                project_id,
             }) => Ok(OAuthCredentialData {
                 access_token,
                 refresh_token,
                 expires_at,
                 account,
+                api_base_url,
+                project_id,
             }),
             Some(AuthCredential::ApiKey { .. }) => Err(RefreshError::NotOAuth {
                 provider: provider_name.to_string(),
@@ -372,7 +378,7 @@ mod tests {
         async fn complete_login(
             &self,
             _flow: &LoginFlow,
-            _code: &str,
+            _code: Option<&str>,
         ) -> Result<OAuthCredentialData> {
             unreachable!("complete_login not exercised in refresh tests")
         }
@@ -384,6 +390,8 @@ mod tests {
                 refresh_token: "rotated-refresh".into(),
                 expires_at: self.new_expires_at.clone(),
                 account: Some("user@example.com".into()),
+                api_base_url: None,
+                project_id: None,
             })
         }
     }
@@ -399,6 +407,8 @@ mod tests {
             refresh_token: "old-refresh".into(),
             expires_at: expires_at.into(),
             account: None,
+            api_base_url: None,
+            project_id: None,
         }
     }
 

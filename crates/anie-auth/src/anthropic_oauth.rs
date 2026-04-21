@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 
 use crate::oauth::{
-    LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, TokenResponse, compute_expires_at,
-    generate_pkce,
+    AuthCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, TokenResponse,
+    compute_expires_at, generate_pkce,
 };
 
 /// Anthropic's public Claude Code OAuth client ID. Base64-
@@ -146,19 +146,23 @@ impl OAuthProvider for AnthropicOAuthProvider {
             .map_err(|err| anyhow!("failed to encode authorize params: {err}"))?;
         let authorize_url = format!("{}?{query}", self.authorize_url);
 
-        Ok(LoginFlow {
+        Ok(LoginFlow::AuthorizationCode(AuthCodeFlow {
             authorize_url,
             state: verifier.clone(),
             verifier,
             redirect_uri: self.redirect_uri.clone(),
-        })
+        }))
     }
 
     async fn complete_login(
         &self,
         flow: &LoginFlow,
-        code: &str,
+        code: Option<&str>,
     ) -> Result<OAuthCredentialData> {
+        let flow = flow.as_auth_code().ok_or_else(|| {
+            anyhow!("Anthropic uses authorization-code flow; device flow not supported")
+        })?;
+        let code = code.ok_or_else(|| anyhow!("Anthropic login requires the authorization code"))?;
         let client_id = Self::client_id()?;
         let body = serde_json::json!({
             "grant_type": "authorization_code",
@@ -171,12 +175,11 @@ impl OAuthProvider for AnthropicOAuthProvider {
         let response: TokenResponse = post_token_request(&self.client, &self.token_url, &body)
             .await
             .context("authorization_code exchange failed")?;
-        Ok(OAuthCredentialData {
-            access_token: response.access_token,
-            refresh_token: response.refresh_token,
-            expires_at: compute_expires_at(response.expires_in)?,
-            account: None,
-        })
+        Ok(OAuthCredentialData::new(
+            response.access_token,
+            response.refresh_token,
+            compute_expires_at(response.expires_in)?,
+        ))
     }
 
     async fn refresh(&self, credential: &OAuthCredentialData) -> Result<OAuthCredentialData> {
@@ -194,6 +197,8 @@ impl OAuthProvider for AnthropicOAuthProvider {
             refresh_token: response.refresh_token,
             expires_at: compute_expires_at(response.expires_in)?,
             account: credential.account.clone(),
+            api_base_url: credential.api_base_url.clone(),
+            project_id: credential.project_id.clone(),
         })
     }
 }
@@ -265,10 +270,13 @@ mod tests {
     async fn begin_login_produces_a_valid_authorize_url() {
         let provider = AnthropicOAuthProvider::new();
         let flow = provider.begin_login().await.expect("begin_login");
+        let auth_code = flow
+            .as_auth_code()
+            .expect("anthropic must use auth-code flow");
         assert!(
-            flow.authorize_url.starts_with(DEFAULT_AUTHORIZE_URL),
+            auth_code.authorize_url.starts_with(DEFAULT_AUTHORIZE_URL),
             "{}",
-            flow.authorize_url
+            auth_code.authorize_url
         );
         // Required query params are present.
         for key in [
@@ -282,13 +290,13 @@ mod tests {
             "state=",
         ] {
             assert!(
-                flow.authorize_url.contains(key),
+                auth_code.authorize_url.contains(key),
                 "missing {key} in: {}",
-                flow.authorize_url
+                auth_code.authorize_url
             );
         }
         // state == verifier per pi's convention.
-        assert_eq!(flow.state, flow.verifier);
+        assert_eq!(auth_code.state, auth_code.verifier);
     }
 
     #[tokio::test]
@@ -311,7 +319,7 @@ mod tests {
         );
         let flow = provider.begin_login().await.expect("begin");
         let cred = provider
-            .complete_login(&flow, "the-code")
+            .complete_login(&flow, Some("the-code"))
             .await
             .expect("complete");
         assert_eq!(cred.access_token, "sk-ant-oat01-new");
@@ -346,6 +354,8 @@ mod tests {
             refresh_token: "old-refresh".into(),
             expires_at: "2026-04-20T00:00:00Z".into(),
             account: Some("user@example.com".into()),
+            api_base_url: None,
+            project_id: None,
         };
         let refreshed = provider.refresh(&prior).await.expect("refresh");
         assert_eq!(refreshed.access_token, "sk-ant-oat01-new");
@@ -372,12 +382,11 @@ mod tests {
             format!("{}/v1/oauth/token", server.uri()),
             "http://localhost:53692/callback".into(),
         );
-        let prior = OAuthCredentialData {
-            access_token: "old".into(),
-            refresh_token: "old".into(),
-            expires_at: "2026-04-20T00:00:00Z".into(),
-            account: None,
-        };
+        let prior = OAuthCredentialData::new(
+            "old".into(),
+            "old".into(),
+            "2026-04-20T00:00:00Z".into(),
+        );
         // `{err:#}` flattens the anyhow context chain so the
         // inner HTTP-status + body strings surface in the output.
         let err = format!("{:#}", provider.refresh(&prior).await.unwrap_err());

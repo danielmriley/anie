@@ -17,14 +17,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use anie_auth::{
-    AnthropicOAuthProvider, AuthCredential, CallbackError, CredentialStore, OAuthCredentialData,
-    OAuthProvider, await_callback,
+    AnthropicOAuthProvider, AuthCredential, CallbackError, CredentialStore, LoginFlow,
+    OAuthCredentialData, OAuthProvider, await_callback,
 };
 
-/// Port the callback server binds. Anthropic's OAuth client
-/// registration fixes this to 53692 — pi uses the same value,
-/// see `crates/anie-auth/src/anthropic_oauth.rs`.
-const CALLBACK_PORT: u16 = 53692;
+/// Fallback callback port when the provider's redirect URI
+/// doesn't include one (shouldn't happen for the flows we
+/// support today, but keeps the path safe). Matches Anthropic's
+/// registered port.
+const DEFAULT_CALLBACK_PORT: u16 = 53692;
 
 /// Upper bound on how long we'll wait for the user to complete
 /// the browser step. 5 minutes is generous enough for real
@@ -43,29 +44,51 @@ pub async fn run_login(provider_name: &str) -> Result<()> {
         .await
         .context("failed to start OAuth login flow")?;
 
-    let opened = try_open_browser(&flow.authorize_url);
-    print_login_prompt(&flow.authorize_url, opened, LOGIN_TIMEOUT);
+    let credential_data = match &flow {
+        LoginFlow::AuthorizationCode(auth_code) => {
+            let opened = try_open_browser(&auth_code.authorize_url);
+            print_login_prompt(&auth_code.authorize_url, opened, LOGIN_TIMEOUT);
 
-    let callback = await_callback(CALLBACK_PORT, LOGIN_TIMEOUT)
-        .await
-        .map_err(translate_callback_error)?;
+            // Callback port is derived from the redirect_uri
+            // the provider published, so each provider can
+            // listen on its own registered port. We parse the
+            // port out of `http://localhost:<port>/...`.
+            let port = callback_port_from_uri(&auth_code.redirect_uri)
+                .unwrap_or(DEFAULT_CALLBACK_PORT);
+            let callback = await_callback(port, LOGIN_TIMEOUT)
+                .await
+                .map_err(translate_callback_error)?;
 
-    // Verify state before exchanging — rejects CSRF-style
-    // attacks where someone feeds us a foreign redirect URL.
-    if callback.state != flow.state {
-        return Err(anyhow!(
-            "OAuth state mismatch: expected {expected}, got {got}. \
-             This can mean a stale browser tab completed the flow — \
-             re-run `anie login {provider_name}` and try again.",
-            expected = redact_state(&flow.state),
-            got = redact_state(&callback.state),
-        ));
-    }
+            if callback.state != auth_code.state {
+                return Err(anyhow!(
+                    "OAuth state mismatch: expected {expected}, got {got}. \
+                     This can mean a stale browser tab completed the flow — \
+                     re-run `anie login {provider_name}` and try again.",
+                    expected = redact_state(&auth_code.state),
+                    got = redact_state(&callback.state),
+                ));
+            }
 
-    let credential_data = provider
-        .complete_login(&flow, &callback.code)
-        .await
-        .context("token exchange failed")?;
+            provider
+                .complete_login(&flow, Some(&callback.code))
+                .await
+                .context("token exchange failed")?
+        }
+        LoginFlow::Device(device) => {
+            print_device_prompt(device);
+            if let Some(complete_uri) = &device.verification_uri_complete {
+                // Auto-open the "complete" URL if the provider
+                // published one — saves the user from typing.
+                try_open_browser(complete_uri);
+            } else {
+                try_open_browser(&device.verification_uri);
+            }
+            provider
+                .complete_login(&flow, None)
+                .await
+                .context("device-flow polling failed")?
+        }
+    };
 
     persist_credential(&store, provider_name, &credential_data)?;
 
@@ -74,8 +97,32 @@ pub async fn run_login(provider_name: &str) -> Result<()> {
     } else {
         println!("Logged in to {provider_name}. Access token stored.");
     }
-    println!("Token expires at {} (local refresh is automatic).", credential_data.expires_at);
+    println!(
+        "Token expires at {} (local refresh is automatic).",
+        credential_data.expires_at
+    );
     Ok(())
+}
+
+/// Pull the port out of `http://localhost:<port>/<path>`. Used
+/// when each OAuth provider publishes a different callback
+/// port (Anthropic 53692, Codex 1455, Antigravity 51121,
+/// Gemini 8085).
+fn callback_port_from_uri(uri: &str) -> Option<u16> {
+    let rest = uri.strip_prefix("http://").or_else(|| uri.strip_prefix("https://"))?;
+    let (host_port, _) = rest.split_once('/').unwrap_or((rest, ""));
+    let (_, port_str) = host_port.rsplit_once(':')?;
+    port_str.parse().ok()
+}
+
+fn print_device_prompt(device: &anie_auth::DeviceCodeFlow) {
+    println!("Device-code authorization required:");
+    println!("  Open:   {}", device.verification_uri);
+    println!("  Enter:  {}", device.user_code);
+    println!(
+        "  Waiting for authorization (expires in {}s)",
+        device.expires_in.as_secs()
+    );
 }
 
 /// Run the logout flow for `provider_name`.
@@ -155,6 +202,8 @@ fn persist_credential(
         refresh_token: data.refresh_token.clone(),
         expires_at: data.expires_at.clone(),
         account: data.account.clone(),
+        api_base_url: data.api_base_url.clone(),
+        project_id: data.project_id.clone(),
     };
     store
         .set_credential(provider_name, credential)
@@ -184,8 +233,9 @@ fn translate_callback_error(err: CallbackError) -> anyhow::Error {
             secs = d.as_secs(),
         ),
         CallbackError::Bind(err) => anyhow!(
-            "failed to bind callback port {CALLBACK_PORT}: {err}. \
-             Another instance of `anie login` may already be running."
+            "failed to bind callback port: {err}. \
+             Another instance of `anie login` may already be running, \
+             or the port is in use by something else."
         ),
         CallbackError::ProviderError(message) => anyhow!(
             "provider rejected the login request: {message}"
