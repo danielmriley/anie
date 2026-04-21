@@ -294,6 +294,35 @@ impl App {
         self
     }
 
+    /// Toggle markdown rendering for finalized assistant messages.
+    /// Takes effect immediately — the output pane invalidates its
+    /// line cache so the next frame re-renders with the new
+    /// setting. Streaming blocks always render plain regardless;
+    /// see the comment on `assistant_answer_lines` for rationale.
+    #[must_use]
+    pub fn with_markdown_enabled(mut self, enabled: bool) -> Self {
+        self.output_pane.set_markdown_enabled(enabled);
+        self
+    }
+
+    /// Record detected terminal capabilities so markdown
+    /// rendering can tailor hyperlink / image emission to the
+    /// terminal.
+    #[must_use]
+    pub fn with_terminal_capabilities(
+        mut self,
+        capabilities: crate::TerminalCapabilities,
+    ) -> Self {
+        self.output_pane.set_terminal_capabilities(capabilities);
+        self
+    }
+
+    /// Flip markdown rendering at runtime. Used by the
+    /// `/markdown on|off` slash command.
+    pub fn set_markdown_enabled(&mut self, enabled: bool) {
+        self.output_pane.set_markdown_enabled(enabled);
+    }
+
     /// Read-only view of the current transcript blocks in the
     /// output pane.
     #[must_use]

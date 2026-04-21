@@ -43,14 +43,26 @@ pub struct UiConfig {
     /// when the user types `/`. Disable for a minimal experience
     /// while keeping `/help` and direct dispatch intact.
     pub slash_command_popup_enabled: bool,
+    /// Whether finalized assistant messages render as markdown
+    /// (headings, lists, code blocks, tables, …) or as plain
+    /// wrapped text. Streaming blocks always render plain so the
+    /// render loop doesn't re-parse markdown on every delta —
+    /// the toggle only affects already-finalized blocks.
+    #[serde(default = "default_markdown_enabled")]
+    pub markdown_enabled: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             slash_command_popup_enabled: true,
+            markdown_enabled: default_markdown_enabled(),
         }
     }
+}
+
+fn default_markdown_enabled() -> bool {
+    true
 }
 
 /// Default model selection.

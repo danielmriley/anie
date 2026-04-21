@@ -14,14 +14,12 @@ pub struct MarkdownTheme {
     pub h2: Style,
     pub h3: Style,
     pub h4_plus: Style,
-    pub paragraph: Style,
     pub strong: Style,
     pub emphasis: Style,
     pub strikethrough: Style,
     pub inline_code: Style,
     pub code_block_border: Style,
     pub code_block_lang: Style,
-    pub code_block_body: Style,
     pub list_bullet: Style,
     pub blockquote_gutter: Style,
     pub blockquote_body: Style,
@@ -49,7 +47,6 @@ impl MarkdownTheme {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
             h4_plus: Style::new().add_modifier(Modifier::BOLD),
-            paragraph: Style::new(),
             strong: Style::new().add_modifier(Modifier::BOLD),
             emphasis: Style::new().add_modifier(Modifier::ITALIC),
             strikethrough: Style::new().add_modifier(Modifier::CROSSED_OUT),
@@ -58,7 +55,6 @@ impl MarkdownTheme {
             code_block_lang: Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
-            code_block_body: Style::new(),
             list_bullet: Style::new().fg(Color::Cyan),
             blockquote_gutter: Style::new().fg(Color::DarkGray),
             blockquote_body: Style::new().add_modifier(Modifier::ITALIC),

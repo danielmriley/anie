@@ -13,7 +13,7 @@
 //! through to a plain-text stringification.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Tag, TagEnd};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::theme::MarkdownTheme;
@@ -233,9 +233,9 @@ impl<'a> LineBuilder<'a> {
                 let style = heading_style(level, self.theme);
                 self.push_style(style);
             }
-            Tag::Strong => self.push_style_modifier(Modifier::BOLD),
-            Tag::Emphasis => self.push_style_modifier(Modifier::ITALIC),
-            Tag::Strikethrough => self.push_style_modifier(Modifier::CROSSED_OUT),
+            Tag::Strong => self.push_style(self.theme.strong),
+            Tag::Emphasis => self.push_style(self.theme.emphasis),
+            Tag::Strikethrough => self.push_style(self.theme.strikethrough),
             Tag::CodeBlock(kind) => {
                 self.flush_line();
                 let lang = match kind {
@@ -266,6 +266,7 @@ impl<'a> LineBuilder<'a> {
             Tag::BlockQuote(_) => {
                 self.flush_line();
                 self.blockquote_depth = self.blockquote_depth.saturating_add(1);
+                self.push_style(self.theme.blockquote_body);
             }
             Tag::List(start) => {
                 self.flush_line();
@@ -355,6 +356,7 @@ impl<'a> LineBuilder<'a> {
             TagEnd::BlockQuote(_) => {
                 self.flush_line();
                 self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
+                self.pop_style();
                 // Blank line after the quote block, outside the
                 // gutter.
                 if self.blockquote_depth == 0 && self.list_stack.is_empty() {
@@ -448,11 +450,6 @@ impl<'a> LineBuilder<'a> {
     fn push_style(&mut self, style: Style) {
         let top = self.current_style();
         self.style_stack.push(top.patch(style));
-    }
-
-    fn push_style_modifier(&mut self, modifier: Modifier) {
-        let top = self.current_style();
-        self.style_stack.push(top.add_modifier(modifier));
     }
 
     fn pop_style(&mut self) {
@@ -995,6 +992,7 @@ fn cells_to_line(cells: Vec<(char, Style)>) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     fn render_plain(text: &str, width: u16) -> Vec<String> {
         render(text, width, &MarkdownTheme::default_dark())

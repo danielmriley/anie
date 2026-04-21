@@ -6,6 +6,9 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use crate::markdown::MarkdownTheme;
+use crate::terminal_capabilities::TerminalCapabilities;
+
 /// A rendered transcript block.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderedBlock {
@@ -61,6 +64,32 @@ struct LineCache {
     lines: Vec<Line<'static>>,
 }
 
+/// Render-time configuration carried alongside the blocks. Kept
+/// on the pane so the public `render()` signature stays
+/// unchanged — the embedding app mutates this via
+/// `set_markdown_enabled` / `set_terminal_capabilities` when
+/// config changes, and the pane invalidates its per-block cache
+/// so the next frame re-renders with the new settings.
+///
+/// Mirrors pi's `RenderContext` in shape: capabilities (OSC 8 +
+/// image protocol) + visual theme + runtime toggles.
+#[derive(Debug, Clone)]
+struct RenderContext {
+    markdown_enabled: bool,
+    capabilities: TerminalCapabilities,
+    theme: MarkdownTheme,
+}
+
+impl Default for RenderContext {
+    fn default() -> Self {
+        Self {
+            markdown_enabled: true,
+            capabilities: TerminalCapabilities::default(),
+            theme: MarkdownTheme::default_dark(),
+        }
+    }
+}
+
 /// Scrollable output pane.
 pub struct OutputPane {
     blocks: Vec<RenderedBlock>,
@@ -74,6 +103,10 @@ pub struct OutputPane {
     auto_scroll: bool,
     last_total_lines: u16,
     last_viewport_height: u16,
+    /// Visual rendering settings. Changing any field here
+    /// invalidates the cache because block → line computations
+    /// depend on it.
+    render_context: RenderContext,
 }
 
 impl OutputPane {
@@ -87,6 +120,36 @@ impl OutputPane {
             auto_scroll: true,
             last_total_lines: 0,
             last_viewport_height: 1,
+            render_context: RenderContext::default(),
+        }
+    }
+
+    /// Toggle markdown rendering for finalized assistant blocks.
+    /// Streaming blocks always render as plain text — see the
+    /// module comment for why.
+    pub fn set_markdown_enabled(&mut self, enabled: bool) {
+        if self.render_context.markdown_enabled == enabled {
+            return;
+        }
+        self.render_context.markdown_enabled = enabled;
+        self.invalidate_all_caches();
+    }
+
+    /// Record detected terminal capabilities. Today this only
+    /// matters for `link.rs` (OSC 8 deferral lives there); in the
+    /// future, image protocols + truecolor decisions can read off
+    /// the same context.
+    pub fn set_terminal_capabilities(&mut self, capabilities: TerminalCapabilities) {
+        if self.render_context.capabilities == capabilities {
+            return;
+        }
+        self.render_context.capabilities = capabilities;
+        self.invalidate_all_caches();
+    }
+
+    fn invalidate_all_caches(&mut self) {
+        for slot in &mut self.caches {
+            *slot = None;
         }
     }
 
@@ -353,7 +416,7 @@ impl OutputPane {
                 continue;
             }
 
-            let computed = block_lines(block, width, spinner_frame);
+            let computed = block_lines(block, width, spinner_frame, &self.render_context);
             if hits_cache
                 && let Some(slot) = self.caches.get_mut(index)
             {
@@ -419,7 +482,12 @@ fn block_has_animated_content(block: &RenderedBlock) -> bool {
     }
 }
 
-fn block_lines(block: &RenderedBlock, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
+fn block_lines(
+    block: &RenderedBlock,
+    width: u16,
+    spinner_frame: &str,
+    ctx: &RenderContext,
+) -> Vec<Line<'static>> {
     match block {
         RenderedBlock::UserMessage { text, .. } => wrap_spans(
             vec![Span::styled(
@@ -446,6 +514,7 @@ fn block_lines(block: &RenderedBlock, width: u16, spinner_frame: &str) -> Vec<Li
             error_message.as_deref(),
             width,
             spinner_frame,
+            ctx,
         ),
         RenderedBlock::ToolCall {
             tool_name,
@@ -483,6 +552,7 @@ fn assistant_block_lines(
     error_message: Option<&str>,
     width: u16,
     spinner_frame: &str,
+    ctx: &RenderContext,
 ) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let inline_thinking_status = is_streaming && text.is_empty() && !thinking.is_empty();
@@ -495,7 +565,10 @@ fn assistant_block_lines(
             inline_thinking_status.then_some(spinner_frame),
         ),
     );
-    append_assistant_section(&mut result, assistant_answer_lines(text, width));
+    append_assistant_section(
+        &mut result,
+        assistant_answer_lines(text, width, is_streaming, ctx),
+    );
     append_assistant_section(
         &mut result,
         assistant_streaming_lines(
@@ -576,12 +649,33 @@ fn assistant_thinking_lines(
     lines
 }
 
-fn assistant_answer_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+/// Assistant-answer rendering with a streaming-vs-finalized split.
+///
+/// Streaming blocks always render as plain wrapped text — the
+/// block's content changes every delta (potentially every few ms
+/// under fast models), and running a CommonMark parse + syntect
+/// highlight pass per frame would dominate the render loop and
+/// break the block cache that Plan 02 of `tui_responsiveness/`
+/// introduced. Once the block is finalized, we re-render as
+/// markdown and the cache from `build_lines` memoizes it.
+///
+/// UX implication: during streaming the user sees raw markdown
+/// syntax (`**bold**` literally). When the turn finalizes the
+/// block "settles" into rendered markdown. pi's markdown widget
+/// behaves the same way by construction.
+fn assistant_answer_lines(
+    text: &str,
+    width: u16,
+    is_streaming: bool,
+    ctx: &RenderContext,
+) -> Vec<Line<'static>> {
     if text.is_empty() {
-        Vec::new()
-    } else {
-        wrap_text(text, width, Style::default())
+        return Vec::new();
     }
+    if is_streaming || !ctx.markdown_enabled {
+        return wrap_text(text, width, Style::default());
+    }
+    crate::markdown::render_markdown(text, width, &ctx.theme)
 }
 
 fn assistant_streaming_lines(
