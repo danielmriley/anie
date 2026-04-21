@@ -413,7 +413,20 @@ impl AgentLoop {
             let options = anie_provider::StreamOptions {
                 api_key: request.api_key,
                 temperature: None,
-                max_tokens: Some(model.max_tokens),
+                // Intentionally `None`: the upstream owns the
+                // `input + output <= context_window` invariant
+                // server-side and knows the real tokenizer.
+                // Bounding output at the agent layer is how
+                // pi avoids context-overflow 400s
+                // (`pi/packages/ai/src/providers/openai-completions.ts:394`
+                // only emits `max_tokens` when the caller
+                // explicitly sets it). Budget management is
+                // handled by compaction (`reserve_tokens`),
+                // which shrinks the *input* instead of capping
+                // the *output*. Compaction summarization still
+                // sets its own `max_tokens` explicitly — see
+                // `anie-cli/src/compaction.rs`.
+                max_tokens: None,
                 thinking: self.config.thinking,
                 headers: request.headers,
             };

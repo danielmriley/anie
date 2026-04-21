@@ -220,6 +220,22 @@ fn openai_tool_call_id_roundtrips() {
 }
 
 #[test]
+fn openai_request_omits_max_tokens_when_options_does_not_set_it() {
+    // Regression: a 262 k-context OpenRouter model 400'd because
+    // we were sending `max_tokens = 262_144`. The fix (per pi's
+    // model) is to leave `max_tokens` off the wire on the main
+    // agent path so the upstream picks its own default that's
+    // always compatible with `input + output <= context_window`.
+    // Compaction summarization still sets it explicitly — tested
+    // in the compaction module directly.
+    let body = build_openai_body(signed_thinking_fixture());
+    assert!(
+        body.get("max_tokens").is_none(),
+        "max_tokens must not be on the wire for a default StreamOptions request; body = {body}"
+    );
+}
+
+#[test]
 fn anthropic_tool_call_id_roundtrips() {
     let body = build_anthropic_body(signed_thinking_fixture());
     let serialized = serde_json::to_string(&body).unwrap();
