@@ -304,35 +304,21 @@ impl Model {
 
 impl ModelInfo {
     /// Convert a discovered model into a runtime model definition using conservative defaults.
+    ///
+    /// `max_tokens` is recorded on the `Model` for operator
+    /// reference and for the compaction summarization path (which
+    /// explicitly caps its output). The *main agent stream* does
+    /// not forward this value — see
+    /// `docs/max_tokens_handling/README.md` and the comment at
+    /// `agent_loop.rs` where `StreamOptions::max_tokens = None`.
+    /// That means this number doesn't need to be a carefully-
+    /// clamped "safe to send" value anymore; the provider-advertised
+    /// `max_output_tokens` is carried through verbatim when present,
+    /// and a simple fallback is used otherwise.
     #[must_use]
     pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
         let context_window = self.context_length.unwrap_or(32_768);
-        // Prefer the provider-advertised output-token cap when we
-        // have one (OpenRouter reports it via
-        // `top_provider.max_completion_tokens`). For reasoning-
-        // capable models without an advertised cap, bump the
-        // default to 32 k — the 8 k default routinely clips
-        // reasoning upstreams mid-thought and surfaces as a
-        // `ResponseTruncated` error. For non-reasoning models
-        // lacking an advertised cap, 8 k stays fine.
-        let advertised = self.max_output_tokens.unwrap_or_else(|| {
-            if self.supports_reasoning.unwrap_or(false) {
-                32_768
-            } else {
-                8_192
-            }
-        });
-        // `max_completion_tokens` from OpenRouter is the model's
-        // *physical* maximum — it's often equal to the full
-        // context window, which is only achievable with zero
-        // input. On the wire, `max_tokens` still has to satisfy
-        // `input + max_tokens <= context_window`. Cap at half the
-        // window so input has room (50% is generous for agent
-        // conversations, which typically run well under that)
-        // while still giving reasoning models a big output
-        // budget. User saw a 400 from OpenRouter with
-        // `max_tokens = 262_144` on a 262 k-context model.
-        let max_tokens = advertised.min(context_window / 2).max(1);
+        let max_tokens = self.max_output_tokens.unwrap_or(8_192);
         Model {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -372,35 +358,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_model_honors_advertised_max_output_tokens_when_it_leaves_input_headroom() {
-        // 40k advertised cap on a 128k context: we can honor the
-        // full cap because input still has 88k of room.
-        let info = ModelInfo {
-            id: "openai/o3".into(),
-            name: "o3".into(),
-            provider: "openrouter".into(),
-            context_length: Some(128_000),
-            max_output_tokens: Some(40_000),
-            supports_images: Some(false),
-            supports_reasoning: Some(true),
-            pricing: None,
-            supported_parameters: None,
-        };
-        let model = info.to_model(
-            ApiKind::OpenAICompletions,
-            "https://openrouter.ai/api/v1",
-        );
-        assert_eq!(model.max_tokens, 40_000);
-    }
-
-    #[test]
-    fn to_model_clamps_advertised_max_output_tokens_to_half_of_context_window() {
-        // Regression: OpenRouter's `top_provider.max_completion_tokens`
-        // is frequently equal to the context window (a theoretical
-        // max, not usable). Without a clamp we'd send
-        // `max_tokens = 262_144` on a 262 k context and the
-        // upstream would 400 because `input + max_tokens` exceeds
-        // the window. Clamp to half so input always has headroom.
+    fn to_model_preserves_advertised_max_output_tokens_verbatim() {
+        // After max_tokens/PR1, the main agent stream doesn't
+        // forward this value onto the wire (the compaction path
+        // still does, but caps explicitly). So we carry whatever
+        // the provider advertised — no client-side clamping, no
+        // bumping. Matches pi's approach of letting the upstream
+        // own the `input + output <= context_window` invariant.
         let info = ModelInfo {
             id: "x/huge-context-model".into(),
             name: "huge".into(),
@@ -416,36 +380,16 @@ mod tests {
             ApiKind::OpenAICompletions,
             "https://openrouter.ai/api/v1",
         );
-        assert_eq!(model.max_tokens, 131_072);
+        assert_eq!(model.max_tokens, 262_144);
+        assert_eq!(model.context_window, 262_144);
     }
 
     #[test]
-    fn to_model_bumps_default_for_reasoning_models_without_advertised_cap() {
-        // Regression: 8 k default was too small for reasoning
-        // upstreams that emit several thousand tokens of
-        // reasoning before answering — surfaced as
-        // `ResponseTruncated` in the wild. Reasoning-capable
-        // models without an advertised cap now get 32 k.
-        let info = ModelInfo {
-            id: "nvidia/nemotron-3-super-120b-a12b:free".into(),
-            name: "Nemotron".into(),
-            provider: "openrouter".into(),
-            context_length: Some(131_072),
-            max_output_tokens: None,
-            supports_images: Some(false),
-            supports_reasoning: Some(true),
-            pricing: None,
-            supported_parameters: None,
-        };
-        let model = info.to_model(
-            ApiKind::OpenAICompletions,
-            "https://openrouter.ai/api/v1",
-        );
-        assert_eq!(model.max_tokens, 32_768);
-    }
-
-    #[test]
-    fn to_model_keeps_conservative_default_for_non_reasoning_models() {
+    fn to_model_falls_back_to_eight_k_when_no_max_is_advertised() {
+        // Catalog-level fallback for operators or for the
+        // compaction path. Simpler than the reasoning-specific
+        // bump we used to do — we don't need a higher default
+        // anymore because the main stream ignores this value.
         let info = ModelInfo {
             id: "gpt-4o".into(),
             name: "GPT-4o".into(),
