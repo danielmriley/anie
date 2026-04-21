@@ -306,6 +306,7 @@ impl ModelInfo {
     /// Convert a discovered model into a runtime model definition using conservative defaults.
     #[must_use]
     pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
+        let context_window = self.context_length.unwrap_or(32_768);
         // Prefer the provider-advertised output-token cap when we
         // have one (OpenRouter reports it via
         // `top_provider.max_completion_tokens`). For reasoning-
@@ -314,20 +315,31 @@ impl ModelInfo {
         // reasoning upstreams mid-thought and surfaces as a
         // `ResponseTruncated` error. For non-reasoning models
         // lacking an advertised cap, 8 k stays fine.
-        let max_tokens = self.max_output_tokens.unwrap_or_else(|| {
+        let advertised = self.max_output_tokens.unwrap_or_else(|| {
             if self.supports_reasoning.unwrap_or(false) {
                 32_768
             } else {
                 8_192
             }
         });
+        // `max_completion_tokens` from OpenRouter is the model's
+        // *physical* maximum — it's often equal to the full
+        // context window, which is only achievable with zero
+        // input. On the wire, `max_tokens` still has to satisfy
+        // `input + max_tokens <= context_window`. Cap at half the
+        // window so input has room (50% is generous for agent
+        // conversations, which typically run well under that)
+        // while still giving reasoning models a big output
+        // budget. User saw a 400 from OpenRouter with
+        // `max_tokens = 262_144` on a 262 k-context model.
+        let max_tokens = advertised.min(context_window / 2).max(1);
         Model {
             id: self.id.clone(),
             name: self.name.clone(),
             provider: self.provider.clone(),
             api,
             base_url: base_url.to_string(),
-            context_window: self.context_length.unwrap_or(32_768),
+            context_window,
             max_tokens,
             supports_reasoning: self.supports_reasoning.unwrap_or(false),
             reasoning_capabilities: None,
@@ -360,13 +372,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn to_model_honors_advertised_max_output_tokens() {
+    fn to_model_honors_advertised_max_output_tokens_when_it_leaves_input_headroom() {
+        // 40k advertised cap on a 128k context: we can honor the
+        // full cap because input still has 88k of room.
         let info = ModelInfo {
             id: "openai/o3".into(),
             name: "o3".into(),
             provider: "openrouter".into(),
             context_length: Some(128_000),
-            max_output_tokens: Some(65_536),
+            max_output_tokens: Some(40_000),
             supports_images: Some(false),
             supports_reasoning: Some(true),
             pricing: None,
@@ -376,7 +390,33 @@ mod tests {
             ApiKind::OpenAICompletions,
             "https://openrouter.ai/api/v1",
         );
-        assert_eq!(model.max_tokens, 65_536);
+        assert_eq!(model.max_tokens, 40_000);
+    }
+
+    #[test]
+    fn to_model_clamps_advertised_max_output_tokens_to_half_of_context_window() {
+        // Regression: OpenRouter's `top_provider.max_completion_tokens`
+        // is frequently equal to the context window (a theoretical
+        // max, not usable). Without a clamp we'd send
+        // `max_tokens = 262_144` on a 262 k context and the
+        // upstream would 400 because `input + max_tokens` exceeds
+        // the window. Clamp to half so input always has headroom.
+        let info = ModelInfo {
+            id: "x/huge-context-model".into(),
+            name: "huge".into(),
+            provider: "openrouter".into(),
+            context_length: Some(262_144),
+            max_output_tokens: Some(262_144),
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+        };
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://openrouter.ai/api/v1",
+        );
+        assert_eq!(model.max_tokens, 131_072);
     }
 
     #[test]
