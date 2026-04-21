@@ -241,8 +241,7 @@ impl SessionContext {
 /// pi's 2-field shape is what consumers actually need.
 ///
 /// **anie-specific (not in pi):** none. Deduplication is
-/// expected from callers — we don't hash or canonicalize paths
-/// on the way in.
+/// handled by `extract_compaction_details` during construction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CompactionDetails {
     /// Paths read via tracked tool calls during the summarized
@@ -254,6 +253,99 @@ pub struct CompactionDetails {
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modified_files: Vec<String>,
+}
+
+impl CompactionDetails {
+    /// Whether both vectors are empty. Used by the compaction
+    /// caller to decide `Option<CompactionDetails>`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.read_files.is_empty() && self.modified_files.is_empty()
+    }
+}
+
+/// Walk a discarded message sequence and extract file paths
+/// from `read` / `write` / `edit` tool calls. Paths are
+/// deduplicated in first-seen order.
+///
+/// Matches pi's extraction logic: only the canonical `read`,
+/// `write`, and `edit` tool names are tracked. Custom or
+/// user-registered tools with different names are intentionally
+/// not picked up — correctness beats breadth here.
+#[must_use]
+pub fn extract_compaction_details(messages: &[Message]) -> CompactionDetails {
+    let mut read_files: Vec<String> = Vec::new();
+    let mut modified_files: Vec<String> = Vec::new();
+    for message in messages {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        for block in &assistant.content {
+            let ContentBlock::ToolCall(call) = block else {
+                continue;
+            };
+            let Some(path) = tool_call_path(&call.arguments) else {
+                continue;
+            };
+            match call.name.as_str() {
+                "read" => push_unique(&mut read_files, path),
+                "write" | "edit" => push_unique(&mut modified_files, path),
+                _ => {}
+            }
+        }
+    }
+    CompactionDetails {
+        read_files,
+        modified_files,
+    }
+}
+
+/// Extract the file path from a tool-call argument object.
+/// Handles `path` (canonical) and `file_path` (alternative
+/// convention seen in some provider / third-party tool
+/// definitions).
+fn tool_call_path(arguments: &serde_json::Value) -> Option<String> {
+    arguments
+        .get("path")
+        .or_else(|| arguments.get("file_path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn push_unique(vec: &mut Vec<String>, value: String) {
+    if !vec.iter().any(|existing| existing == &value) {
+        vec.push(value);
+    }
+}
+
+/// Append file-op details to a summary as XML-like tag blocks.
+/// The summarizer LLM sees the prose; the tags give resumed
+/// sessions a grep-able record of exact paths inside the
+/// compacted summary text. pi does this so file paths survive
+/// even when the prose doesn't mention them explicitly.
+#[must_use]
+pub fn append_details_to_summary(summary: &str, details: &CompactionDetails) -> String {
+    if details.is_empty() {
+        return summary.to_string();
+    }
+    let mut out = summary.trim_end().to_string();
+    if !details.read_files.is_empty() {
+        out.push_str("\n\n<read-files>\n");
+        for path in &details.read_files {
+            out.push_str(path);
+            out.push('\n');
+        }
+        out.push_str("</read-files>");
+    }
+    if !details.modified_files.is_empty() {
+        out.push_str("\n\n<modified-files>\n");
+        for path in &details.modified_files {
+            out.push_str(path);
+            out.push('\n');
+        }
+        out.push_str("</modified-files>");
+    }
+    out
 }
 
 /// Summary metadata returned after a successful compaction.
@@ -890,9 +982,23 @@ impl SessionManager {
             .map(|message| message.message.clone())
             .collect::<Vec<_>>();
         let existing_summary = self.latest_compaction_summary();
-        let summary = summarizer
+        let prose = summarizer
             .summarize(&source_messages, existing_summary.as_deref())
             .await?;
+
+        // Extract file-op details from the discarded interval
+        // and merge into the final summary via
+        // `<read-files>` / `<modified-files>` tag blocks so
+        // resumed sessions retain grep-able path records. The
+        // typed mirror on `SessionEntry::Compaction.details`
+        // gives programmatic access without re-parsing tags.
+        let details = extract_compaction_details(&source_messages);
+        let summary = append_details_to_summary(&prose, &details);
+        let persisted_details = if details.is_empty() {
+            None
+        } else {
+            Some(details)
+        };
 
         let entry = SessionEntry::Compaction {
             base: EntryBase {
@@ -903,11 +1009,7 @@ impl SessionManager {
             summary: summary.clone(),
             tokens_before,
             first_kept_entry_id: first_kept_entry_id.clone(),
-            // PR B extracts file-op details here. PR A ships
-            // the field wire-unused so every Compaction entry
-            // serializes without `details` until extraction
-            // lands.
-            details: None,
+            details: persisted_details,
         };
         self.add_entries(vec![entry])?;
 
@@ -1806,6 +1908,164 @@ mod tests {
         )));
     }
 
+    fn assistant_with_tool_calls(calls: Vec<(&str, serde_json::Value)>, timestamp: u64) -> Message {
+        assistant_with_tool_calls_and_text("", calls, timestamp)
+    }
+
+    fn assistant_with_tool_calls_and_text(
+        text: &str,
+        calls: Vec<(&str, serde_json::Value)>,
+        timestamp: u64,
+    ) -> Message {
+        use anie_protocol::ToolCall;
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: text.to_string(),
+            });
+        }
+        for (idx, (name, arguments)) in calls.into_iter().enumerate() {
+            blocks.push(ContentBlock::ToolCall(ToolCall {
+                id: format!("call-{idx}"),
+                name: name.to_string(),
+                arguments,
+            }));
+        }
+        Message::Assistant(AssistantMessage {
+            content: blocks,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp,
+            reasoning_details: None,
+        })
+    }
+
+    #[test]
+    fn extract_compaction_details_picks_up_read_and_write_paths() {
+        let messages = vec![
+            user_message("prompt", 1),
+            assistant_with_tool_calls(
+                vec![
+                    ("read", serde_json::json!({"path": "src/a.rs"})),
+                    ("write", serde_json::json!({"path": "src/b.rs"})),
+                ],
+                2,
+            ),
+            assistant_with_tool_calls(
+                vec![("edit", serde_json::json!({"path": "src/c.rs"}))],
+                3,
+            ),
+        ];
+        let details = extract_compaction_details(&messages);
+        assert_eq!(details.read_files, vec!["src/a.rs"]);
+        assert_eq!(details.modified_files, vec!["src/b.rs", "src/c.rs"]);
+    }
+
+    #[test]
+    fn extract_compaction_details_dedupes_repeated_paths() {
+        let messages = vec![
+            assistant_with_tool_calls(
+                vec![
+                    ("read", serde_json::json!({"path": "src/a.rs"})),
+                    ("read", serde_json::json!({"path": "src/a.rs"})),
+                    ("read", serde_json::json!({"path": "src/b.rs"})),
+                ],
+                1,
+            ),
+            assistant_with_tool_calls(
+                vec![("edit", serde_json::json!({"path": "src/a.rs"}))],
+                2,
+            ),
+            assistant_with_tool_calls(
+                vec![("edit", serde_json::json!({"path": "src/a.rs"}))],
+                3,
+            ),
+        ];
+        let details = extract_compaction_details(&messages);
+        assert_eq!(details.read_files, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(details.modified_files, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn extract_compaction_details_ignores_unknown_tool_names() {
+        // Custom tools outside the read/write/edit triad should
+        // never populate details even if they carry a "path" arg.
+        let messages = vec![assistant_with_tool_calls(
+            vec![
+                ("bash", serde_json::json!({"command": "ls"})),
+                ("my-custom-reader", serde_json::json!({"path": "src/a.rs"})),
+            ],
+            1,
+        )];
+        let details = extract_compaction_details(&messages);
+        assert!(details.is_empty(), "{details:?}");
+    }
+
+    #[test]
+    fn extract_compaction_details_accepts_file_path_alias() {
+        // Some provider tool-call conventions name the arg
+        // `file_path` instead of `path`; we support both so the
+        // list stays comprehensive across third-party tools.
+        let messages = vec![assistant_with_tool_calls(
+            vec![("read", serde_json::json!({"file_path": "src/x.rs"}))],
+            1,
+        )];
+        let details = extract_compaction_details(&messages);
+        assert_eq!(details.read_files, vec!["src/x.rs"]);
+    }
+
+    #[test]
+    fn extract_compaction_details_skips_calls_without_path() {
+        let messages = vec![assistant_with_tool_calls(
+            vec![("read", serde_json::json!({"offset": 10}))],
+            1,
+        )];
+        let details = extract_compaction_details(&messages);
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    fn append_details_to_summary_injects_xml_tags() {
+        let details = CompactionDetails {
+            read_files: vec!["src/a.rs".into(), "src/b.rs".into()],
+            modified_files: vec!["src/a.rs".into()],
+        };
+        let out = append_details_to_summary("prose body", &details);
+        assert!(
+            out.contains("<read-files>\nsrc/a.rs\nsrc/b.rs\n</read-files>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<modified-files>\nsrc/a.rs\n</modified-files>"),
+            "{out}"
+        );
+        assert!(out.starts_with("prose body"), "{out}");
+    }
+
+    #[test]
+    fn append_details_to_summary_is_identity_when_details_empty() {
+        let details = CompactionDetails::default();
+        let out = append_details_to_summary("prose body", &details);
+        assert_eq!(out, "prose body");
+    }
+
+    #[test]
+    fn append_details_to_summary_omits_empty_section() {
+        let details = CompactionDetails {
+            read_files: vec!["src/a.rs".into()],
+            modified_files: Vec::new(),
+        };
+        let out = append_details_to_summary("prose", &details);
+        assert!(out.contains("<read-files>"), "{out}");
+        assert!(
+            !out.contains("<modified-files>"),
+            "empty modified section should not appear: {out}"
+        );
+    }
+
     #[test]
     fn compaction_entry_roundtrips_with_details_payload() {
         // Regression: v4 compaction entries carrying file-op
@@ -2068,6 +2328,118 @@ mod tests {
         let context = session.build_context();
         assert!(
             matches!(&context.messages[0].message, Message::User(user) if join_text_content(&user.content).contains("Goal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_compact_populates_details_from_discarded_tool_calls() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
+
+        // Big enough to force a compaction cut past these entries.
+        session
+            .append_message(&user_message(&"a".repeat(3_000), 1))
+            .expect("append first");
+        session
+            .append_message(&assistant_with_tool_calls_and_text(
+                &"x".repeat(3_000),
+                vec![
+                    ("read", serde_json::json!({"path": "src/a.rs"})),
+                    ("write", serde_json::json!({"path": "src/b.rs"})),
+                ],
+                2,
+            ))
+            .expect("append assistant with tools");
+        session
+            .append_message(&user_message("recent prompt", 3))
+            .expect("append recent");
+
+        let summarizer = RecordingSummarizer::with_summary("Prose summary.");
+
+        session
+            .auto_compact(
+                &CompactionConfig {
+                    context_window: 1_000,
+                    reserve_tokens: 100,
+                    keep_recent_tokens: 100,
+                },
+                &summarizer,
+            )
+            .await
+            .expect("auto compact")
+            .expect("compaction ran");
+
+        let details = session
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { details, .. } => Some(details.clone()),
+                _ => None,
+            })
+            .flatten()
+            .expect("details populated");
+        assert_eq!(details.read_files, vec!["src/a.rs"]);
+        assert_eq!(details.modified_files, vec!["src/b.rs"]);
+
+        // Summary text should also carry the tagged blocks so
+        // resumed sessions see the paths even without the
+        // structured field.
+        let summary = session
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("summary present");
+        assert!(summary.contains("<read-files>"), "{summary}");
+        assert!(summary.contains("src/a.rs"), "{summary}");
+        assert!(summary.contains("<modified-files>"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn auto_compact_omits_details_when_no_tracked_tools_fired() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
+        session
+            .append_message(&user_message(&"a".repeat(3_000), 1))
+            .expect("append first");
+        session
+            .append_message(&assistant_message(&"b".repeat(3_000), 2))
+            .expect("append assistant");
+        session
+            .append_message(&user_message("recent prompt", 3))
+            .expect("append recent");
+
+        let summarizer = RecordingSummarizer::with_summary("Prose summary.");
+        session
+            .auto_compact(
+                &CompactionConfig {
+                    context_window: 1_000,
+                    reserve_tokens: 100,
+                    keep_recent_tokens: 100,
+                },
+                &summarizer,
+            )
+            .await
+            .expect("auto compact")
+            .expect("compaction ran");
+
+        let details = session
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction { details, .. } => Some(details.clone()),
+                _ => None,
+            })
+            .expect("compaction entry");
+        assert!(
+            details.is_none(),
+            "details should be None when no tracked tools ran: {details:?}"
         );
     }
 
