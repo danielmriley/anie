@@ -24,11 +24,29 @@ Status of each plan's PRs. Update inline as work lands.
 
 | # | Plan | PR | Status | Commit |
 |---|------|----|--------|--------|
-| 05 | Markdown renderer | A (scaffolding + parser) | pending | — |
-| 05 | Markdown renderer | B (code blocks + syntax) | pending | — |
-| 05 | Markdown renderer | C (lists/tables/quotes) | pending | — |
-| 05 | Markdown renderer | D (links + OSC 8) | pending | — |
-| 05 | Markdown renderer | E (ship — flip default) | pending | — |
+| 05 | Markdown renderer | A (scaffolding + parser) | landed | `6450bc1` |
+| 05 | Markdown renderer | B (code blocks + syntax) | landed | `0f48a52` |
+| 05 | Markdown renderer | C.1 (lists + blockquotes) | landed | `48a4fb4` |
+| 05 | Markdown renderer | C.2 (tables) | landed | `a4baec3` |
+| 05 | Markdown renderer | D (links + inline images, OSC 8 deferred) | landed | `f22b741` |
+| 05 | Markdown renderer | E.1 (wire into output pane) | landed | `3720627` |
+| 05 | Markdown renderer | E.2 (`/markdown on\|off`) | landed | `0eb6a1b` |
+
+**Plan 05 notes:**
+- C split into C.1 + C.2 so table rendering (collect-then-emit)
+  landed as a separate reviewable unit from list / blockquote
+  prefix handling.
+- OSC 8 hyperlink emission (PR D) is deferred — rationale in
+  `crates/anie-tui/src/markdown/link.rs`: ratatui's
+  unicode-width accounting counts the URL body inside the OSC 8
+  escape as visible cells, breaking layout. The fallback path
+  (visible ` (url)` after link text) is the default. Revisit
+  when ratatui ships native hyperlink support or we find a
+  backend-level workaround.
+- Not yet verified: "No observable TUI latency regression on a
+  long agent run." and "Manual visual smoke against 3+ real
+  assistant responses." Both require running the TUI against a
+  live provider; pending a dedicated smoke session.
 
 ## Tier 4 — significant depth
 
