@@ -2,11 +2,13 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod anthropic_oauth;
+pub mod callback;
 pub mod oauth;
 pub mod refresh;
 mod store;
 
 pub use anthropic_oauth::AnthropicOAuthProvider;
+pub use callback::{Callback, CallbackError, await_callback};
 pub use oauth::{
     LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, generate_pkce, parse_expires_at,
 };
@@ -161,6 +163,32 @@ impl RequestOptionsResolver for AuthResolver {
             });
         }
 
+        // OAuth path: if the stored credential is structured
+        // (type: "oauth"), run it through the refresh-with-lock
+        // broker so the returned access token is fresh. Falls
+        // back to the flat-string path for ApiKey entries or
+        // when the credential lives in the native keyring
+        // (keyring values are opaque strings — always ApiKey).
+        if let Some(credential) = self.credential_store.get_credential(&model.provider) {
+            match credential {
+                AuthCredential::OAuth { .. } => {
+                    let token = self.resolve_oauth_token(&model.provider).await?;
+                    return Ok(ResolvedRequestOptions {
+                        api_key: Some(token),
+                        headers: HashMap::new(),
+                        base_url_override: None,
+                    });
+                }
+                AuthCredential::ApiKey { key } => {
+                    return Ok(ResolvedRequestOptions {
+                        api_key: Some(key),
+                        headers: HashMap::new(),
+                        base_url_override: None,
+                    });
+                }
+            }
+        }
+
         let api_key = self.credential_store.get(&model.provider).or_else(|| {
             let configured_env = self
                 .config
@@ -177,6 +205,46 @@ impl RequestOptionsResolver for AuthResolver {
             headers: HashMap::new(),
             base_url_override: None,
         })
+    }
+}
+
+impl AuthResolver {
+    /// Refresh (if needed) and return the OAuth access token for
+    /// `provider_name`. Called by the OAuth branch of `resolve`.
+    /// The lookup from provider name to concrete OAuth client
+    /// is hardcoded for the providers we support today — add an
+    /// entry here when a new OAuth provider lands.
+    async fn resolve_oauth_token(&self, provider_name: &str) -> Result<String, ProviderError> {
+        let oauth_provider = oauth_provider_for(provider_name).ok_or_else(|| {
+            ProviderError::Auth(format!(
+                "no OAuth client registered for provider '{provider_name}'"
+            ))
+        })?;
+        let auth_file = self
+            .credential_store
+            .json_fallback_path()
+            .ok_or_else(|| {
+                ProviderError::Auth(
+                    "OAuth refresh requires a JSON auth file; none is configured".into(),
+                )
+            })?;
+        let lock_dir = refresh::default_lock_dir(auth_file);
+        let refresher =
+            OAuthRefresher::new(oauth_provider.as_ref(), &self.credential_store, lock_dir);
+        refresher
+            .resolve_access_token()
+            .await
+            .map_err(|err| ProviderError::Auth(format!("{err:#}")))
+    }
+}
+
+/// Map a provider name to its OAuth client. Hardcoded for PR
+/// D.1 — turn into a registry when a second OAuth provider
+/// lands.
+fn oauth_provider_for(provider_name: &str) -> Option<Box<dyn OAuthProvider>> {
+    match provider_name {
+        "anthropic" => Some(Box::new(AnthropicOAuthProvider::new())),
+        _ => None,
     }
 }
 

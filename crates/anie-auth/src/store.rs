@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use crate::{
     AuthCredential, AuthStore, default_auth_file_path, load_auth_store_at, save_api_key_at,
     save_credential_at,
+    refresh::CredentialPersistence,
 };
 
 #[derive(Debug, Clone)]
@@ -184,6 +185,14 @@ impl CredentialStore {
             .as_deref()
             .context("home directory is not available for JSON credential fallback")?;
         save_api_key_at(path, provider, key)
+    }
+
+    /// JSON-fallback path backing this store. Used by the
+    /// OAuth refresh lock to place `auth.lock/` alongside the
+    /// auth file. `None` means keyring-only, no JSON file.
+    #[must_use]
+    pub fn json_fallback_path(&self) -> Option<&Path> {
+        self.json_fallback.as_deref()
     }
 
     /// Store a structured credential (ApiKey or OAuth) in the
@@ -361,6 +370,21 @@ impl CredentialStore {
     #[cfg(not(feature = "keyring-native"))]
     fn delete_from_system_keyring(&self, _provider: &str) -> Result<()> {
         Ok(())
+    }
+}
+
+/// `CredentialStore` participates in the OAuth refresh lock's
+/// `CredentialPersistence` trait. `load` reads whatever the
+/// store has (OAuth structure preserved via `get_credential`);
+/// `save` writes back structured credentials, keyring-bypassed
+/// so the OAuth rotation lands in `auth.json`.
+impl CredentialPersistence for CredentialStore {
+    fn load(&self, provider: &str) -> Option<AuthCredential> {
+        self.get_credential(provider)
+    }
+
+    fn save(&self, provider: &str, credential: AuthCredential) -> Result<()> {
+        self.set_credential(provider, credential)
     }
 }
 

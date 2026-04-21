@@ -6,6 +6,7 @@ mod commands;
 mod compaction;
 mod controller;
 mod interactive_mode;
+mod login_command;
 mod model_catalog;
 mod models_command;
 mod onboarding;
@@ -87,6 +88,20 @@ pub enum Command {
         #[arg(long)]
         refresh: bool,
     },
+    /// Log in to an OAuth-capable provider (currently:
+    /// `anthropic`). Opens a browser callback flow + persists
+    /// the access + refresh tokens.
+    Login {
+        /// Provider to log in to. Only `anthropic` is wired up
+        /// for now; add more as OAuth clients land.
+        provider: String,
+    },
+    /// Clear stored credentials for a provider. Works for
+    /// both OAuth and API-key entries.
+    Logout {
+        /// Provider to clear credentials for.
+        provider: String,
+    },
 }
 
 /// Run the CLI entry point.
@@ -102,6 +117,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Onboard) => return onboarding::run_onboarding().await,
         Some(Command::Models { provider, refresh }) => {
             return models_command::run_models_command(provider.as_deref(), *refresh).await;
+        }
+        Some(Command::Login { provider }) => {
+            return login_command::run_login(provider).await;
+        }
+        Some(Command::Logout { provider }) => {
+            return login_command::run_logout(provider).await;
         }
         None => {}
     }
