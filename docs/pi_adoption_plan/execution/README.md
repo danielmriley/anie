@@ -69,11 +69,27 @@ Status of each plan's PRs. Update inline as work lands.
 - Not yet verified: the two manual exit criteria ("30+ message
   session compacts mid-turn" and "`jq` inspection of a real
   session") — both need a live provider session.
-| 07 | OAuth | A (Credential tagged enum) | pending | — |
-| 07 | OAuth | B (OAuthProvider trait + Anthropic impl) | pending | — |
-| 07 | OAuth | C (refresh-with-lock) | pending | — |
-| 07 | OAuth | D (CLI + TUI integration) | pending | — |
-| 07 | OAuth | E (second provider, optional) | pending | — |
+| 07 | OAuth | A (Credential tagged enum) | landed | `91f6f82` |
+| 07 | OAuth | B (OAuthProvider trait + Anthropic impl) | landed | `c91af1b` |
+| 07 | OAuth | C (refresh-with-lock) | landed | `eb27cc2` |
+| 07 | OAuth | D.1 (anie login/logout CLI + AuthResolver) | landed | `8c3555a` |
+| 07 | OAuth | D.2 (TUI /login + onboarding + /providers) | pending | — |
+| 07 | OAuth | E (second provider, optional) | deferred | — |
+
+**Plan 07 notes:**
+- PR D split into D.1 (CLI) + D.2 (TUI polish). D.1 stands on
+  its own: `anie login anthropic` runs the full OAuth flow
+  against Anthropic's production endpoints, and any agent run
+  thereafter picks up the OAuth credential automatically via
+  the refreshed AuthResolver.
+- Endpoints + client ID verified against pi's
+  `packages/ai/src/utils/oauth/anthropic.ts` on 2026-04-21.
+- E (second provider) marked deferred — plan explicitly says
+  "ship only when motivated; don't speculatively add."
+- Manual exit-criterion still outstanding: end-to-end
+  `anie login anthropic` smoke (browser + redirect + token
+  exchange + real Anthropic model request). Needs a human at
+  the terminal.
 
 ## Suggested landing order
 

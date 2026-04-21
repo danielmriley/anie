@@ -67,6 +67,7 @@ dependencies = [
  "async-trait",
  "base64",
  "dirs",
+ "fs4",
  "keyring",
  "rand",
  "reqwest",
