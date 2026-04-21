@@ -1,6 +1,6 @@
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ModelCompat, ReasoningCapabilities, ReasoningControlMode,
-    ReasoningOutputMode, ReplayCapabilities,
+    ApiKind, CostPerMillion, MaxTokensField, Model, ModelCompat, OpenAICompletionsCompat,
+    ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode, ReplayCapabilities,
 };
 
 fn native_separated_reasoning() -> Option<ReasoningCapabilities> {
@@ -123,7 +123,12 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 0.0,
             },
             replay_capabilities: None,
-            compat: ModelCompat::None,
+            // OpenAI o-series requires `max_completion_tokens` on
+            // the wire — the legacy `max_tokens` 400s post-2024.
+            compat: ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+                max_tokens_field: Some(MaxTokensField::MaxCompletionTokens),
+                ..Default::default()
+            }),
         },
     ]
 }

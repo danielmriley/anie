@@ -114,6 +114,24 @@ pub fn apply_openrouter_capabilities(model: &mut Model) {
     if reasoning.is_some() {
         model.reasoning_capabilities = reasoning;
     }
+
+    // OpenAI o-series + GPT-5 require `max_completion_tokens` on
+    // the wire. OpenRouter normalizes this for intra-proxy use
+    // but once a request hits the actual OpenAI endpoint it
+    // 400s on the legacy name. Opt the compat flag in for
+    // upstreams we know about.
+    if is_openai_reasoning_upstream(&model.id) {
+        let current_compat = match std::mem::take(&mut model.compat) {
+            anie_provider::ModelCompat::OpenAICompletions(compat) => compat,
+            anie_provider::ModelCompat::None => anie_provider::OpenAICompletionsCompat::default(),
+        };
+        model.compat = anie_provider::ModelCompat::OpenAICompletions(
+            anie_provider::OpenAICompletionsCompat {
+                max_tokens_field: Some(anie_provider::MaxTokensField::MaxCompletionTokens),
+                ..current_compat
+            },
+        );
+    }
 }
 
 /// True when the outbound request body should carry an
@@ -303,6 +321,56 @@ mod tests {
                 .request_mode,
             Some(ThinkingRequestMode::NestedReasoning)
         );
+    }
+
+    #[test]
+    fn apply_openrouter_capabilities_opts_openai_o_series_into_max_completion_tokens() {
+        // Plan 01 PR A: o-series upstreams 400 on the legacy
+        // `max_tokens` wire name. OpenRouter normalizes it
+        // internally but once a request reaches the real
+        // OpenAI endpoint the rejection surfaces. Opt-in via
+        // the compat blob during discovery.
+        use anie_provider::{MaxTokensField, ModelCompat as MC, OpenAICompletionsCompat};
+
+        for id in ["openai/o1", "openai/o3", "openai/o4-mini", "openai/gpt-5"] {
+            let mut model = openrouter_model(id, true);
+            apply_openrouter_capabilities(&mut model);
+            match &model.compat {
+                MC::OpenAICompletions(OpenAICompletionsCompat {
+                    max_tokens_field, ..
+                }) => assert_eq!(
+                    *max_tokens_field,
+                    Some(MaxTokensField::MaxCompletionTokens),
+                    "{id} should opt into max_completion_tokens",
+                ),
+                other => panic!("{id}: expected OpenAICompletions compat, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn apply_openrouter_capabilities_leaves_non_openai_upstreams_on_legacy_field() {
+        // Anthropic / Google / Meta upstreams still accept the
+        // legacy name on OpenRouter — don't flip them.
+        use anie_provider::ModelCompat as MC;
+
+        for id in [
+            "anthropic/claude-sonnet-4",
+            "google/gemini-2.5-pro",
+            "meta-llama/llama-3.1-8b-instruct",
+        ] {
+            let mut model = openrouter_model(id, true);
+            apply_openrouter_capabilities(&mut model);
+            match &model.compat {
+                MC::None => {}
+                MC::OpenAICompletions(compat) => {
+                    assert!(
+                        compat.max_tokens_field.is_none(),
+                        "{id} should not opt into max_completion_tokens",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

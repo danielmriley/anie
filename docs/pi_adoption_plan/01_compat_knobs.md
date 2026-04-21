@@ -33,11 +33,21 @@ work, and OpenRouter translates. But:
   OpenAI o-series endpoint.
 
 The fix is a compat-blob field that the outbound body-builder
-reads and emits under the right name. We match pi's default:
-`"max_completion_tokens"` on OpenAI-compatible endpoints unless
-a catalog entry explicitly opts into `"max_tokens"` (e.g., for
-a proxy that demands the legacy name, or for local servers
-like llama.cpp that haven't adopted the newer field).
+reads and emits under the right name.
+
+**anie-specific (not in pi):** we keep the default at
+`"max_tokens"` rather than matching pi's `"max_completion_tokens"`
+default. Reason: anie targets a broader set of endpoints than pi's
+typical user, including local servers (llama.cpp variants,
+older LM Studio builds) that haven't adopted the newer field
+name. Opt-in-by-catalog-entry is the conservative path: the
+built-in o4-mini entry and the OpenRouter `openai/o*` +
+`openai/gpt-5*` capability mapping set
+`MaxTokensField::MaxCompletionTokens` explicitly. Everything
+else keeps the legacy wire name that predates the o-series
+rename, matching current anie behavior. If a future problem
+surfaces on a server that rejects `max_tokens`, flip its
+compat entry.
 
 ### `"minimal"` thinking level
 

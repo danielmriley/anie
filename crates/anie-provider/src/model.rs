@@ -153,6 +153,33 @@ pub struct OpenAICompletionsCompat {
     /// into the outbound request body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openrouter_routing: Option<OpenRouterRouting>,
+    /// Which outbound field name carries the output-token cap.
+    /// `None` (the default) emits `max_tokens`, matching anie's
+    /// existing behavior and the most widely-accepted wire
+    /// form. Set to `MaxCompletionTokens` for catalog entries
+    /// whose upstream rejects the legacy name — OpenAI's
+    /// o-series and GPT-5 family post-2024, for example. pi's
+    /// default is `max_completion_tokens`; we deviate for
+    /// backward compat with the broader set of OpenAI-compat
+    /// servers anie talks to (local, proxied, older).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<MaxTokensField>,
+}
+
+/// Outbound wire-name for the output-token cap.
+///
+/// OpenAI renamed `max_tokens` → `max_completion_tokens` when
+/// they shipped the o-series reasoning models, deprecating the
+/// legacy name for those models. Older OpenAI-compat servers
+/// still only understand `max_tokens`. Per-model selection via
+/// `OpenAICompletionsCompat::max_tokens_field`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// Legacy name, still accepted by most OpenAI-compat servers.
+    MaxTokens,
+    /// New name required by OpenAI's o-series + GPT-5 endpoints.
+    MaxCompletionTokens,
 }
 
 /// OpenRouter provider-routing preferences.
@@ -478,6 +505,7 @@ mod tests {
                 ignore: None,
                 zdr: Some(true),
             }),
+            ..Default::default()
         });
         let model = sample_model(compat.clone());
         let json = serde_json::to_string(&model).expect("serialize model");
@@ -486,6 +514,43 @@ mod tests {
 
         let roundtrip: Model = serde_json::from_str(&json).expect("deserialize model");
         assert_eq!(roundtrip.compat, compat);
+    }
+
+    #[test]
+    fn max_tokens_field_defaults_to_none_and_is_skipped_on_serialize() {
+        let compat = OpenAICompletionsCompat::default();
+        let json = serde_json::to_string(&compat).expect("serialize");
+        // Both optional fields should be skipped → the struct
+        // serializes as an empty object.
+        assert_eq!(json, "{}");
+        let roundtrip: OpenAICompletionsCompat =
+            serde_json::from_str(&json).expect("deserialize");
+        assert!(roundtrip.max_tokens_field.is_none());
+    }
+
+    #[test]
+    fn max_tokens_field_variants_roundtrip() {
+        for variant in [MaxTokensField::MaxTokens, MaxTokensField::MaxCompletionTokens] {
+            let compat = OpenAICompletionsCompat {
+                max_tokens_field: Some(variant),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&compat).expect("serialize");
+            let roundtrip: OpenAICompletionsCompat =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(roundtrip.max_tokens_field, Some(variant));
+        }
+    }
+
+    #[test]
+    fn max_tokens_field_serializes_as_snake_case() {
+        // Wire-compat: if we ever surface these through config
+        // they should be readable. snake_case matches the actual
+        // OpenAI field names.
+        let json = serde_json::to_string(&MaxTokensField::MaxCompletionTokens).unwrap();
+        assert_eq!(json, "\"max_completion_tokens\"");
+        let json = serde_json::to_string(&MaxTokensField::MaxTokens).unwrap();
+        assert_eq!(json, "\"max_tokens\"");
     }
 
     #[test]

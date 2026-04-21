@@ -16,8 +16,9 @@ use serde_json::json;
 
 use anie_protocol::{Message, ToolDef};
 use anie_provider::{
-    LlmContext, LlmMessage, Model, ModelCompat, Provider, ProviderError, ProviderEvent,
-    ProviderStream, ReasoningControlMode, StreamOptions, ThinkingLevel, ThinkingRequestMode,
+    LlmContext, LlmMessage, MaxTokensField, Model, ModelCompat, Provider, ProviderError,
+    ProviderEvent, ProviderStream, ReasoningControlMode, StreamOptions, ThinkingLevel,
+    ThinkingRequestMode,
 };
 
 use crate::openrouter::{insert_anthropic_cache_control, needs_anthropic_cache_control};
@@ -158,7 +159,19 @@ impl OpenAIProvider {
             body.insert("temperature".into(), json!(temperature));
         }
         if let Some(max_tokens) = effective_max_tokens(model, options) {
-            body.insert("max_tokens".into(), json!(max_tokens));
+            // OpenAI renamed `max_tokens` to `max_completion_tokens`
+            // for the o-series and GPT-5 models; the old name 400s
+            // on those endpoints. Per-model selection via the
+            // compat blob. Default is the legacy name for
+            // backward compat with older OpenAI-compat servers.
+            let field_name = match &model.compat {
+                ModelCompat::OpenAICompletions(compat) => match compat.max_tokens_field {
+                    Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
+                    Some(MaxTokensField::MaxTokens) | None => "max_tokens",
+                },
+                ModelCompat::None => "max_tokens",
+            };
+            body.insert(field_name.into(), json!(max_tokens));
         }
         if let ModelCompat::OpenAICompletions(compat) = &model.compat
             && let Some(routing) = compat.openrouter_routing.as_ref()
@@ -1087,6 +1100,7 @@ mod tests {
                 ignore: None,
                 zdr: Some(true),
             }),
+            ..Default::default()
         });
         let body = openai_request_body_for(&model, "hi");
         let provider_field = body["provider"].as_object().expect("provider object");
@@ -1116,8 +1130,97 @@ mod tests {
         let mut model = openrouter_model("openai/o3");
         model.compat = ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
             openrouter_routing: Some(OpenRouterRouting::default()),
+            ..Default::default()
         });
         let body = openai_request_body_for(&model, "hi");
         assert!(!body.as_object().expect("body").contains_key("provider"));
+    }
+
+    // ---------------------------------------------------------
+    // Plan 01 PR A — max_tokens_field compat flag.
+    // ---------------------------------------------------------
+
+    fn nemotron_style_hosted_model() -> Model {
+        // Hosted reasoning model without the MaxCompletionTokens
+        // compat flag — should emit the legacy `max_tokens` field.
+        let mut model = sample_nested_hosted_model();
+        model.compat = ModelCompat::None;
+        model
+    }
+
+    fn openai_request_body_with_tokens(model: &Model) -> serde_json::Value {
+        let provider = OpenAIProvider::new();
+        let options = StreamOptions {
+            max_tokens: Some(2_048),
+            ..StreamOptions::default()
+        };
+        provider.build_request_body(
+            model,
+            &LlmContext {
+                system_prompt: String::new(),
+                messages: vec![LlmMessage {
+                    role: "user".into(),
+                    content: json!("hi"),
+                }],
+                tools: Vec::new(),
+            },
+            &options,
+            true,
+        )
+    }
+
+    #[test]
+    fn max_tokens_field_defaults_to_legacy_max_tokens() {
+        let body = openai_request_body_with_tokens(&nemotron_style_hosted_model());
+        assert_eq!(body["max_tokens"], json!(2_048));
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn max_tokens_field_max_tokens_explicit_matches_legacy_default() {
+        use anie_provider::{MaxTokensField, OpenAICompletionsCompat};
+        let mut model = nemotron_style_hosted_model();
+        model.compat = ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+            max_tokens_field: Some(MaxTokensField::MaxTokens),
+            ..Default::default()
+        });
+        let body = openai_request_body_with_tokens(&model);
+        assert_eq!(body["max_tokens"], json!(2_048));
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn max_tokens_field_max_completion_tokens_emits_new_name() {
+        // Regression for OpenAI o-series / GPT-5: the legacy
+        // `max_tokens` name 400s on these endpoints. When the
+        // catalog opts in, the new field name must appear
+        // instead.
+        use anie_provider::{MaxTokensField, OpenAICompletionsCompat};
+        let mut model = nemotron_style_hosted_model();
+        model.compat = ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+            max_tokens_field: Some(MaxTokensField::MaxCompletionTokens),
+            ..Default::default()
+        });
+        let body = openai_request_body_with_tokens(&model);
+        assert_eq!(body["max_completion_tokens"], json!(2_048));
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn builtin_o4_mini_opts_into_max_completion_tokens() {
+        let catalog = crate::builtin_models();
+        let o4_mini = catalog
+            .iter()
+            .find(|model| model.id == "o4-mini")
+            .expect("o4-mini");
+        match &o4_mini.compat {
+            ModelCompat::OpenAICompletions(compat) => {
+                assert_eq!(
+                    compat.max_tokens_field,
+                    Some(anie_provider::MaxTokensField::MaxCompletionTokens),
+                );
+            }
+            other => panic!("expected OpenAICompletions compat, got {other:?}"),
+        }
     }
 }
