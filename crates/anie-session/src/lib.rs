@@ -971,13 +971,13 @@ impl SessionManager {
         summarizer: &dyn MessageSummarizer,
     ) -> Result<Option<CompactionResult>> {
         let context = self.build_context();
-        let Ok((discard, _keep, first_kept_entry_id)) =
-            find_cut_point(&context.messages, keep_recent_tokens)
-        else {
+        let Ok(cut_point) = find_cut_point(&context.messages, keep_recent_tokens) else {
             return Ok(None);
         };
+        let first_kept_entry_id = cut_point.first_kept_entry_id.clone();
 
-        let source_messages = discard
+        let source_messages = cut_point
+            .discarded
             .iter()
             .map(|message| message.message.clone())
             .collect::<Vec<_>>();
@@ -1017,7 +1017,7 @@ impl SessionManager {
             summary,
             tokens_before,
             first_kept_entry_id,
-            messages_discarded: discard.len(),
+            messages_discarded: cut_point.discarded.len(),
         }))
     }
 }
@@ -1195,15 +1195,44 @@ Keep the summary concise but comprehensive. Focus on information needed to conti
     prompt
 }
 
+/// Result of compaction-cut analysis. Replaces the prior tuple
+/// return so plan 06 PR C can carry `split_turn` metadata
+/// without another breaking change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutPoint {
+    /// Messages that will be summarized / discarded.
+    pub discarded: Vec<SessionContextMessage>,
+    /// Messages kept verbatim after the cut.
+    pub kept: Vec<SessionContextMessage>,
+    /// `entry_id` of the first message in `kept`.
+    pub first_kept_entry_id: String,
+    /// When the cut lands mid-turn, the prefix of the turn that
+    /// belongs on the discarded side. `None` when the cut
+    /// happens cleanly at a turn boundary. PR C.1 populates
+    /// `None` uniformly — PR C.2 will detect mid-turn cases and
+    /// populate this field, driving two-summary split-turn
+    /// compaction.
+    pub split_turn: Option<SplitTurn>,
+}
+
+/// Information about a turn that straddles the compaction cut.
+/// `prefix_entry_ids` is the set of `entry_id` values from
+/// `CutPoint::discarded` that belong to the split turn; the
+/// rest of the turn stays in `kept`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitTurn {
+    /// Entry ID of the user message that started the turn
+    /// straddling the cut.
+    pub turn_start_entry_id: String,
+    /// Discarded-side entry IDs for the turn prefix.
+    pub prefix_entry_ids: Vec<String>,
+}
+
 /// Find the compaction cut point for the provided active-branch context.
 pub fn find_cut_point(
     messages: &[SessionContextMessage],
     keep_recent_tokens: u64,
-) -> Result<(
-    Vec<SessionContextMessage>,
-    Vec<SessionContextMessage>,
-    String,
-)> {
+) -> Result<CutPoint> {
     let mut accumulated = 0u64;
     let mut cut_index = messages.len();
 
@@ -1226,10 +1255,15 @@ pub fn find_cut_point(
         return Err(anyhow!("cannot compact: not enough messages to discard"));
     }
 
-    let discard = messages[..cut_index].to_vec();
-    let keep = messages[cut_index..].to_vec();
-    let first_kept_entry_id = keep[0].entry_id.clone();
-    Ok((discard, keep, first_kept_entry_id))
+    let discarded = messages[..cut_index].to_vec();
+    let kept = messages[cut_index..].to_vec();
+    let first_kept_entry_id = kept[0].entry_id.clone();
+    Ok(CutPoint {
+        discarded,
+        kept,
+        first_kept_entry_id,
+        split_turn: None,
+    })
 }
 
 fn generate_unique_id(existing: &HashSet<String>) -> String {
@@ -2283,10 +2317,45 @@ mod tests {
             },
         ];
 
-        let (discard, keep, first_kept) = find_cut_point(&messages, 3).expect("cut point");
-        assert_eq!(discard.len(), 3);
-        assert_eq!(keep.len(), 1);
-        assert_eq!(first_kept, "4");
+        let cut_point = find_cut_point(&messages, 3).expect("cut point");
+        assert_eq!(cut_point.discarded.len(), 3);
+        assert_eq!(cut_point.kept.len(), 1);
+        assert_eq!(cut_point.first_kept_entry_id, "4");
+        assert!(
+            cut_point.split_turn.is_none(),
+            "PR C.1 preserves pre-split-turn behavior: {:?}",
+            cut_point.split_turn
+        );
+    }
+
+    #[test]
+    fn cut_point_struct_carries_all_fields() {
+        // Regression for the tuple→struct refactor. Ensures all
+        // four fields are observable from a single call.
+        // Token budget and message lengths are chosen so the
+        // cut lands partway through — not at either end.
+        let messages = vec![
+            SessionContextMessage {
+                entry_id: "1".into(),
+                message: user_message(&"a".repeat(800), 1),
+            },
+            SessionContextMessage {
+                entry_id: "2".into(),
+                message: assistant_message(&"b".repeat(800), 2),
+            },
+            SessionContextMessage {
+                entry_id: "3".into(),
+                message: user_message(&"c".repeat(800), 3),
+            },
+        ];
+        let cut_point = find_cut_point(&messages, 300).expect("cut point");
+        assert!(!cut_point.discarded.is_empty());
+        assert!(!cut_point.kept.is_empty());
+        assert_eq!(
+            cut_point.first_kept_entry_id,
+            cut_point.kept[0].entry_id
+        );
+        assert!(cut_point.split_turn.is_none());
     }
 
     #[tokio::test]
