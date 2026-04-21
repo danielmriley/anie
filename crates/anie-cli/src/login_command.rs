@@ -17,8 +17,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use anie_auth::{
-    AnthropicOAuthProvider, AuthCredential, CallbackError, CredentialStore, LoginFlow,
-    OAuthCredentialData, OAuthProvider, OpenAICodexOAuthProvider, await_callback_on_path,
+    AnthropicOAuthProvider, AuthCredential, CallbackError, CredentialStore, GithubCopilotOAuthProvider,
+    LoginFlow, OAuthCredentialData, OAuthProvider, OpenAICodexOAuthProvider, await_callback_on_path,
 };
 
 /// Fallback callback port when the provider's redirect URI
@@ -224,9 +224,10 @@ fn build_oauth_provider(provider_name: &str) -> Result<Box<dyn OAuthProvider>> {
     match provider_name {
         "anthropic" => Ok(Box::new(AnthropicOAuthProvider::new())),
         "openai-codex" => Ok(Box::new(OpenAICodexOAuthProvider::new())),
+        "github-copilot" => Ok(Box::new(GithubCopilotOAuthProvider::new())),
         other => Err(anyhow!(
             "'{other}' does not support OAuth login. \
-             Supported providers: anthropic, openai-codex."
+             Supported providers: anthropic, openai-codex, github-copilot."
         )),
     }
 }
@@ -270,6 +271,7 @@ mod tests {
     fn build_oauth_provider_accepts_registered_providers() {
         assert!(build_oauth_provider("anthropic").is_ok());
         assert!(build_oauth_provider("openai-codex").is_ok());
+        assert!(build_oauth_provider("github-copilot").is_ok());
     }
 
     #[test]
@@ -284,6 +286,7 @@ mod tests {
         assert!(err.contains("OAuth"), "{err}");
         assert!(err.contains("anthropic"), "{err}");
         assert!(err.contains("openai-codex"), "{err}");
+        assert!(err.contains("github-copilot"), "{err}");
     }
 
     #[test]
