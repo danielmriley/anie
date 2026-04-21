@@ -3,12 +3,14 @@
 
 pub mod anthropic_oauth;
 pub mod oauth;
+pub mod refresh;
 mod store;
 
 pub use anthropic_oauth::AnthropicOAuthProvider;
 pub use oauth::{
     LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, generate_pkce, parse_expires_at,
 };
+pub use refresh::{CredentialPersistence, OAuthRefresher, RefreshError, default_lock_dir};
 
 use std::{
     collections::HashMap,
