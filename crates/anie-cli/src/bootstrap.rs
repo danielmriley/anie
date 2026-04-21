@@ -7,7 +7,9 @@ use anie_config::{CliOverrides, load_config};
 use anie_provider::{ProviderRegistry, RequestOptionsResolver};
 use anie_providers_builtin::register_builtin_providers;
 use anie_session::SessionManager;
-use anie_tools::{BashTool, EditTool, FileMutationQueue, GrepTool, ReadTool, WriteTool};
+use anie_tools::{
+    BashTool, EditTool, FileMutationQueue, FindTool, GrepTool, LsTool, ReadTool, WriteTool,
+};
 use anie_tui::UiAction;
 
 use crate::{
@@ -116,6 +118,8 @@ pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistr
     )));
     tools.register(Arc::new(BashTool::new(cwd.to_path_buf())));
     tools.register(Arc::new(GrepTool::new(cwd.to_path_buf())));
+    tools.register(Arc::new(FindTool::new(cwd.to_path_buf())));
+    tools.register(Arc::new(LsTool::new(cwd.to_path_buf())));
     Arc::new(tools)
 }
 

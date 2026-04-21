@@ -163,6 +163,8 @@ fn tool_registry_contains_core_tools_by_default() {
     assert!(names.contains(&"edit".to_string()));
     assert!(names.contains(&"bash".to_string()));
     assert!(names.contains(&"grep".to_string()));
+    assert!(names.contains(&"find".to_string()));
+    assert!(names.contains(&"ls".to_string()));
 }
 
 #[test]
