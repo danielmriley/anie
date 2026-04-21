@@ -73,23 +73,38 @@ Status of each plan's PRs. Update inline as work lands.
 | 07 | OAuth | B (OAuthProvider trait + Anthropic impl) | landed | `c91af1b` |
 | 07 | OAuth | C (refresh-with-lock) | landed | `eb27cc2` |
 | 07 | OAuth | D.1 (anie login/logout CLI + AuthResolver) | landed | `8c3555a` |
+| 07 | OAuth | D.1+ (auto-open browser, compact prompt) | landed | `a35f37a` |
 | 07 | OAuth | D.2 (TUI /login + onboarding + /providers) | pending | — |
-| 07 | OAuth | E (second provider, optional) | deferred | — |
+| 07 | OAuth | E.1 (trait refactor: device flow + credential extras) | landed | `d71e533` |
+| 07 | OAuth | E.2 (OpenAI Codex provider) | landed | `eda8448` |
+| 07 | OAuth | E.3 (GitHub Copilot provider, device flow) | landed | `4a79550` |
+| 07 | OAuth | E.4 (Google Antigravity provider) | landed | `0c22b64` |
+| 07 | OAuth | E.5 (Google Gemini CLI provider) | landed | `2891169` |
 
 **Plan 07 notes:**
 - PR D split into D.1 (CLI) + D.2 (TUI polish). D.1 stands on
-  its own: `anie login anthropic` runs the full OAuth flow
-  against Anthropic's production endpoints, and any agent run
-  thereafter picks up the OAuth credential automatically via
-  the refreshed AuthResolver.
-- Endpoints + client ID verified against pi's
-  `packages/ai/src/utils/oauth/anthropic.ts` on 2026-04-21.
-- E (second provider) marked deferred — plan explicitly says
-  "ship only when motivated; don't speculatively add."
-- Manual exit-criterion still outstanding: end-to-end
-  `anie login anthropic` smoke (browser + redirect + token
-  exchange + real Anthropic model request). Needs a human at
-  the terminal.
+  its own: `anie login <provider>` runs the full OAuth flow
+  against production endpoints, and agent runs thereafter pick
+  up the OAuth credential automatically via AuthResolver +
+  refresh-with-lock.
+- D.1+ followup: `anie login` now auto-opens the browser
+  (opener crate) and collapses the terminal output to three
+  compact lines.
+- Endpoints + client IDs verified against pi's corresponding
+  TS files on 2026-04-21 — each provider's module doc records
+  the line numbers.
+- PR E was broken into E.1–E.5. E.1 extended the trait
+  (LoginFlow became an enum, DeviceCodeFlow added,
+  `api_base_url` / `project_id` added to credential shape).
+  E.2–E.5 each added one provider with 9–13 wiremock-backed
+  tests.
+- Five providers now registered: `anthropic`, `openai-codex`,
+  `github-copilot`, `google-antigravity`, `google-gemini-cli`.
+- Manual exit-criterion still outstanding for each provider:
+  end-to-end login smoke against the real provider endpoint.
+  Anthropic is actively enforcing third-party-agent ToS
+  restrictions; Copilot / Gemini are known-safer smoke
+  targets. Needs a human at the terminal with a browser.
 
 ## Suggested landing order
 
