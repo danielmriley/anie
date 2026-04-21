@@ -123,13 +123,29 @@ pub struct CustomModelConfig {
 }
 
 /// Context-compaction settings.
+///
+/// The main agent stream does not send `max_tokens` — see
+/// `docs/max_tokens_handling/README.md` — so the upstream
+/// enforces `input + output <= context_window` with its own
+/// defaults. Our job here is to trigger compaction *before* the
+/// input gets close enough to the ceiling that the model has no
+/// room to answer. `reserve_tokens` is that headroom: compaction
+/// fires when `context_tokens > context_window - reserve_tokens`,
+/// which guarantees the next turn has at least `reserve_tokens`
+/// free for the response. 16 k is pi's default and covers the
+/// common case including reasoning-model runs; bump it if a
+/// specific model routinely runs up against it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactionConfig {
     /// Whether compaction is enabled.
     pub enabled: bool,
-    /// Reserved token budget.
+    /// Tokens of headroom to keep free of input so the upstream
+    /// has room for its response. Effective constraint:
+    /// compaction triggers when
+    /// `context_tokens > context_window - reserve_tokens`.
     pub reserve_tokens: u64,
-    /// Recent-token budget to keep verbatim.
+    /// Recent-token budget to keep verbatim past the compaction
+    /// boundary (the tail of the transcript isn't summarized).
     pub keep_recent_tokens: u64,
 }
 
