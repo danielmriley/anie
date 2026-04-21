@@ -196,7 +196,7 @@ impl RequestOptionsResolver for AuthResolver {
                     let token = self.resolve_oauth_token(&model.provider).await?;
                     return Ok(ResolvedRequestOptions {
                         api_key: Some(token),
-                        headers: HashMap::new(),
+                        headers: oauth_request_headers(&model.provider),
                         // OAuth providers may return a per-user
                         // API base URL at login time (GitHub
                         // Copilot's `proxy-ep` rewrite is the
@@ -269,6 +269,25 @@ impl AuthResolver {
 /// Map a provider name to its OAuth client. Hardcoded for PR
 /// D.1 — turn into a registry when a second OAuth provider
 /// lands.
+/// Per-provider request headers attached to every chat request
+/// when the credential is OAuth. GitHub Copilot rejects calls
+/// from clients that don't present the editor-identifying
+/// headers pi pins — so discovery AND chat both need them, same
+/// set, same values.
+fn oauth_request_headers(provider_name: &str) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if provider_name == "github-copilot" {
+        headers.insert("User-Agent".into(), "GitHubCopilotChat/0.35.0".into());
+        headers.insert("Editor-Version".into(), "vscode/1.107.0".into());
+        headers.insert(
+            "Editor-Plugin-Version".into(),
+            "copilot-chat/0.35.0".into(),
+        );
+        headers.insert("Copilot-Integration-Id".into(), "vscode-chat".into());
+    }
+    headers
+}
+
 fn oauth_provider_for(provider_name: &str) -> Option<Box<dyn OAuthProvider>> {
     match provider_name {
         "anthropic" => Some(Box::new(AnthropicOAuthProvider::new())),

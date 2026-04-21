@@ -15,6 +15,7 @@ use std::collections::HashSet;
 
 use anyhow::{Result, anyhow};
 
+use anie_auth::{AuthCredential, CredentialStore};
 use anie_config::{AnieConfig, configured_models};
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ThinkingLevel};
 use anie_providers_builtin::{builtin_models, detect_local_servers};
@@ -64,10 +65,12 @@ pub(crate) fn resolve_initial_selection(
     let runtime_provider = runtime_state.provider.clone();
 
     let preferred_provider = cli_provider
+        .clone()
         .or_else(|| session_model.as_ref().map(|(provider, _)| provider.clone()))
         .or(runtime_provider)
         .unwrap_or_else(|| config.model.provider.clone());
     let preferred_model = cli_model
+        .clone()
         .or_else(|| session_model.as_ref().map(|(_, model)| model.clone()))
         .or(runtime_model)
         .unwrap_or_else(|| config.model.id.clone());
@@ -77,13 +80,55 @@ pub(crate) fn resolve_initial_selection(
         .or(runtime_state.thinking)
         .unwrap_or(config.model.thinking);
 
-    let model = if cli.provider.is_some() && cli.model.is_none() {
+    // If the user gave an explicit `--provider`, don't let the
+    // local-model fallback silently pick something different.
+    // The previous behavior produced extremely surprising runs
+    // (user types `--provider github-copilot` → ollama answers)
+    // because the catalog doesn't include OAuth-discovered
+    // providers at startup.
+    let explicit_provider = cli_provider.is_some();
+
+    let credential_store = CredentialStore::new();
+
+    // When the user gave an explicit --provider on the CLI we
+    // take a strict path: exact (provider, model_id) match in
+    // the catalog, or fabricate via fallback_model_from_provider
+    // (reads OAuth credential's api_base_url for OAuth-backed
+    // providers), or error. `resolve_model`'s internal fallbacks
+    // would otherwise silently return the first catalog entry
+    // — the exact bug that made --provider github-copilot
+    // --model claude-sonnet-4.6 land on anthropic.
+    let model = if explicit_provider {
+        exact_or_fabricate(
+            &preferred_provider,
+            cli_model.as_deref(),
+            &preferred_model,
+            model_catalog,
+            config,
+            &credential_store,
+        )?
+    } else if cli.provider.is_some() && cli.model.is_none() {
         resolve_model(
             Some(preferred_provider.as_str()),
             None,
             model_catalog,
             local_models_available,
         )
+        .or_else(|_| {
+            fallback_model_from_provider(
+                preferred_provider.as_str(),
+                preferred_model.as_str(),
+                config,
+                model_catalog,
+                &credential_store,
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "no model configured for provider '{preferred_provider}'; \
+                     pass --model, or add the provider to config.toml"
+                )
+            })
+        })?
     } else {
         resolve_model(
             Some(preferred_provider.as_str()),
@@ -97,8 +142,14 @@ pub(crate) fn resolve_initial_selection(
                 preferred_model.as_str(),
                 config,
                 model_catalog,
+                &credential_store,
             )
-            .ok_or_else(|| anyhow!("no model named '{preferred_model}' was found"))
+            .ok_or_else(|| {
+                anyhow!(
+                    "no model named '{preferred_model}' was found for \
+                     provider '{preferred_provider}'"
+                )
+            })
         })
         .or_else(|_| {
             resolve_model(
@@ -115,10 +166,77 @@ pub(crate) fn resolve_initial_selection(
                 model_catalog,
                 local_models_available,
             )
-        })
-    }?;
+        })?
+    };
 
+    tracing::info!(
+        target: "anie_cli::model_catalog",
+        provider = %model.provider,
+        id = %model.id,
+        base_url = %model.base_url,
+        "initial model selection"
+    );
     Ok(InitialSelection { model, thinking })
+}
+
+/// Strict resolution when the user pinned `--provider` on the
+/// CLI. Unlike `resolve_model`, this does NOT silently fall
+/// back to "the first thing in the catalog" — the whole reason
+/// `--provider` exists is to target a specific one. Order:
+///
+/// 1. Exact `(provider, model_id)` match in the catalog (only
+///    when the user also specified `--model`).
+/// 2. Fabricate via `fallback_model_from_provider` — reads
+///    config.toml entries + OAuth credentials so a just-logged-
+///    in provider works without manual config.
+/// 3. Any catalog model under `provider` (when the user didn't
+///    specify `--model`).
+/// 4. Error with a clear message.
+fn exact_or_fabricate(
+    provider: &str,
+    cli_model: Option<&str>,
+    preferred_model: &str,
+    catalog: &[Model],
+    config: &AnieConfig,
+    credential_store: &CredentialStore,
+) -> Result<Model> {
+    // Step 1: exact catalog match only if the user asked for a
+    // specific model. When they passed --provider alone, skip
+    // straight to "any model under this provider".
+    if cli_model.is_some() {
+        if let Some(model) = catalog
+            .iter()
+            .find(|m| m.provider == provider && m.id == preferred_model)
+        {
+            return Ok(model.clone());
+        }
+    } else if let Some(model) = catalog.iter().find(|m| m.provider == provider) {
+        return Ok(model.clone());
+    }
+
+    // Step 2: fabricate from config / OAuth credential.
+    if let Some(model) = fallback_model_from_provider(
+        provider,
+        preferred_model,
+        config,
+        catalog,
+        credential_store,
+    ) {
+        return Ok(model);
+    }
+
+    // Step 3: any catalog entry for the provider, as a last resort.
+    if let Some(model) = catalog.iter().find(|m| m.provider == provider) {
+        return Ok(model.clone());
+    }
+
+    // Step 4: error — don't silently pick something unrelated.
+    Err(anyhow!(
+        "no model available for provider '{provider}' \
+         (asked for '{preferred_model}'). Check that the provider \
+         is logged in (`anie login {provider}`) or registered in \
+         config.toml."
+    ))
 }
 
 /// Resolve a user-typed model request (`"provider:id"` or bare id
@@ -195,12 +313,21 @@ pub(crate) fn resolve_model(
 }
 
 /// Fabricate a `Model` for a provider that isn't in the catalog but
-/// has enough config metadata to send a request.
+/// has enough config metadata — or a stored OAuth credential — to
+/// send a request.
+///
+/// Resolution order for the base URL:
+/// 1. `config.toml` [providers.<name>] explicit base_url.
+/// 2. Any catalog entry already using this provider.
+/// 3. Stored OAuth credential's `api_base_url` (Copilot's
+///    per-user proxy-ep rewrite lands here).
+/// 4. Hardcoded defaults for common providers.
 pub(crate) fn fallback_model_from_provider(
     provider: &str,
     model_id: &str,
     config: &AnieConfig,
     catalog: &[Model],
+    credential_store: &CredentialStore,
 ) -> Option<Model> {
     let provider_config = config.providers.get(provider);
     let api = provider_config
@@ -217,6 +344,7 @@ pub(crate) fn fallback_model_from_provider(
                 .find(|candidate| candidate.provider == provider)
                 .map(|candidate| candidate.base_url.clone())
         })
+        .or_else(|| oauth_credential_base_url(provider, credential_store))
         .or_else(|| match provider {
             "anthropic" => Some("https://api.anthropic.com".to_string()),
             "openai" => Some("https://api.openai.com/v1".to_string()),
@@ -238,6 +366,18 @@ pub(crate) fn fallback_model_from_provider(
         replay_capabilities: None,
         compat: ModelCompat::None,
     })
+}
+
+/// Pull `api_base_url` out of a stored OAuth credential, if one
+/// exists. Used by `fallback_model_from_provider` so a user who
+/// just ran `anie login github-copilot` can immediately use
+/// `anie --provider github-copilot --model <id>` without
+/// hand-editing config.toml.
+fn oauth_credential_base_url(provider: &str, store: &CredentialStore) -> Option<String> {
+    match store.get_credential(provider)? {
+        AuthCredential::OAuth { api_base_url, .. } => api_base_url,
+        AuthCredential::ApiKey { .. } => None,
+    }
 }
 
 /// Replace or append a model in the catalog by (provider, id).
@@ -337,6 +477,77 @@ mod tests {
         let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
         let resolved = resolve_model(None, None, &models, true).expect("resolve model");
         assert_eq!(resolved.provider, "ollama");
+    }
+
+    #[test]
+    fn exact_or_fabricate_rejects_unknown_provider_without_credential() {
+        // Regression: prior to PR G, an unknown --provider with a
+        // mismatched --model would silently fall back to the
+        // first catalog entry. Now we error instead.
+        let config = AnieConfig::default();
+        let store = anie_auth::CredentialStore::with_config(
+            "anie-test-g",
+            None,
+        )
+        .without_native_keyring();
+        let catalog = vec![
+            model("claude-sonnet-4-6", "anthropic"),
+            model("gpt-4o", "openai"),
+        ];
+        let err = exact_or_fabricate(
+            "github-copilot",
+            Some("claude-sonnet-4.6"),
+            "claude-sonnet-4.6",
+            &catalog,
+            &config,
+            &store,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("github-copilot"), "{err}");
+        assert!(err.contains("anie login"), "{err}");
+    }
+
+    #[test]
+    fn exact_or_fabricate_uses_oauth_api_base_url_when_present() {
+        // Regression: fallback_model_from_provider must consult
+        // the credential store for providers with no config
+        // entry. The resulting Model must use the OAuth
+        // credential's api_base_url (per-user endpoint).
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let auth_path = tempdir.path().join("auth.json");
+        let store = anie_auth::CredentialStore::with_config(
+            "anie-test-g",
+            Some(auth_path),
+        )
+        .without_native_keyring();
+        store
+            .set_credential(
+                "github-copilot",
+                anie_auth::AuthCredential::OAuth {
+                    access_token: "copilot-token".into(),
+                    refresh_token: "github-oauth".into(),
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                    account: Some("octocat".into()),
+                    api_base_url: Some("https://api.individual.githubcopilot.com".into()),
+                    project_id: None,
+                },
+            )
+            .expect("save");
+        let config = AnieConfig::default();
+        let catalog: Vec<Model> = Vec::new();
+        let model = exact_or_fabricate(
+            "github-copilot",
+            Some("claude-sonnet-4.6"),
+            "claude-sonnet-4.6",
+            &catalog,
+            &config,
+            &store,
+        )
+        .expect("fabricate");
+        assert_eq!(model.provider, "github-copilot");
+        assert_eq!(model.id, "claude-sonnet-4.6");
+        assert_eq!(model.base_url, "https://api.individual.githubcopilot.com");
     }
 
     #[test]

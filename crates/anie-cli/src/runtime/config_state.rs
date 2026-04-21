@@ -91,6 +91,7 @@ impl ConfigState {
                         model_id,
                         &self.anie_config,
                         model_catalog,
+                        &anie_auth::CredentialStore::new(),
                     )
                 })
         {
@@ -145,8 +146,14 @@ impl ConfigState {
             local_models_available,
         )
         .or_else(|_| {
-            fallback_model_from_provider(current_provider, current_model, &config, &model_catalog)
-                .ok_or_else(|| anyhow!("no model named '{current_model}' was found"))
+            fallback_model_from_provider(
+                current_provider,
+                current_model,
+                &config,
+                &model_catalog,
+                &anie_auth::CredentialStore::new(),
+            )
+            .ok_or_else(|| anyhow!("no model named '{current_model}' was found"))
         })
         .or_else(|_| {
             resolve_model(
@@ -162,6 +169,7 @@ impl ConfigState {
                 &config.model.id,
                 &config,
                 &model_catalog,
+                &anie_auth::CredentialStore::new(),
             )
             .ok_or_else(|| anyhow!("no model named '{}' was found", config.model.id))
         })?;
