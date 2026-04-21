@@ -991,6 +991,7 @@ fn current_date_ymd() -> Result<String> {
 pub(crate) fn parse_thinking_level(value: &str) -> Result<ThinkingLevel, String> {
     match value.to_ascii_lowercase().as_str() {
         "off" => Ok(ThinkingLevel::Off),
+        "minimal" => Ok(ThinkingLevel::Minimal),
         "low" => Ok(ThinkingLevel::Low),
         "medium" => Ok(ThinkingLevel::Medium),
         "high" => Ok(ThinkingLevel::High),
@@ -1001,6 +1002,7 @@ pub(crate) fn parse_thinking_level(value: &str) -> Result<ThinkingLevel, String>
 fn format_thinking(level: ThinkingLevel) -> String {
     match level {
         ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
         ThinkingLevel::Low => "low",
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",

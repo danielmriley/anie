@@ -388,6 +388,13 @@ fn thinking_config(options: &StreamOptions, model: &Model) -> Option<(u64, serde
     // expanded to accommodate it rather than the budget being capped by it.
     let budget = match options.thinking {
         ThinkingLevel::Off => return None,
+        // Anthropic doesn't expose a "minimal" effort knob of
+        // its own — the API's minimum useful budget is ~1 k
+        // tokens. Treat `Minimal` as the smallest practical
+        // extended-thinking budget rather than skipping it
+        // entirely; if the caller truly wanted no reasoning
+        // they'd pick `Off`.
+        ThinkingLevel::Minimal => 1_024,
         ThinkingLevel::Low => 2_048,
         ThinkingLevel::Medium => 8_192,
         ThinkingLevel::High => 16_384,

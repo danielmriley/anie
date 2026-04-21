@@ -171,6 +171,10 @@ fn parse_thinking_accepts_supported_levels() {
         ThinkingLevel::Off
     );
     assert_eq!(
+        parse_thinking_level("minimal").expect("minimal"),
+        ThinkingLevel::Minimal
+    );
+    assert_eq!(
         parse_thinking_level("low").expect("low"),
         ThinkingLevel::Low
     );
@@ -182,6 +186,17 @@ fn parse_thinking_accepts_supported_levels() {
         parse_thinking_level("high").expect("high"),
         ThinkingLevel::High
     );
+}
+
+#[test]
+fn thinking_levels_order_from_off_to_high() {
+    // Variant ordering is observable via PartialOrd and is
+    // documented in `anie-provider/src/thinking.rs`. The order
+    // is Off < Minimal < Low < Medium < High.
+    assert!(ThinkingLevel::Off < ThinkingLevel::Minimal);
+    assert!(ThinkingLevel::Minimal < ThinkingLevel::Low);
+    assert!(ThinkingLevel::Low < ThinkingLevel::Medium);
+    assert!(ThinkingLevel::Medium < ThinkingLevel::High);
 }
 
 #[tokio::test]

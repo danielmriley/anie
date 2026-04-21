@@ -262,7 +262,7 @@ mod tests {
     fn renders_label_and_description_columns() {
         let popup = AutocompletePopup::from_suggestions(set(
             vec![
-                ("thinking", Some("[off|low|medium|high] — Set effort")),
+                ("thinking", Some("[off|minimal|low|medium|high] — Set effort")),
                 ("help", Some("Show help")),
             ],
             "/",

@@ -23,7 +23,7 @@ pub(crate) use anie_tui::{ArgumentSpec, SlashCommandInfo, SlashCommandSource};
 ///
 /// Shared by the builtin catalog and the autocomplete argument
 /// source (plan 12).
-pub(crate) const THINKING_LEVELS: &[&str] = &["off", "low", "medium", "high"];
+pub(crate) const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
 
 /// Known subcommands for `/session`.
 pub(crate) const SESSION_SUBCOMMANDS: &[&str] = &["list"];
@@ -221,7 +221,7 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
                 values: THINKING_LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact the session context"),
         SlashCommandInfo::builtin("fork", "Create a child session branched from now"),
@@ -380,7 +380,7 @@ mod tests {
         let registry = CommandRegistry::with_builtins();
         let help = registry.format_help();
         assert!(
-            help.contains("/thinking") && help.contains("[off|low|medium|high]"),
+            help.contains("/thinking") && help.contains("[off|minimal|low|medium|high]"),
             "expected thinking row with hint column, got:\n{help}"
         );
         assert!(

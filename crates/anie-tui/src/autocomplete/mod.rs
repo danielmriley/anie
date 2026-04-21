@@ -162,7 +162,7 @@ mod tests {
     use super::*;
     use crate::commands::{ArgumentSpec, SlashCommandInfo};
 
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
 
     fn catalog() -> Vec<SlashCommandInfo> {
         vec![
@@ -173,7 +173,7 @@ mod tests {
                     values: LEVELS,
                     required: false,
                 },
-                Some("[off|low|medium|high]"),
+                Some("[off|minimal|low|medium|high]"),
             ),
             SlashCommandInfo::builtin("compact", "Manually compact"),
         ]

@@ -23,7 +23,7 @@ use crate::{
 /// `registry_covers_every_dispatched_slash_command` in
 /// `anie-cli/src/commands.rs`.
 fn default_test_commands() -> Vec<SlashCommandInfo> {
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
     const SESSION_SUBS: &[&str] = &["list"];
     vec![
         SlashCommandInfo::builtin_with_args(
@@ -39,7 +39,7 @@ fn default_test_commands() -> Vec<SlashCommandInfo> {
                 values: LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
         SlashCommandInfo::builtin("fork", "Fork session"),
@@ -1559,7 +1559,7 @@ fn long_thinking_does_not_bleed_past_gutter_boundary() {
 /// regression tests. Mirrors the shape produced by the CLI's
 /// `builtin_commands()` without pulling in the full list.
 fn phase_c_catalog() -> Vec<SlashCommandInfo> {
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
     vec![
         SlashCommandInfo::builtin_with_args(
             "thinking",
@@ -1568,7 +1568,7 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
                 values: LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
         SlashCommandInfo::builtin("help", "Show help"),
@@ -1730,7 +1730,7 @@ fn typing_slash_thinking_space_opens_enumerated_popup() {
     terminal.draw(|frame| app.render(frame)).expect("draw");
     let screen = render_to_string(terminal.backend());
     assert!(screen.contains("/thinking values"), "{screen}");
-    for level in ["off", "low", "medium", "high"] {
+    for level in ["off", "minimal", "low", "medium", "high"] {
         assert!(screen.contains(level), "level {level} missing:\n{screen}");
     }
 }
@@ -1741,7 +1741,8 @@ fn enter_on_enumerated_value_applies_without_trailing_space() {
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
-    type_chars(&mut app, "/thinking m");
+    // Use `me` — after adding `minimal`, just `m` is ambiguous.
+    type_chars(&mut app, "/thinking me");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
     assert_eq!(app.input_pane_contents(), "/thinking medium");
@@ -1757,7 +1758,8 @@ fn second_enter_submits_fully_typed_command() {
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
-    type_chars(&mut app, "/thinking m");
+    // Use `me` — after adding `minimal`, just `m` is ambiguous.
+    type_chars(&mut app, "/thinking me");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // applies "medium"
 
     // After applying, the input is "/thinking medium". The popup
@@ -1916,7 +1918,7 @@ fn popup_description_exposes_same_argument_hint_as_help() {
     terminal.draw(|frame| app.render(frame)).expect("draw");
     let screen = render_to_string(terminal.backend());
     assert!(
-        screen.contains("[off|low|medium|high]"),
+        screen.contains("[off|minimal|low|medium|high]"),
         "popup description should expose the argument hint:\n{screen}"
     );
 }

@@ -95,7 +95,7 @@ pub struct SlashCommandInfo {
     /// `/help` and the autocomplete popup.
     ///
     /// Convention: wrap with square brackets for optional
-    /// arguments (`[off|low|medium|high]`) and angle brackets for
+    /// arguments (`[off|minimal|low|medium|high]`) and angle brackets for
     /// required ones (`<provider:id>`). `None` means the command
     /// takes no arguments or the hint would be redundant with the
     /// summary.
@@ -180,7 +180,7 @@ impl SlashCommandInfo {
 mod tests {
     use super::*;
 
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
 
     fn thinking_info() -> SlashCommandInfo {
         SlashCommandInfo::builtin_with_args(
@@ -190,7 +190,7 @@ mod tests {
                 values: LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
         )
     }
 

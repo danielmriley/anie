@@ -19,6 +19,7 @@ use crate::local::default_local_reasoning_capabilities;
 pub(super) fn reasoning_effort(thinking: ThinkingLevel) -> Option<&'static str> {
     match thinking {
         ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => Some("minimal"),
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),
@@ -55,6 +56,9 @@ pub(super) fn local_reasoning_prompt_steering(thinking: ThinkingLevel) -> &'stat
     match thinking {
         ThinkingLevel::Off => {
             "For this response, answer directly and avoid a visible reasoning block unless it is necessary."
+        }
+        ThinkingLevel::Minimal => {
+            "For this response, do the minimum reasoning necessary — favor a direct answer unless the question genuinely requires analysis."
         }
         ThinkingLevel::Low => {
             "For this response, do a brief internal plan and keep reasoning concise before answering."
@@ -121,6 +125,9 @@ pub(super) fn effective_max_tokens(model: &Model, options: &StreamOptions) -> Op
         .is_some();
     let base_headroom = match options.thinking {
         ThinkingLevel::Off => 0,
+        // Minimal sits between Off and Low — the reasoning
+        // output is expected to be very brief.
+        ThinkingLevel::Minimal => max_tokens / 20,
         ThinkingLevel::Low => max_tokens / 10,
         ThinkingLevel::Medium => max_tokens / 5,
         ThinkingLevel::High => max_tokens / 4,
@@ -128,6 +135,7 @@ pub(super) fn effective_max_tokens(model: &Model, options: &StreamOptions) -> Op
     let visible_reasoning_headroom = if visible_reasoning_output_likely {
         match options.thinking {
             ThinkingLevel::Off => 0,
+            ThinkingLevel::Minimal => 64,
             ThinkingLevel::Low => 128,
             ThinkingLevel::Medium => 256,
             ThinkingLevel::High => 512,
@@ -292,6 +300,16 @@ mod tests {
     fn native_reasoning_delta_returns_none_when_no_recognized_field_present() {
         let delta = serde_json::json!({ "content": "plain text", "role": "assistant" });
         assert_eq!(native_reasoning_delta(&delta), None);
+    }
+
+    #[test]
+    fn reasoning_effort_maps_minimal_level_to_minimal_string() {
+        // Plan 01 PR B: GPT-5 family accepts `reasoning_effort:
+        // "minimal"`. Providers without `supportsReasoningEffort`
+        // ignore it silently; the mapping just has to be in
+        // place so those that do support it get the right wire
+        // value.
+        assert_eq!(reasoning_effort(ThinkingLevel::Minimal), Some("minimal"));
     }
 
     #[test]

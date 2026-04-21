@@ -160,7 +160,7 @@ mod tests {
     use super::*;
     use crate::commands::{ArgumentSpec, SlashCommandInfo};
 
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
 
     fn catalog() -> Vec<SlashCommandInfo> {
         vec![
@@ -177,7 +177,7 @@ mod tests {
                     values: LEVELS,
                     required: false,
                 },
-                Some("[off|low|medium|high]"),
+                Some("[off|minimal|low|medium|high]"),
             ),
             SlashCommandInfo::builtin_with_args(
                 "session",
@@ -222,13 +222,20 @@ mod tests {
             }
         );
         let values: Vec<_> = set.items.iter().map(|s| s.value.as_str()).collect();
-        assert_eq!(values, vec!["off", "low", "medium", "high"]);
+        assert_eq!(values, vec!["off", "minimal", "low", "medium", "high"]);
     }
 
     #[test]
     fn thinking_argument_prefix_narrows_values() {
         let provider = CommandCompletionProvider::new(catalog());
+        // `m` matches both `minimal` and `medium`.
         let line = "/thinking m";
+        let set = provider.suggestions(line, line.len()).expect("set");
+        let values: Vec<_> = set.items.iter().map(|s| s.value.as_str()).collect();
+        assert_eq!(values, vec!["minimal", "medium"]);
+
+        // `me` narrows to just `medium`.
+        let line = "/thinking me";
         let set = provider.suggestions(line, line.len()).expect("set");
         let values: Vec<_> = set.items.iter().map(|s| s.value.as_str()).collect();
         assert_eq!(values, vec!["medium"]);
@@ -274,7 +281,7 @@ mod tests {
             .description
             .as_deref()
             .expect("description present");
-        assert!(desc.contains("[off|low|medium|high]"), "{desc}");
+        assert!(desc.contains("[off|minimal|low|medium|high]"), "{desc}");
         assert!(desc.contains("Set reasoning effort"), "{desc}");
     }
 
