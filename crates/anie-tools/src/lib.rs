@@ -4,6 +4,7 @@
 mod bash;
 mod edit;
 mod file_mutation_queue;
+mod grep;
 mod read;
 mod shared;
 mod write;
@@ -11,6 +12,7 @@ mod write;
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use file_mutation_queue::FileMutationQueue;
+pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use write::WriteTool;
 
