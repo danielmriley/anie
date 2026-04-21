@@ -5,6 +5,12 @@ mod app;
 mod autocomplete;
 pub mod commands;
 mod input;
+// Plan 05 PR A lands the markdown scaffolding ahead of the wiring
+// in PR E. Items are exercised by tests but don't yet have a
+// production call-site, so suppress dead-code warnings at the
+// module boundary rather than speckling `#[allow]` everywhere.
+#[allow(dead_code)]
+mod markdown;
 mod output;
 mod overlay;
 mod overlays;
