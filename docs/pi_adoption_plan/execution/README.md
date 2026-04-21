@@ -6,9 +6,9 @@ Status of each plan's PRs. Update inline as work lands.
 
 | # | Plan | PR | Status | Commit |
 |---|------|----|--------|--------|
-| 01 | Compat knobs — maxTokensField + "minimal" | A (maxTokensField) | pending | — |
-| 01 | Compat knobs — maxTokensField + "minimal" | B (minimal) | pending | — |
-| 03 | Token estimation — usage-seeded | (single PR) | pending | — |
+| 01 | Compat knobs — maxTokensField + "minimal" | A (maxTokensField) | landed | `787c13a` |
+| 01 | Compat knobs — maxTokensField + "minimal" | B (minimal) | landed | `1945add` |
+| 03 | Token estimation — usage-seeded | (single PR) | landed | `2855ebc` |
 
 ## Tier 2 — low risk, clearly scoped
 
