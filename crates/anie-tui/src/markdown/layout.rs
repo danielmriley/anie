@@ -1,14 +1,14 @@
 //! Transform a `pulldown-cmark` event stream into ratatui
 //! `Line`s, applying theme styles and wrapping.
 //!
-//! **Scope of PR A + B (Plan 05).** This module currently handles
-//! headings, paragraphs, bold / italic / strikethrough, inline
-//! code, HTML-as-literal-text, horizontal rules, and fenced /
-//! indented code blocks with syntect-based highlighting. Lists,
-//! blockquotes, tables, and links land in later PRs of the plan.
-//! Unimplemented element events fall through to a plain-text
-//! stringification so nothing crashes; the quality just improves
-//! as more PRs land.
+//! **Scope of PR A + B + C.1 (Plan 05).** This module currently
+//! handles headings, paragraphs, bold / italic / strikethrough,
+//! inline code, HTML-as-literal-text, horizontal rules, fenced /
+//! indented code blocks with syntect-based highlighting,
+//! unordered and ordered lists (with nesting), and blockquotes.
+//! Tables and links land in later PRs. Unimplemented element
+//! events fall through to a plain-text stringification so
+//! nothing crashes; the quality just improves as more PRs land.
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
@@ -46,11 +46,29 @@ struct LineBuilder<'a> {
     // Code block text is captured verbatim here and rendered as
     // a bordered, syntax-highlighted box on `End(CodeBlock)`.
     code_block: Option<CodeBlockState>,
+    // Nesting state for `>` blockquotes. Every flushed line picks
+    // up `│ ` gutter spans per depth.
+    blockquote_depth: u32,
+    // Active list nesting. Empty → not in a list. The outermost
+    // frame is at index 0, innermost at the end.
+    list_stack: Vec<ListFrame>,
+    // One-shot override for the next line the builder flushes —
+    // used to put the bullet / number marker on the first line of
+    // a list item while the continuation lines fall back to the
+    // default prefix from `continuation_prefix()`.
+    pending_first_line_prefix: Option<Vec<Span<'static>>>,
 }
 
 struct CodeBlockState {
     lang: Option<String>,
     buf: String,
+}
+
+#[derive(Debug)]
+struct ListFrame {
+    // `Some(n)` → ordered list, with `n` as the next marker.
+    // `None`    → unordered.
+    next_number: Option<u64>,
 }
 
 impl<'a> LineBuilder<'a> {
@@ -64,6 +82,9 @@ impl<'a> LineBuilder<'a> {
             current_heading: None,
             in_unhandled_block: 0,
             code_block: None,
+            blockquote_depth: 0,
+            list_stack: Vec::new(),
+            pending_first_line_prefix: None,
         }
     }
 
@@ -168,12 +189,24 @@ impl<'a> LineBuilder<'a> {
                     buf: String::new(),
                 });
             }
+            Tag::BlockQuote(_) => {
+                self.flush_line();
+                self.blockquote_depth = self.blockquote_depth.saturating_add(1);
+            }
+            Tag::List(start) => {
+                self.flush_line();
+                self.list_stack.push(ListFrame {
+                    next_number: start,
+                });
+            }
+            Tag::Item => {
+                // Flush whatever was pending from a prior item.
+                self.flush_line();
+                self.begin_list_item();
+            }
             // Block elements not yet handled: render their inline
             // content as plain text, ignore their structure.
-            Tag::BlockQuote(_)
-            | Tag::HtmlBlock
-            | Tag::List(_)
-            | Tag::Item
+            Tag::HtmlBlock
             | Tag::Table(_)
             | Tag::TableHead
             | Tag::TableRow
@@ -195,8 +228,11 @@ impl<'a> LineBuilder<'a> {
             TagEnd::Paragraph => {
                 self.flush_line();
                 // Blank line between paragraphs if there's
-                // already content above.
-                if !self.lines.is_empty() {
+                // already content above. Skip when inside a list
+                // so tight / loose list items stay visually
+                // compact instead of gaining a blank row between
+                // each item.
+                if !self.lines.is_empty() && self.list_stack.is_empty() {
                     self.lines.push(Line::default());
                 }
             }
@@ -216,10 +252,29 @@ impl<'a> LineBuilder<'a> {
                 // the end tag arrives without a matching start,
                 // which pulldown-cmark shouldn't produce.
             }
-            TagEnd::BlockQuote(_)
-            | TagEnd::HtmlBlock
-            | TagEnd::List(_)
-            | TagEnd::Item
+            TagEnd::BlockQuote(_) => {
+                self.flush_line();
+                self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
+                // Blank line after the quote block, outside the
+                // gutter.
+                if self.blockquote_depth == 0 && self.list_stack.is_empty() {
+                    self.lines.push(Line::default());
+                }
+            }
+            TagEnd::List(_) => {
+                self.flush_line();
+                self.list_stack.pop();
+                // Trailing blank line separates a closed list
+                // from following content, but only when we're
+                // back out to the top level.
+                if self.list_stack.is_empty() && self.blockquote_depth == 0 {
+                    self.lines.push(Line::default());
+                }
+            }
+            TagEnd::Item => {
+                self.flush_line();
+            }
+            TagEnd::HtmlBlock
             | TagEnd::Table
             | TagEnd::TableHead
             | TagEnd::TableRow
@@ -285,15 +340,104 @@ impl<'a> LineBuilder<'a> {
     }
 
     fn flush_line(&mut self) {
+        // Consume any pending first-line prefix even on empty
+        // flushes so it doesn't accidentally leak to a later line.
+        let first_prefix_override = self.pending_first_line_prefix.take();
+
         if self.current_spans.is_empty() {
-            // Preserve blank lines inside paragraphs.
+            // Blank lines don't carry list or blockquote prefixes
+            // — matches conventional rendering where a blank row
+            // between paragraphs is truly blank.
             self.lines.push(Line::default());
             return;
         }
+
+        let first_prefix = first_prefix_override
+            .unwrap_or_else(|| self.continuation_prefix());
+        let cont_prefix = self.continuation_prefix();
+        let first_width = prefix_span_width(&first_prefix);
+        let cont_width = prefix_span_width(&cont_prefix);
+
+        let inner_first = (self.width as usize).saturating_sub(first_width).max(1);
+        let inner_cont = (self.width as usize).saturating_sub(cont_width).max(1);
+
         let spans = std::mem::take(&mut self.current_spans);
-        for wrapped in wrap_spans(spans, self.width) {
-            self.lines.push(wrapped);
+        // Use the smaller width so neither line overflows the
+        // terminal after the prefix is prepended.
+        let wrap_width = inner_first.min(inner_cont).max(1) as u16;
+        let wrapped = wrap_spans(spans, wrap_width);
+
+        for (idx, line) in wrapped.into_iter().enumerate() {
+            let mut combined: Vec<Span<'static>> = if idx == 0 {
+                first_prefix.clone()
+            } else {
+                cont_prefix.clone()
+            };
+            combined.extend(line.spans);
+            self.lines.push(Line::from(combined));
         }
+    }
+
+    /// Prefix applied to continuation (non-first) lines inside a
+    /// blockquote / list context. Never includes the bullet —
+    /// that's set once via `pending_first_line_prefix` at
+    /// `Start(Item)`.
+    fn continuation_prefix(&self) -> Vec<Span<'static>> {
+        let mut parts: Vec<Span<'static>> = Vec::new();
+        for _ in 0..self.blockquote_depth {
+            parts.push(Span::styled("│ ", self.theme.blockquote_gutter));
+        }
+        if !self.list_stack.is_empty() {
+            // Two spaces per nesting level + two spaces reserved
+            // for the bullet column so content aligns under
+            // wrapped rows.
+            let indent = "  ".repeat(self.list_stack.len() + 1);
+            parts.push(Span::raw(indent));
+        }
+        parts
+    }
+
+    /// Called at `Start(Item)`. Computes the bullet / number
+    /// marker, records it as the pending first-line prefix, and
+    /// advances the ordered-list counter if relevant.
+    fn begin_list_item(&mut self) {
+        let depth = match self.list_stack.len() {
+            0 => return,
+            n => n - 1,
+        };
+        let Some(frame) = self.list_stack.last_mut() else {
+            return;
+        };
+        let (marker, marker_style) = match &mut frame.next_number {
+            Some(n) => {
+                let out = format!("{n}. ");
+                *n += 1;
+                (out, self.theme.list_bullet)
+            }
+            None => {
+                let bullet = match depth {
+                    0 => "• ",
+                    1 => "◦ ",
+                    _ => "▪ ",
+                };
+                (bullet.to_string(), self.theme.list_bullet)
+            }
+        };
+        let mut prefix: Vec<Span<'static>> = Vec::new();
+        for _ in 0..self.blockquote_depth {
+            prefix.push(Span::styled("│ ", self.theme.blockquote_gutter));
+        }
+        // One `"  "` for each enclosing list level (not counting
+        // the current one — that's the column the marker lives in).
+        if depth > 0 {
+            prefix.push(Span::raw("  ".repeat(depth)));
+        }
+        // Shared 2-column gutter before the bullet. This mirrors
+        // the extra `"  "` reserved by `continuation_prefix` so
+        // wrapped lines align under the item text.
+        prefix.push(Span::raw("  "));
+        prefix.push(Span::styled(marker, marker_style));
+        self.pending_first_line_prefix = Some(prefix);
     }
 
     /// Render a completed code block as a bordered, syntax-
@@ -349,6 +493,13 @@ impl<'a> LineBuilder<'a> {
         }
         self.lines
     }
+}
+
+/// Sum the displayed character width of a span sequence.
+/// Approximates cell width with `chars().count()` — good enough
+/// for the ASCII + box-drawing chars we use in prefixes.
+fn prefix_span_width(spans: &[Span<'static>]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
 fn heading_style(level: HeadingLevel, theme: &MarkdownTheme) -> Style {
@@ -786,12 +937,121 @@ mod tests {
 
     #[test]
     fn unhandled_block_falls_through_to_plain_text() {
-        // List items aren't styled yet (PR C). Verify the text
+        // Tables aren't styled yet (PR C.2). Verify the text
         // still surfaces instead of being silently dropped.
+        let md = "| a | b |\n| - | - |\n| 1 | 2 |";
+        let out = render_plain(md, 80);
+        let joined = out.join("\n");
+        assert!(joined.contains("a"));
+        assert!(joined.contains("b"));
+    }
+
+    #[test]
+    fn unordered_list_emits_bullet_prefix() {
         let out = render_plain("- one\n- two\n- three", 80);
         let joined = out.join("\n");
-        assert!(joined.contains("one"));
-        assert!(joined.contains("two"));
-        assert!(joined.contains("three"));
+        assert!(joined.contains("• one"), "{out:?}");
+        assert!(joined.contains("• two"), "{out:?}");
+        assert!(joined.contains("• three"), "{out:?}");
+    }
+
+    #[test]
+    fn ordered_list_preserves_source_numbering() {
+        let out = render_plain("3. alpha\n4. beta\n5. gamma", 80);
+        let joined = out.join("\n");
+        assert!(joined.contains("3. alpha"), "{out:?}");
+        assert!(joined.contains("4. beta"), "{out:?}");
+        assert!(joined.contains("5. gamma"), "{out:?}");
+    }
+
+    #[test]
+    fn nested_unordered_list_uses_distinct_bullets() {
+        let md = "- outer\n  - inner\n    - deeper";
+        let out = render_plain(md, 80);
+        let joined = out.join("\n");
+        assert!(joined.contains("• outer"), "outer missing: {out:?}");
+        assert!(joined.contains("◦ inner"), "inner missing: {out:?}");
+        assert!(joined.contains("▪ deeper"), "deeper missing: {out:?}");
+    }
+
+    #[test]
+    fn nested_list_item_is_indented() {
+        let md = "- outer\n  - inner";
+        let out = render_plain(md, 80);
+        let outer = out.iter().find(|l| l.contains("outer")).expect("outer");
+        let inner = out.iter().find(|l| l.contains("inner")).expect("inner");
+        // Inner line should start with more leading whitespace
+        // than the outer line.
+        let outer_ws = outer.chars().take_while(|c| c.is_whitespace()).count();
+        let inner_ws = inner.chars().take_while(|c| c.is_whitespace()).count();
+        assert!(inner_ws > outer_ws, "inner not indented: {out:?}");
+    }
+
+    #[test]
+    fn blockquote_lines_have_gutter_prefix() {
+        let out = render_plain("> quoted text", 80);
+        let joined = out.join("\n");
+        assert!(joined.contains("│ quoted text"), "{out:?}");
+    }
+
+    #[test]
+    fn blockquote_spans_multiple_paragraphs() {
+        let out = render_plain("> first\n>\n> second", 80);
+        let joined = out.join("\n");
+        assert!(joined.contains("│ first"), "{out:?}");
+        assert!(joined.contains("│ second"), "{out:?}");
+    }
+
+    #[test]
+    fn long_list_item_wraps_with_continuation_indent() {
+        // Width 14 — forces wrapping. Item text is 18 chars.
+        let out = render_plain("- alpha beta gamma", 14);
+        let first = out
+            .iter()
+            .find(|l| l.contains("• "))
+            .expect("bullet line");
+        let bullet_col = first.find('•').expect("bullet col");
+        // A continuation line (no bullet) should start with at
+        // least `bullet_col + 2` spaces so wrapped content aligns
+        // under the item text.
+        let cont = out
+            .iter()
+            .skip_while(|l| !l.contains('•'))
+            .skip(1)
+            .find(|l| !l.is_empty())
+            .expect("continuation line");
+        let leading = cont.chars().take_while(|c| c.is_whitespace()).count();
+        assert!(
+            leading >= bullet_col + 2,
+            "continuation {cont:?} not aligned under {first:?}"
+        );
+    }
+
+    #[test]
+    fn bullet_span_is_styled_with_list_bullet_theme() {
+        let lines = render("- x", 80, &MarkdownTheme::default_dark());
+        let bullet_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains('•'))
+            .expect("bullet span");
+        assert_eq!(
+            bullet_span.style,
+            MarkdownTheme::default_dark().list_bullet
+        );
+    }
+
+    #[test]
+    fn blockquote_gutter_span_uses_gutter_theme() {
+        let lines = render("> q", 80, &MarkdownTheme::default_dark());
+        let gutter = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains('│'))
+            .expect("gutter span");
+        assert_eq!(
+            gutter.style,
+            MarkdownTheme::default_dark().blockquote_gutter
+        );
     }
 }
