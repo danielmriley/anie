@@ -39,7 +39,7 @@ use anyhow::{Context, Result, anyhow};
 use fs4::fs_std::FileExt;
 use thiserror::Error;
 use time::OffsetDateTime;
-use tracing::debug;
+use tracing::{info, warn};
 
 use crate::{
     AuthCredential,
@@ -170,8 +170,14 @@ impl<'a> OAuthRefresher<'a> {
         }
 
         // Slow path: acquire the lock, re-check, refresh if
-        // still needed, persist.
-        debug!(provider = provider_name, "acquiring OAuth refresh lock");
+        // still needed, persist. Info-level so the log file is
+        // enough to confirm "refresh fired at T" without needing
+        // RUST_LOG=debug.
+        info!(
+            provider = provider_name,
+            expires_at = %current.expires_at,
+            "OAuth token near expiry; acquiring refresh lock"
+        );
         let lock_file = self.acquire_lock(provider_name)?;
 
         // Scope the lock so it releases even on early returns.
@@ -179,6 +185,11 @@ impl<'a> OAuthRefresher<'a> {
 
         // fs4 releases on drop; explicit unlock for clarity.
         FileExt::unlock(&lock_file).ok();
+
+        match &result {
+            Ok(_) => info!(provider = provider_name, "OAuth refresh complete"),
+            Err(err) => warn!(provider = provider_name, %err, "OAuth refresh failed"),
+        }
         result
     }
 
@@ -187,7 +198,7 @@ impl<'a> OAuthRefresher<'a> {
         // we waited for the lock.
         let current = self.load_oauth_data(provider_name)?;
         if !is_near_expiry(&current.expires_at, provider_name)? {
-            debug!(
+            info!(
                 provider = provider_name,
                 "token refreshed by another process while waiting on lock"
             );
@@ -200,6 +211,12 @@ impl<'a> OAuthRefresher<'a> {
                 source,
             }
         })?;
+
+        info!(
+            provider = provider_name,
+            new_expires_at = %refreshed.expires_at,
+            "OAuth token refreshed; persisting"
+        );
 
         let credential = AuthCredential::OAuth {
             access_token: refreshed.access_token.clone(),
