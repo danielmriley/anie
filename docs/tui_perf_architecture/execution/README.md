@@ -11,7 +11,7 @@ perf trajectory is readable at a glance.
 | 01 | PR-A (perf-trace JSONL) | **landed** | commit `306e4e3` | JSONL spans for 6 hot functions, writes to `~/.anie/logs/perf.log.<pid>` |
 | 01 | PR-B (criterion bench) | **landed** | this commit | 3 scenarios; numbers in `baseline_numbers.md` |
 | 01 | PR-C (top-5 + flamegraph) | **landed** | commit `cd06e21` | Top-5 self-time via PerfSpan aggregation; flamegraph recipe deferred (sysctl `perf_event_paranoid=4`). Priority flip: `markdown_render` is the real bottleneck, `wrap_spans` much less so. |
-| 02 | synchronized output | not started | — | |
+| 02 | synchronized output | **landed** | commit `f524233` | DECSET 2026 wrap around the main `terminal.draw`; unit tests use CrosstermBackend<Arc<Mutex<Vec<u8>>>> adapter. |
 | 03 | PR-A (Arc-wrap cache) | not started | — | |
 | 03 | PR-B (wrap_spans rewrite) | not started | — | |
 | 03 | PR-C (helper sweep) | not started | — | |
@@ -20,7 +20,7 @@ perf trajectory is readable at a glance.
 | 05 | PR-A (BlockRender merge) | not started | — | |
 | 05 | PR-B (per-block link cache) | not started | — | |
 | 05 | PR-C (resize debounce) | not started | — | |
-| 06 | PR-A (autocomplete debounce) | not started | — | |
+| 06 | PR-A (autocomplete debounce) | **landed** | commit `162d414` | 80 ms debounce, eager-on-first, popup-consumer flush, test-only `flush_pending_autocomplete_for_test` helper. |
 | 06 | PR-B (stall-aware spinner) | not started | — | |
 | 06 | PR-C (mouse motion trace) | not started | — | |
 | 08 | PR-A (collector struct + tests) | not started | — | Codex-style streaming |

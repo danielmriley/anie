@@ -10,7 +10,7 @@ conflict-minimizing multi-agent assignment layout.
 
 | # | Plan | Status | Notes |
 |---|------|--------|-------|
-| 01 | Tool registry + schema validation | pending | cheap starter plan |
+| 01 | Tool registry + schema validation | **landed** | 3/3 PRs shipped as Phase 1.2/1.3 of the refactor worklist |
 | 02 | Agent turn ownership + event payloads | pending | clone-heavy run-loop cleanup |
 | 03 | Session indexing + context construction | pending | single-index session simplification |
 | 04 | TUI output hot path | pending | overlaps `docs/tui_responsiveness/` |
@@ -25,9 +25,9 @@ conflict-minimizing multi-agent assignment layout.
 
 | Plan | PR | Scope | Status | Commit |
 |------|----|-------|--------|--------|
-| 01 | A | cached sorted definitions | pending | — |
-| 01 | B | precompiled validators | pending | — |
-| 01 | C | borrowed `definitions()` API (optional) | pending | — |
+| 01 | A | cached sorted definitions | **landed** | `baa0839` |
+| 01 | B | precompiled validators | **landed** | `cd1cd06` |
+| 01 | C | borrowed `definitions()` API (optional) | **landed** (as part of A) | `baa0839` |
 | 02 | A | `Cow` sanitization fast path | pending | — |
 | 02 | B | prompt replay ownership cleanup | pending | — |
 | 02 | C | tool-result ownership cleanup | pending | — |
