@@ -256,6 +256,28 @@ struct ModelCapabilities {
     images: Option<bool>,
     #[serde(default)]
     reasoning: Option<bool>,
+    /// GitHub Copilot nests context + output limits under
+    /// `capabilities.limits.*`. OpenAI + OpenRouter surface
+    /// them at the top level (`context_length`,
+    /// `max_output_tokens`), so this stays Option and is only
+    /// read as a fallback source.
+    #[serde(default)]
+    limits: Option<CapabilityLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CapabilityLimits {
+    #[serde(default)]
+    max_context_window_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    /// Upper bound on input-side tokens. Not used directly for
+    /// context_window (which the pipeline treats as input +
+    /// output combined), but useful if we later surface a
+    /// tighter "prompt-only" cap.
+    #[allow(dead_code)]
+    #[serde(default)]
+    max_prompt_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -397,11 +419,32 @@ async fn discover_openai_compatible_models(
                         .top_provider
                         .as_ref()
                         .and_then(|top| top.context_length)
+                })
+                // GitHub Copilot's /models response nests the
+                // real context window under capabilities.limits.
+                // Without this the fallback in ModelInfo::to_model
+                // kicks in and every Copilot model shows 32.8k
+                // (= 2^15, the ancient default) regardless of the
+                // 200k Opus / 128k GPT sizes Copilot actually
+                // serves.
+                .or_else(|| {
+                    entry
+                        .capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.limits.as_ref())
+                        .and_then(|limits| limits.max_context_window_tokens)
                 });
             let max_output_tokens = entry
                 .top_provider
                 .as_ref()
-                .and_then(|top| top.max_completion_tokens);
+                .and_then(|top| top.max_completion_tokens)
+                .or_else(|| {
+                    entry
+                        .capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.limits.as_ref())
+                        .and_then(|limits| limits.max_output_tokens)
+                });
             ModelInfo {
                 id: entry.id.clone(),
                 name: entry.name.unwrap_or(entry.id.clone()),
@@ -1331,6 +1374,50 @@ mod tests {
 
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["claude-sonnet-4.6", "gpt-4.1"]);
+    }
+
+    #[tokio::test]
+    async fn copilot_context_window_parsed_from_nested_capability_limits() {
+        // Regression: Copilot's /models nests context under
+        // capabilities.limits.max_context_window_tokens, not at
+        // the top level like OpenAI / OpenRouter do. Missing
+        // this caused every Copilot model to default to 32k in
+        // the status bar even though Claude Opus serves 200k
+        // through Copilot.
+        let fixture = r#"{
+            "data": [{
+                "id": "claude-opus-4.7",
+                "type": "chat",
+                "supported_endpoints": ["/chat/completions"],
+                "model_picker_enabled": true,
+                "capabilities": {
+                    "family": "claude-opus-4.7",
+                    "limits": {
+                        "max_context_window_tokens": 200000,
+                        "max_output_tokens": 64000,
+                        "max_prompt_tokens": 128000
+                    }
+                }
+            }]
+        }"#;
+
+        let server = spawn_mock_server(move |_path, _headers| {
+            MockResponse::ok_json(fixture)
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "github-copilot",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            Some("copilot-token"),
+        ))
+        .await
+        .expect("discover");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_length, Some(200_000));
+        assert_eq!(models[0].max_output_tokens, Some(64_000));
     }
 
     #[tokio::test]

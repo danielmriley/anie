@@ -673,13 +673,31 @@ impl ControllerState {
     async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
         let (config, strategy) =
             self.compaction_strategy(self.config.anie_config().compaction.keep_recent_tokens);
+
+        // Pre-check: if the session isn't past the threshold
+        // yet, skip without announcing anything — we don't want
+        // "Compacting context…" messages flickering past every
+        // turn. When we DO plan to compact, emit the start
+        // event BEFORE the (slow) LLM summarization call so the
+        // user sees the progress indicator while waiting
+        // instead of a silent pause followed by both the start
+        // and end messages at once.
+        let tokens_before = self.session.inner().estimate_context_tokens();
+        let threshold = config
+            .context_window
+            .saturating_sub(config.reserve_tokens);
+        if tokens_before <= threshold {
+            return Ok(());
+        }
+
+        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+
         if let Some(result) = self
             .session
             .inner_mut()
             .auto_compact(&config, &strategy)
             .await?
         {
-            anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
             self.emit_compaction_end(event_tx, &result).await;
             anie_agent::send_event(event_tx, self.status_event()).await;
         }
