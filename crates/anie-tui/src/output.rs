@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::{
@@ -62,12 +63,18 @@ pub struct ToolCallResult {
 #[derive(Debug, Clone)]
 struct LineCache {
     width: u16,
-    lines: Vec<Line<'static>>,
+    /// `Arc` so cache reads hand out a cheap reference-count
+    /// bump instead of deep-cloning every `Line` + `Span`.
+    /// Writes also avoid an extra clone — the computed vec
+    /// moves into the Arc and the render path borrows via
+    /// `.iter()`.
+    lines: Arc<Vec<Line<'static>>>,
     /// Link ranges per line, same length as `lines`. Empty
     /// `Vec<LinkRange>` entries correspond to lines without
     /// clickable URLs. Cached alongside the lines so cache-
-    /// hit paths don't re-scan.
-    links: Vec<Vec<LinkRange>>,
+    /// hit paths don't re-scan. Also `Arc`-shared for the
+    /// same reason as `lines`.
+    links: Arc<Vec<Vec<LinkRange>>>,
 }
 
 /// Render-time configuration carried alongside the blocks. Kept
@@ -474,6 +481,12 @@ impl OutputPane {
                 && let Some(cached) = self.caches.get(index).and_then(Option::as_ref)
                 && cached.width == width
             {
+                // Arc-backed cache: `iter().cloned()` still
+                // clones each `Line`, but that's the only way
+                // to push into `out`. The cache itself is not
+                // cloned — we're just borrowing through the
+                // `Arc` deref. The previous shape paid this
+                // cost AND cloned the outer Vec.
                 out.extend(cached.lines.iter().cloned());
                 link_map.extend(cached.links.iter().cloned());
                 cache_hits += 1;
@@ -512,18 +525,23 @@ impl OutputPane {
                 }
                 links
             };
+            // Move the computed vecs into `Arc` once; the cache
+            // entry and the output stream now share the same
+            // backing allocation via refcount bumps. Plan 04 PR-B.
+            let lines_arc = Arc::new(computed);
+            let links_arc = Arc::new(computed_links);
             if hits_cache
                 && let Some(slot) = self.caches.get_mut(index)
             {
                 *slot = Some(LineCache {
                     width,
-                    lines: computed.clone(),
-                    links: computed_links.clone(),
+                    lines: Arc::clone(&lines_arc),
+                    links: Arc::clone(&links_arc),
                 });
                 cache_misses += 1;
             }
-            out.extend(computed);
-            link_map.extend(computed_links);
+            out.extend(lines_arc.iter().cloned());
+            link_map.extend(links_arc.iter().cloned());
         }
         if out.is_empty() {
             out.push(Line::default());
