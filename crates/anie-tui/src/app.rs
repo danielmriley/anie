@@ -105,6 +105,12 @@ pub enum AgentUiState {
     Streaming,
     /// A tool is currently executing.
     ToolExecuting { tool_name: String },
+    /// A context compaction is in flight — the LLM is
+    /// summarizing the transcript. The wall-clock start is
+    /// tracked so the status bar can show elapsed seconds.
+    Compacting {
+        started_at: std::time::Instant,
+    },
 }
 
 /// Actions emitted from the TUI to the controller layer.
@@ -323,6 +329,14 @@ impl App {
         self.output_pane.set_markdown_enabled(enabled);
     }
 
+    /// Read-only view of the current agent UI state. Primarily
+    /// for tests that verify transitions (`CompactionStart` →
+    /// `Compacting`, etc.).
+    #[must_use]
+    pub fn agent_state(&self) -> &AgentUiState {
+        &self.agent_state
+    }
+
     /// Read-only view of the current transcript blocks in the
     /// output pane.
     #[must_use]
@@ -526,8 +540,15 @@ impl App {
                 self.status_bar.last_known_input_tokens = None;
             }
             AgentEvent::CompactionStart => {
+                // Permanent record in the transcript + transition
+                // the agent state so the status bar shows the
+                // live elapsed counter while the summarization
+                // LLM call is in flight.
                 self.output_pane
                     .add_system_message("Compacting context…".to_string());
+                self.agent_state = AgentUiState::Compacting {
+                    started_at: std::time::Instant::now(),
+                };
             }
             AgentEvent::CompactionEnd {
                 summary,
@@ -540,6 +561,13 @@ impl App {
                     format_tokens(tokens_after),
                     summary,
                 ));
+                // Only return to Idle when no streaming / tool run
+                // is queued behind the compaction (the controller
+                // doesn't do this today but the guard costs
+                // nothing and keeps state transitions predictable).
+                if matches!(self.agent_state, AgentUiState::Compacting { .. }) {
+                    self.agent_state = AgentUiState::Idle;
+                }
             }
             AgentEvent::RetryScheduled {
                 attempt,
@@ -602,9 +630,9 @@ impl App {
     fn handle_key_event(&mut self, key: KeyEvent) {
         match self.agent_state {
             AgentUiState::Idle => self.handle_idle_key(key),
-            AgentUiState::Streaming | AgentUiState::ToolExecuting { .. } => {
-                self.handle_active_key(key)
-            }
+            AgentUiState::Streaming
+            | AgentUiState::ToolExecuting { .. }
+            | AgentUiState::Compacting { .. } => self.handle_active_key(key),
         }
     }
 
@@ -1565,12 +1593,10 @@ fn render_status_bar(
     let used_tokens = state
         .last_known_input_tokens
         .unwrap_or(state.estimated_context_tokens);
+    let agent_indicator = format_agent_indicator(agent_state, spinner_frame);
     let status = format!(
         " {} {}{}:{} │ thinking: {} │ {}/{} │ {}",
-        match agent_state {
-            AgentUiState::Idle => " ",
-            _ => spinner_frame,
-        },
+        agent_indicator,
         if transcript_scrolled {
             "↑ history │ "
         } else {
@@ -1588,6 +1614,21 @@ fn render_status_bar(
         Style::default().fg(Color::DarkGray),
     )))
     .render(area, buf);
+}
+
+/// Compose the leading agent-state indicator that prefixes the
+/// status bar. During `Compacting`, append the elapsed seconds
+/// so users can see that the (long-running) summarization call
+/// is actually progressing.
+fn format_agent_indicator(agent_state: &AgentUiState, spinner_frame: &str) -> String {
+    match agent_state {
+        AgentUiState::Idle => " ".to_string(),
+        AgentUiState::Compacting { started_at } => {
+            let elapsed = started_at.elapsed().as_secs();
+            format!("{spinner_frame} compacting {elapsed}s")
+        }
+        AgentUiState::Streaming | AgentUiState::ToolExecuting { .. } => spinner_frame.to_string(),
+    }
 }
 
 fn format_tokens(tokens: u64) -> String {

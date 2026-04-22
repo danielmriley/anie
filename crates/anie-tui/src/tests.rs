@@ -116,6 +116,78 @@ fn static_layout_renders_output_status_and_input() {
 }
 
 #[test]
+fn compaction_start_transitions_to_compacting_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::CompactionStart)
+        .expect("handle");
+
+    assert!(
+        matches!(app.agent_state(), AgentUiState::Compacting { .. }),
+        "expected Compacting, got {:?}",
+        app.agent_state()
+    );
+    // Permanent transcript record remains.
+    assert!(
+        app.output_blocks()
+            .iter()
+            .any(|block| matches!(block, RenderedBlock::SystemMessage { text } if text.contains("Compacting")))
+    );
+}
+
+#[test]
+fn compaction_end_transitions_back_to_idle() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::CompactionStart)
+        .expect("start");
+    app.handle_agent_event(AgentEvent::CompactionEnd {
+        summary: "Prior conversation covered setup work.".into(),
+        tokens_before: 150_000,
+        tokens_after: 8_000,
+    })
+    .expect("end");
+
+    assert!(matches!(app.agent_state(), AgentUiState::Idle));
+}
+
+#[test]
+fn status_bar_shows_elapsed_seconds_while_compacting() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    {
+        let status = app.status_bar_mut();
+        status.provider_name = "github-copilot".into();
+        status.model_name = "claude-sonnet-4.6".into();
+        status.thinking = "medium".into();
+        status.estimated_context_tokens = 150_000;
+        status.context_window = 200_000;
+        status.cwd = "~/project".into();
+    }
+    app.handle_agent_event(AgentEvent::CompactionStart)
+        .expect("start");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert!(
+        screen.contains("compacting"),
+        "status bar should show 'compacting': {screen}"
+    );
+    // 0s immediately after CompactionStart (Instant just set).
+    assert!(
+        screen.contains("compacting 0s"),
+        "expected '0s' suffix: {screen}"
+    );
+}
+
+#[test]
 fn shift_modified_characters_are_inserted() {
     use crate::InputPane;
 
