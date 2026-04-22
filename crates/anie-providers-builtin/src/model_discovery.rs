@@ -163,6 +163,19 @@ struct OpenAiModelEntry {
     supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     architecture: Option<ArchitectureEntry>,
+    // GitHub Copilot fields. Pi's Copilot catalog at
+    // `packages/ai/src/models.generated.ts` curates the list
+    // by hand; the live `/models` endpoint returns extras
+    // (embeddings, completion-only, internal routers) that
+    // explode with `unsupported_api_for_model` if you try to
+    // chat with them. Both fields are optional so OpenAI /
+    // OpenRouter / local stays unaffected.
+    #[serde(default)]
+    supported_endpoints: Option<Vec<String>>,
+    #[serde(rename = "type", default)]
+    model_type: Option<String>,
+    #[serde(default)]
+    model_picker_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +326,7 @@ async fn discover_openai_compatible_models(
         })?;
 
     let provider_is_openrouter = request.provider_name.eq_ignore_ascii_case("openrouter");
+    let provider_is_copilot = request.provider_name.eq_ignore_ascii_case("github-copilot");
     Ok(body
         .data
         .into_iter()
@@ -331,6 +345,35 @@ async fn discover_openai_compatible_models(
                 .is_some_and(|params| {
                     params.iter().any(|param| param.eq_ignore_ascii_case("tools"))
                 })
+        })
+        .filter(|entry| {
+            // GitHub Copilot's /models response is a mixed bag:
+            // chat models, embedding models, internal routing
+            // entries (like `accounts/msft/routers/*`), and
+            // completions-only models. Selecting a non-chat
+            // one produces
+            // `HTTP 400 unsupported_api_for_model` on the first
+            // request. Keep only entries that advertise
+            // /chat/completions + mark type == "chat" +
+            // model_picker_enabled != false.
+            if !provider_is_copilot {
+                return true;
+            }
+            let endpoints_ok = entry
+                .supported_endpoints
+                .as_deref()
+                .is_some_and(|eps| {
+                    eps.iter().any(|ep| ep.eq_ignore_ascii_case("/chat/completions"))
+                });
+            let type_ok = entry
+                .model_type
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("chat"))
+                .unwrap_or(true);
+            // model_picker_enabled defaults to true if absent —
+            // Copilot uses it as the explicit "show in UI" flag.
+            let picker_ok = entry.model_picker_enabled.unwrap_or(true);
+            endpoints_ok && type_ok && picker_ok
         })
         .map(|entry| {
             let supports_images = infer_openai_images(
@@ -1227,6 +1270,96 @@ mod tests {
 
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["anthropic/claude-sonnet-4", "openai/o3"]);
+    }
+
+    #[tokio::test]
+    async fn copilot_discovery_keeps_chat_models_and_drops_others() {
+        // Copilot's /models endpoint returns embedding, routing,
+        // and completion-only entries alongside chat models.
+        // Trying to use the non-chat ones produces
+        // `HTTP 400 unsupported_api_for_model`. Discovery must
+        // filter to models that advertise /chat/completions AND
+        // type == "chat" AND model_picker_enabled != false.
+        let fixture = r#"{
+            "data": [
+                {
+                    "id": "claude-sonnet-4.6",
+                    "type": "chat",
+                    "supported_endpoints": ["/v1/messages", "/chat/completions"],
+                    "model_picker_enabled": true
+                },
+                {
+                    "id": "text-embedding-3-small",
+                    "type": "embeddings",
+                    "supported_endpoints": ["/embeddings"]
+                },
+                {
+                    "id": "accounts/msft/routers/abc",
+                    "type": "chat",
+                    "supported_endpoints": ["/chat/completions"],
+                    "model_picker_enabled": false
+                },
+                {
+                    "id": "gpt-5.4-mini",
+                    "type": "completion",
+                    "supported_endpoints": ["/completions"]
+                },
+                {
+                    "id": "gpt-4.1",
+                    "type": "chat",
+                    "supported_endpoints": ["/chat/completions"],
+                    "model_picker_enabled": true
+                }
+            ]
+        }"#;
+
+        let server = spawn_mock_server(move |path, _headers| {
+            // Copilot discovery hits `/models` (no /v1 prefix).
+            assert_eq!(path, "/models");
+            MockResponse::ok_json(fixture)
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "github-copilot",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            Some("copilot-token"),
+        ))
+        .await
+        .expect("discover copilot models");
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["claude-sonnet-4.6", "gpt-4.1"]);
+    }
+
+    #[tokio::test]
+    async fn copilot_filter_does_not_drop_entries_missing_optional_fields() {
+        // Defensive: an entry with neither `type` nor
+        // `supported_endpoints` nor `model_picker_enabled` was
+        // valid before the filter and should stay valid for
+        // non-Copilot providers. (We never hit this path for
+        // Copilot itself since its responses always carry these
+        // fields, but the absence defaults are what keep other
+        // OpenAI-compat providers unaffected.)
+        let fixture = r#"{
+            "data": [{"id": "gpt-4o"}]
+        }"#;
+
+        let server = spawn_mock_server(move |_path, _headers| {
+            MockResponse::ok_json(fixture)
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "openai",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            Some("sk-test"),
+        ))
+        .await
+        .expect("discover");
+        assert_eq!(models.len(), 1);
     }
 
     #[tokio::test]

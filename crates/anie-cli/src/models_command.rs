@@ -94,7 +94,13 @@ async fn configured_requests(
                     provider_config.api_key_env.as_deref(),
                     credential_store,
                 ),
-                headers: Default::default(),
+                // Provider-specific headers (Copilot's editor
+                // identifiers) must ride along even when the
+                // user has added the provider to config.toml
+                // manually. Otherwise discovery works the first
+                // time via the OAuth fallback loop below but
+                // breaks as soon as a config entry exists.
+                headers: oauth_request_headers(provider_name),
             },
         );
     }
