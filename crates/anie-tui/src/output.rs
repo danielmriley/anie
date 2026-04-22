@@ -388,9 +388,22 @@ impl OutputPane {
         self.last_viewport_height = area.height.max(1);
         let scroll = self.current_scroll();
         self.set_scroll(scroll);
-        Paragraph::new(lines)
-            .scroll((self.scroll_offset, 0))
-            .render(area, buf);
+
+        // Slice to the visible viewport before handing off to
+        // Paragraph. ratatui's Paragraph::scroll() walks every
+        // line on every frame regardless of visibility — at
+        // 600 blocks that's 17 ms/frame, scaling linearly with
+        // transcript length. Feeding just the visible slice
+        // caps per-frame cost at O(viewport_height) instead.
+        let start = self.scroll_offset as usize;
+        let viewport_height = area.height as usize;
+        let end = start.saturating_add(viewport_height).min(lines.len());
+        let visible = if start < end {
+            lines[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        Paragraph::new(visible).render(area, buf);
     }
 
     fn build_lines(&mut self, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
@@ -1150,11 +1163,289 @@ mod cache_tests {
     }
 
     #[test]
+    fn render_only_feeds_visible_slice_to_paragraph() {
+        // Regression: pre-fix the render path handed the full
+        // line vec to Paragraph and relied on Paragraph.scroll()
+        // to hide the invisible portion. That meant Paragraph
+        // walked every line every frame (O(transcript)). Now
+        // we slice to the visible viewport first.
+        //
+        // This test pokes the render path with a scrolled
+        // offset and confirms the emitted buffer matches the
+        // expected visible slice.
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut pane = OutputPane::new();
+        for i in 0..20 {
+            pane.add_user_message(format!("msg {i}"), i as u64);
+        }
+
+        // Warm the caches at a known width.
+        let area = Rect::new(0, 0, 80, 5);
+        let _backend = TestBackend::new(80, 5);
+        let mut buf = Buffer::empty(area);
+        pane.render(area, &mut buf, ".");
+
+        // Scroll down past the first 10 lines, render again.
+        pane.scroll_line_down(10);
+        let mut buf = Buffer::empty(area);
+        pane.render(area, &mut buf, ".");
+
+        // With scroll_offset ~= 10 and viewport height 5, the
+        // top visible cell should render a later message, not
+        // "msg 0".
+        let top_row: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(
+            !top_row.contains("msg 0"),
+            "scroll didn't take effect: {top_row}"
+        );
+    }
+
+    #[test]
     fn clear_drops_all_caches() {
         let mut pane = pane_with_settled_history();
         let _ = pane.build_lines(80, ".");
         pane.clear();
         assert_eq!(pane.cache_slot_count(), 0);
         assert_eq!(pane.blocks().len(), 0);
+    }
+
+    /// Stress-measure how long a fully-cached `build_lines`
+    /// takes on a realistic transcript. Run with:
+    ///
+    ///     cargo test -p anie-tui --release \
+    ///         build_lines_cached_stress -- --ignored --nocapture
+    ///
+    /// Marked `#[ignore]` so it doesn't slow the regular test
+    /// suite. Used to validate perf assumptions for Plan 09.
+    #[test]
+    #[ignore]
+    fn build_lines_cached_stress() {
+        measure_build_lines(30);
+        measure_build_lines(100);
+        measure_cache_miss_cost();
+        measure_full_render(30);
+        measure_full_render(100);
+        measure_full_render(300);
+    }
+
+    /// End-to-end render cost: build_lines + Paragraph.render
+    /// into a TestBackend buffer. If this is much slower than
+    /// build_lines alone, the bottleneck is ratatui's
+    /// line-walking / UnicodeWidthStr work inside Paragraph.
+    fn measure_full_render(turns: usize) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::time::Instant;
+
+        let mut pane = build_markdown_transcript(turns);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        // Warm caches.
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                pane.render(area, frame.buffer_mut(), ".");
+            })
+            .expect("draw");
+
+        let iterations = 200;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    pane.render(area, frame.buffer_mut(), ".");
+                })
+                .expect("draw");
+        }
+        let elapsed = start.elapsed();
+        let per_frame_us = elapsed.as_micros() as u64 / iterations as u64;
+        println!(
+            "full_render: {} blocks, viewport=120x40, {} iterations, \
+             total={:?}, per-frame={}us ({:.1} fps budget)",
+            pane.blocks().len(),
+            iterations,
+            elapsed,
+            per_frame_us,
+            1_000_000.0 / per_frame_us.max(1) as f64,
+        );
+    }
+
+    fn build_markdown_transcript(turns: usize) -> OutputPane {
+        let mut pane = OutputPane::new();
+        for turn in 0..turns {
+            pane.add_user_message(format!("Question {turn} about something"), turn as u64);
+            pane.add_streaming_assistant();
+            let body = format!(
+                "## Answer {turn}\n\nHere's a longer prose paragraph. It has \
+                 **bold** text, *italic*, and some `inline code` spanning \
+                 multiple words. Also a link: [the docs](https://example.com/docs/{turn}).\n\n\
+                 - bullet one\n\
+                 - bullet two with `code`\n\
+                 - bullet three\n\n\
+                 ```rust\n\
+                 fn main() {{\n    println!(\"turn {turn}\");\n}}\n\
+                 ```\n\n\
+                 > a blockquote reminder\n\n\
+                 Final paragraph tying it together.",
+            );
+            pane.append_to_last_assistant(&body);
+            pane.finalize_last_assistant(body, String::new(), turn as u64, None);
+        }
+        pane
+    }
+
+    /// How long does the FIRST render of a newly-finalized
+    /// markdown block take? This is the cost paid when a new
+    /// assistant message arrives — parse + syntect + layout.
+    fn measure_cache_miss_cost() {
+        use std::time::Instant;
+
+        // Heavy markdown block: multiple code blocks, prose,
+        // lists, nested structures. Represents a
+        // "here's how I'll implement this" response.
+        let heavy_block = r#"
+Here's the full implementation plan:
+
+## Setup
+
+First, install the deps:
+
+```rust
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub name: String,
+    pub values: HashMap<String, u64>,
+}
+
+impl Config {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            values: HashMap::new(),
+        }
+    }
+}
+```
+
+Then wire it:
+
+```python
+def process_config(config):
+    for key, value in config.values.items():
+        print(f"{key}: {value}")
+    return config.name
+```
+
+## Steps
+
+1. Parse the input
+2. Validate each field
+3. Apply transformations
+4. Emit to the sink
+
+Note: this assumes **async runtime** is available with
+`tokio::main` or equivalent. See [the docs](https://example.com)
+for details.
+
+| Column A | Column B | Column C |
+|----------|----------|----------|
+| row 1    | data     | value    |
+| row 2    | more     | stuff    |
+
+> Blockquote with important context about the above.
+
+```sql
+SELECT *
+FROM users
+WHERE id > 100
+  AND created_at > NOW() - INTERVAL '1 day'
+ORDER BY id DESC;
+```
+
+Final notes to wrap up the example.
+"#;
+
+        let iterations = 50;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            // Fresh pane per iteration so each build_lines call
+            // is a cache miss for the heavy block.
+            let mut pane = OutputPane::new();
+            pane.add_streaming_assistant();
+            pane.append_to_last_assistant(heavy_block);
+            pane.finalize_last_assistant(
+                heavy_block.to_string(),
+                String::new(),
+                1,
+                None,
+            );
+            let _ = pane.build_lines(120, ".");
+        }
+        let elapsed = start.elapsed();
+        let per_miss_ms = elapsed.as_millis() as u64 / iterations as u64;
+        println!(
+            "cache-miss heavy markdown: {} iterations, total={:?}, per-miss={}ms ({}us)",
+            iterations,
+            elapsed,
+            per_miss_ms,
+            elapsed.as_micros() as u64 / iterations as u64,
+        );
+    }
+
+    fn measure_build_lines(turns: usize) {
+        use std::time::Instant;
+
+        let mut pane = OutputPane::new();
+        // Build a 2×turns-block transcript: alternating user + long
+        // markdown-heavy assistant messages.
+        for turn in 0..turns {
+            pane.add_user_message(format!("Question {turn} about something"), turn as u64);
+            pane.add_streaming_assistant();
+            let body = format!(
+                "## Answer {turn}\n\n\
+                 Here's a longer prose paragraph. It has **bold** text, \
+                 *italic*, and some `inline code` spanning multiple words. \
+                 Also a link: [the docs](https://example.com/docs/{turn}).\n\n\
+                 - bullet one\n\
+                 - bullet two with `code`\n\
+                 - bullet three\n\n\
+                 ```rust\n\
+                 fn main() {{\n    println!(\"turn {turn}\");\n}}\n\
+                 ```\n\n\
+                 > a blockquote reminder\n\n\
+                 Final paragraph tying it together.",
+            );
+            pane.append_to_last_assistant(&body);
+            pane.finalize_last_assistant(body, String::new(), turn as u64, None);
+        }
+
+        // Warm the cache.
+        let _ = pane.build_lines(120, ".");
+
+        let iterations = 200;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = pane.build_lines(120, ".");
+        }
+        let elapsed = start.elapsed();
+        let per_frame_us = elapsed.as_micros() as u64 / iterations as u64;
+        println!(
+            "build_lines stress: {} blocks, {} iterations, total={:?}, \
+             per-frame={}us ({:.1} fps budget)",
+            pane.blocks().len(),
+            iterations,
+            elapsed,
+            per_frame_us,
+            1_000_000.0 / per_frame_us.max(1) as f64,
+        );
     }
 }
