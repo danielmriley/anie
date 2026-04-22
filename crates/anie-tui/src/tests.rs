@@ -1859,12 +1859,19 @@ fn type_chars(app: &mut App, s: &str) {
     for ch in s.chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
             .expect("type");
+        // Autocomplete refreshes are debounced to fire from
+        // the render loop. Tests don't drive a render cycle
+        // per keystroke, so flush synchronously here to keep
+        // the popup state matching what a user would see
+        // after a paused typing sequence.
+        app.flush_pending_autocomplete_for_test();
     }
 }
 
 fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     app.handle_terminal_event(Event::Key(KeyEvent::new(code, modifiers)))
         .expect("press");
+    app.flush_pending_autocomplete_for_test();
 }
 
 #[test]

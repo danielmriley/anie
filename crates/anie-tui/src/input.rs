@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -9,6 +10,13 @@ use ratatui::{
 };
 
 use crate::autocomplete::{AutocompletePopup, AutocompleteProvider, SuggestionKind};
+
+/// Delay between the last keystroke and when the autocomplete
+/// provider is re-queried. Set below typing perception
+/// threshold so a user never *sees* the debounce, while giving
+/// burst-typists one refresh instead of one-per-keystroke.
+/// See `docs/refactor_worklist_2026-04-22/tui_perf_06_quick_wins.md`.
+const AUTOCOMPLETE_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// Outcome of processing an input key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +45,12 @@ pub struct InputPane {
     history_index: Option<usize>,
     saved_content: Option<String>,
     autocomplete: Option<AutocompleteState>,
+    /// When set, an autocomplete refresh is queued to fire on
+    /// or after this instant. `None` means the popup is in
+    /// steady state and no refresh is pending. Set on every
+    /// mutating keystroke; cleared by `tick_autocomplete` once
+    /// the debounce has elapsed and the refresh has fired.
+    pending_autocomplete_at: Option<Instant>,
 }
 
 impl InputPane {
@@ -50,6 +64,7 @@ impl InputPane {
             history_index: None,
             saved_content: None,
             autocomplete: None,
+            pending_autocomplete_at: None,
         }
     }
 
@@ -102,6 +117,25 @@ impl InputPane {
 
     /// Handle a key press while the editor is focused.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        // Popup-consuming actions (Enter, Tab, arrow-nav, Esc)
+        // need current popup state. Flush any pending refresh
+        // BEFORE checking `autocomplete_is_open()` — a flush may
+        // close the popup (no matches for current buffer), in
+        // which case Enter should fall through to submit rather
+        // than be absorbed by the popup branch.
+        if matches!(
+            (key.modifiers, key.code),
+            (_, KeyCode::Enter)
+                | (_, KeyCode::Tab)
+                | (KeyModifiers::NONE, KeyCode::Up)
+                | (KeyModifiers::CONTROL, KeyCode::Char('p'))
+                | (KeyModifiers::NONE, KeyCode::Down)
+                | (KeyModifiers::CONTROL, KeyCode::Char('n'))
+                | (KeyModifiers::NONE, KeyCode::Esc)
+        ) {
+            self.flush_pending_autocomplete();
+        }
+
         // Popup-open key routing. Keys that don't belong to the
         // popup fall through to the normal editor and then trigger
         // a popup refresh.
@@ -142,8 +176,71 @@ impl InputPane {
         }
 
         let action = self.dispatch_editor_key(key);
-        self.refresh_autocomplete();
+        // Debounce: rather than re-querying the provider on
+        // every keystroke, mark the popup stale and let
+        // tick_autocomplete fire the refresh once typing
+        // pauses. See AUTOCOMPLETE_DEBOUNCE.
+        self.schedule_autocomplete_refresh();
         action
+    }
+
+    /// Mark the autocomplete popup as stale.
+    ///
+    /// Eager-on-first: a keystroke that starts a new burst
+    /// (no refresh currently pending) fires the refresh
+    /// synchronously so the popup reflects the immediate
+    /// change. Subsequent keystrokes *within* the debounce
+    /// window only push the deadline forward; the actual
+    /// refresh fires from the render loop's
+    /// `tick_autocomplete` call once typing pauses for at
+    /// least the debounce window, or from
+    /// `flush_pending_autocomplete` when a popup-consuming
+    /// action is about to read state.
+    fn schedule_autocomplete_refresh(&mut self) {
+        if self.autocomplete.is_none() {
+            return;
+        }
+        let was_pending = self.pending_autocomplete_at.is_some();
+        self.pending_autocomplete_at = Some(Instant::now() + AUTOCOMPLETE_DEBOUNCE);
+        if !was_pending {
+            // First keystroke of a new burst: refresh now so
+            // the popup appears immediately. The deadline we
+            // just set squelches the next N keystrokes.
+            self.refresh_autocomplete();
+        }
+    }
+
+    /// Run a pending autocomplete refresh if its debounce has
+    /// elapsed. Returns `true` if a refresh actually fired
+    /// (useful for tests). Intended to be called from the
+    /// app's render / idle-tick path; cheap enough to call
+    /// every frame.
+    pub fn tick_autocomplete(&mut self) -> bool {
+        let Some(deadline) = self.pending_autocomplete_at else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.pending_autocomplete_at = None;
+        self.refresh_autocomplete();
+        true
+    }
+
+    /// Force any pending autocomplete refresh to fire now,
+    /// ignoring the debounce deadline. Returns `true` if a
+    /// refresh ran.
+    ///
+    /// Used (a) before popup-consuming actions like Enter /
+    /// Tab / arrow-navigation so the popup reflects the
+    /// current buffer, and (b) from tests that don't drive
+    /// a render cycle between typing and assertion.
+    pub fn flush_pending_autocomplete(&mut self) -> bool {
+        if self.pending_autocomplete_at.take().is_none() {
+            return false;
+        }
+        self.refresh_autocomplete();
+        true
     }
 
     /// Whether applying the highlighted suggestion would be a
@@ -658,4 +755,121 @@ fn next_boundary(content: &str, cursor: usize) -> Option<usize> {
 
 fn is_text_input_modifiers(modifiers: KeyModifiers) -> bool {
     modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::autocomplete::{AutocompleteProvider, SuggestionSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts suggestions() invocations. Every call the input
+    /// pane delegates to a real provider increments the
+    /// counter; tests assert on how many fired.
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AutocompleteProvider for CountingProvider {
+        fn suggestions(&self, _line: &str, _cursor: usize) -> Option<SuggestionSet> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    fn input_with_counter() -> (InputPane, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: counter.clone(),
+        };
+        let pane = InputPane::new().with_autocomplete(Arc::new(provider));
+        (pane, counter)
+    }
+
+    fn type_char(pane: &mut InputPane, ch: char) {
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+
+    /// A burst of keystrokes fires the provider exactly once
+    /// (on the first keystroke, eager-on-first) while the
+    /// remaining keystrokes defer to the debounce window.
+    #[test]
+    fn autocomplete_debounce_collapses_burst_to_one_eager_plus_one_deferred_refresh() {
+        let (mut pane, calls) = input_with_counter();
+        for ch in ['h', 'e', 'l', 'l', 'o'] {
+            type_char(&mut pane, ch);
+        }
+        // Eager-on-first: the first keystroke in the burst
+        // fires. The remaining four defer.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the first keystroke in a burst should fire the provider"
+        );
+
+        // Drive the debounce deadline into the past by
+        // rewinding it. Directly adjusting the field avoids
+        // a real sleep in tests.
+        pane.pending_autocomplete_at = Some(Instant::now() - Duration::from_millis(1));
+        let fired = pane.tick_autocomplete();
+        assert!(fired, "tick must fire once the debounce has elapsed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "tick flush after burst adds one more refresh"
+        );
+    }
+
+    /// tick_autocomplete called before the debounce elapses is
+    /// a no-op; the provider isn't queried beyond whatever the
+    /// eager-on-first fire produced.
+    #[test]
+    fn autocomplete_tick_before_deadline_is_noop() {
+        let (mut pane, calls) = input_with_counter();
+        type_char(&mut pane, 'a');
+        // One eager-on-first call fired.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // tick immediately after: pending is ~80ms in the
+        // future, so no additional fire.
+        let fired = pane.tick_autocomplete();
+        assert!(!fired, "tick before deadline must not fire");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Popup-consuming actions (Enter/Tab/Up/Down/Esc) flush
+    /// any pending refresh before they read popup state. This
+    /// guards against acting on stale suggestion lists.
+    #[test]
+    fn popup_consuming_action_flushes_pending_refresh() {
+        let (mut pane, calls) = input_with_counter();
+        // First keystroke fires eager.
+        type_char(&mut pane, 'a');
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Second keystroke defers.
+        type_char(&mut pane, 'b');
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Enter should flush the pending refresh.
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The provider was queried once more during the flush.
+        // (Enter may also produce additional queries if it
+        // triggers apply_autocomplete_selection, but the
+        // counter-provider returns None so apply is a no-op.)
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "Enter must flush pending refresh before reading popup"
+        );
+    }
+
+    /// With no autocomplete provider installed, the pane never
+    /// schedules a refresh and tick_autocomplete is always a
+    /// no-op — regression guard so adding debounce doesn't
+    /// change behavior for panes that never installed one.
+    #[test]
+    fn autocomplete_tick_without_provider_stays_noop() {
+        let mut pane = InputPane::new();
+        type_char(&mut pane, 'x');
+        type_char(&mut pane, 'y');
+        assert_eq!(pane.pending_autocomplete_at, None);
+        assert!(!pane.tick_autocomplete());
+    }
 }

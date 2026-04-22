@@ -357,6 +357,16 @@ impl App {
         self.input_pane.autocomplete_is_open()
     }
 
+    /// Test-only helper. Production-path popup refreshes are
+    /// debounced and fired from the render loop's
+    /// `tick_autocomplete` call; unit tests that assert popup
+    /// state without driving a render cycle call this to
+    /// flush any pending refresh synchronously.
+    #[cfg(test)]
+    pub(crate) fn flush_pending_autocomplete_for_test(&mut self) {
+        self.input_pane.flush_pending_autocomplete();
+    }
+
     /// Preload a transcript without routing through streaming events.
     pub fn load_transcript(&mut self, messages: &[Message]) {
         for message in messages {
@@ -366,6 +376,10 @@ impl App {
 
     /// Render the full app frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        // Fire any pending autocomplete refresh whose debounce
+        // has elapsed. Cheap (one Option<Instant> comparison)
+        // when nothing is pending.
+        self.input_pane.tick_autocomplete();
         let spinner_frame = self.spinner.tick().to_string();
         let half_height = frame.area().height.saturating_sub(2).max(8) / 2;
         let bottom_height = match &self.bottom_pane {
