@@ -485,7 +485,10 @@ impl OutputPane {
                 let mut s = PerfSpan::enter(PerfSpanKind::BlockLines);
                 let lines = block_lines(block, width, spinner_frame, &self.render_context);
                 if let Some(s) = s.as_mut() {
-                    s.record("kind", block_kind_tag(block));
+                    // Use `block_kind` not `kind` — `kind` is a
+                    // reserved field name that holds the span type
+                    // label and jq aggregations group on it.
+                    s.record("block_kind", block_kind_tag(block));
                     s.record("width", u64::from(width));
                     s.record("lines", u64::try_from(lines.len()).unwrap_or(u64::MAX));
                 }

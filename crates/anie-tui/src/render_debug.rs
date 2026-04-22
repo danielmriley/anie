@@ -195,21 +195,25 @@ impl PerfSpan {
 
     /// Produce the JSON line that would be written for this span.
     /// Exposed separately from `Drop` so tests can assert on the
-    /// output without touching the global log file. `kind`,
-    /// `elapsed_us`, and `ts_ms` are always present; recorded
-    /// fields are merged afterwards (explicit caller keys win
-    /// over same-named reserved keys).
+    /// output without touching the global log file.
+    ///
+    /// Field precedence: reserved keys (`kind`, `elapsed_us`,
+    /// `ts_ms`) are authoritative. If a caller recorded a
+    /// same-named custom field, the reserved value wins. This
+    /// protects jq aggregations that group on `kind`.
     fn serialize_line(&mut self, elapsed_us: u64, ts_ms: u64) -> String {
         let mut obj = serde_json::Map::new();
+        for (k, v) in std::mem::take(&mut self.fields) {
+            obj.insert(k, v);
+        }
+        // Reserved fields inserted AFTER custom fields so they
+        // overwrite any collision.
         obj.insert(
             "kind".into(),
             serde_json::Value::String(self.kind.as_str().into()),
         );
         obj.insert("elapsed_us".into(), serde_json::Value::from(elapsed_us));
         obj.insert("ts_ms".into(), serde_json::Value::from(ts_ms));
-        for (k, v) in std::mem::take(&mut self.fields) {
-            obj.insert(k, v);
-        }
         let mut line = serde_json::to_string(&obj).unwrap_or_default();
         line.push('\n');
         line
@@ -311,19 +315,24 @@ mod tests {
     }
 
     #[test]
-    fn serialize_line_custom_field_overrides_reserved_key() {
-        // Documented behavior: explicit caller keys win. This
-        // test pins that so future-us doesn't silently break jq
-        // filters that depend on the default reserved shape.
+    fn serialize_line_reserved_kind_wins_over_custom_collision() {
+        // Documented contract: reserved keys (kind, elapsed_us,
+        // ts_ms) are authoritative. A caller who accidentally
+        // uses one of these names for a custom field cannot break
+        // jq aggregations that group on `kind`.
         let mut span = PerfSpan {
             kind: PerfSpanKind::BuildLines,
             started: Instant::now(),
             fields: serde_json::Map::new(),
         };
         span.record("kind", "custom_override");
+        span.record("elapsed_us", 999_999_u64);
+        span.record("ts_ms", 0_u64);
         let line = span.serialize_line(1, 2);
         let parsed: serde_json::Value =
             serde_json::from_str(line.trim_end()).expect("valid JSON");
-        assert_eq!(parsed["kind"], "custom_override");
+        assert_eq!(parsed["kind"], "build_lines");
+        assert_eq!(parsed["elapsed_us"], 1);
+        assert_eq!(parsed["ts_ms"], 2);
     }
 }

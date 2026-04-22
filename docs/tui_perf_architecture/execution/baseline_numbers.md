@@ -16,6 +16,59 @@ Outliers at each: 5%, 2%, 5% respectively — acceptable
 within the ±15% variance budget stated in
 `docs/refactor_worklist_2026-04-22.md`.
 
+## Top-5 self-time functions (PerfSpan aggregation)
+
+Captured by running the `resize_during_stream` scenario with
+`ANIE_PERF_TRACE=1` and aggregating the resulting JSONL over
+~119 frames. Sorted by total wall-time contribution to the
+benchmark. These are the concrete targets for Phases 2-4.
+
+| # | Function | File:line | Total time | Calls | Mean | p95 | p99 |
+|---|----------|-----------|-----------:|------:|------:|-----:|-----:|
+| 1 | `build_lines` | `crates/anie-tui/src/output.rs:431` | 14,095 ms | 119 | 118 ms | 121 ms | 128 ms |
+| 2 | `block_lines` | `crates/anie-tui/src/output.rs:483` (call site) | 13,063 ms | 142,801 | 91 µs | 186 µs | 196 µs |
+| 3 | `markdown_render` | `crates/anie-tui/src/markdown/layout.rs:26` | 12,743 ms | 71,400 | 178 µs | 187 µs | 209 µs |
+| 4 | `wrap_spans` | `crates/anie-tui/src/markdown/layout.rs:848` | 455 ms | 499,800 | ~1 µs | 5 µs | 5 µs |
+| 5 | `find_link_ranges` | `crates/anie-tui/src/output.rs:487` (call site) | 71 ms | 142,801 | ~0 µs | 1 µs | 1 µs |
+| 6 | `paragraph_render` | `crates/anie-tui/src/output.rs:428` | 14 ms | 119 | 121 µs | 132 µs | 151 µs |
+
+### What this data changes
+
+The audit in `docs/tui_perf_architecture/README.md` had
+`wrap_spans` as the #1 hot path. **The benchmark disagrees.**
+In the realistic `resize_during_stream` workload:
+
+- **`markdown_render` dominates at 178 µs per call × 71,400
+  calls = 12,743 ms total** — ~91% of `build_lines` total
+  time. Every cache miss triggers a full `pulldown-cmark` +
+  syntect re-parse.
+- **`wrap_spans` is only 455 ms total** — 36× cheaper than
+  markdown. Not the bottleneck.
+- **`paragraph_render` at 14 ms total** — confirms Plan 09
+  viewport slicing did its job. Not a target.
+
+### Priority flip
+
+Phase 2 should target:
+
+1. **Width-keyed cache that doesn't invalidate needlessly on
+   same-width re-renders.** The current cache invalidates
+   all blocks when width changes; if width oscillates (the
+   `resize_during_stream` pattern), every frame is a
+   cache-miss storm. Widths should be compared per-block,
+   and re-rendering at the previous width should hit cache.
+2. **Cache `markdown_render` output per `(text, width)`.**
+   Currently re-parses on every miss. The finalized block
+   text is immutable — the parse result can be memoized
+   with a content hash. This is where the 91% win is.
+3. **Arc-wrap the `LineCache` payload** (Plan 04 PR-B). Same
+   as before; cheap constant-factor win.
+4. **`wrap_spans` per-segment rewrite (Plan 04 PR-E).**
+   Demoted from #1 to later in the plan because the
+   benchmark says it's not where the time goes in the
+   resize scenario. It may still matter in streaming; we'll
+   measure again after #1-3 land.
+
 ## Observations
 
 - **`scroll_static_600` at 3.2 ms** — cache-hit steady state
