@@ -1259,7 +1259,12 @@ async fn discover_models_for_entry(
             entry.api_key_env.as_deref(),
             credential_store,
         ),
-        headers: HashMap::new(),
+        // Copilot's `/models` endpoint rejects calls without
+        // the editor-identifying headers pi pins. Sharing the
+        // helper keeps this path in lock-step with the CLI
+        // `anie models` flow and the TUI model-picker
+        // discovery.
+        headers: anie_auth::oauth_request_headers(&entry.name),
     };
     discover_models(&request)
         .await

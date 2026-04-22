@@ -1733,7 +1733,7 @@ fn discovery_request_for_context(
             api: preset.model.api,
             base_url: preset.model.base_url.clone(),
             api_key: Some(api_key.clone()),
-            headers: std::collections::HashMap::new(),
+            headers: anie_auth::oauth_request_headers(preset.provider_name),
         }),
         ModelPickerContext::CustomEndpoint {
             api_key,
@@ -1749,7 +1749,7 @@ fn discovery_request_for_context(
             } else {
                 Some(api_key.clone())
             },
-            headers: std::collections::HashMap::new(),
+            headers: anie_auth::oauth_request_headers(provider_name),
         }),
     }
 }
