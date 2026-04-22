@@ -76,6 +76,15 @@ enum OnboardingState {
     ProviderPresetList {
         selected: usize,
     },
+    /// Terminal state for OAuth-backed presets. Shows the user
+    /// the exact `anie login <provider>` command + a brief
+    /// explanation of why we can't run the flow in-process.
+    /// Enter / Esc returns to the preset list.
+    OAuthLoginInstructions {
+        provider_name: &'static str,
+        display_name: &'static str,
+        preset_index: usize,
+    },
     ApiKeyInput {
         preset_index: usize,
         input: TextField,
@@ -158,6 +167,12 @@ struct ProviderPreset {
     provider_name: &'static str,
     kind: ConfiguredProviderKind,
     model: Model,
+    /// OAuth-backed provider — selecting it in the preset list
+    /// routes to the `OAuthLoginInstructions` state instead of
+    /// the API key input. Login itself happens via the CLI
+    /// (`anie login <provider>`) because the callback server
+    /// can't run inside the alternate-screen TUI.
+    oauth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +261,9 @@ impl OnboardingScreen {
             OnboardingState::LocalServerSelect { .. } => self.handle_local_select_key(key),
             OnboardingState::NoLocalServers => self.handle_no_local_servers_key(key),
             OnboardingState::ProviderPresetList { .. } => self.handle_provider_preset_key(key),
+            OnboardingState::OAuthLoginInstructions { .. } => {
+                self.handle_oauth_instructions_key(key)
+            }
             OnboardingState::ApiKeyInput { .. } => self.handle_api_key_input_key(key),
             OnboardingState::CustomEndpoint { .. } => self.handle_custom_endpoint_key(key),
             OnboardingState::Busy { .. } => self.handle_busy_key(key),
@@ -337,6 +355,11 @@ impl OnboardingScreen {
             OnboardingState::ProviderPresetList { selected } => {
                 self.render_provider_presets(frame, inner, *selected)
             }
+            OnboardingState::OAuthLoginInstructions {
+                provider_name,
+                display_name,
+                ..
+            } => self.render_oauth_instructions(frame, inner, provider_name, display_name),
             OnboardingState::ApiKeyInput {
                 preset_index,
                 input,
@@ -680,9 +703,45 @@ impl OnboardingScreen {
                 *selected = (*selected + 1).min(presets.len().saturating_sub(1));
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                self.state = OnboardingState::ApiKeyInput {
-                    preset_index: *selected,
-                    input: TextField::masked(),
+                let preset = presets.get(*selected).cloned();
+                if let Some(preset) = preset {
+                    if preset.oauth {
+                        // Pivot to the OAuth instructions screen
+                        // instead of the API key prompt.
+                        self.state = OnboardingState::OAuthLoginInstructions {
+                            provider_name: preset.provider_name,
+                            display_name: preset.display_name,
+                            preset_index: *selected,
+                        };
+                    } else {
+                        self.state = OnboardingState::ApiKeyInput {
+                            preset_index: *selected,
+                            input: TextField::masked(),
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_oauth_instructions_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let preset_index = match &self.state {
+            OnboardingState::OAuthLoginInstructions { preset_index, .. } => *preset_index,
+            _ => return OnboardingAction::Continue,
+        };
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc)
+            | (KeyModifiers::NONE, KeyCode::Backspace)
+            | (KeyModifiers::NONE, KeyCode::Enter) => {
+                // Enter on the instructions screen means "I've
+                // read this, take me back so I can pick
+                // something else." Actually running `anie
+                // login` is on the user; we're just a
+                // signpost.
+                self.state = OnboardingState::ProviderPresetList {
+                    selected: preset_index,
                 };
             }
             _ => {}
@@ -1471,6 +1530,36 @@ impl OnboardingScreen {
         self.render_status_panel(frame, area, title, body, Color::Cyan, footer);
     }
 
+    /// Render the OAuth login-instructions screen. Static —
+    /// dominant element is the exact `anie login <provider>`
+    /// command so the user can copy it and run externally.
+    fn render_oauth_instructions(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        provider_name: &str,
+        display_name: &str,
+    ) {
+        let body = format!(
+            "{display_name} uses OAuth login, which needs a browser \
+             callback server that conflicts with the TUI's alternate\
+             -screen state.\n\n\
+             Run this in a regular shell to finish setup:\n\n\
+             \x20   anie login {provider_name}\n\n\
+             A browser will open; complete the flow there. Once the \
+             credential is saved, relaunch anie and {display_name} \
+             models will appear in the picker automatically.",
+        );
+        self.render_status_panel(
+            frame,
+            area,
+            "OAuth Login Required",
+            &body,
+            Color::Yellow,
+            footer_line("[Enter/Esc] Back"),
+        );
+    }
+
     fn render_status_panel(
         &self,
         frame: &mut Frame<'_>,
@@ -1870,12 +1959,14 @@ fn provider_presets() -> Vec<ProviderPreset> {
             provider_name: "anthropic",
             kind: ConfiguredProviderKind::BuiltinHosted,
             model: anthropic,
+            oauth: false,
         },
         ProviderPreset {
             display_name: "OpenAI (GPT-4o, o-series)",
             provider_name: "openai",
             kind: ConfiguredProviderKind::BuiltinHosted,
             model: openai,
+            oauth: false,
         },
         custom_openai_preset(
             "OpenRouter (discovery, 500+ models)",
@@ -1908,7 +1999,60 @@ fn provider_presets() -> Vec<ProviderPreset> {
             "https://api.mistral.ai/v1",
             "mistral-large-latest",
         ),
+        // OAuth-backed providers. Selecting these routes to the
+        // `OAuthLoginInstructions` screen with the exact `anie
+        // login <provider>` command to run. We can't run the
+        // flow in-process because the browser callback server
+        // would clash with the TUI's alternate-screen state.
+        oauth_preset("GitHub Copilot (OAuth)", "github-copilot"),
+        oauth_preset("OpenAI Codex (ChatGPT OAuth)", "openai-codex"),
+        oauth_preset("Google Gemini CLI (OAuth)", "google-gemini-cli"),
+        oauth_preset("Google Antigravity (OAuth)", "google-antigravity"),
+        // Intentionally NO Anthropic OAuth here: the flow
+        // works, but Anthropic actively enforces ToS against
+        // third-party agent use and steering new users towards
+        // it from an onboarding UX would be irresponsible.
+        // Power users who know the risk can still run
+        // `anie login anthropic` directly.
     ]
+}
+
+fn oauth_preset(display_name: &'static str, provider_name: &'static str) -> ProviderPreset {
+    // Placeholder Model for the preset's display; real model
+    // metadata arrives later via OAuth-backed discovery after
+    // the user logs in.
+    let model = Model {
+        id: oauth_default_model_id(provider_name).to_string(),
+        name: oauth_default_model_id(provider_name).to_string(),
+        provider: provider_name.to_string(),
+        api: ApiKind::OpenAICompletions,
+        base_url: "oauth://pending".to_string(),
+        context_window: 200_000,
+        max_tokens: 16_384,
+        supports_reasoning: true,
+        reasoning_capabilities: None,
+        supports_images: false,
+        cost_per_million: CostPerMillion::zero(),
+        replay_capabilities: None,
+        compat: ModelCompat::None,
+    };
+    ProviderPreset {
+        display_name,
+        provider_name,
+        kind: ConfiguredProviderKind::BuiltinHosted,
+        model,
+        oauth: true,
+    }
+}
+
+fn oauth_default_model_id(provider_name: &str) -> &'static str {
+    match provider_name {
+        "github-copilot" => "claude-sonnet-4.6",
+        "openai-codex" => "gpt-5",
+        "google-gemini-cli" => "gemini-2.5-pro",
+        "google-antigravity" => "gemini-3-pro-preview",
+        _ => "default",
+    }
 }
 
 fn default_openai_preset() -> ProviderPreset {
@@ -1945,6 +2089,7 @@ fn custom_openai_preset(
             replay_capabilities: None,
             compat: ModelCompat::None,
         },
+        oauth: false,
     }
 }
 
@@ -1989,6 +2134,45 @@ mod tests {
                 compat: ModelCompat::None,
             }],
         }
+    }
+
+    #[test]
+    fn oauth_presets_are_listed_alongside_api_key_presets() {
+        let presets = provider_presets();
+        for expected in [
+            "github-copilot",
+            "openai-codex",
+            "google-gemini-cli",
+            "google-antigravity",
+        ] {
+            let preset = presets
+                .iter()
+                .find(|p| p.provider_name == expected)
+                .unwrap_or_else(|| panic!("{expected} preset missing"));
+            assert!(
+                preset.oauth,
+                "{expected} preset should be marked oauth=true"
+            );
+            assert!(
+                preset.display_name.to_ascii_lowercase().contains("oauth"),
+                "display_name should signal OAuth: {}",
+                preset.display_name
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_preset_list_excludes_anthropic_by_design() {
+        let presets = provider_presets();
+        // Anthropic OAuth works technically but Anthropic
+        // actively enforces third-party-agent ToS. We don't
+        // advertise it in onboarding; power users can still
+        // run `anie login anthropic` directly.
+        let anthropic = presets
+            .iter()
+            .find(|p| p.provider_name == "anthropic")
+            .expect("anthropic API-key preset should still exist");
+        assert!(!anthropic.oauth);
     }
 
     #[test]
