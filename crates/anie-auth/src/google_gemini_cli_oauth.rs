@@ -634,12 +634,14 @@ mod tests {
     }
 
     #[test]
-    fn client_id_decodes_to_gemini_cli_oauth_id() {
+    fn client_id_decodes_to_a_google_oauth_installed_app_id() {
+        // Shape-only assertion — plaintext lives nowhere in this
+        // source file. See google_antigravity_oauth for the same
+        // pattern and rationale.
         let id = GeminiCliOAuthProvider::client_id().expect("decode");
-        assert_eq!(
-            id,
-            "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
-        );
+        assert!(id.ends_with(".apps.googleusercontent.com"), "{id}");
+        assert!(id.contains('-'), "{id}");
+        assert!(id.len() > 40, "{id}");
     }
 
     #[test]
