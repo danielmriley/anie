@@ -69,17 +69,24 @@ Status of each plan's PRs. Update inline as work lands.
 - Not yet verified: the two manual exit criteria ("30+ message
   session compacts mid-turn" and "`jq` inspection of a real
   session") — both need a live provider session.
+
+| # | Plan | PR | Status | Commit |
+|---|------|----|--------|--------|
 | 07 | OAuth | A (Credential tagged enum) | landed | `91f6f82` |
 | 07 | OAuth | B (OAuthProvider trait + Anthropic impl) | landed | `c91af1b` |
 | 07 | OAuth | C (refresh-with-lock) | landed | `eb27cc2` |
 | 07 | OAuth | D.1 (anie login/logout CLI + AuthResolver) | landed | `8c3555a` |
 | 07 | OAuth | D.1+ (auto-open browser, compact prompt) | landed | `a35f37a` |
-| 07 | OAuth | D.2 (TUI /login + onboarding + /providers) | pending | — |
 | 07 | OAuth | E.1 (trait refactor: device flow + credential extras) | landed | `d71e533` |
 | 07 | OAuth | E.2 (OpenAI Codex provider) | landed | `eda8448` |
 | 07 | OAuth | E.3 (GitHub Copilot provider, device flow) | landed | `4a79550` |
 | 07 | OAuth | E.4 (Google Antigravity provider) | landed | `0c22b64` |
 | 07 | OAuth | E.5 (Google Gemini CLI provider) | landed | `2891169` |
+| 07 | OAuth | F (OAuth provider routing + model catalog) | landed | `47e6f37` |
+| 07 | OAuth | G (fix --provider resolver + Copilot headers) | landed | `3d16f8a` |
+| 07 | OAuth | D.2 (TUI OAuth surface: picker + /providers + /login) | landed | `3a733c4` |
+| 07 | OAuth | D.2+ (headers on all discovery paths) | landed | `480160f` |
+| 07 | OAuth | D.2++ (Copilot chat-model filter + saved-config fix) | landed | `f9bba9e` |
 
 **Plan 07 notes:**
 - PR D split into D.1 (CLI) + D.2 (TUI polish). D.1 stands on
@@ -93,18 +100,31 @@ Status of each plan's PRs. Update inline as work lands.
 - Endpoints + client IDs verified against pi's corresponding
   TS files on 2026-04-21 — each provider's module doc records
   the line numbers.
-- PR E was broken into E.1–E.5. E.1 extended the trait
-  (LoginFlow became an enum, DeviceCodeFlow added,
-  `api_base_url` / `project_id` added to credential shape).
-  E.2–E.5 each added one provider with 9–13 wiremock-backed
-  tests.
-- Five providers now registered: `anthropic`, `openai-codex`,
+- PR E broken into E.1–E.5. E.1 extended the trait (LoginFlow
+  became an enum, DeviceCodeFlow added, `api_base_url` /
+  `project_id` added to credential shape). E.2–E.5 each added
+  one provider with 9–13 wiremock-backed tests.
+- PRs F + G + D.2 each shipped with multiple follow-ups after
+  live smoke caught silent bugs: resolver falling through to
+  the wrong provider, missing headers on parallel TUI
+  discovery paths, and unfiltered Copilot model catalog
+  (non-chat models crashing chat requests). All caught only by
+  running against the real endpoint.
+- Five providers registered: `anthropic`, `openai-codex`,
   `github-copilot`, `google-antigravity`, `google-gemini-cli`.
-- Manual exit-criterion still outstanding for each provider:
-  end-to-end login smoke against the real provider endpoint.
-  Anthropic is actively enforcing third-party-agent ToS
-  restrictions; Copilot / Gemini are known-safer smoke
-  targets. Needs a human at the terminal with a browser.
+- End-to-end smoke verified with GitHub Copilot on 2026-04-21
+  (login → model discovery → chat). Anthropic / Codex / Gemini
+  unshipped-to-user verification — providers technically
+  complete but Anthropic actively enforces third-party-agent
+  ToS so don't smoke it.
+
+**Plan 07 deferred:**
+- Onboarding first-run flow offering OAuth as a preset. `anie
+  login <provider>` works standalone; surfacing it inside
+  onboarding is a UX polish task.
+- Live refresh-with-lock exercise. Copilot access tokens
+  expire ~30 min after login; the next `anie` run after expiry
+  should transparently refresh. Not yet seen in the wild.
 
 ## Suggested landing order
 
