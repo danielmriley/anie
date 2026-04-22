@@ -17,6 +17,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::theme::MarkdownTheme;
+use crate::render_debug::{PerfSpan, PerfSpanKind};
 
 /// Render a markdown string to ratatui lines at the given width.
 ///
@@ -24,12 +25,20 @@ use super::theme::MarkdownTheme;
 /// Unhandled block elements degrade to raw text extraction.
 #[must_use]
 pub fn render(text: &str, width: u16, theme: &MarkdownTheme) -> Vec<Line<'static>> {
+    let mut span = PerfSpan::enter(PerfSpanKind::MarkdownRender);
     let mut builder = LineBuilder::new(width.max(1), theme);
     let events = super::parser::parse(text);
     for event in events {
         builder.consume(event);
     }
-    builder.finish()
+    let out = builder.finish();
+    if let Some(s) = span.as_mut() {
+        s.record("text_len", u64::try_from(text.len()).unwrap_or(u64::MAX));
+        s.record("width", u64::from(width));
+        s.record("lines", u64::try_from(out.len()).unwrap_or(u64::MAX));
+    }
+    drop(span);
+    out
 }
 
 struct LineBuilder<'a> {
@@ -837,7 +846,9 @@ fn heading_style(level: HeadingLevel, theme: &MarkdownTheme) -> Style {
 /// for normal prose; long runs without spaces wrap at the
 /// character boundary (as for URLs / long identifiers).
 fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
-    let width = width.max(1) as usize;
+    let mut span_guard = PerfSpan::enter(PerfSpanKind::WrapSpans);
+    let spans_in = spans.len();
+    let width_u = width.max(1) as usize;
 
     // Flatten `(char, style)` so wrapping can respect cell
     // widths without losing style information. `char` here means
@@ -852,6 +863,8 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
             cells.push((ch, style));
         }
     }
+    let char_count = cells.len();
+    let width = width_u;
 
     if cells.is_empty() {
         return vec![Line::default()];
@@ -895,6 +908,13 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     if !current_cells.is_empty() {
         lines.push(cells_to_line(current_cells));
     }
+    if let Some(s) = span_guard.as_mut() {
+        s.record("spans_in", u64::try_from(spans_in).unwrap_or(u64::MAX));
+        s.record("char_count", u64::try_from(char_count).unwrap_or(u64::MAX));
+        s.record("lines_out", u64::try_from(lines.len()).unwrap_or(u64::MAX));
+        s.record("width", u64::try_from(width).unwrap_or(u64::MAX));
+    }
+    drop(span_guard);
     lines
 }
 

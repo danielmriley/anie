@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::markdown::{LinkRange, MarkdownTheme, find_link_ranges};
+use crate::render_debug::{PerfSpan, PerfSpanKind, perf_trace_enabled};
 use crate::terminal_capabilities::TerminalCapabilities;
 
 /// A rendered transcript block.
@@ -424,7 +425,14 @@ impl OutputPane {
         } else {
             Vec::new()
         };
+        let mut paragraph_span = PerfSpan::enter(PerfSpanKind::ParagraphRender);
+        if let Some(s) = paragraph_span.as_mut() {
+            s.record("lines", u64::try_from(visible.len()).unwrap_or(u64::MAX));
+            s.record("area_w", u64::from(area.width));
+            s.record("area_h", u64::from(area.height));
+        }
         Paragraph::new(visible).render(area, buf);
+        drop(paragraph_span);
     }
 
     fn build_lines(&mut self, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
@@ -433,8 +441,8 @@ impl OutputPane {
             self.caches.len(),
             "block and cache vectors must stay parallel",
         );
+        let mut perf_span = PerfSpan::enter(PerfSpanKind::BuildLines);
         let perf_trace = perf_trace_enabled();
-        let total_start = perf_trace.then(std::time::Instant::now);
         let mut cache_hits: usize = 0;
         let mut cache_misses: usize = 0;
         let mut slowest_miss_us: u64 = 0;
@@ -473,9 +481,18 @@ impl OutputPane {
             }
 
             let miss_start = perf_trace.then(std::time::Instant::now);
-            let computed = block_lines(block, width, spinner_frame, &self.render_context);
+            let computed = {
+                let mut s = PerfSpan::enter(PerfSpanKind::BlockLines);
+                let lines = block_lines(block, width, spinner_frame, &self.render_context);
+                if let Some(s) = s.as_mut() {
+                    s.record("kind", block_kind_tag(block));
+                    s.record("width", u64::from(width));
+                    s.record("lines", u64::try_from(lines.len()).unwrap_or(u64::MAX));
+                }
+                lines
+            };
             if let Some(start) = miss_start {
-                let micros = start.elapsed().as_micros() as u64;
+                let micros = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
                 if micros > slowest_miss_us {
                     slowest_miss_us = micros;
                     slowest_miss_block = block_kind_tag(block);
@@ -483,7 +500,15 @@ impl OutputPane {
             }
             // Scan for clickable URL ranges once per cache-fill
             // so cached hits are free.
-            let computed_links = find_link_ranges(&computed, &theme);
+            let computed_links = {
+                let mut s = PerfSpan::enter(PerfSpanKind::FindLinkRanges);
+                let links = find_link_ranges(&computed, &theme);
+                if let Some(s) = s.as_mut() {
+                    s.record("lines", u64::try_from(computed.len()).unwrap_or(u64::MAX));
+                    s.record("ranges", u64::try_from(links.len()).unwrap_or(u64::MAX));
+                }
+                links
+            };
             if hits_cache
                 && let Some(slot) = self.caches.get_mut(index)
             {
@@ -508,20 +533,21 @@ impl OutputPane {
         );
         self.last_link_map = link_map;
 
-        if let Some(start) = total_start {
-            let total_us = start.elapsed().as_micros() as u64;
-            tracing::info!(
-                target: "anie_tui::perf",
-                blocks = self.blocks.len(),
-                cache_hits,
-                cache_misses,
-                total_us,
-                slowest_miss_us,
-                slowest_miss_block,
-                width,
-                "build_lines"
+        if let Some(span) = perf_span.as_mut() {
+            span.record(
+                "blocks",
+                u64::try_from(self.blocks.len()).unwrap_or(u64::MAX),
             );
+            span.record("cache_hits", u64::try_from(cache_hits).unwrap_or(u64::MAX));
+            span.record(
+                "cache_misses",
+                u64::try_from(cache_misses).unwrap_or(u64::MAX),
+            );
+            span.record("slowest_miss_us", slowest_miss_us);
+            span.record("slowest_miss_block", slowest_miss_block);
+            span.record("width", u64::from(width));
         }
+        drop(perf_span);
         out
     }
 
@@ -588,19 +614,6 @@ impl Default for OutputPane {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Gate perf instrumentation behind an env var so the 30 fps
-/// tick loop doesn't pay the clock-read cost in production.
-/// Reads the var once per process; flipping it requires a
-/// restart.
-fn perf_trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ANIE_PERF_TRACE")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    })
 }
 
 /// Short label identifying the block kind for perf traces.
