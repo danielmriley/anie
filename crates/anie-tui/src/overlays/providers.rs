@@ -17,7 +17,7 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use anie_auth::CredentialStore;
+use anie_auth::{AuthCredential, CredentialStore};
 use anie_config::{
     CliOverrides, ConfigMutator, find_project_config, global_config_path, load_config_with_paths,
     preferred_write_target,
@@ -44,6 +44,10 @@ pub struct ProviderEntry {
 pub enum ProviderType {
     Local,
     ApiKey,
+    /// OAuth-backed provider — login / logout via the OAuth flow
+    /// rather than pasting an API key. Stored credentials carry
+    /// refresh tokens and per-user endpoints.
+    OAuth,
     Custom,
 }
 
@@ -596,6 +600,7 @@ impl ProviderManagementScreen {
                     Cell::from(match entry.provider_type {
                         ProviderType::Local => "Local",
                         ProviderType::ApiKey => "API",
+                        ProviderType::OAuth => "OAuth",
                         ProviderType::Custom => "Custom",
                     }),
                     Cell::from(entry.default_model.clone()),
@@ -1060,6 +1065,13 @@ fn load_provider_entries(
         .map(|name| {
             let provider_config = config.providers.get(&name);
             let builtin_default = builtin_catalog.iter().find(|model| model.provider == name);
+            let stored_credential = credential_store.get_credential(&name);
+            let oauth_defaults = stored_credential
+                .as_ref()
+                .and_then(|cred| match cred {
+                    AuthCredential::OAuth { .. } => oauth_provider_display_defaults(&name),
+                    _ => None,
+                });
             let default_model = if has_any_config && config.model.provider == name {
                 config.model.id.clone()
             } else {
@@ -1067,14 +1079,31 @@ fn load_provider_entries(
                     .and_then(|provider| provider.models.first())
                     .map(|model| model.id.clone())
                     .or_else(|| builtin_default.map(|model| model.id.clone()))
+                    .or_else(|| oauth_defaults.map(|(id, _)| id.to_string()))
                     .unwrap_or_else(|| "unknown".to_string())
             };
+            // OAuth credentials carry a per-user `api_base_url`
+            // (Copilot's proxy-ep rewrite). Prefer the stored
+            // value so the /providers card shows the user's
+            // actual endpoint rather than the generic default.
+            let oauth_base_url = stored_credential
+                .as_ref()
+                .and_then(|cred| match cred {
+                    AuthCredential::OAuth { api_base_url, .. } => api_base_url.clone(),
+                    _ => None,
+                });
             let base_url = provider_config
                 .and_then(|provider| provider.base_url.clone())
-                .or_else(|| builtin_default.map(|model| model.base_url.clone()));
-            let provider_type = classify_provider_type(&name, base_url.as_deref());
+                .or(oauth_base_url)
+                .or_else(|| builtin_default.map(|model| model.base_url.clone()))
+                .or_else(|| oauth_defaults.map(|(_, url)| url.to_string()));
+            let provider_type = classify_provider_type(
+                &name,
+                base_url.as_deref(),
+                stored_credential.as_ref(),
+            );
             ProviderEntry {
-                has_credential: credential_store.get(&name).is_some(),
+                has_credential: stored_credential.is_some(),
                 is_default: has_any_config && config.model.provider == name,
                 name,
                 provider_type,
@@ -1088,8 +1117,18 @@ fn load_provider_entries(
     Ok(entries)
 }
 
-fn classify_provider_type(provider: &str, base_url: Option<&str>) -> ProviderType {
+fn classify_provider_type(
+    provider: &str,
+    base_url: Option<&str>,
+    credential: Option<&AuthCredential>,
+) -> ProviderType {
     let provider = provider.to_ascii_lowercase();
+    // OAuth credential trumps name-based guessing: a provider
+    // that's in our OAuth registry AND has a stored OAuth
+    // credential should render as `OAuth`, not `Custom`.
+    if matches!(credential, Some(AuthCredential::OAuth { .. })) {
+        return ProviderType::OAuth;
+    }
     let is_local = matches!(provider.as_str(), "ollama" | "lmstudio" | "vllm")
         || base_url.is_some_and(is_local_base_url);
     if is_local {
@@ -1098,6 +1137,27 @@ fn classify_provider_type(provider: &str, base_url: Option<&str>) -> ProviderTyp
         ProviderType::ApiKey
     } else {
         ProviderType::Custom
+    }
+}
+
+/// Default model + base URL to show in `/providers` listings
+/// for OAuth-backed providers. Matches
+/// `oauth_placeholder_model` in `anie-cli::model_catalog` so the
+/// TUI's picker and the overlay agree on a "first model" for
+/// each provider before live discovery runs.
+fn oauth_provider_display_defaults(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider {
+        "github-copilot" => Some((
+            "claude-sonnet-4.6",
+            "https://api.individual.githubcopilot.com",
+        )),
+        "openai-codex" => Some(("gpt-5", "https://api.openai.com/v1")),
+        "google-gemini-cli" => Some(("gemini-2.5-pro", "https://cloudcode-pa.googleapis.com")),
+        "google-antigravity" => {
+            Some(("gemini-3-pro-preview", "https://cloudcode-pa.googleapis.com"))
+        }
+        "anthropic" => Some(("claude-sonnet-4-6", "https://api.anthropic.com")),
+        _ => None,
     }
 }
 

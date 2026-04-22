@@ -32,19 +32,113 @@ pub(crate) struct InitialSelection {
 }
 
 /// Build the model catalog from all sources (builtin, configured,
-/// detected local servers) and return whether any local server was
-/// actually detected.
+/// detected local servers, stored OAuth credentials) and return
+/// whether any local server was actually detected.
+///
+/// For OAuth-backed providers we emit a single placeholder
+/// entry per provider so the provider appears in the TUI model
+/// picker immediately. Real discovery fires on first picker
+/// open (see `spawn_model_discovery`), replacing the placeholder
+/// with the authoritative list.
 pub(crate) async fn build_model_catalog(config: &AnieConfig) -> (Vec<Model>, bool) {
+    let credential_store = CredentialStore::new();
     let local_servers = detect_local_servers().await;
     let local_models = local_servers
         .iter()
         .flat_map(|server| server.models.clone())
         .collect::<Vec<_>>();
+    let oauth_models = oauth_placeholder_models(&credential_store);
     let mut model_catalog = builtin_models();
     model_catalog.extend(configured_models(config));
     model_catalog.extend(local_models);
+    model_catalog.extend(oauth_models);
     dedupe_models(&mut model_catalog);
     (model_catalog, !local_servers.is_empty())
+}
+
+/// Walk the credential store and emit one placeholder model
+/// per OAuth-backed provider so the TUI can render them in the
+/// model picker without requiring a network round-trip at
+/// startup. The placeholder ID is picked to be a reasonable
+/// default for each provider (Copilot → claude-sonnet-4.6,
+/// Gemini CLI → gemini-2.5-pro, etc.); live discovery replaces
+/// them with the real list as soon as the user opens the picker
+/// for that provider.
+fn oauth_placeholder_models(store: &CredentialStore) -> Vec<Model> {
+    let mut out = Vec::new();
+    for provider_name in store.list_providers() {
+        let Some(AuthCredential::OAuth {
+            api_base_url,
+            ..
+        }) = store.get_credential(&provider_name)
+        else {
+            continue;
+        };
+        let Some(placeholder) =
+            oauth_placeholder_model(&provider_name, api_base_url.as_deref())
+        else {
+            continue;
+        };
+        out.push(placeholder);
+    }
+    out
+}
+
+/// Pick a reasonable default model ID + base URL for each
+/// OAuth-backed provider. These are not authoritative — live
+/// discovery replaces them once the user opens the picker —
+/// but they need to be plausible enough that a user who types
+/// nothing still gets a working selection.
+fn oauth_placeholder_model(provider_name: &str, api_base_url: Option<&str>) -> Option<Model> {
+    let (id, fallback_base_url, api) = match provider_name {
+        "github-copilot" => (
+            "claude-sonnet-4.6",
+            "https://api.individual.githubcopilot.com",
+            ApiKind::OpenAICompletions,
+        ),
+        "openai-codex" => (
+            "gpt-5",
+            "https://api.openai.com/v1",
+            ApiKind::OpenAICompletions,
+        ),
+        "google-gemini-cli" => (
+            "gemini-2.5-pro",
+            "https://cloudcode-pa.googleapis.com",
+            ApiKind::OpenAICompletions,
+        ),
+        "google-antigravity" => (
+            "gemini-3-pro-preview",
+            "https://cloudcode-pa.googleapis.com",
+            ApiKind::OpenAICompletions,
+        ),
+        // Anthropic OAuth uses the same wire protocol as the
+        // API-key flow; falling back to its default base URL
+        // is fine when the credential doesn't carry one.
+        "anthropic" => (
+            "claude-sonnet-4-6",
+            "https://api.anthropic.com",
+            ApiKind::AnthropicMessages,
+        ),
+        _ => return None,
+    };
+    let base_url = api_base_url
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback_base_url.to_string());
+    Some(Model {
+        id: id.to_string(),
+        name: id.to_string(),
+        provider: provider_name.to_string(),
+        api,
+        base_url,
+        context_window: 200_000,
+        max_tokens: 16_384,
+        supports_reasoning: true,
+        reasoning_capabilities: None,
+        supports_images: false,
+        cost_per_million: CostPerMillion::zero(),
+        replay_capabilities: None,
+        compat: ModelCompat::None,
+    })
 }
 
 /// Decide what model and thinking level to use at session open,

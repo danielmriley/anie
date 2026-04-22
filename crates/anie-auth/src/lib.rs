@@ -270,11 +270,15 @@ impl AuthResolver {
 /// D.1 — turn into a registry when a second OAuth provider
 /// lands.
 /// Per-provider request headers attached to every chat request
-/// when the credential is OAuth. GitHub Copilot rejects calls
-/// from clients that don't present the editor-identifying
-/// headers pi pins — so discovery AND chat both need them, same
-/// set, same values.
-fn oauth_request_headers(provider_name: &str) -> HashMap<String, String> {
+/// and every model-discovery request when the credential is
+/// OAuth. GitHub Copilot rejects calls from clients that don't
+/// present the editor-identifying headers pi pins — discovery
+/// AND chat both need them, same set, same values.
+///
+/// Public so the TUI's model-picker discovery path and the CLI
+/// `anie models` flow can share one source of truth.
+#[must_use]
+pub fn oauth_request_headers(provider_name: &str) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     if provider_name == "github-copilot" {
         headers.insert("User-Agent".into(), "GitHubCopilotChat/0.35.0".into());

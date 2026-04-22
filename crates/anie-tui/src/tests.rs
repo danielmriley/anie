@@ -1561,6 +1561,13 @@ fn long_thinking_does_not_bleed_past_gutter_boundary() {
 fn phase_c_catalog() -> Vec<SlashCommandInfo> {
     const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
     const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
+    const OAUTH_PROVIDERS: &[&str] = &[
+        "anthropic",
+        "openai-codex",
+        "github-copilot",
+        "google-antigravity",
+        "google-gemini-cli",
+    ];
     vec![
         SlashCommandInfo::builtin_with_args(
             "thinking",
@@ -1579,6 +1586,21 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
                 required: false,
             },
             Some("[on|off]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "login",
+            "OAuth login instructions",
+            ArgumentSpec::Enumerated {
+                values: OAUTH_PROVIDERS,
+                required: true,
+            },
+            Some("<provider>"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "logout",
+            "Remove stored credential",
+            ArgumentSpec::FreeForm { required: true },
+            Some("<provider>"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
         SlashCommandInfo::builtin("help", "Show help"),
@@ -1709,6 +1731,35 @@ fn slash_markdown_invalid_arg_is_rejected() {
     // the /markdown dispatch arm.
     assert!(msg.contains("maybe"), "{msg}");
     assert!(msg.contains("on") && msg.contains("off"), "{msg}");
+}
+
+#[test]
+fn slash_login_points_user_at_cli_flow() {
+    // OAuth login needs a browser callback + localhost server
+    // that would interfere with the alternate-screen TUI, so
+    // the /login command is a documentation nudge, not an
+    // actual login runner.
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/login github-copilot");
+
+    let msg = last_system_message(&app).expect("expected instruction");
+    assert!(msg.contains("anie login github-copilot"), "{msg}");
+}
+
+#[test]
+fn slash_logout_without_stored_credential_reports_missing() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/logout no-such-provider");
+
+    let msg = last_system_message(&app).expect("expected status");
+    assert!(msg.contains("No stored credential"), "{msg}");
+    assert!(msg.contains("no-such-provider"), "{msg}");
 }
 
 #[test]

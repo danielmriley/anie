@@ -31,6 +31,17 @@ pub(crate) const SESSION_SUBCOMMANDS: &[&str] = &["list"];
 /// Accepted values for `/markdown`.
 pub(crate) const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
 
+/// Providers that expose OAuth login (and are valid arguments
+/// to `/login` / `/logout`). Mirrors the registry in
+/// `anie-cli::login_command::build_oauth_provider`.
+pub(crate) const OAUTH_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai-codex",
+    "github-copilot",
+    "google-antigravity",
+    "google-gemini-cli",
+];
+
 /// All slash commands known to this anie process.
 ///
 /// Populated at startup with `builtin_commands()`; future
@@ -253,6 +264,21 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
             },
             Some("[on|off]"),
         ),
+        SlashCommandInfo::builtin_with_args(
+            "login",
+            "Show instructions for OAuth login against a provider",
+            ArgumentSpec::Enumerated {
+                values: OAUTH_PROVIDERS,
+                required: true,
+            },
+            Some("<provider>"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "logout",
+            "Remove a stored OAuth or API-key credential",
+            ArgumentSpec::FreeForm { required: true },
+            Some("<provider>"),
+        ),
         SlashCommandInfo::builtin("help", "Show this list"),
         SlashCommandInfo::builtin("quit", "Quit anie"),
     ]
@@ -422,6 +448,8 @@ mod tests {
             "reload",
             "copy",
             "markdown",
+            "login",
+            "logout",
             "help",
             "quit",
         ];
@@ -451,6 +479,10 @@ mod tests {
             ("markdown", |spec| {
                 matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == MARKDOWN_SWITCHES)
             }),
+            ("login", |spec| {
+                matches!(spec, ArgumentSpec::Enumerated { values, required: true } if *values == OAUTH_PROVIDERS)
+            }),
+            ("logout", |spec| matches!(spec, ArgumentSpec::FreeForm { required: true })),
             ("compact", |spec| matches!(spec, ArgumentSpec::None)),
             ("help", |spec| matches!(spec, ArgumentSpec::None)),
             ("quit", |spec| matches!(spec, ArgumentSpec::None)),

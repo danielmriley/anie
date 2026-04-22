@@ -815,6 +815,56 @@ impl App {
                     ));
                 }
             },
+            "login" => match arg {
+                Some(provider) => {
+                    // OAuth login needs a browser callback server
+                    // on a specific port per provider. That would
+                    // block the TUI event loop and doesn't play
+                    // nicely with the alternate-screen terminal
+                    // state, so we redirect the user to the CLI
+                    // flow rather than running it in-process.
+                    self.output_pane.add_system_message(format!(
+                        "To log in to {provider}, exit anie (Ctrl-C) and run \
+                         `anie login {provider}` in a regular shell. \
+                         When the flow completes, your credential will be \
+                         picked up automatically on the next `anie` run."
+                    ));
+                }
+                None => {
+                    self.output_pane.add_system_message(
+                        "Usage: /login <provider>. Providers that support \
+                         OAuth login: anthropic, openai-codex, github-copilot, \
+                         google-antigravity, google-gemini-cli."
+                            .to_string(),
+                    );
+                }
+            },
+            "logout" => match arg {
+                Some(provider) => {
+                    // Logout is synchronous and safe to run
+                    // in-process — no browser, no callback server.
+                    let store = anie_auth::CredentialStore::new();
+                    match store.get_credential(provider) {
+                        None => {
+                            self.output_pane.add_system_message(format!(
+                                "No stored credential for {provider}."
+                            ));
+                        }
+                        Some(_) => match store.delete(provider) {
+                            Ok(()) => self.output_pane.add_system_message(format!(
+                                "Removed stored credential for {provider}."
+                            )),
+                            Err(error) => self.output_pane.add_system_message(format!(
+                                "Failed to remove credential for {provider}: {error}"
+                            )),
+                        },
+                    }
+                }
+                None => {
+                    self.output_pane
+                        .add_system_message("Usage: /logout <provider>".to_string());
+                }
+            },
             "new" => {
                 let _ = self.action_tx.send(UiAction::NewSession);
             }
@@ -1125,12 +1175,15 @@ impl App {
         }
 
         let api_key = resolve_provider_api_key(&context.provider_name);
+        // Provider-specific discovery headers (e.g. Copilot's
+        // editor identifiers) ride along on the same registry
+        // we use for chat requests.
         let request = ModelDiscoveryRequest {
             provider_name: context.provider_name.clone(),
             api: context.api,
             base_url: context.base_url.clone(),
             api_key,
-            headers: std::collections::HashMap::new(),
+            headers: anie_auth::oauth_request_headers(&context.provider_name),
         };
         let cache = Arc::clone(&self.discovery_cache);
         let tx = self.worker_tx.clone();

@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::Result;
 
-use anie_auth::{AuthCredential, CredentialStore};
+use anie_auth::{AuthCredential, CredentialStore, oauth_request_headers};
 use anie_config::{CliOverrides, load_config};
 use anie_provider::{ApiKind, ModelInfo};
 use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest, detect_local_servers};
@@ -145,7 +145,7 @@ async fn configured_requests(
                 api: default_api(&provider_name),
                 base_url,
                 api_key: Some(access_token),
-                headers: oauth_discovery_headers(&provider_name),
+                headers: oauth_request_headers(&provider_name),
             },
         );
     }
@@ -220,24 +220,6 @@ fn oauth_provider_default_base_url(provider_name: &str) -> Option<String> {
     }
 }
 
-/// Provider-specific request headers required by OAuth-backed
-/// model-discovery endpoints. GitHub Copilot's `/models`
-/// endpoint rejects calls without the editor-identifying
-/// headers pi's Copilot flow uses — the same values land on
-/// both the token-exchange and model-list paths.
-fn oauth_discovery_headers(provider_name: &str) -> std::collections::HashMap<String, String> {
-    let mut headers = std::collections::HashMap::new();
-    if provider_name == "github-copilot" {
-        headers.insert("User-Agent".into(), "GitHubCopilotChat/0.35.0".into());
-        headers.insert("Editor-Version".into(), "vscode/1.107.0".into());
-        headers.insert(
-            "Editor-Plugin-Version".into(),
-            "copilot-chat/0.35.0".into(),
-        );
-        headers.insert("Copilot-Integration-Id".into(), "vscode-chat".into());
-    }
-    headers
-}
 
 fn print_models_table(rows: &[(String, ModelInfo)]) {
     let provider_width = rows
@@ -298,19 +280,6 @@ mod tests {
     use anie_config::AnieConfig;
     use tempfile::tempdir;
 
-    #[test]
-    fn oauth_discovery_headers_for_copilot_carry_editor_identifiers() {
-        let h = oauth_discovery_headers("github-copilot");
-        assert!(h.contains_key("User-Agent"));
-        assert!(h.contains_key("Editor-Version"));
-        assert!(h.contains_key("Copilot-Integration-Id"));
-    }
-
-    #[test]
-    fn oauth_discovery_headers_empty_for_unknown_provider() {
-        let h = oauth_discovery_headers("some-other-provider");
-        assert!(h.is_empty());
-    }
 
     #[tokio::test]
     async fn configured_requests_picks_up_oauth_providers_without_config_entry() {
