@@ -29,4 +29,9 @@ anie-protocol.workspace = true
 anie-providers-builtin.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tempfile.workspace = true
+
+[[bench]]
+name = "tui_render"
+harness = false

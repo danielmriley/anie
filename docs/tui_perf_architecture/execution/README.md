@@ -8,9 +8,9 @@ perf trajectory is readable at a glance.
 
 | Plan | PR | Status | Baseline delta | Notes |
 |------|----|--------|----------------|-------|
-| 01 | PR-A (perf-trace JSONL) | not started | — | |
-| 01 | PR-B (criterion bench) | not started | — | |
-| 01 | PR-C (flamegraph capture) | not started | — | |
+| 01 | PR-A (perf-trace JSONL) | **landed** | commit `306e4e3` | JSONL spans for 6 hot functions, writes to `~/.anie/logs/perf.log.<pid>` |
+| 01 | PR-B (criterion bench) | **landed** | this commit | 3 scenarios; numbers in `baseline_numbers.md` |
+| 01 | PR-C (flamegraph capture) | deferred | — | `perf_event_paranoid=4` on host; docs/recipe in `baseline_numbers.md`. Not blocking — JSONL spans are a partial substitute. |
 | 02 | synchronized output | not started | — | |
 | 03 | PR-A (Arc-wrap cache) | not started | — | |
 | 03 | PR-B (wrap_spans rewrite) | not started | — | |
@@ -30,19 +30,28 @@ perf trajectory is readable at a glance.
 
 ## Baseline numbers
 
-To be populated by Plan 01 PR-B. Expected format:
+Captured 2026-04-22. See
+[`baseline_numbers.md`](./baseline_numbers.md) for full
+methodology + criterion CIs + re-run instructions.
 
-```
-scroll_static_600       p50=X.XXms  p95=X.XXms  p99=X.XXms
-stream_into_static_600  p50=X.XXms  p95=X.XXms  p99=X.XXms
-resize_during_stream    p50=X.XXms  p95=X.XXms  p99=X.XXms
-```
+| Scenario | Mean frame time |
+|----------|----------------:|
+| `scroll_static_600` | 3.20 ms |
+| `stream_into_static_600` | 3.40 ms |
+| `resize_during_stream` | 104.00 ms |
+
+Key takeaway: cache-hit render is fine; resize-storm is the
+primary sluggishness. Phase 4 cache hardening is the real
+payoff target.
 
 ## Flamegraph
 
-Placeholder — to be added by Plan 01 PR-C.
-`flamegraph_baseline.svg` (or equivalent) will live in this
-directory.
+Capture deferred — host `kernel.perf_event_paranoid=4`
+blocks user-mode perf recording. Recipe for running with
+sudo-tweaked sysctl, plus alternative tools (samply,
+pprof-rs), documented in
+[`baseline_numbers.md`](./baseline_numbers.md). JSONL spans
+from PR-A are a partial substitute.
 
 ## Subjective smoke list
 
