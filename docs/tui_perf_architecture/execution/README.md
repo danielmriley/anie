@@ -10,7 +10,7 @@ perf trajectory is readable at a glance.
 |------|----|--------|----------------|-------|
 | 01 | PR-A (perf-trace JSONL) | **landed** | commit `306e4e3` | JSONL spans for 6 hot functions, writes to `~/.anie/logs/perf.log.<pid>` |
 | 01 | PR-B (criterion bench) | **landed** | this commit | 3 scenarios; numbers in `baseline_numbers.md` |
-| 01 | PR-C (flamegraph capture) | deferred | — | `perf_event_paranoid=4` on host; docs/recipe in `baseline_numbers.md`. Not blocking — JSONL spans are a partial substitute. |
+| 01 | PR-C (top-5 + flamegraph) | **landed** | commit `cd06e21` | Top-5 self-time via PerfSpan aggregation; flamegraph recipe deferred (sysctl `perf_event_paranoid=4`). Priority flip: `markdown_render` is the real bottleneck, `wrap_spans` much less so. |
 | 02 | synchronized output | not started | — | |
 | 03 | PR-A (Arc-wrap cache) | not started | — | |
 | 03 | PR-B (wrap_spans rewrite) | not started | — | |
