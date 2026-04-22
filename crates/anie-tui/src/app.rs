@@ -704,7 +704,29 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.output_pane.scroll_line_up(3),
             MouseEventKind::ScrollDown => self.output_pane.scroll_line_down(3),
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.handle_left_click(mouse.row, mouse.column);
+            }
             _ => {}
+        }
+    }
+
+    /// Check whether the click landed on a rendered URL in the
+    /// output pane and, if so, open it in the user's default
+    /// browser. Non-URL clicks (prose, status bar, input) are
+    /// silently ignored — users expect text regions to be
+    /// inert to clicks in a TUI with mouse capture.
+    fn handle_left_click(&mut self, row: u16, col: u16) {
+        if let Some(url) = self
+            .output_pane
+            .url_at_terminal_position(row, col)
+            .map(str::to_string)
+            && let Err(err) = opener::open_browser(&url)
+        {
+            // Don't spam the transcript with failures; a
+            // debug log is enough. Users will notice if their
+            // browser doesn't open.
+            tracing::debug!(%err, %url, "failed to open clicked URL");
         }
     }
 

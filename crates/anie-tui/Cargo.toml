@@ -13,6 +13,7 @@ workspace = true
 anyhow.workspace = true
 arboard = "3"
 crossterm.workspace = true
+opener.workspace = true
 futures.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true

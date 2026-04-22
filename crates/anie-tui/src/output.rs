@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::markdown::MarkdownTheme;
+use crate::markdown::{LinkRange, MarkdownTheme, find_link_ranges};
 use crate::terminal_capabilities::TerminalCapabilities;
 
 /// A rendered transcript block.
@@ -62,6 +62,11 @@ pub struct ToolCallResult {
 struct LineCache {
     width: u16,
     lines: Vec<Line<'static>>,
+    /// Link ranges per line, same length as `lines`. Empty
+    /// `Vec<LinkRange>` entries correspond to lines without
+    /// clickable URLs. Cached alongside the lines so cache-
+    /// hit paths don't re-scan.
+    links: Vec<Vec<LinkRange>>,
 }
 
 /// Render-time configuration carried alongside the blocks. Kept
@@ -99,6 +104,17 @@ pub struct OutputPane {
     /// aligned and invalidate the affected slot — see the
     /// `invalidate_*` helpers below.
     caches: Vec<Option<LineCache>>,
+    /// Flat link map covering the most recent `build_lines`
+    /// output. Indexed by global line number; empty `Vec`s for
+    /// lines without clickable URLs. Rebuilt every
+    /// `build_lines` so a mouse hit test at (screen row, col)
+    /// can translate via `scroll_offset + pane_y` → global
+    /// line → optional URL.
+    last_link_map: Vec<Vec<LinkRange>>,
+    /// Screen `y` (top row) of the output pane from the last
+    /// render. Needed for mouse hit tests, which arrive in
+    /// terminal-global coordinates.
+    last_render_top: u16,
     scroll_offset: u16,
     auto_scroll: bool,
     last_total_lines: u16,
@@ -116,6 +132,8 @@ impl OutputPane {
         Self {
             blocks: Vec::new(),
             caches: Vec::new(),
+            last_link_map: Vec::new(),
+            last_render_top: 0,
             scroll_offset: 0,
             auto_scroll: true,
             last_total_lines: 0,
@@ -386,6 +404,9 @@ impl OutputPane {
         let lines = self.build_lines(area.width.max(1), spinner_frame);
         self.last_total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         self.last_viewport_height = area.height.max(1);
+        // Record pane position so mouse hit tests can translate
+        // terminal-global coordinates back to pane-local.
+        self.last_render_top = area.y;
         let scroll = self.current_scroll();
         self.set_scroll(scroll);
 
@@ -420,9 +441,16 @@ impl OutputPane {
         let mut slowest_miss_block: &'static str = "";
 
         let mut out = Vec::new();
+        // Rebuild the link map from scratch each frame so the
+        // indexing stays in lockstep with `out`. Same-length
+        // parallel structure; empty entries for lines without
+        // URLs.
+        let mut link_map: Vec<Vec<LinkRange>> = Vec::new();
+        let theme = self.render_context.theme;
         for (index, block) in self.blocks.iter().enumerate() {
             if !out.is_empty() {
                 out.push(Line::default());
+                link_map.push(Vec::new());
             }
 
             // Spinner-bearing blocks (`is_streaming` /
@@ -439,6 +467,7 @@ impl OutputPane {
                 && cached.width == width
             {
                 out.extend(cached.lines.iter().cloned());
+                link_map.extend(cached.links.iter().cloned());
                 cache_hits += 1;
                 continue;
             }
@@ -452,20 +481,32 @@ impl OutputPane {
                     slowest_miss_block = block_kind_tag(block);
                 }
             }
+            // Scan for clickable URL ranges once per cache-fill
+            // so cached hits are free.
+            let computed_links = find_link_ranges(&computed, &theme);
             if hits_cache
                 && let Some(slot) = self.caches.get_mut(index)
             {
                 *slot = Some(LineCache {
                     width,
                     lines: computed.clone(),
+                    links: computed_links.clone(),
                 });
                 cache_misses += 1;
             }
             out.extend(computed);
+            link_map.extend(computed_links);
         }
         if out.is_empty() {
             out.push(Line::default());
+            link_map.push(Vec::new());
         }
+        debug_assert_eq!(
+            out.len(),
+            link_map.len(),
+            "link_map must parallel build_lines output"
+        );
+        self.last_link_map = link_map;
 
         if let Some(start) = total_start {
             let total_us = start.elapsed().as_micros() as u64;
@@ -482,6 +523,33 @@ impl OutputPane {
             );
         }
         out
+    }
+
+    /// Translate a terminal-global mouse click into a
+    /// clickable URL, if the click hit one. Returns `None` for
+    /// misses / clicks outside the pane / clicks on lines with
+    /// no registered link ranges.
+    ///
+    /// Caller: `App::handle_mouse_event` on `MouseEventKind::
+    /// Down(Left)`. The mouse event's `row`/`column` are
+    /// terminal-global; the pane's top row is recorded by the
+    /// last `render` call.
+    #[must_use]
+    pub fn url_at_terminal_position(&self, row: u16, col: u16) -> Option<&str> {
+        let pane_top = self.last_render_top;
+        let pane_bottom = pane_top.saturating_add(self.last_viewport_height);
+        if row < pane_top || row >= pane_bottom {
+            return None;
+        }
+        let line_index = self
+            .scroll_offset
+            .checked_add(row.saturating_sub(pane_top))?
+            as usize;
+        let line_links = self.last_link_map.get(line_index)?;
+        line_links
+            .iter()
+            .find(|range| col >= range.col_start && col < range.col_end)
+            .map(|range| range.url.as_str())
     }
 
     fn find_tool_call_index(&self, call_id: &str) -> Option<usize> {
@@ -1160,6 +1228,59 @@ mod cache_tests {
         );
         let _ = pane.build_lines(80, ".");
         assert!(pane.is_cached(0));
+    }
+
+    #[test]
+    fn url_at_terminal_position_hits_the_link_span() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        // Build a single assistant message that contains a
+        // markdown link. Markdown enabled by default on
+        // RenderContext, so `render_markdown` fires and the
+        // link's fallback span gets a LinkRange entry.
+        let mut pane = OutputPane::new();
+        pane.add_streaming_assistant();
+        let body = "Visit [the docs](https://example.com/specific) for details.";
+        pane.append_to_last_assistant(body);
+        pane.finalize_last_assistant(body.into(), String::new(), 1, None);
+
+        // Render at a known position. Pane top = 5 so we can
+        // verify the coordinate translation.
+        let area = Rect::new(0, 5, 120, 10);
+        let mut buf = Buffer::empty(area);
+        pane.render(area, &mut buf, ".");
+
+        // Any cell BEFORE the URL fallback starts returns None.
+        assert!(pane.url_at_terminal_position(5, 0).is_none());
+        // A cell INSIDE the URL text returns the URL. The
+        // assistant output renders as something like:
+        //   Visit the docs (https://example.com/specific) for details.
+        // We find the URL by scanning the rendered buffer.
+        let top_row: String = (0..area.width)
+            .map(|x| buf[(x, 5)].symbol())
+            .collect::<String>();
+        let url_col = top_row
+            .find("https://")
+            .expect("URL should appear in rendered output")
+            as u16;
+        let hit = pane.url_at_terminal_position(5, url_col + 5);
+        assert_eq!(hit, Some("https://example.com/specific"));
+    }
+
+    #[test]
+    fn url_at_terminal_position_returns_none_outside_pane() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let mut pane = OutputPane::new();
+        pane.add_user_message("hi".into(), 1);
+        let area = Rect::new(0, 5, 40, 3);
+        let mut buf = Buffer::empty(area);
+        pane.render(area, &mut buf, ".");
+        // Row 4 is above the pane; row 8 is below. Neither
+        // should match.
+        assert!(pane.url_at_terminal_position(4, 0).is_none());
+        assert!(pane.url_at_terminal_position(8, 0).is_none());
     }
 
     #[test]

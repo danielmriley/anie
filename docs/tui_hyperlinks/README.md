@@ -1,4 +1,4 @@
-# Plan 10 — clickable hyperlinks in the TUI (OSC 8)
+# Plan 10 — clickable hyperlinks in the TUI
 
 **Feature. Makes URLs in agent output clickable.**
 
@@ -9,6 +9,42 @@ calculations. The fallback shipped: show `[text] (url)` with
 the text underlined.
 
 User wants the real hyperlinks.
+
+## Approach pivot (2026-04-22)
+
+After surveying ratatui 0.29's Buffer / Cell API, OSC 8 via a
+wrapping backend remains substantial work (~200+ LOC) and
+relies on running custom code between ratatui's buffer flush
+and crossterm's stdout. The abstractions aren't designed for
+this extension point; any implementation is brittle against
+ratatui releases.
+
+**Simpler path that works on every terminal with mouse
+capture (which anie already enables):** click-to-open.
+
+- Record `(line_index, col_start, col_end, url)` ranges during
+  markdown rendering — specifically for the visible `(url)`
+  fallback text in the link's link_url-styled span.
+- On `MouseEventKind::Down(Left)` in the output pane, translate
+  screen coords → line index (via scroll_offset + pane_y) →
+  look up hit registry → if url matched, `opener::open(url)`.
+- Only the URL text itself is clickable, not the hyperlink
+  text. Precise target; no false positives from clicking prose
+  that happens to contain a link.
+
+Loses vs. OSC 8:
+- Native hover-to-preview (browsers / terminals show the URL
+  above the cursor on hover for OSC 8 links). Click-to-open
+  has no hover indication.
+- Link stays clickable even when the user scrolls — hit test
+  accounts for scroll_offset.
+
+Wins vs. OSC 8:
+- Works on any terminal anie supports (mouse capture was
+  already required for scroll).
+- No terminal-capability gating needed — if mouse works, clicks
+  work.
+- Implementation is ~50 LOC + markdown rendering hook.
 
 ## Rationale
 
