@@ -40,8 +40,8 @@ conflict-minimizing multi-agent assignment layout.
 | 03 | D | `find_cut_point` trim | pending | — |
 | 03 | E | lightweight `list_sessions` | pending | — |
 | 03 | F | session-local helper sweep | pending | — |
-| 04 | A | render scheduling cross-link / landing | pending | — |
-| 04 | B | Arc-backed output cache storage | pending | — |
+| 04 | A | render scheduling cross-link / landing | **landed** (no-op — already shipped via `tui_responsiveness/`) | `3fb113d` |
+| 04 | B | Arc-backed output cache storage | **landed** | `3fb113d` |
 | 04 | C | cache read-side cleanup + invalidation audit | pending | — |
 | 04 | D | `wrap_plain_text` rewrite | pending | — |
 | 04 | E | `wrap_spans` rewrite | pending | — |
