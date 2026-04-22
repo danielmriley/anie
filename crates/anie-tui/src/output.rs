@@ -399,6 +399,13 @@ impl OutputPane {
             self.caches.len(),
             "block and cache vectors must stay parallel",
         );
+        let perf_trace = perf_trace_enabled();
+        let total_start = perf_trace.then(std::time::Instant::now);
+        let mut cache_hits: usize = 0;
+        let mut cache_misses: usize = 0;
+        let mut slowest_miss_us: u64 = 0;
+        let mut slowest_miss_block: &'static str = "";
+
         let mut out = Vec::new();
         for (index, block) in self.blocks.iter().enumerate() {
             if !out.is_empty() {
@@ -419,10 +426,19 @@ impl OutputPane {
                 && cached.width == width
             {
                 out.extend(cached.lines.iter().cloned());
+                cache_hits += 1;
                 continue;
             }
 
+            let miss_start = perf_trace.then(std::time::Instant::now);
             let computed = block_lines(block, width, spinner_frame, &self.render_context);
+            if let Some(start) = miss_start {
+                let micros = start.elapsed().as_micros() as u64;
+                if micros > slowest_miss_us {
+                    slowest_miss_us = micros;
+                    slowest_miss_block = block_kind_tag(block);
+                }
+            }
             if hits_cache
                 && let Some(slot) = self.caches.get_mut(index)
             {
@@ -430,11 +446,27 @@ impl OutputPane {
                     width,
                     lines: computed.clone(),
                 });
+                cache_misses += 1;
             }
             out.extend(computed);
         }
         if out.is_empty() {
             out.push(Line::default());
+        }
+
+        if let Some(start) = total_start {
+            let total_us = start.elapsed().as_micros() as u64;
+            tracing::info!(
+                target: "anie_tui::perf",
+                blocks = self.blocks.len(),
+                cache_hits,
+                cache_misses,
+                total_us,
+                slowest_miss_us,
+                slowest_miss_block,
+                width,
+                "build_lines"
+            );
         }
         out
     }
@@ -474,6 +506,29 @@ impl OutputPane {
 impl Default for OutputPane {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Gate perf instrumentation behind an env var so the 30 fps
+/// tick loop doesn't pay the clock-read cost in production.
+/// Reads the var once per process; flipping it requires a
+/// restart.
+fn perf_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ANIE_PERF_TRACE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Short label identifying the block kind for perf traces.
+fn block_kind_tag(block: &RenderedBlock) -> &'static str {
+    match block {
+        RenderedBlock::UserMessage { .. } => "user",
+        RenderedBlock::AssistantMessage { .. } => "assistant",
+        RenderedBlock::ToolCall { .. } => "tool",
+        RenderedBlock::SystemMessage { .. } => "system",
     }
 }
 
