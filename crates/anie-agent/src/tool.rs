@@ -1,10 +1,24 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use jsonschema::Validator;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use anie_protocol::{ToolDef, ToolResult};
+
+/// Result of compiling a tool's JSON schema at registration
+/// time. `Invalid` preserves current semantics: the tool
+/// stays registered so the error is surfaced on first use,
+/// but we don't hide it behind a lazy recompile per call.
+pub enum ValidatorState {
+    /// The schema compiled successfully.
+    Ready(Arc<Validator>),
+    /// The schema failed to compile. The stored message is
+    /// surfaced verbatim on any tool call — identical wording
+    /// to what the old inline compilation would have returned.
+    Invalid(String),
+}
 
 /// Trait implemented by every tool.
 #[async_trait]
@@ -50,6 +64,11 @@ pub struct ToolRegistry {
     /// registration happens only at startup, so the rebuild
     /// is paid exactly once per tool.
     sorted_definitions: Vec<ToolDef>,
+    /// Precompiled JSON schema validators keyed by tool name.
+    /// Compiled once in `register()`; reused on every tool call.
+    /// If compilation failed, the stored error message is
+    /// returned verbatim on use.
+    validators: HashMap<String, ValidatorState>,
 }
 
 impl ToolRegistry {
@@ -59,14 +78,30 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             sorted_definitions: Vec::new(),
+            validators: HashMap::new(),
         }
     }
 
     /// Register a tool, replacing any existing tool with the same name.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        let name = tool.definition().name;
+        let definition = tool.definition();
+        let name = definition.name.clone();
+        let validator_state = match jsonschema::validator_for(&definition.parameters) {
+            Ok(validator) => ValidatorState::Ready(Arc::new(validator)),
+            Err(error) => ValidatorState::Invalid(format!(
+                "Tool schema compilation failed: {error}"
+            )),
+        };
+        self.validators.insert(name.clone(), validator_state);
         self.tools.insert(name, tool);
         self.rebuild_sorted_definitions();
+    }
+
+    /// Return the precompiled validator state for a registered
+    /// tool, or `None` if no tool with that name is registered.
+    #[must_use]
+    pub fn validator(&self, name: &str) -> Option<&ValidatorState> {
+        self.validators.get(name)
     }
 
     /// Look up a tool by name.
@@ -198,5 +233,53 @@ mod tests {
         registry.register(stub("tool"));
         registry.register(stub("tool"));
         assert_eq!(registry.definitions().len(), 1);
+    }
+
+    /// A tool with a valid schema gets a `Ready` validator
+    /// precompiled at registration time; no runtime compile.
+    #[test]
+    fn tool_registry_compiles_valid_schema_at_registration() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StubTool {
+            def: ToolDef {
+                name: "echo".into(),
+                description: "e".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"msg": {"type": "string"}},
+                    "required": ["msg"]
+                }),
+            },
+        }));
+        match registry.validator("echo") {
+            Some(ValidatorState::Ready(_)) => {}
+            Some(ValidatorState::Invalid(msg)) => panic!("expected Ready, got Invalid({msg})"),
+            None => panic!("expected Ready, got missing validator"),
+        }
+    }
+
+    /// An invalid schema is stored as `Invalid(msg)` so the
+    /// error surfaces on first use rather than being retried
+    /// (and failing again) on every call.
+    #[test]
+    fn tool_registry_stores_invalid_schema_as_stringified_error() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StubTool {
+            def: ToolDef {
+                name: "broken".into(),
+                description: "b".into(),
+                // `type` must be a string or array, not an int.
+                parameters: serde_json::json!({"type": 42}),
+            },
+        }));
+        match registry.validator("broken") {
+            Some(ValidatorState::Invalid(msg)) => {
+                assert!(
+                    msg.starts_with("Tool schema compilation failed:"),
+                    "legacy error prefix must be preserved: {msg}"
+                );
+            }
+            _ => panic!("expected Invalid for malformed schema"),
+        }
     }
 }

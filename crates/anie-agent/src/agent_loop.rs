@@ -805,9 +805,19 @@ impl AgentLoop {
             return tool_result_message(&tool_call, result, true);
         };
 
-        let definition = tool.definition();
-        if let Err(message) = validate_tool_arguments(&definition.parameters, &tool_call.arguments)
-        {
+        // Fetch the precompiled validator from the registry.
+        // Missing validator would mean we skipped registration
+        // (can't happen here — `tool_registry.get` above
+        // returned Some(tool) so the validator also exists),
+        // but handle it defensively with the legacy error
+        // message so behavior is identical to the pre-cache
+        // code path.
+        let validator_state = self.tool_registry.validator(&tool_call.name);
+        let validation_result = match validator_state {
+            Some(state) => validate_tool_arguments(state, &tool_call.arguments),
+            None => Err("Tool schema compilation failed: validator missing from registry".into()),
+        };
+        if let Err(message) = validation_result {
             let result = error_tool_result(message);
             send_event(
                 event_tx,
@@ -998,11 +1008,16 @@ fn sanitize_assistant_for_request(
 }
 
 fn validate_tool_arguments(
-    schema: &serde_json::Value,
+    validator_state: &crate::tool::ValidatorState,
     args: &serde_json::Value,
 ) -> Result<(), String> {
-    let validator = jsonschema::validator_for(schema)
-        .map_err(|error| format!("Tool schema compilation failed: {error}"))?;
+    let validator = match validator_state {
+        crate::tool::ValidatorState::Ready(v) => v,
+        // Preserve the legacy error wording verbatim so any
+        // downstream log-match or integration test that keyed
+        // on "Tool schema compilation failed:" still works.
+        crate::tool::ValidatorState::Invalid(message) => return Err(message.clone()),
+    };
     let errors: Vec<String> = validator
         .iter_errors(args)
         .map(|error| error.to_string())
