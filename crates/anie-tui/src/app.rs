@@ -1478,7 +1478,11 @@ pub async fn run_tui(
     loop {
         if dirty && last_render_at.elapsed() >= FRAME_BUDGET {
             let frame = crate::render_debug::RenderFrame::begin();
-            terminal.draw(|f| app.render(f))?;
+            // Wrap in DECSET 2026 synchronized output so modern
+            // GPU terminals composite each frame atomically. No-op
+            // on terminals that don't understand the sequence.
+            // See crates/anie-tui/src/terminal.rs for the helper.
+            crate::terminal::draw_synchronized(terminal, |f| app.render(f))?;
             frame.end(app.output_pane.blocks().len());
             dirty = false;
             last_render_at = Instant::now();
