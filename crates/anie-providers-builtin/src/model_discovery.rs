@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -52,6 +53,11 @@ pub async fn discover_models(
 }
 
 /// In-memory TTL cache for provider model discovery.
+///
+/// Plan 06 PR-E: hits return `Arc<[ModelInfo]>` so consumers
+/// share the backing allocation across lookups instead of
+/// deep-cloning the full discovered catalog on every read.
+/// Misses wrap the freshly-discovered Vec in an Arc once.
 pub struct ModelDiscoveryCache {
     entries: HashMap<CacheKey, CacheEntry>,
     default_ttl: Duration,
@@ -71,19 +77,19 @@ impl ModelDiscoveryCache {
     pub async fn get_or_discover(
         &mut self,
         request: &ModelDiscoveryRequest,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
+    ) -> Result<Arc<[ModelInfo]>, ProviderError> {
         let key = request.cache_key();
         if let Some(entry) = self.entries.get(&key)
             && entry.fetched_at.elapsed() < self.default_ttl
         {
-            return Ok(entry.models.clone());
+            return Ok(Arc::clone(&entry.models));
         }
 
-        let models = discover_models(request).await?;
+        let models: Arc<[ModelInfo]> = discover_models(request).await?.into();
         self.entries.insert(
             key,
             CacheEntry {
-                models: models.clone(),
+                models: Arc::clone(&models),
                 fetched_at: Instant::now(),
             },
         );
@@ -94,13 +100,13 @@ impl ModelDiscoveryCache {
     pub async fn refresh(
         &mut self,
         request: &ModelDiscoveryRequest,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
+    ) -> Result<Arc<[ModelInfo]>, ProviderError> {
         let key = request.cache_key();
-        let models = discover_models(request).await?;
+        let models: Arc<[ModelInfo]> = discover_models(request).await?.into();
         self.entries.insert(
             key,
             CacheEntry {
-                models: models.clone(),
+                models: Arc::clone(&models),
                 fetched_at: Instant::now(),
             },
         );
@@ -123,7 +129,7 @@ struct CacheKey {
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    models: Vec<ModelInfo>,
+    models: Arc<[ModelInfo]>,
     fetched_at: Instant,
 }
 

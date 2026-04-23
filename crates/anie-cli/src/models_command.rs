@@ -33,8 +33,12 @@ pub async fn run_models_command(provider_filter: Option<&str>, refresh: bool) ->
         };
         match result {
             Ok(models) => {
-                for model in models {
-                    rows.push((request.provider_name.clone(), model));
+                // Plan 06 PR-E: `get_or_discover` returns
+                // `Arc<[ModelInfo]>`. Clone each element into the
+                // rows vec since the aggregate needs ownership;
+                // the Arc itself drops when the loop ends.
+                for model in models.iter() {
+                    rows.push((request.provider_name.clone(), model.clone()));
                 }
             }
             Err(error) => errors.push((request.provider_name.clone(), error.to_string())),

@@ -1440,11 +1440,17 @@ impl App {
         let cache = Arc::clone(&self.discovery_cache);
         let tx = self.worker_tx.clone();
         tokio::spawn(async move {
+            // Plan 06 PR-E: cache now returns Arc<[ModelInfo]>.
+            // Convert to Vec at the event boundary so the
+            // AppWorkerEvent payload stays owned data; the
+            // Arc-sharing benefit applies to in-cache lookups,
+            // not to one-shot worker events.
             let result = cache
                 .lock()
                 .await
                 .refresh(&request)
                 .await
+                .map(|models| models.to_vec())
                 .map_err(|error| error.to_string());
             let _ = tx.send(AppWorkerEvent::ModelDiscoveryComplete {
                 provider_name: context.provider_name,
