@@ -380,7 +380,10 @@ impl App {
         // has elapsed. Cheap (one Option<Instant> comparison)
         // when nothing is pending.
         self.input_pane.tick_autocomplete();
-        let spinner_frame = self.spinner.tick().to_string();
+        // `Spinner::tick` returns a `&'static str` — borrow it
+        // directly instead of allocating a `String` per frame.
+        // Plan 04 PR-F.
+        let spinner_frame: &'static str = self.spinner.tick();
         let half_height = frame.area().height.saturating_sub(2).max(8) / 2;
         let bottom_height = match &self.bottom_pane {
             BottomPane::Editor => self
@@ -395,14 +398,14 @@ impl App {
         let (output_area, status_area, bottom_area) = layout(frame.area(), bottom_height);
 
         self.output_pane
-            .render(output_area, frame.buffer_mut(), &spinner_frame);
+            .render(output_area, frame.buffer_mut(), spinner_frame);
         render_status_bar(
             &self.status_bar,
             &self.agent_state,
             self.output_pane.is_scrolled(),
             status_area,
             frame.buffer_mut(),
-            &spinner_frame,
+            spinner_frame,
         );
 
         let cursor = match &mut self.bottom_pane {
@@ -410,7 +413,7 @@ impl App {
             BottomPane::ModelPicker(session) => {
                 session
                     .picker
-                    .render(bottom_area, frame.buffer_mut(), &spinner_frame)
+                    .render(bottom_area, frame.buffer_mut(), spinner_frame)
             }
         };
         frame.set_cursor_position(cursor);
@@ -1750,15 +1753,7 @@ fn tool_result_body(result: &ToolResult) -> String {
     {
         return diff.to_string();
     }
-    result
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_text_blocks(&result.content)
 }
 
 fn tool_result_message_body(result: &ToolResultMessage) -> String {
@@ -1769,15 +1764,41 @@ fn tool_result_message_body(result: &ToolResultMessage) -> String {
     {
         return diff.to_string();
     }
-    result
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_text_blocks(&result.content)
+}
+
+/// Concatenate the `ContentBlock::Text` blocks in `content`
+/// joined by newlines. Single-pass allocation: reserves the
+/// exact output capacity and writes in place, rather than
+/// collecting into an intermediate `Vec<&str>` + `.join()`
+/// (which allocates twice — once for the Vec, once for the
+/// joined String). Plan 04 PR-F / finding #52.
+fn join_text_blocks(content: &[ContentBlock]) -> String {
+    // First pass: compute output capacity + count the text
+    // blocks so we can write the join separators exactly.
+    let mut total_bytes = 0usize;
+    let mut text_blocks = 0usize;
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            if text_blocks > 0 {
+                total_bytes += 1; // '\n' separator
+            }
+            total_bytes += text.len();
+            text_blocks += 1;
+        }
+    }
+    let mut out = String::with_capacity(total_bytes);
+    let mut first = true;
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            if !first {
+                out.push('\n');
+            }
+            out.push_str(text);
+            first = false;
+        }
+    }
+    out
 }
 
 fn tool_result_args_display(result: &ToolResultMessage) -> String {

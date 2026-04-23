@@ -757,15 +757,18 @@ fn block_lines(
 ) -> Vec<Line<'static>> {
     match block {
         RenderedBlock::UserMessage { text, .. } => wrap_spans(
-            vec![Span::styled(
-                "> You: ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]
-            .into_iter()
-            .chain(vec![Span::raw(text.clone())])
-            .collect(),
+            // Direct vector build — the previous shape allocated
+            // two intermediate `Vec<Span>` and chained them via
+            // iterators. Plan 04 PR-F / finding #48.
+            vec![
+                Span::styled(
+                    "> You: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text.clone()),
+            ],
             width,
         ),
         RenderedBlock::AssistantMessage {

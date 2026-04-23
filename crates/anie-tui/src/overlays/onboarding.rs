@@ -325,7 +325,9 @@ impl OnboardingScreen {
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
-        let spinner_frame = self.spinner.tick().to_string();
+        // Borrow the &'static str from Spinner::tick rather
+        // than allocating a fresh String per frame. Plan 04 PR-F.
+        let spinner_frame: &'static str = self.spinner.tick();
         match &self.state {
             OnboardingState::MainMenu { selected } => {
                 self.render_main_menu(frame, inner, *selected)
@@ -343,7 +345,7 @@ impl OnboardingScreen {
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::LocalServerSelect { selected } => {
-                self.render_local_server_select(frame, inner, *selected, &spinner_frame)
+                self.render_local_server_select(frame, inner, *selected, spinner_frame)
             }
             OnboardingState::NoLocalServers => self.render_busy_panel(
                 frame,
@@ -382,7 +384,7 @@ impl OnboardingScreen {
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::PickingModel { picker, .. } => {
-                self.render_model_picker(frame, inner, picker, &spinner_frame)
+                self.render_model_picker(frame, inner, picker, spinner_frame)
             }
             OnboardingState::Success { message } => self.render_status_panel(
                 frame,

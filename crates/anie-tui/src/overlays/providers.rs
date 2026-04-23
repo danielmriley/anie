@@ -235,7 +235,9 @@ impl ProviderManagementScreen {
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
-        let spinner_frame = self.spinner.tick().to_string();
+        // Borrow the &'static str from Spinner::tick rather
+        // than allocating a fresh String per frame. Plan 04 PR-F.
+        let spinner_frame: &'static str = self.spinner.tick();
         match &self.mode {
             ProviderManagementMode::Table => self.render_table(frame, inner),
             ProviderManagementMode::ActionMenu { selected } => {
@@ -264,7 +266,7 @@ impl ProviderManagementScreen {
                 footer_line("[Esc] Back"),
             ),
             ProviderManagementMode::PickingModel { picker, .. } => {
-                self.render_model_picker(frame, inner, picker, &spinner_frame)
+                self.render_model_picker(frame, inner, picker, spinner_frame)
             }
             ProviderManagementMode::Status { message, is_error } => self.render_status_panel(
                 frame,
