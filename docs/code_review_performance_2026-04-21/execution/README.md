@@ -16,7 +16,7 @@ conflict-minimizing multi-agent assignment layout.
 | 04 | TUI output hot path | **landed** | 6/6 PRs shipped; scroll_static_600: 3.16 ms → 296 µs (10.7×) |
 | 05 | Picker search + fuzzy matching | **landed** | 4/4 PRs shipped as Phase 6.1-6.4 |
 | 06 | Provider streaming + local models | **landed** | 7/7 PRs shipped as Phase 8.1-8.7 |
-| 07 | Tool read/grep/bash/edit + truncation | pending | shared truncation helper likely starts here |
+| 07 | Tool read/grep/bash/edit + truncation | **landed** | 7/8 PRs shipped; PR-H (streamed read) deferred per plan's explicit optional gate |
 | 08 | Low-risk helper sweep | pending | land last |
 | 09 | Tool output display modes | **landed** | 3/3 PRs shipped as Phase 5.1-5.3 |
 | 10 | TUI scrolling + markdown overflow | **landed** | 3/4 PRs shipped (A/B/C); PR-D horizontal pan deferred per plan gate |
@@ -57,14 +57,14 @@ conflict-minimizing multi-agent assignment layout.
 | 06 | E | model-discovery cache ownership | **landed** | `97ee40e` |
 | 06 | F | local probe normalization | **landed** | `0b52586` |
 | 06 | G | provider helper sweep | **landed** | `0b52586` |
-| 07 | A | shared truncation helper scaffold | pending | — |
-| 07 | B | grep direct-write path | pending | — |
-| 07 | C | bash tail rendering cleanup | pending | — |
-| 07 | D | edit fuzzy normalization | pending | — |
-| 07 | E | edit BOM / line-ending helper cleanup | pending | — |
-| 07 | F | read-path cheap wins (output-body work) | pending | — |
-| 07 | G | read helper cleanup | pending | — |
-| 07 | H | streamed / size-gated read follow-up (optional) | pending | — |
+| 07 | A | shared truncation helper scaffold | **landed** | `ac3cf8f` |
+| 07 | B | grep direct-write path | **landed** | `ac3cf8f` |
+| 07 | C | bash tail rendering cleanup | **landed** | `ac3cf8f` |
+| 07 | D | edit fuzzy normalization | **landed** | `472c1ff` |
+| 07 | E | edit BOM / line-ending helper cleanup | **landed** | `9512ece` |
+| 07 | F | read-path cheap wins (output-body work) | **landed** | `800dbe6` |
+| 07 | G | read helper cleanup | **landed** | `800dbe6` |
+| 07 | H | streamed / size-gated read follow-up (optional) | **deferred** (by plan design) | — | Plan explicitly optional; streaming rewrite must carefully handle binary detection (`bytes.contains(&0)`). |
 | 08 | A | text assembly helper sweep | pending | — |
 | 08 | B | token-estimation helper cleanup | pending | — |
 | 08 | C | model-catalog cleanup | pending | — |
