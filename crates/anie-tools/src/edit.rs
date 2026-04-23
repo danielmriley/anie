@@ -300,7 +300,26 @@ fn fuzzy_find_all_occurrences_in_normalized(
 }
 
 fn normalize_to_lf(value: &str) -> String {
-    value.replace("\r\n", "\n").replace('\r', "\n")
+    // Plan 07 PR-E: single-pass CRLF + CR → LF normalization.
+    // The previous shape was `replace("\r\n", "\n").replace('\r', "\n")`
+    // which allocates a new String on each `replace` call — two
+    // full passes over the input for a file that's already LF-
+    // normalized. Now: one allocation sized to the source, one
+    // pass.
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            // Collapse "\r\n" into "\n"; bare "\r" also becomes "\n".
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn detect_line_ending(value: &str) -> LineEnding {
@@ -334,7 +353,11 @@ fn decode_utf8_with_bom(bytes: &[u8]) -> Result<(bool, String), std::string::Fro
 
 fn encode_utf8_with_bom(value: &str, has_bom: bool) -> Vec<u8> {
     const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-    let mut bytes = Vec::new();
+    // Plan 07 PR-E: size the buffer up front so extend_from_slice
+    // doesn't grow it (one reallocation avoided for files with
+    // a BOM; the non-BOM path sizes exactly).
+    let capacity = value.len() + if has_bom { UTF8_BOM.len() } else { 0 };
+    let mut bytes = Vec::with_capacity(capacity);
     if has_bom {
         bytes.extend_from_slice(UTF8_BOM);
     }
