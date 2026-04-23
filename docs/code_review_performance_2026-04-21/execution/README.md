@@ -11,8 +11,8 @@ conflict-minimizing multi-agent assignment layout.
 | # | Plan | Status | Notes |
 |---|------|--------|-------|
 | 01 | Tool registry + schema validation | **landed** | 3/3 PRs shipped as Phase 1.2/1.3 of the refactor worklist |
-| 02 | Agent turn ownership + event payloads | pending | clone-heavy run-loop cleanup |
-| 03 | Session indexing + context construction | pending | single-index session simplification |
+| 02 | Agent turn ownership + event payloads | **partial** | PR-A (Cow sanitization) landed; B-F deferred as small residual cleanups. |
+| 03 | Session indexing + context construction | **partial** | PR-A (remove id_set) + PR-D (trim CutPoint.kept) landed; B/C/E/F deferred. |
 | 04 | TUI output hot path | **landed** | 6/6 PRs shipped; scroll_static_600: 3.16 ms → 296 µs (10.7×) |
 | 05 | Picker search + fuzzy matching | **landed** | 4/4 PRs shipped as Phase 6.1-6.4 |
 | 06 | Provider streaming + local models | pending | correctness-sensitive Anthropic work inside |
@@ -28,18 +28,18 @@ conflict-minimizing multi-agent assignment layout.
 | 01 | A | cached sorted definitions | **landed** | `baa0839` |
 | 01 | B | precompiled validators | **landed** | `cd1cd06` |
 | 01 | C | borrowed `definitions()` API (optional) | **landed** (as part of A) | `baa0839` |
-| 02 | A | `Cow` sanitization fast path | pending | — |
-| 02 | B | prompt replay ownership cleanup | pending | — |
-| 02 | C | tool-result ownership cleanup | pending | — |
-| 02 | D | `finish_with_assistant` cleanup | pending | — |
-| 02 | E | centralized run-finalization | pending | — |
-| 02 | F | optional `AgentEnd` payload change | pending | — |
-| 03 | A | remove `id_set` | pending | — |
-| 03 | B | `open_session` / `add_entries` clone cleanup | pending | — |
-| 03 | C | borrowed branch walk | pending | — |
-| 03 | D | `find_cut_point` trim | pending | — |
-| 03 | E | lightweight `list_sessions` | pending | — |
-| 03 | F | session-local helper sweep | pending | — |
+| 02 | A | `Cow` sanitization fast path | **landed** | `d953196` |
+| 02 | B | prompt replay ownership cleanup | **deferred** | — | Medium-risk loop reordering; no user-visible impact beyond Cow win. Safe to revisit per plan. |
+| 02 | C | tool-result ownership cleanup | **deferred** | — | Same as PR-B. |
+| 02 | D | `finish_with_assistant` cleanup | **deferred** | — | Function-local; can land independently. |
+| 02 | E | centralized run-finalization | **deferred** | — | Touches exit paths — land after B/C. |
+| 02 | F | optional `AgentEnd` payload change | **deferred** (by plan design) | — | Plan says "only if still needed after E". |
+| 03 | A | remove `id_set` | **landed** | `06c86e3` |
+| 03 | B | `open_session` / `add_entries` clone cleanup | **deferred** | — | Small residual clones; follow-up. |
+| 03 | C | borrowed branch walk | **deferred** | — | Small residual allocations in branch walk. |
+| 03 | D | `find_cut_point` trim | **landed** | `c97bf48` |
+| 03 | E | lightweight `list_sessions` | **deferred** | — | Only fires on `/session list` — not a keystroke path. |
+| 03 | F | session-local helper sweep | **deferred** | — | Cheap wins; fold into a follow-up. |
 | 04 | A | render scheduling cross-link / landing | **landed** (no-op — already shipped via `tui_responsiveness/`) | `3fb113d` |
 | 04 | B | Arc-backed output cache storage | **landed** | `3fb113d` |
 | 04 | C | cache read-side cleanup + invalidation audit | **landed** — 10.7× scroll speedup | `26f6e8a` |
