@@ -1674,6 +1674,17 @@ pub async fn run_tui(
     // gate waits `RESIZE_DEBOUNCE` from this instant before
     // repainting; cleared on the next successful paint.
     let mut last_resize_at: Option<Instant> = None;
+    // Opt-in tracing of keystroke → paint latency. Set
+    // `ANIE_TRACE_TYPING=1` and a line is emitted to the log
+    // file every keystroke-driven paint with the measured
+    // `t_key_to_paint_us`. Off by default (one atomic load
+    // per loop when unset).
+    let trace_typing = std::env::var("ANIE_TRACE_TYPING")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    // Time of the most recent key arrival in the term-events
+    // branch. `None` once its paint completes.
+    let mut key_arrival_at: Option<Instant> = None;
 
     loop {
         // Two gates: frame budget (coalesce streaming bursts)
@@ -1686,12 +1697,31 @@ pub async fn run_tui(
         let budget_ready = input_urgent || last_render_at.elapsed() >= FRAME_BUDGET;
         if dirty && budget_ready && resize_ready {
             let frame = crate::render_debug::RenderFrame::begin();
-            // Wrap in DECSET 2026 synchronized output so modern
-            // GPU terminals composite each frame atomically. No-op
-            // on terminals that don't understand the sequence.
-            // See crates/anie-tui/src/terminal.rs for the helper.
-            crate::terminal::draw_synchronized(terminal, |f| app.render(f))?;
+            // Fast-path keystroke paints bypass the DECSET 2026
+            // synchronized-output wrap: a single typed char
+            // changes only a handful of cells and the tearing
+            // sync prevents isn't visible on that scale, while
+            // the wrap itself can add a VSync-alignment wait on
+            // GPU terminals. Non-urgent paints (streaming,
+            // scrolling, resize-final) still wrap for atomic
+            // composition.
+            if input_urgent {
+                crate::terminal::draw_urgent(terminal, |f| app.render(f))?;
+            } else {
+                crate::terminal::draw_synchronized(terminal, |f| app.render(f))?;
+            }
             frame.end(app.output_pane.blocks().len());
+            if trace_typing
+                && let Some(arrived) = key_arrival_at.take()
+            {
+                let us = arrived.elapsed().as_micros();
+                tracing::info!(
+                    target: "anie_tui::input_latency",
+                    t_key_to_paint_us = us as u64,
+                    urgent = input_urgent,
+                    "keystroke paint",
+                );
+            }
             dirty = false;
             input_urgent = false;
             last_render_at = Instant::now();
@@ -1749,6 +1779,9 @@ pub async fn run_tui(
                     // keystroke lands on screen without waiting
                     // out the 33 ms coalescing budget.
                     input_urgent = true;
+                    if trace_typing && key_arrival_at.is_none() {
+                        key_arrival_at = Some(Instant::now());
+                    }
                 }
                 if affects_render {
                     dirty = true;

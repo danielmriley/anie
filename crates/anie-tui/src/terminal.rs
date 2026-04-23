@@ -166,6 +166,32 @@ where
     Ok(())
 }
 
+/// Draw a single frame WITHOUT the DECSET 2026 wrap —
+/// intended for keystroke-driven paints where input
+/// latency matters more than tearing avoidance. A single
+/// keystroke changes only a handful of cells (the typed
+/// char plus the cursor position); tearing that the sync
+/// wrap prevents isn't perceptible on that scale, and
+/// skipping BSU/ESU saves a terminal round-trip (on
+/// sync-capable terminals, it also skips a VSync-alignment
+/// wait that can add 8-16 ms).
+///
+/// Callers should use this only when they'd prefer lowest
+/// latency over atomic composition. Streaming paints,
+/// scroll redraws, and resize-final paints still want
+/// `draw_synchronized`.
+pub fn draw_urgent<B, F>(
+    terminal: &mut Terminal<B>,
+    render_callback: F,
+) -> io::Result<()>
+where
+    B: Backend + io::Write,
+    F: FnOnce(&mut Frame),
+{
+    terminal.draw(render_callback)?;
+    Ok(())
+}
+
 /// Read-once toggle for the synchronized-output wrap. See
 /// `draw_synchronized` for the rationale.
 fn sync_output_disabled() -> bool {
