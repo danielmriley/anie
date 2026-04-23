@@ -17,7 +17,7 @@ conflict-minimizing multi-agent assignment layout.
 | 05 | Picker search + fuzzy matching | **landed** | 4/4 PRs shipped as Phase 6.1-6.4 |
 | 06 | Provider streaming + local models | **landed** | 7/7 PRs shipped as Phase 8.1-8.7 |
 | 07 | Tool read/grep/bash/edit + truncation | **landed** | 7/8 PRs shipped; PR-H (streamed read) deferred per plan's explicit optional gate |
-| 08 | Low-risk helper sweep | pending | land last |
+| 08 | Low-risk helper sweep | **landed** | 2/4 PRs shipped as Phase 10.1-10.3; PR-B and PR-D absorbed by earlier phases. |
 | 09 | Tool output display modes | **landed** | 3/3 PRs shipped as Phase 5.1-5.3 |
 | 10 | TUI scrolling + markdown overflow | **landed** | 3/4 PRs shipped (A/B/C); PR-D horizontal pan deferred per plan gate |
 
@@ -65,10 +65,10 @@ conflict-minimizing multi-agent assignment layout.
 | 07 | F | read-path cheap wins (output-body work) | **landed** | `800dbe6` |
 | 07 | G | read helper cleanup | **landed** | `800dbe6` |
 | 07 | H | streamed / size-gated read follow-up (optional) | **deferred** (by plan design) | — | Plan explicitly optional; streaming rewrite must carefully handle binary detection (`bytes.contains(&0)`). |
-| 08 | A | text assembly helper sweep | pending | — |
-| 08 | B | token-estimation helper cleanup | pending | — |
-| 08 | C | model-catalog cleanup | pending | — |
-| 08 | D | remaining TUI/CLI helpers | pending | — |
+| 08 | A | text assembly helper sweep | **landed** | `f06d87d` |
+| 08 | B | token-estimation helper cleanup | **deferred** | — | Finding #14 was absorbed by Plan 03's session work. No standalone target left. |
+| 08 | C | model-catalog cleanup | **landed** | `82e9fed` + `8ed250b` |
+| 08 | D | remaining TUI/CLI helpers | **deferred** — absorbed by earlier phases | — | Findings #22/#41/#42 covered by spinner tick (Phase 2.6), join_text_blocks (Phase 2.6), prefix clone cleanup. No standalone target left. |
 | 09 | A | config + pane plumbing | **landed** | `597d702` |
 | 09 | B | compact rendering for `bash` / `read` | **landed** | `e33724d` |
 | 09 | C | `/tool-output` runtime toggle | **landed** | `15d48c8` |
