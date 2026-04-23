@@ -935,12 +935,25 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
-fn sanitize_context_for_request(
-    messages: &[Message],
+/// Plan 02 PR-A: return `Cow::Borrowed` on the common no-
+/// sanitization path so the entire context Vec isn't cloned
+/// every turn. The needs-sanitization scan inspects each
+/// assistant message and short-circuits as soon as one
+/// would have been filtered or rewritten; if none would,
+/// the caller borrows the original slice.
+fn sanitize_context_for_request<'a>(
+    messages: &'a [Message],
     includes_thinking_in_replay: bool,
     requires_thinking_signature: bool,
-) -> Vec<Message> {
-    messages
+) -> std::borrow::Cow<'a, [Message]> {
+    if !context_needs_sanitization(
+        messages,
+        includes_thinking_in_replay,
+        requires_thinking_signature,
+    ) {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    let sanitized: Vec<Message> = messages
         .iter()
         .filter_map(|message| match message {
             Message::Assistant(assistant) => sanitize_assistant_for_request(
@@ -951,7 +964,59 @@ fn sanitize_context_for_request(
             .map(Message::Assistant),
             _ => Some(message.clone()),
         })
-        .collect()
+        .collect();
+    std::borrow::Cow::Owned(sanitized)
+}
+
+/// `true` when any assistant message in `messages` would be
+/// filtered or rewritten by `sanitize_assistant_for_request`.
+/// Mirrors the sanitizer's own predicates — when they drift,
+/// update both.
+fn context_needs_sanitization(
+    messages: &[Message],
+    includes_thinking_in_replay: bool,
+    requires_thinking_signature: bool,
+) -> bool {
+    messages.iter().any(|message| {
+        let Message::Assistant(assistant) = message else {
+            return false;
+        };
+        if matches!(
+            assistant.stop_reason,
+            StopReason::Error | StopReason::Aborted
+        ) {
+            return true;
+        }
+        let mut non_thinking_visible = false;
+        let mut any_drop = false;
+        for block in &assistant.content {
+            match block {
+                ContentBlock::Text { text } if text.trim().is_empty() => any_drop = true,
+                ContentBlock::Text { .. } => non_thinking_visible = true,
+                ContentBlock::Thinking { thinking, .. } if thinking.trim().is_empty() => {
+                    any_drop = true
+                }
+                ContentBlock::Thinking { .. } if !includes_thinking_in_replay => any_drop = true,
+                ContentBlock::Thinking {
+                    signature: None, ..
+                } if requires_thinking_signature => any_drop = true,
+                ContentBlock::Thinking { .. } => {}
+                ContentBlock::RedactedThinking { .. } if !includes_thinking_in_replay => {
+                    any_drop = true
+                }
+                ContentBlock::RedactedThinking { .. } => {}
+                _ => non_thinking_visible = true,
+            }
+        }
+        if any_drop {
+            return true;
+        }
+        // Sanitizer also filters out messages with no non-
+        // thinking visible blocks. If the original already
+        // has none, the sanitizer would filter it — sanitize
+        // path needed.
+        !non_thinking_visible
+    })
 }
 
 fn sanitize_assistant_for_request(
@@ -1297,6 +1362,61 @@ mod tests {
             timestamp,
             reasoning_details: None,
         }
+    }
+
+    /// Plan 02 PR-A fast path: a context with no empty/
+    /// failed/filter-eligible assistants returns
+    /// `Cow::Borrowed`.
+    #[test]
+    fn sanitize_context_fast_path_returns_borrowed_when_no_rewrite_needed() {
+        use std::borrow::Cow;
+
+        let context = vec![
+            user_message("first", 1),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text {
+                    text: "visible".into(),
+                }],
+                StopReason::Stop,
+                2,
+            )),
+            user_message("second", 3),
+        ];
+
+        let sanitized = sanitize_context_for_request(&context, false, false);
+        assert!(
+            matches!(sanitized, Cow::Borrowed(_)),
+            "expected borrowed Cow on fast path"
+        );
+    }
+
+    /// Plan 02 PR-A: the owned path still runs when any
+    /// assistant message triggers a filter or rewrite.
+    #[test]
+    fn sanitize_context_owned_path_runs_when_rewrite_needed() {
+        use std::borrow::Cow;
+
+        // Empty-text assistant forces a drop — sanitizer must
+        // rewrite, so the Cow is Owned.
+        let context = vec![
+            user_message("first", 1),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text { text: "  ".into() }],
+                StopReason::Stop,
+                2,
+            )),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text { text: "keep".into() }],
+                StopReason::Stop,
+                3,
+            )),
+        ];
+
+        let sanitized = sanitize_context_for_request(&context, false, false);
+        assert!(
+            matches!(sanitized, Cow::Owned(_)),
+            "expected owned Cow when rewrite needed"
+        );
     }
 
     #[test]
