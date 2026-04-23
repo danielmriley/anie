@@ -213,13 +213,20 @@ impl OpenAiStreamState {
     ) {
         for part in parts {
             match part {
+                // Plan 06 PR-C: skip empty fragments. Tagged-
+                // reasoning split can produce empty halves when
+                // a delta is entirely inside or outside a tag.
                 StreamContentPart::Text(text) => {
-                    self.text.push_str(&text);
-                    events.push(ProviderEvent::TextDelta(text));
+                    if !text.is_empty() {
+                        self.text.push_str(&text);
+                        events.push(ProviderEvent::TextDelta(text));
+                    }
                 }
                 StreamContentPart::Thinking(thinking) => {
-                    self.thinking.push_str(&thinking);
-                    events.push(ProviderEvent::ThinkingDelta(thinking));
+                    if !thinking.is_empty() {
+                        self.thinking.push_str(&thinking);
+                        events.push(ProviderEvent::ThinkingDelta(thinking));
+                    }
                 }
             }
         }

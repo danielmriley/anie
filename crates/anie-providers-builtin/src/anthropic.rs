@@ -543,27 +543,35 @@ impl AnthropicStreamState {
                 let delta = &payload["delta"];
                 match delta["type"].as_str() {
                     Some("text_delta") => {
-                        let text = delta["text"].as_str().unwrap_or_default().to_string();
-                        if let Some(AnthropicBlockState::Text(existing)) =
-                            self.blocks.get_mut(&index)
-                        {
-                            existing.push_str(&text);
+                        // Plan 06 PR-B: borrow the &str first and skip
+                        // empty fragments — the upstream emits them
+                        // occasionally between real tokens. Only
+                        // allocate when we have something to emit.
+                        let text = delta["text"].as_str().unwrap_or_default();
+                        if !text.is_empty() {
+                            if let Some(AnthropicBlockState::Text(existing)) =
+                                self.blocks.get_mut(&index)
+                            {
+                                existing.push_str(text);
+                            }
+                            events.push(ProviderEvent::TextDelta(text.to_string()));
                         }
-                        events.push(ProviderEvent::TextDelta(text));
                     }
                     Some("thinking_delta") => {
+                        // Plan 06 PR-B: skip empty thinking fragments.
                         let thinking = delta
                             .get("thinking")
                             .and_then(serde_json::Value::as_str)
                             .or_else(|| delta.get("text").and_then(serde_json::Value::as_str))
-                            .unwrap_or_default()
-                            .to_string();
-                        if let Some(AnthropicBlockState::Thinking(state)) =
-                            self.blocks.get_mut(&index)
-                        {
-                            state.thinking.push_str(&thinking);
+                            .unwrap_or_default();
+                        if !thinking.is_empty() {
+                            if let Some(AnthropicBlockState::Thinking(state)) =
+                                self.blocks.get_mut(&index)
+                            {
+                                state.thinking.push_str(thinking);
+                            }
+                            events.push(ProviderEvent::ThinkingDelta(thinking.to_string()));
                         }
-                        events.push(ProviderEvent::ThinkingDelta(thinking));
                     }
                     Some("input_json_delta") => {
                         let partial_json = delta["partial_json"]
