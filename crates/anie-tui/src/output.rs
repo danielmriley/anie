@@ -817,11 +817,26 @@ fn block_lines(
             result,
             is_executing,
             ..
-        } => boxed_lines(
-            format_tool_title(tool_name, args_display),
-            if let Some(result) = result {
-                if let Some(elapsed) = result.elapsed {
-                    format!("{}\n\nTook {:.1}s", result.content, elapsed.as_secs_f64())
+        } => {
+            // Plan 09 PR-B: in compact mode, successful bash /
+            // read tool results render as title only. Errors,
+            // edit/write results, and other tool kinds keep
+            // their full body so debugging and diffs stay
+            // visible. `is_executing` blocks always show the
+            // "executing..." spinner regardless of mode.
+            let body = if let Some(result) = result {
+                if compact_hides_body(
+                    tool_name,
+                    result,
+                    ctx.tool_output_mode,
+                ) {
+                    String::new()
+                } else if let Some(elapsed) = result.elapsed {
+                    format!(
+                        "{}\n\nTook {:.1}s",
+                        result.content,
+                        elapsed.as_secs_f64(),
+                    )
                 } else {
                     result.content.clone()
                 }
@@ -829,15 +844,35 @@ fn block_lines(
                 format!("{spinner_frame} executing...")
             } else {
                 String::new()
-            },
-            width,
-            result.as_ref().is_some_and(|value| value.is_error),
-            *is_executing,
-        ),
+            };
+            boxed_lines(
+                format_tool_title(tool_name, args_display),
+                body,
+                width,
+                result.as_ref().is_some_and(|value| value.is_error),
+                *is_executing,
+            )
+        }
         RenderedBlock::SystemMessage { text } => {
             wrap_text(text, width, Style::default().fg(Color::DarkGray))
         }
     }
+}
+
+/// Plan 09 PR-B: a successful `bash` or `read` tool result
+/// should hide its body in compact mode. Errors always keep
+/// their body (suppressing an error message would hide the
+/// most actionable debugging info in the transcript). `edit`
+/// and `write` keep their body so diffs stay visible; other
+/// tools keep their body for this first pass per plan scope.
+fn compact_hides_body(
+    tool_name: &str,
+    result: &ToolCallResult,
+    mode: ToolOutputMode,
+) -> bool {
+    matches!(mode, ToolOutputMode::Compact)
+        && !result.is_error
+        && (tool_name == "bash" || tool_name == "read")
 }
 
 fn assistant_block_lines(
@@ -1240,6 +1275,184 @@ impl OutputPane {
     /// Number of block slots (should always equal `blocks.len()`).
     pub(crate) fn cache_slot_count(&self) -> usize {
         self.caches.len()
+    }
+}
+
+#[cfg(test)]
+mod tool_output_mode_tests {
+    use super::*;
+
+    fn rendered_to_text(pane: &mut OutputPane, width: u16) -> String {
+        let lines = pane.build_lines(width, ".");
+        let mut out = String::new();
+        for line in &lines {
+            for span in &line.spans {
+                out.push_str(&span.content);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn pane_with_tool(
+        tool_name: &str,
+        title_arg: &str,
+        body: &str,
+        is_error: bool,
+    ) -> OutputPane {
+        let mut pane = OutputPane::new();
+        pane.add_tool_call(
+            "call-1".into(),
+            tool_name.to_string(),
+            title_arg.to_string(),
+        );
+        pane.finalize_tool_result(
+            "call-1",
+            body.to_string(),
+            is_error,
+            None,
+        );
+        pane
+    }
+
+    /// Plan 09 PR-B: compact mode drops the body for a
+    /// successful bash tool block. The title line (`$ <cmd>`)
+    /// is preserved.
+    #[test]
+    fn compact_mode_hides_successful_bash_body_but_keeps_title() {
+        let mut pane = pane_with_tool("bash", "ls /tmp", "file1\nfile2\nfile3", false);
+        pane.set_tool_output_mode(ToolOutputMode::Compact);
+        let rendered = rendered_to_text(&mut pane, 80);
+        assert!(rendered.contains("ls /tmp"), "title missing:\n{rendered}");
+        assert!(
+            !rendered.contains("file1"),
+            "compact mode should hide successful bash body:\n{rendered}"
+        );
+    }
+
+    /// Compact mode drops the body for a successful read.
+    #[test]
+    fn compact_mode_hides_successful_read_body_but_keeps_title() {
+        let mut pane = pane_with_tool(
+            "read",
+            "/tmp/secret.txt",
+            "line1\nline2\npassword=hunter2",
+            false,
+        );
+        pane.set_tool_output_mode(ToolOutputMode::Compact);
+        let rendered = rendered_to_text(&mut pane, 80);
+        assert!(
+            rendered.contains("/tmp/secret.txt"),
+            "title missing:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("password=hunter2"),
+            "compact mode should hide successful read body:\n{rendered}"
+        );
+    }
+
+    /// Compact mode keeps edit diffs visible — they're often
+    /// the whole point of inspecting an edit tool call.
+    #[test]
+    fn compact_mode_keeps_edit_diff_visible() {
+        let mut pane = pane_with_tool(
+            "edit",
+            "/tmp/main.rs",
+            "--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-old line\n+new line",
+            false,
+        );
+        pane.set_tool_output_mode(ToolOutputMode::Compact);
+        let rendered = rendered_to_text(&mut pane, 80);
+        assert!(
+            rendered.contains("new line"),
+            "edit diff must stay visible in compact mode:\n{rendered}"
+        );
+    }
+
+    /// Compact mode keeps write results visible so confirmation
+    /// of a destructive action doesn't get hidden.
+    #[test]
+    fn compact_mode_keeps_write_result_visible() {
+        let mut pane = pane_with_tool(
+            "write",
+            "/tmp/out.txt",
+            "Wrote 128 bytes to /tmp/out.txt",
+            false,
+        );
+        pane.set_tool_output_mode(ToolOutputMode::Compact);
+        let rendered = rendered_to_text(&mut pane, 80);
+        assert!(
+            rendered.contains("128 bytes"),
+            "write result must stay visible in compact mode:\n{rendered}"
+        );
+    }
+
+    /// Compact mode keeps bash errors visible — hiding them
+    /// would make debugging far worse.
+    #[test]
+    fn compact_mode_keeps_bash_errors_visible() {
+        let mut pane = pane_with_tool(
+            "bash",
+            "/usr/bin/false",
+            "command failed with exit code 1",
+            true,
+        );
+        pane.set_tool_output_mode(ToolOutputMode::Compact);
+        let rendered = rendered_to_text(&mut pane, 80);
+        assert!(
+            rendered.contains("command failed"),
+            "bash error body must stay visible:\n{rendered}"
+        );
+    }
+
+    /// Compact mode keeps read errors visible.
+    #[test]
+    fn compact_mode_keeps_read_errors_visible() {
+        let mut pane = pane_with_tool(
+            "read",
+            "/no/such/file",
+            "read failed: permission denied",
+            true,
+        );
+        pane.set_tool_output_mode(ToolOutputMode::Compact);
+        let rendered = rendered_to_text(&mut pane, 80);
+        assert!(
+            rendered.contains("permission denied"),
+            "read error body must stay visible:\n{rendered}"
+        );
+    }
+
+    /// Verbose mode (the default) keeps today's behavior:
+    /// successful bash bodies still render. Regression guard
+    /// against breaking the opt-in boundary.
+    #[test]
+    fn verbose_mode_keeps_successful_bash_body_visible() {
+        let mut pane = pane_with_tool("bash", "ls /tmp", "file1\nfile2", false);
+        // Default is Verbose — no explicit set needed, but be
+        // explicit for readability.
+        pane.set_tool_output_mode(ToolOutputMode::Verbose);
+        let rendered = rendered_to_text(&mut pane, 80);
+        assert!(
+            rendered.contains("file1"),
+            "verbose mode preserves body:\n{rendered}"
+        );
+    }
+
+    /// Toggling the mode invalidates cached lines — a pane
+    /// that rendered in Verbose and then flipped to Compact
+    /// must reflect the new setting on the next build. Guards
+    /// against cache-staleness.
+    #[test]
+    fn toggling_tool_output_mode_invalidates_cached_lines() {
+        let mut pane = pane_with_tool("bash", "ls", "visible content", false);
+        let verbose = rendered_to_text(&mut pane, 80);
+        assert!(verbose.contains("visible content"));
+        pane.set_tool_output_mode(ToolOutputMode::Compact);
+        let compact = rendered_to_text(&mut pane, 80);
+        assert!(
+            !compact.contains("visible content"),
+            "mode change must invalidate cache:\n{compact}"
+        );
     }
 }
 
