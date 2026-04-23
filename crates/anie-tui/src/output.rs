@@ -112,10 +112,27 @@ pub struct OutputPane {
     /// aligned and invalidate the affected slot — see the
     /// `invalidate_*` helpers below.
     caches: Vec<Option<LineCache>>,
+    /// Flattened render output from the last `build_lines`
+    /// call. Reused across frames when no block content has
+    /// changed and the terminal width hasn't moved — cuts the
+    /// cache-hit render path from O(total_lines) per-Line
+    /// clones to O(visible_lines) per frame. See Plan 04 PR-C.
+    /// Invalidation tracked via `flat_cache_valid`.
+    flat_lines: Vec<Line<'static>>,
+    /// Width that `flat_lines` was built at. `None` before the
+    /// first render. When the current render width differs,
+    /// we rebuild regardless of `flat_cache_valid` because
+    /// block-level caches also invalidate on width change.
+    flat_cache_width: Option<u16>,
+    /// Whether `flat_lines` and `last_link_map` reflect the
+    /// current block state. Any mutation that could change
+    /// the rendered output clears this flag; `build_lines`
+    /// rebuilds when unset.
+    flat_cache_valid: bool,
     /// Flat link map covering the most recent `build_lines`
     /// output. Indexed by global line number; empty `Vec`s for
-    /// lines without clickable URLs. Rebuilt every
-    /// `build_lines` so a mouse hit test at (screen row, col)
+    /// lines without clickable URLs. Rebuilt when the flat
+    /// cache rebuilds so a mouse hit test at (screen row, col)
     /// can translate via `scroll_offset + pane_y` → global
     /// line → optional URL.
     last_link_map: Vec<Vec<LinkRange>>,
@@ -140,6 +157,9 @@ impl OutputPane {
         Self {
             blocks: Vec::new(),
             caches: Vec::new(),
+            flat_lines: Vec::new(),
+            flat_cache_width: None,
+            flat_cache_valid: false,
             last_link_map: Vec::new(),
             last_render_top: 0,
             scroll_offset: 0,
@@ -183,24 +203,28 @@ impl OutputPane {
         for slot in &mut self.caches {
             *slot = None;
         }
+        self.flat_cache_valid = false;
     }
 
     /// Add a transcript block.
     pub fn add_block(&mut self, block: RenderedBlock) {
         self.blocks.push(block);
         self.caches.push(None);
+        self.flat_cache_valid = false;
     }
 
     fn invalidate_last(&mut self) {
         if let Some(slot) = self.caches.last_mut() {
             *slot = None;
         }
+        self.flat_cache_valid = false;
     }
 
     fn invalidate_at(&mut self, index: usize) {
         if let Some(slot) = self.caches.get_mut(index) {
             *slot = None;
         }
+        self.flat_cache_valid = false;
     }
 
     /// Read-only view of the current block list. Used by tests
@@ -351,6 +375,10 @@ impl OutputPane {
     pub fn clear(&mut self) {
         self.blocks.clear();
         self.caches.clear();
+        self.flat_lines.clear();
+        self.flat_cache_valid = false;
+        self.flat_cache_width = None;
+        self.last_link_map.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
         self.last_total_lines = 0;
@@ -409,8 +437,8 @@ impl OutputPane {
         buf: &mut ratatui::buffer::Buffer,
         spinner_frame: &str,
     ) {
-        let lines = self.build_lines(area.width.max(1), spinner_frame);
-        self.last_total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        self.rebuild_flat_cache(area.width.max(1), spinner_frame);
+        self.last_total_lines = u16::try_from(self.flat_lines.len()).unwrap_or(u16::MAX);
         self.last_viewport_height = area.height.max(1);
         // Record pane position so mouse hit tests can translate
         // terminal-global coordinates back to pane-local.
@@ -424,11 +452,19 @@ impl OutputPane {
         // 600 blocks that's 17 ms/frame, scaling linearly with
         // transcript length. Feeding just the visible slice
         // caps per-frame cost at O(viewport_height) instead.
+        //
+        // PR-C: slice borrows from self.flat_lines (persistent
+        // across frames when the flat cache is valid), then
+        // clones only the visible range into an owned Vec for
+        // Paragraph. Previously the full flat Vec was rebuilt
+        // every frame regardless of whether anything changed.
         let start = self.scroll_offset as usize;
         let viewport_height = area.height as usize;
-        let end = start.saturating_add(viewport_height).min(lines.len());
+        let end = start
+            .saturating_add(viewport_height)
+            .min(self.flat_lines.len());
         let visible = if start < end {
-            lines[start..end].to_vec()
+            self.flat_lines[start..end].to_vec()
         } else {
             Vec::new()
         };
@@ -442,7 +478,45 @@ impl OutputPane {
         drop(paragraph_span);
     }
 
+    /// Whether any current block has animated content
+    /// (streaming assistant / executing tool). Animated blocks
+    /// update their spinner every frame, so the flat cache
+    /// cannot be reused when any are present.
+    fn has_animated_blocks(&self) -> bool {
+        self.blocks.iter().any(block_has_animated_content)
+    }
+
+    /// Test-only wrapper: rebuilds the flat cache and returns
+    /// an owned snapshot of the current line output. Production
+    /// code paths use `rebuild_flat_cache` + `self.flat_lines`
+    /// directly to avoid the outer Vec clone; tests that want
+    /// to assert on the output shape use this helper.
+    #[cfg(test)]
     fn build_lines(&mut self, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
+        self.rebuild_flat_cache(width, spinner_frame);
+        self.flat_lines.clone()
+    }
+
+    /// Fast-path the flat cache when nothing has changed.
+    /// Rebuilds `self.flat_lines` and `self.last_link_map`
+    /// in place only when an invalidation or width change
+    /// demands it. Called from `render`; the mouse hit test
+    /// also calls it indirectly via `last_link_map`.
+    fn rebuild_flat_cache(&mut self, width: u16, spinner_frame: &str) {
+        // Fast-path: cache is valid, width matches, and no
+        // animated spinner block means the flat output is
+        // still accurate. O(1) frame cost for idle
+        // long-transcript scrolling.
+        if self.flat_cache_valid
+            && self.flat_cache_width == Some(width)
+            && !self.has_animated_blocks()
+        {
+            return;
+        }
+        self.build_flat_lines(width, spinner_frame);
+    }
+
+    fn build_flat_lines(&mut self, width: u16, spinner_frame: &str) {
         debug_assert_eq!(
             self.blocks.len(),
             self.caches.len(),
@@ -455,12 +529,17 @@ impl OutputPane {
         let mut slowest_miss_us: u64 = 0;
         let mut slowest_miss_block: &'static str = "";
 
-        let mut out = Vec::new();
-        // Rebuild the link map from scratch each frame so the
-        // indexing stays in lockstep with `out`. Same-length
-        // parallel structure; empty entries for lines without
-        // URLs.
-        let mut link_map: Vec<Vec<LinkRange>> = Vec::new();
+        // Reuse the existing flat_lines allocation; .clear()
+        // drops the elements but keeps the backing capacity,
+        // so subsequent pushes don't reallocate on a stable
+        // transcript size.
+        self.flat_lines.clear();
+        let out = &mut self.flat_lines;
+        // Rebuild the link map from scratch so the indexing
+        // stays in lockstep with `out`. Same-length parallel
+        // structure; empty entries for lines without URLs.
+        self.last_link_map.clear();
+        let link_map = &mut self.last_link_map;
         let theme = self.render_context.theme;
         for (index, block) in self.blocks.iter().enumerate() {
             if !out.is_empty() {
@@ -552,7 +631,20 @@ impl OutputPane {
             link_map.len(),
             "link_map must parallel build_lines output"
         );
-        self.last_link_map = link_map;
+        // out and link_map are &mut references into
+        // self.flat_lines / self.last_link_map; reborrows end
+        // on function exit.
+        let _ = out;
+        let _ = link_map;
+        self.flat_cache_width = Some(width);
+        // Flat cache is valid at this width only if no
+        // animated blocks are present — animated blocks
+        // require a spinner update on every frame. The fast-
+        // path check `has_animated_blocks()` in
+        // `rebuild_flat_cache` handles this anyway, but
+        // being explicit here avoids surprises if a future
+        // caller invokes build_flat_lines directly.
+        self.flat_cache_valid = !self.has_animated_blocks();
 
         if let Some(span) = perf_span.as_mut() {
             span.record(
@@ -569,7 +661,6 @@ impl OutputPane {
             span.record("width", u64::from(width));
         }
         drop(perf_span);
-        out
     }
 
     /// Translate a terminal-global mouse click into a
