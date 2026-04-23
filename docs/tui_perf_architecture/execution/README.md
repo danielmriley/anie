@@ -15,8 +15,9 @@ perf trajectory is readable at a glance.
 | 03 | PR-A (Arc-wrap cache) | not started | — | |
 | 03 | PR-B (wrap_spans rewrite) | not started | — | |
 | 03 | PR-C (helper sweep) | not started | — | |
-| 04 | PR-A (drain-batch deltas) | not started | — | |
-| 04 | PR-B (bounded channel) | not started | — | |
+| 04 | PR-A (drain-batch deltas) | **landed** | commit `38eda8e` | Coalesces consecutive TextDelta/ThinkingDelta runs into one append per run. |
+| 04 | PR-B (bounded channel) | **landed** (pre-existing) | — | Agent→UI channel was already `mpsc::channel(256)` with awaiting sends in `anie-cli/src/{interactive_mode,print_mode}.rs`. Producer-side `send_event` in `anie-agent/src/agent_loop.rs` uses `.send().await` so backpressure naturally applies. No code change needed. |
+| 08 | PR-A/B/C (streaming collector) | **deferred** | — | Gate from `docs/refactor_worklist_2026-04-22.md`: 3.1+3.2 + Phase 2 reduced `stream_into_static_600` from 3.35 ms → 2.19 ms, well under the 33 ms budget. Collector is not needed for current sluggishness; revisit if long-stream performance regresses. |
 | 05 | PR-A (BlockRender merge) | not started | — | |
 | 05 | PR-B (per-block link cache) | not started | — | |
 | 05 | PR-C (resize debounce) | not started | — | |
