@@ -14,7 +14,7 @@ conflict-minimizing multi-agent assignment layout.
 | 02 | Agent turn ownership + event payloads | pending | clone-heavy run-loop cleanup |
 | 03 | Session indexing + context construction | pending | single-index session simplification |
 | 04 | TUI output hot path | **landed** | 6/6 PRs shipped; scroll_static_600: 3.16 ms → 296 µs (10.7×) |
-| 05 | Picker search + fuzzy matching | pending | pi tokenized fuzzy ideas land here |
+| 05 | Picker search + fuzzy matching | **landed** | 4/4 PRs shipped as Phase 6.1-6.4 |
 | 06 | Provider streaming + local models | pending | correctness-sensitive Anthropic work inside |
 | 07 | Tool read/grep/bash/edit + truncation | pending | shared truncation helper likely starts here |
 | 08 | Low-risk helper sweep | pending | land last |
@@ -46,10 +46,10 @@ conflict-minimizing multi-agent assignment layout.
 | 04 | D | `wrap_plain_text` rewrite | **landed** | `458aea5` |
 | 04 | E | `wrap_spans` rewrite | **landed** (both output.rs + layout.rs variants) | `646de92` |
 | 04 | F | render helper cleanup | **landed** | `c058f51` |
-| 05 | A | lowered-query scorer API | pending | — |
-| 05 | B | tokenized model-picker filtering | pending | — |
-| 05 | C | autocomplete lowercase caches | pending | — |
-| 05 | D | text-field helpers | pending | — |
+| 05 | A | lowered-query scorer API | **landed** | `189c6ed` |
+| 05 | B | tokenized model-picker filtering | **landed** | `189c6ed` |
+| 05 | C | autocomplete lowercase caches | **landed** | `c22266c` |
+| 05 | D | text-field helpers | **landed** (cursor_x cleaned; render_value deferred per plan) | `5a09649` |
 | 06 | A | Anthropic request-body ordering | pending | — |
 | 06 | B | Anthropic empty-delta cleanup | pending | — |
 | 06 | C | OpenAI empty-delta cleanup | pending | — |
