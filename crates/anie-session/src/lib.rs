@@ -1268,16 +1268,14 @@ Keep the summary concise but comprehensive. Focus on information needed to conti
 pub struct CutPoint {
     /// Messages that will be summarized / discarded.
     pub discarded: Vec<SessionContextMessage>,
-    /// Messages kept verbatim after the cut.
-    pub kept: Vec<SessionContextMessage>,
-    /// `entry_id` of the first message in `kept`.
+    /// `entry_id` of the first message that would be kept.
+    /// Callers that need the kept slice itself walk their own
+    /// context by this entry id — the cut point no longer
+    /// clones the kept vector just to hand it back. Plan 03 PR-D.
     pub first_kept_entry_id: String,
     /// When the cut lands mid-turn, the prefix of the turn that
     /// belongs on the discarded side. `None` when the cut
-    /// happens cleanly at a turn boundary. PR C.1 populates
-    /// `None` uniformly — PR C.2 will detect mid-turn cases and
-    /// populate this field, driving two-summary split-turn
-    /// compaction.
+    /// happens cleanly at a turn boundary.
     pub split_turn: Option<SplitTurn>,
 }
 
@@ -1321,13 +1319,15 @@ pub fn find_cut_point(
         return Err(anyhow!("cannot compact: not enough messages to discard"));
     }
 
+    // Plan 03 PR-D: clone only `discarded` + the single
+    // first-kept entry id. The previous shape cloned the
+    // entire `kept` slice too, which compact_internal never
+    // read.
     let discarded = messages[..cut_index].to_vec();
-    let kept = messages[cut_index..].to_vec();
-    let first_kept_entry_id = kept[0].entry_id.clone();
+    let first_kept_entry_id = messages[cut_index].entry_id.clone();
     let split_turn = detect_split_turn(messages, cut_index);
     Ok(CutPoint {
         discarded,
-        kept,
         first_kept_entry_id,
         split_turn,
     })
@@ -2459,7 +2459,9 @@ mod tests {
 
         let cut_point = find_cut_point(&messages, 3).expect("cut point");
         assert_eq!(cut_point.discarded.len(), 3);
-        assert_eq!(cut_point.kept.len(), 1);
+        // Plan 03 PR-D removed the `kept` field; the kept
+        // slice is `messages[cut_index..]` derivable from
+        // the entry_id. first_kept_entry_id still pins it.
         assert_eq!(cut_point.first_kept_entry_id, "4");
         assert!(
             cut_point.split_turn.is_none(),
@@ -2575,10 +2577,15 @@ mod tests {
         ];
         let cut_point = find_cut_point(&messages, 300).expect("cut point");
         assert!(!cut_point.discarded.is_empty());
-        assert!(!cut_point.kept.is_empty());
-        assert_eq!(
-            cut_point.first_kept_entry_id,
-            cut_point.kept[0].entry_id
+        // Plan 03 PR-D: kept slice derivable from
+        // first_kept_entry_id + the caller's messages vec.
+        // We assert the first kept entry id points at a real
+        // message in the input.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.entry_id == cut_point.first_kept_entry_id),
+            "first_kept_entry_id must match a message in the input"
         );
         assert!(cut_point.split_turn.is_none());
     }
