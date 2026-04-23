@@ -1047,10 +1047,31 @@ fn wrap_plain_text(text: &str, width: u16) -> Vec<String> {
             lines.push(String::new());
             continue;
         }
-        let chars = raw_line.chars().collect::<Vec<_>>();
-        for chunk in chars.chunks(width) {
-            lines.push(chunk.iter().collect::<String>());
+        // PR-D (Plan 04): walk the source once by char index,
+        // slicing at byte boundaries when the char counter hits
+        // `width`. The previous shape collected every char into
+        // a `Vec<char>` and rebuilt a `String` per chunk — O(n)
+        // allocations per wrapped input. New shape does O(lines)
+        // `String` allocations, matching the output size.
+        //
+        // Preserves char-count (USV) semantics per plan — this
+        // is not a display-width correctness change. Wide CJK
+        // and ZWJ sequences still wrap at `chars().count()`
+        // boundaries, identical to the previous behavior.
+        let mut char_in_line = 0usize;
+        let mut byte_start = 0usize;
+        for (byte_idx, _) in raw_line.char_indices() {
+            if char_in_line == width {
+                lines.push(raw_line[byte_start..byte_idx].to_string());
+                byte_start = byte_idx;
+                char_in_line = 0;
+            }
+            char_in_line += 1;
         }
+        // Tail after the last boundary. Always non-empty for
+        // a non-empty raw_line (the loop pushes at boundaries
+        // and leaves the remainder for this step).
+        lines.push(raw_line[byte_start..].to_string());
     }
     if lines.is_empty() {
         vec![String::new()]
@@ -1161,6 +1182,67 @@ impl OutputPane {
     /// Number of block slots (should always equal `blocks.len()`).
     pub(crate) fn cache_slot_count(&self) -> usize {
         self.caches.len()
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    /// Regression for the PR-D rewrite. Output must match the
+    /// previous `chars().chunks()` shape byte-for-byte.
+    #[test]
+    fn wrap_plain_text_splits_ascii_at_width_boundaries() {
+        assert_eq!(
+            wrap_plain_text("abcdefghij", 3),
+            vec!["abc", "def", "ghi", "j"]
+        );
+    }
+
+    /// USV counting, not byte counting — a multi-byte UTF-8
+    /// rune is one "cell" for wrap purposes. This is the
+    /// explicitly-preserved contract from Plan 04 ("keep char
+    /// count semantics unchanged; defer Unicode display-width
+    /// correctness"). Each `é` is 2 bytes but 1 char.
+    #[test]
+    fn wrap_plain_text_counts_chars_not_bytes() {
+        let lines = wrap_plain_text("éééééé", 2);
+        // 6 chars at width=2 → 3 lines of 2 chars each.
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert_eq!(line.chars().count(), 2);
+        }
+    }
+
+    /// Newlines split lines before width wrapping applies.
+    /// Empty lines are preserved as empty strings.
+    #[test]
+    fn wrap_plain_text_preserves_empty_lines_from_newlines() {
+        let lines = wrap_plain_text("hi\n\nthere", 10);
+        assert_eq!(lines, vec!["hi", "", "there"]);
+    }
+
+    /// Empty input yields a single empty-string line — same
+    /// as the previous implementation.
+    #[test]
+    fn wrap_plain_text_empty_input_yields_one_empty_line() {
+        assert_eq!(wrap_plain_text("", 80), vec![String::new()]);
+    }
+
+    /// Width zero clamps to 1 so we don't produce an infinite
+    /// number of empty lines.
+    #[test]
+    fn wrap_plain_text_width_zero_clamps_to_one() {
+        let lines = wrap_plain_text("abc", 0);
+        assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    /// Line exactly equal to width is a single line with no
+    /// trailing empty — guards off-by-one in the boundary
+    /// check.
+    #[test]
+    fn wrap_plain_text_line_exactly_width_is_one_line() {
+        assert_eq!(wrap_plain_text("abcdef", 6), vec!["abcdef"]);
     }
 }
 
