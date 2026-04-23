@@ -789,15 +789,18 @@ fn block_lines(
 ) -> Vec<Line<'static>> {
     match block {
         RenderedBlock::UserMessage { text, .. } => wrap_spans(
-            // Direct vector build — the previous shape allocated
-            // two intermediate `Vec<Span>` and chained them via
-            // iterators. Plan 04 PR-F / finding #48.
+            // Shorter, quieter inbound-message marker. Codex
+            // uses `› ` as a bold-dim prefix in
+            // `codex-rs/tui/src/history_cell.rs:367-388`;
+            // borrowing it shrinks the cyan "> You: " banner
+            // that cluttered long transcripts without
+            // sacrificing the "this is a user turn" cue.
             vec![
                 Span::styled(
-                    "> You: ",
+                    "› ",
                     Style::default()
                         .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                        .add_modifier(Modifier::BOLD | Modifier::DIM),
                 ),
                 Span::raw(text.clone()),
             ],
@@ -1102,17 +1105,28 @@ fn assistant_streaming_status_text(text: &str, thinking: &str) -> &'static str {
 }
 
 fn thinking_label_style() -> Style {
-    Style::default().fg(Color::Indexed(246))
+    // PR 1: thinking label explicitly DIM so the "thinking"
+    // header reads as lower-priority than the answer text.
+    // Mirrors Codex's `ReasoningSummaryCell` styling in
+    // `codex-rs/tui/src/history_cell.rs:422-441`.
+    Style::default()
+        .fg(Color::Indexed(246))
+        .add_modifier(Modifier::DIM)
 }
 
 fn thinking_gutter_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM)
 }
 
 fn thinking_body_style() -> Style {
+    // Italic + dim — explicit visual secondary channel for
+    // reasoning text so it reads as "notes" rather than
+    // "answer."
     Style::default()
         .fg(Color::Indexed(248))
-        .add_modifier(Modifier::ITALIC)
+        .add_modifier(Modifier::ITALIC | Modifier::DIM)
 }
 
 fn streaming_status_style() -> Style {

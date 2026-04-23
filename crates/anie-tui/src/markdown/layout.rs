@@ -213,7 +213,7 @@ impl<'a> LineBuilder<'a> {
                     rule,
                     self.theme.horizontal_rule,
                 )));
-                self.lines.push(Line::default());
+                self.push_blank_separator();
             }
             Event::TaskListMarker(checked) => {
                 let marker = if checked { "[x] " } else { "[ ] " };
@@ -343,14 +343,14 @@ impl<'a> LineBuilder<'a> {
                 // compact instead of gaining a blank row between
                 // each item.
                 if !self.lines.is_empty() && self.list_stack.is_empty() {
-                    self.lines.push(Line::default());
+                    self.push_blank_separator();
                 }
             }
             TagEnd::Heading(_) => {
                 self.flush_line();
                 self.pop_style();
                 self.current_heading = None;
-                self.lines.push(Line::default());
+                self.push_blank_separator();
             }
             TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough => {
                 self.pop_style();
@@ -369,7 +369,7 @@ impl<'a> LineBuilder<'a> {
                 // Blank line after the quote block, outside the
                 // gutter.
                 if self.blockquote_depth == 0 && self.list_stack.is_empty() {
-                    self.lines.push(Line::default());
+                    self.push_blank_separator();
                 }
             }
             TagEnd::List(_) => {
@@ -379,7 +379,7 @@ impl<'a> LineBuilder<'a> {
                 // from following content, but only when we're
                 // back out to the top level.
                 if self.list_stack.is_empty() && self.blockquote_depth == 0 {
-                    self.lines.push(Line::default());
+                    self.push_blank_separator();
                 }
             }
             TagEnd::Item => {
@@ -476,7 +476,7 @@ impl<'a> LineBuilder<'a> {
             // Blank lines don't carry list or blockquote prefixes
             // — matches conventional rendering where a blank row
             // between paragraphs is truly blank.
-            self.lines.push(Line::default());
+            self.push_blank_separator();
             return;
         }
 
@@ -718,7 +718,7 @@ impl<'a> LineBuilder<'a> {
         self.lines
             .push(table_border_line(&widths, '└', '┴', '┘', border_style));
         // Spacer after the table, outside the frame.
-        self.lines.push(Line::default());
+        self.push_blank_separator();
     }
 
     /// Fallback rendering when the viewport is too narrow to
@@ -746,7 +746,7 @@ impl<'a> LineBuilder<'a> {
         }
         // Spacer so subsequent content isn't glued to the
         // fallback block.
-        self.lines.push(Line::default());
+        self.push_blank_separator();
     }
 
     /// Render a completed code block as a bordered, syntax-
@@ -784,7 +784,23 @@ impl<'a> LineBuilder<'a> {
 
         self.lines.push(build_bottom_border(width, border_style));
         // Spacer between the block and the following content.
-        self.lines.push(Line::default());
+        self.push_blank_separator();
+    }
+
+    /// Push a blank line separator unless the last pushed line
+    /// is already blank. Keeps inter-block spacing predictable
+    /// without accumulating double-blanks when two block types
+    /// each append their own trailing separator. Mirrors pi's
+    /// `nextTokenType !== "space"` guard in
+    /// `packages/tui/src/components/markdown.ts:318-330`.
+    fn push_blank_separator(&mut self) {
+        let last_is_blank = self
+            .lines
+            .last()
+            .is_some_and(|line| line.spans.iter().all(|span| span.content.is_empty()));
+        if !last_is_blank {
+            self.lines.push(Line::default());
+        }
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {

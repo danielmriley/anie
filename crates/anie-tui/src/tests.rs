@@ -110,7 +110,7 @@ fn static_layout_renders_output_status_and_input() {
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
 
-    assert!(screen.contains("> You: Fix the bug in main.rs"));
+    assert!(screen.contains("› Fix the bug in main.rs"));
     assert!(screen.contains("anthropic:claude-sonnet-4-6 │ thinking: medium │ 12.4k/200k"));
     assert!(screen.contains("> "));
 }
