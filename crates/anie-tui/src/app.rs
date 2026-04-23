@@ -65,6 +65,12 @@ pub struct App {
     /// `handle_slash_command` for pre-dispatch validation and, in
     /// plan 12, by the inline autocomplete popup.
     commands: Vec<SlashCommandInfo>,
+    /// Last time a `MessageDelta` arrived. Used by the
+    /// stall-aware spinner logic in `needs_tick_redraw` — when
+    /// streaming is stuck (no delta for > STREAM_STALL_WINDOW
+    /// ms), idle-tick redraws are suppressed so the spinner
+    /// freezes rather than eating CPU. Plan 06 PR-B.
+    last_streaming_delta_at: Option<Instant>,
 }
 
 // The ModelPicker variant is intentionally large; the enum holds at most
@@ -274,6 +280,7 @@ impl App {
             worker_tx,
             worker_rx,
             commands,
+            last_streaming_delta_at: None,
         }
     }
 
@@ -486,6 +493,7 @@ impl App {
                         pending_thinking.clear();
                     }
                     pending_text.push_str(&text);
+                    self.last_streaming_delta_at = Some(Instant::now());
                 }
                 AgentEvent::MessageDelta {
                     delta: StreamDelta::ThinkingDelta(text),
@@ -495,6 +503,7 @@ impl App {
                         pending_text.clear();
                     }
                     pending_thinking.push_str(&text);
+                    self.last_streaming_delta_at = Some(Instant::now());
                 }
                 // Any other event flushes both accumulators
                 // first so message-level ordering is preserved.
@@ -526,6 +535,10 @@ impl App {
         match event {
             AgentEvent::AgentStart => {
                 self.agent_state = AgentUiState::Streaming;
+                // Reset the stall tracker so a previous
+                // stream's last delta doesn't make the new
+                // stream appear stalled from the start.
+                self.last_streaming_delta_at = None;
             }
             AgentEvent::MessageStart { message } => match message {
                 Message::User(user_message) => {
@@ -539,13 +552,18 @@ impl App {
                 }
                 Message::ToolResult(_) | Message::Custom(_) => {}
             },
-            AgentEvent::MessageDelta { delta } => match delta {
-                StreamDelta::TextDelta(text) => self.output_pane.append_to_last_assistant(&text),
-                StreamDelta::ThinkingDelta(text) => {
-                    self.output_pane.append_thinking_to_last_assistant(&text)
+            AgentEvent::MessageDelta { delta } => {
+                match delta {
+                    StreamDelta::TextDelta(text) => {
+                        self.output_pane.append_to_last_assistant(&text)
+                    }
+                    StreamDelta::ThinkingDelta(text) => {
+                        self.output_pane.append_thinking_to_last_assistant(&text)
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+                self.last_streaming_delta_at = Some(Instant::now());
+            }
             AgentEvent::MessageEnd { message } => {
                 if let Message::Assistant(assistant) = message {
                     self.output_pane.finalize_last_assistant(
@@ -697,12 +715,30 @@ impl App {
     /// nothing visible — redrawing anyway would re-wrap the
     /// entire transcript 10 times a second for no reason. We
     /// return `true` only when one of those signals is live.
+    ///
+    /// Stall-aware spinner (Plan 06 PR-B): if we're in a
+    /// streaming state but no delta has arrived for
+    /// STREAM_STALL_WINDOW, suppress the redraw so a stuck
+    /// stream doesn't eat CPU animating a spinner. The spinner
+    /// appears frozen — which is accurate; the stream *is*
+    /// stalled. Any arriving delta immediately updates
+    /// `last_streaming_delta_at` and the spinner resumes.
     #[must_use]
     pub fn needs_tick_redraw(&self) -> bool {
         if self.overlay.is_some() {
             return true;
         }
-        !matches!(self.agent_state, AgentUiState::Idle)
+        if matches!(self.agent_state, AgentUiState::Idle) {
+            return false;
+        }
+        if matches!(self.agent_state, AgentUiState::Streaming)
+            && self
+                .last_streaming_delta_at
+                .is_some_and(|t| t.elapsed() >= STREAM_STALL_WINDOW)
+        {
+            return false;
+        }
+        true
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) {
@@ -1536,6 +1572,25 @@ fn event_dirties_render(event: &Event) -> bool {
 /// behavior so background worker polling cadence is unchanged.
 const IDLE_TICK: Duration = Duration::from_millis(100);
 
+/// How long of a streaming-delta gap makes us declare the
+/// stream "stalled" and suppress spinner-only redraws. 500 ms
+/// is below typical timeout perception — a real stall holds
+/// much longer than this — but far enough above the normal
+/// inter-token interval (~10-100 ms) that healthy streams
+/// never trip it. Plan 06 PR-B.
+const STREAM_STALL_WINDOW: Duration = Duration::from_millis(500);
+
+/// Debounce window between terminal `Resize` events and the
+/// next full re-render. Drags (window-edge drag, tmux pane
+/// resize, terminal maximize) fire bursts of `Resize` events
+/// at ~100/s; each one invalidates every block's cache at the
+/// new width, so rendering one per intermediate size spends
+/// ~100 ms/frame rebuilding markdown for no visible benefit.
+/// Skipping paints inside a 50 ms window after the most recent
+/// resize means drag-in-progress stays cheap and the final
+/// size gets a single rebuild. Plan 05 PR-C.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
+
 pub async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -1552,9 +1607,20 @@ pub async fn run_tui(
     let mut last_render_at = Instant::now()
         .checked_sub(FRAME_BUDGET)
         .unwrap_or_else(Instant::now);
+    // When set, the most recent terminal `Resize`. The render
+    // gate waits `RESIZE_DEBOUNCE` from this instant before
+    // repainting; cleared on the next successful paint.
+    let mut last_resize_at: Option<Instant> = None;
 
     loop {
-        if dirty && last_render_at.elapsed() >= FRAME_BUDGET {
+        // Two gates: the frame budget (don't render more than
+        // ~30 fps) AND the resize debounce (don't render mid-
+        // drag). Both must pass before a paint fires.
+        let resize_ready = match last_resize_at {
+            Some(t) => t.elapsed() >= RESIZE_DEBOUNCE,
+            None => true,
+        };
+        if dirty && last_render_at.elapsed() >= FRAME_BUDGET && resize_ready {
             let frame = crate::render_debug::RenderFrame::begin();
             // Wrap in DECSET 2026 synchronized output so modern
             // GPU terminals composite each frame atomically. No-op
@@ -1564,14 +1630,21 @@ pub async fn run_tui(
             frame.end(app.output_pane.blocks().len());
             dirty = false;
             last_render_at = Instant::now();
+            last_resize_at = None;
         }
 
         // Wait at most until the next frame opportunity (when
-        // dirty) or until the next idle tick (when clean). The
-        // sleep branch fires either way and the loop re-checks
-        // whether it's time to draw.
+        // dirty) or until the next idle tick (when clean).
+        // When resize-debouncing, wait at least until the
+        // debounce elapses so the select loop doesn't spin.
         let timeout = if dirty {
-            FRAME_BUDGET.saturating_sub(last_render_at.elapsed())
+            let budget_remaining = FRAME_BUDGET.saturating_sub(last_render_at.elapsed());
+            if let Some(t) = last_resize_at {
+                let debounce_remaining = RESIZE_DEBOUNCE.saturating_sub(t.elapsed());
+                budget_remaining.max(debounce_remaining)
+            } else {
+                budget_remaining
+            }
         } else {
             IDLE_TICK
         };
@@ -1579,6 +1652,7 @@ pub async fn run_tui(
         tokio::select! {
             Some(Ok(event)) = term_events.next() => {
                 let mut affects_render = event_dirties_render(&event);
+                let mut saw_resize = matches!(event, Event::Resize(_, _));
                 app.handle_terminal_event(event)?;
                 // Drain any terminal events already buffered in
                 // the stream. Mouse-motion tracking fires at
@@ -1592,7 +1666,13 @@ pub async fn run_tui(
                     if event_dirties_render(&event) {
                         affects_render = true;
                     }
+                    if matches!(event, Event::Resize(_, _)) {
+                        saw_resize = true;
+                    }
                     app.handle_terminal_event(event)?;
+                }
+                if saw_resize {
+                    last_resize_at = Some(Instant::now());
                 }
                 if affects_render {
                     dirty = true;
