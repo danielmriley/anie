@@ -85,13 +85,15 @@ impl TextField {
     }
 
     /// Cursor column for rendering in character-based terminals.
+    ///
+    /// Plan 05 PR-D: count the char-prefix directly — both
+    /// masked and unmasked paths render one USV per input
+    /// char (mask glyph or the original), so the cell count
+    /// is the char count in both. No need to materialize a
+    /// `String` of repeated `•` just to count it.
     pub(crate) fn cursor_x(&self) -> u16 {
-        let visible = if self.masked {
-            "•".repeat(self.value[..self.cursor].chars().count())
-        } else {
-            self.value[..self.cursor].to_string()
-        };
-        u16::try_from(visible.chars().count()).unwrap_or(u16::MAX)
+        let chars_before_cursor = self.value[..self.cursor].chars().count();
+        u16::try_from(chars_before_cursor).unwrap_or(u16::MAX)
     }
 
     /// Value with surrounding whitespace removed.
