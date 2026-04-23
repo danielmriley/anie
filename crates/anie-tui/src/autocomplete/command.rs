@@ -31,21 +31,67 @@ pub(crate) trait ArgumentSource: Send + Sync {
     fn completions(&self, prefix: &str) -> Vec<Suggestion>;
 }
 
+/// Per-command metadata with cached lowercase forms so
+/// prefix filtering in the hot keystroke path doesn't
+/// lowercase the same stable strings on every comparison.
+/// Plan 05 PR-C.
+struct CachedCommand {
+    info: SlashCommandInfo,
+    name_lower: String,
+    /// Pre-lowercased enumerated argument values (from
+    /// `ArgumentSpec::Enumerated` or `Subcommands`). Empty
+    /// for `FreeForm` and `None` specs.
+    argument_values_lower: Vec<String>,
+}
+
+impl CachedCommand {
+    fn from_info(info: SlashCommandInfo) -> Self {
+        let name_lower = info.name.to_ascii_lowercase();
+        let argument_values_lower = match &info.arguments {
+            ArgumentSpec::Enumerated { values, .. } => {
+                values.iter().map(|v| v.to_ascii_lowercase()).collect()
+            }
+            ArgumentSpec::Subcommands { known } => {
+                known.iter().map(|v| v.to_ascii_lowercase()).collect()
+            }
+            ArgumentSpec::FreeForm { .. } | ArgumentSpec::None => Vec::new(),
+        };
+        Self {
+            info,
+            name_lower,
+            argument_values_lower,
+        }
+    }
+
+    /// Original-case values for building `Suggestion.value` —
+    /// the popup displays the canonical string the user sees,
+    /// not a lowercased one.
+    fn argument_values(&self) -> &[&'static str] {
+        match &self.info.arguments {
+            ArgumentSpec::Enumerated { values, .. } => values,
+            ArgumentSpec::Subcommands { known } => known,
+            ArgumentSpec::FreeForm { .. } | ArgumentSpec::None => &[],
+        }
+    }
+}
+
 /// Completes command names from a `SlashCommandInfo` catalog and
 /// argument values from either the static `ArgumentSpec` or a
 /// registered `ArgumentSource`.
 pub(crate) struct CommandCompletionProvider {
-    commands: Vec<SlashCommandInfo>,
+    commands: Vec<CachedCommand>,
     argument_sources: HashMap<String, Box<dyn ArgumentSource>>,
 }
 
 impl CommandCompletionProvider {
     /// Build a provider from a catalog with no dynamic argument
     /// sources. Sufficient for plan 12 phase B/C/D shipping.
+    /// The provider precomputes lowercase command names and
+    /// enumerated argument values once at construction time.
     #[must_use]
     pub(crate) fn new(commands: Vec<SlashCommandInfo>) -> Self {
         Self {
-            commands,
+            commands: commands.into_iter().map(CachedCommand::from_info).collect(),
             argument_sources: HashMap::new(),
         }
     }
@@ -65,16 +111,14 @@ impl CommandCompletionProvider {
 
     fn command_name_suggestions(&self, prefix: &str) -> Vec<Suggestion> {
         let stripped = prefix.strip_prefix('/').unwrap_or(prefix);
-        let needle = stripped.to_lowercase();
+        let needle = stripped.to_ascii_lowercase();
         self.commands
             .iter()
-            .filter(|info| {
-                needle.is_empty() || info.name.to_lowercase().starts_with(&needle)
-            })
-            .map(|info| Suggestion {
-                value: info.name.to_string(),
-                label: info.name.to_string(),
-                description: description_for(info),
+            .filter(|cmd| needle.is_empty() || cmd.name_lower.starts_with(&needle))
+            .map(|cmd| Suggestion {
+                value: cmd.info.name.to_string(),
+                label: cmd.info.name.to_string(),
+                description: description_for(&cmd.info),
             })
             .collect()
     }
@@ -83,26 +127,28 @@ impl CommandCompletionProvider {
         if let Some(source) = self.argument_sources.get(name) {
             return source.completions(prefix);
         }
-        let Some(info) = self.commands.iter().find(|info| info.name == name) else {
+        let Some(cmd) = self.commands.iter().find(|cmd| cmd.info.name == name) else {
             return Vec::new();
         };
-        static_argument_suggestions(&info.arguments, prefix)
+        static_argument_suggestions(cmd, prefix)
     }
 }
 
-/// Pure function over `ArgumentSpec` so tests can exercise the
-/// matching logic without building a full provider.
-fn static_argument_suggestions(spec: &ArgumentSpec, prefix: &str) -> Vec<Suggestion> {
-    let needle = prefix.to_lowercase();
-    let values: &[&str] = match spec {
-        ArgumentSpec::Enumerated { values, .. } => values,
-        ArgumentSpec::Subcommands { known } => known,
-        ArgumentSpec::FreeForm { .. } | ArgumentSpec::None => return Vec::new(),
-    };
-    values
+/// Prefix-match cached lowercase argument values against
+/// `prefix`. Lowercases `prefix` once rather than lowercasing
+/// every candidate. Emits `Suggestion`s with original-case
+/// `value` fields so the popup shows canonical values.
+fn static_argument_suggestions(cmd: &CachedCommand, prefix: &str) -> Vec<Suggestion> {
+    let values = cmd.argument_values();
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let needle = prefix.to_ascii_lowercase();
+    cmd.argument_values_lower
         .iter()
-        .filter(|value| needle.is_empty() || value.to_lowercase().starts_with(&needle))
-        .map(|value| Suggestion {
+        .zip(values.iter())
+        .filter(|(lower, _)| needle.is_empty() || lower.starts_with(&needle))
+        .map(|(_, value)| Suggestion {
             value: (*value).to_string(),
             label: (*value).to_string(),
             description: None,
@@ -122,7 +168,9 @@ fn description_for(info: &SlashCommandInfo) -> Option<String> {
 
 impl AutocompleteProvider for CommandCompletionProvider {
     fn suggestions(&self, line: &str, cursor: usize) -> Option<SuggestionSet> {
-        match parse_context(line, cursor, &self.commands) {
+        match parse_context(line, cursor, |name| {
+            self.commands.iter().any(|cmd| cmd.info.name == name)
+        }) {
             Context::None => None,
             Context::CommandName { prefix } => {
                 let items = self.command_name_suggestions(&prefix);
