@@ -1009,10 +1009,64 @@ fn assistant_answer_lines(
     if text.is_empty() {
         return Vec::new();
     }
-    if is_streaming || !ctx.markdown_enabled {
+    if !ctx.markdown_enabled {
         return wrap_text(text, width, Style::default());
     }
-    crate::markdown::render_markdown(text, width, &ctx.theme)
+    if !is_streaming {
+        return crate::markdown::render_markdown(text, width, &ctx.theme);
+    }
+    // Streaming + markdown: progressive render. Everything up
+    // to the last safe commit point (a blank line outside any
+    // open code fence) is markdown-rendered; the incomplete
+    // trailing block stays plain until the next commit
+    // boundary. Avoids the "big snap at stream-end" transition
+    // a user sees when the whole message goes from plain to
+    // fully rendered markdown at once.
+    let commit_end = find_last_safe_markdown_boundary(text);
+    if commit_end == 0 {
+        return wrap_text(text, width, Style::default());
+    }
+    let (committed, tail) = text.split_at(commit_end);
+    let mut lines = crate::markdown::render_markdown(committed, width, &ctx.theme);
+    if !tail.is_empty() {
+        lines.extend(wrap_text(tail, width, Style::default()));
+    }
+    lines
+}
+
+/// Return the byte index of the end of the last prefix of
+/// `text` that can be safely rendered as markdown mid-stream.
+///
+/// A "safe" boundary is a blank line (`\n\n`) that sits
+/// outside any open fenced code block. Blank lines inside an
+/// unclosed ``` or ~~~ fence don't count — the fence needs
+/// to close before we can ask pulldown-cmark to render
+/// anything beyond it, or the output will look wrong.
+///
+/// Returns 0 when no safe boundary exists yet (the whole
+/// text is still the "tail" of an in-progress block).
+fn find_last_safe_markdown_boundary(text: &str) -> usize {
+    let mut in_fence = false;
+    let mut last_safe: usize = 0;
+    let mut pos: usize = 0;
+    for line in text.split_inclusive('\n') {
+        let line_end = pos + line.len();
+        let line_text = line.trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = line_text.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        let is_blank = line_text.trim().is_empty();
+        // A blank line outside any fence is the safe commit
+        // point. We include the blank's own `\n` in the
+        // committed prefix so pulldown-cmark sees the
+        // paragraph separator it needs for block layout.
+        if is_blank && !in_fence {
+            last_safe = line_end;
+        }
+        pos = line_end;
+    }
+    last_safe
 }
 
 fn assistant_streaming_lines(
@@ -1460,6 +1514,106 @@ mod tool_output_mode_tests {
             !compact.contains("visible content"),
             "mode change must invalidate cache:\n{compact}"
         );
+    }
+}
+
+#[cfg(test)]
+mod streaming_markdown_tests {
+    use super::*;
+
+    #[test]
+    fn safe_boundary_finds_blank_line_after_paragraph() {
+        // "a\n\nb" — a paragraph, a blank, then in-progress.
+        // Commit point is right after the blank's `\n`.
+        assert_eq!(find_last_safe_markdown_boundary("a\n\nb"), 3);
+    }
+
+    #[test]
+    fn safe_boundary_returns_zero_when_no_blank_line_yet() {
+        assert_eq!(find_last_safe_markdown_boundary("hello"), 0);
+        assert_eq!(find_last_safe_markdown_boundary("line1\nline2\nstill typing"), 0);
+    }
+
+    #[test]
+    fn safe_boundary_empty_input_is_zero() {
+        assert_eq!(find_last_safe_markdown_boundary(""), 0);
+    }
+
+    #[test]
+    fn safe_boundary_ignores_blank_inside_unclosed_fence() {
+        // Paragraph break before the fence opens is committable.
+        // A blank line INSIDE an unclosed fence is not, because
+        // rendering the fence-prefix mid-stream would produce
+        // wrong output.
+        let text = "intro\n\n```rust\n\nlet x = 1;\n[still typing]";
+        //          0      6 7                          — boundary at byte 7
+        assert_eq!(find_last_safe_markdown_boundary(text), 7);
+    }
+
+    #[test]
+    fn safe_boundary_allows_commit_after_fence_closes() {
+        let text = "```\ncode\n```\n\npost-fence paragraph\n\ntail...";
+        // Fence opens+closes; first safe boundary is after the
+        // blank following the fence close, then after the
+        // blank following "post-fence paragraph".
+        let cut = find_last_safe_markdown_boundary(text);
+        // `cut` should land after the second blank line (just
+        // before "tail..."). We assert the committed prefix
+        // ends with `\n\n` and the tail begins with `tail`.
+        assert!(text[..cut].ends_with("\n\n"), "text[..{cut}] = {:?}", &text[..cut]);
+        assert!(text[cut..].starts_with("tail"), "text[{cut}..] = {:?}", &text[cut..]);
+    }
+
+    #[test]
+    fn safe_boundary_recognizes_tilde_fences() {
+        // GFM supports ~~~ fences as well as ```. Both must
+        // suppress mid-fence commits.
+        let text = "before\n\n~~~\nstill inside\n";
+        assert_eq!(find_last_safe_markdown_boundary(text), 8);
+    }
+
+    #[test]
+    fn streaming_answer_lines_split_is_cell_identical_to_full_markdown_at_commit_points() {
+        // At a hard commit boundary (text ends with \n\n\ntail)
+        // the streaming render output differs from a full-text
+        // markdown render only in that the tail portion is
+        // plain-wrapped. But the committed prefix should match
+        // byte-identical to what full-text markdown would
+        // produce for that prefix alone.
+        let ctx = RenderContext::default();
+        let text = "# Heading\n\nBody paragraph.\n\nIn-progress tail line";
+        let streaming = assistant_answer_lines(text, 40, true, &ctx);
+        let expected_committed =
+            crate::markdown::render_markdown("# Heading\n\nBody paragraph.\n\n", 40, &ctx.theme);
+        // The streaming output starts with the committed
+        // prefix's rendered lines.
+        assert!(streaming.len() >= expected_committed.len());
+        for (idx, line) in expected_committed.iter().enumerate() {
+            let lhs: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let rhs: String = streaming[idx]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(lhs, rhs, "committed line {idx} differs");
+        }
+    }
+
+    #[test]
+    fn streaming_answer_lines_falls_back_to_plain_when_no_boundary_yet() {
+        // A streaming message that hasn't produced a paragraph
+        // break yet renders as plain text — no markdown syntax
+        // should appear as styled output mid-word.
+        let ctx = RenderContext::default();
+        let text = "## Title still on the first line";
+        let streaming = assistant_answer_lines(text, 40, true, &ctx);
+        let plain = wrap_text(text, 40, Style::default());
+        assert_eq!(streaming.len(), plain.len());
+        for (a, b) in streaming.iter().zip(plain.iter()) {
+            let lhs: String = a.spans.iter().map(|s| s.content.as_ref()).collect();
+            let rhs: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(lhs, rhs);
+        }
     }
 }
 
