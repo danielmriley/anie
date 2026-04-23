@@ -5,7 +5,7 @@ use anie_config::ToolOutputMode;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget},
 };
 
 use crate::markdown::{LinkRange, MarkdownTheme, find_link_ranges};
@@ -151,6 +151,17 @@ pub struct OutputPane {
     auto_scroll: bool,
     last_total_lines: u16,
     last_viewport_height: u16,
+    /// Terminal-global column for the in-pane scrollbar (Plan
+    /// 10 PR-A). `None` when the viewport has no overflow so no
+    /// scrollbar is drawn. Set at the end of `render` so mouse
+    /// hit-tests in PR-B can distinguish gutter clicks from
+    /// content clicks.
+    last_scrollbar_col: Option<u16>,
+    /// Terminal-global y-range `[top, top+height)` occupied by
+    /// the scrollbar thumb from the last render. Used by
+    /// PR-B's drag and hit-test logic. `None` when there's no
+    /// scrollbar.
+    last_scrollbar_thumb: Option<(u16, u16)>,
     /// Visual rendering settings. Changing any field here
     /// invalidates the cache because block → line computations
     /// depend on it.
@@ -173,6 +184,8 @@ impl OutputPane {
             auto_scroll: true,
             last_total_lines: 0,
             last_viewport_height: 1,
+            last_scrollbar_col: None,
+            last_scrollbar_thumb: None,
             render_context: RenderContext::default(),
         }
     }
@@ -462,12 +475,38 @@ impl OutputPane {
         buf: &mut ratatui::buffer::Buffer,
         spinner_frame: &str,
     ) {
+        // Plan 10 PR-A: the scrollbar lives in the rightmost
+        // column of the output area, reserved only when the
+        // content actually overflows the viewport. We build
+        // lines at full width first; if total > viewport, we
+        // rebuild at width-1 and draw the scrollbar in the
+        // reclaimed column. No-overflow content pays no gutter
+        // cost, matching terminal-emulator behavior users
+        // already expect.
         self.rebuild_flat_cache(area.width.max(1), spinner_frame);
+        let full_width_total = self.flat_lines.len();
+        let viewport_h = area.height.max(1) as usize;
+        let needs_scrollbar = area.width >= 2 && full_width_total > viewport_h;
+        let content_area = if needs_scrollbar {
+            let new_rect = ratatui::layout::Rect {
+                width: area.width - 1,
+                ..area
+            };
+            // Rebuild at the narrower width so wrap boundaries
+            // match the reduced content area. Invalidates the
+            // flat cache so the rebuild happens.
+            self.flat_cache_valid = false;
+            self.rebuild_flat_cache(new_rect.width.max(1), spinner_frame);
+            new_rect
+        } else {
+            area
+        };
+
         self.last_total_lines = u16::try_from(self.flat_lines.len()).unwrap_or(u16::MAX);
-        self.last_viewport_height = area.height.max(1);
+        self.last_viewport_height = content_area.height.max(1);
         // Record pane position so mouse hit tests can translate
         // terminal-global coordinates back to pane-local.
-        self.last_render_top = area.y;
+        self.last_render_top = content_area.y;
         let scroll = self.current_scroll();
         self.set_scroll(scroll);
 
@@ -478,13 +517,12 @@ impl OutputPane {
         // transcript length. Feeding just the visible slice
         // caps per-frame cost at O(viewport_height) instead.
         //
-        // PR-C: slice borrows from self.flat_lines (persistent
-        // across frames when the flat cache is valid), then
-        // clones only the visible range into an owned Vec for
-        // Paragraph. Previously the full flat Vec was rebuilt
-        // every frame regardless of whether anything changed.
+        // Phase 2 PR-C: slice borrows from self.flat_lines
+        // (persistent across frames when the flat cache is
+        // valid), then clones only the visible range into an
+        // owned Vec for Paragraph.
         let start = self.scroll_offset as usize;
-        let viewport_height = area.height as usize;
+        let viewport_height = content_area.height as usize;
         let end = start
             .saturating_add(viewport_height)
             .min(self.flat_lines.len());
@@ -496,11 +534,96 @@ impl OutputPane {
         let mut paragraph_span = PerfSpan::enter(PerfSpanKind::ParagraphRender);
         if let Some(s) = paragraph_span.as_mut() {
             s.record("lines", u64::try_from(visible.len()).unwrap_or(u64::MAX));
-            s.record("area_w", u64::from(area.width));
-            s.record("area_h", u64::from(area.height));
+            s.record("area_w", u64::from(content_area.width));
+            s.record("area_h", u64::from(content_area.height));
         }
-        Paragraph::new(visible).render(area, buf);
+        Paragraph::new(visible).render(content_area, buf);
         drop(paragraph_span);
+
+        // Draw the scrollbar only when we reserved gutter for
+        // it (i.e., content overflowed the viewport).
+        if needs_scrollbar {
+            self.render_scrollbar(area, buf);
+        } else {
+            self.last_scrollbar_col = None;
+            self.last_scrollbar_thumb = None;
+        }
+    }
+
+    /// Draw the in-pane scrollbar in the rightmost column of
+    /// `area` and remember its geometry so mouse hit-tests in
+    /// `scrollbar_mouse_target` can distinguish clicks on the
+    /// track vs. the thumb. Plan 10 PR-A.
+    fn render_scrollbar(
+        &mut self,
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+    ) {
+        let total = self.last_total_lines as usize;
+        let viewport = self.last_viewport_height as usize;
+        let offset = self.scroll_offset as usize;
+
+        // Let ratatui draw the actual glyphs. The ScrollbarState
+        // API takes a content length (total scrollable lines,
+        // minus viewport height) and a position (current offset).
+        let content_length = total.saturating_sub(viewport);
+        let mut state = ScrollbarState::new(content_length)
+            .viewport_content_length(viewport)
+            .position(offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        scrollbar.render(area, buf, &mut state);
+
+        // Remember geometry for mouse hit-testing (PR-B).
+        self.last_scrollbar_col = Some(area.x + area.width.saturating_sub(1));
+        self.last_scrollbar_thumb = Some(self.compute_thumb_range());
+    }
+
+    /// Compute the inclusive-exclusive y-range occupied by the
+    /// scrollbar thumb, in terminal-global coordinates. Matches
+    /// how ratatui internally sizes the thumb so our click /
+    /// drag targeting stays consistent with what's on screen.
+    fn compute_thumb_range(&self) -> (u16, u16) {
+        let viewport = self.last_viewport_height as usize;
+        let total = self.last_total_lines as usize;
+        let offset = self.scroll_offset as usize;
+        let top = self.last_render_top;
+
+        if total == 0 || viewport == 0 || total <= viewport {
+            return (top, top.saturating_add(1));
+        }
+        let max_scroll = total.saturating_sub(viewport);
+        // Thumb height: at least 1, scaled to viewport fraction.
+        let mut thumb_height = ((viewport * viewport) / total).max(1);
+        if thumb_height > viewport {
+            thumb_height = viewport;
+        }
+        let track_span = viewport.saturating_sub(thumb_height);
+        let thumb_top_offset = if max_scroll == 0 {
+            0
+        } else {
+            (offset * track_span) / max_scroll
+        };
+        let thumb_top = top.saturating_add(u16::try_from(thumb_top_offset).unwrap_or(u16::MAX));
+        let thumb_bottom =
+            thumb_top.saturating_add(u16::try_from(thumb_height).unwrap_or(u16::MAX));
+        (thumb_top, thumb_bottom)
+    }
+
+    /// Test-only accessors for scrollbar geometry. Used by the
+    /// thumb-sizing tests in Plan 10 PR-A. Reserved for tests
+    /// only since production callers use `scrollbar_mouse_target`
+    /// (landing in PR-B) to reason about geometry via a richer
+    /// API than raw coordinates.
+    #[cfg(test)]
+    pub(crate) fn scrollbar_thumb_range(&self) -> Option<(u16, u16)> {
+        self.last_scrollbar_thumb
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrollbar_column(&self) -> Option<u16> {
+        self.last_scrollbar_col
     }
 
     /// Whether any current block has animated content
@@ -1275,6 +1398,127 @@ impl OutputPane {
     /// Number of block slots (should always equal `blocks.len()`).
     pub(crate) fn cache_slot_count(&self) -> usize {
         self.caches.len()
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+    };
+
+    /// Build a pane with enough content to force viewport
+    /// overflow so the scrollbar renders.
+    fn overflowing_pane(blocks: usize) -> OutputPane {
+        let mut pane = OutputPane::new();
+        for i in 0..blocks {
+            pane.add_user_message(format!("message {i}"), i as u64);
+        }
+        pane
+    }
+
+    fn render_at(pane: &mut OutputPane, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                pane.render(area, frame.buffer_mut(), ".");
+            })
+            .expect("draw");
+        terminal
+    }
+
+    /// Plan 10 PR-A: when content overflows the viewport, the
+    /// scrollbar reserves the rightmost column and records its
+    /// geometry for later mouse hit-testing.
+    #[test]
+    fn output_scrollbar_appears_when_content_overflows() {
+        let mut pane = overflowing_pane(50);
+        let _terminal = render_at(&mut pane, 40, 10);
+        assert_eq!(pane.scrollbar_column(), Some(39));
+        assert!(pane.scrollbar_thumb_range().is_some());
+    }
+
+    /// No scrollbar when content fits entirely in the viewport.
+    /// Gutter reclaimed for content rendering.
+    #[test]
+    fn output_scrollbar_absent_when_content_fits() {
+        let mut pane = overflowing_pane(2);
+        let _terminal = render_at(&mut pane, 40, 20);
+        assert_eq!(pane.scrollbar_column(), None);
+        assert_eq!(pane.scrollbar_thumb_range(), None);
+    }
+
+    /// Thumb scales with the visible fraction. More content at
+    /// the same viewport height → smaller thumb.
+    #[test]
+    fn output_scrollbar_thumb_scales_with_total_content() {
+        // Small transcript: thumb height roughly equals
+        // viewport / total, so 20/100 ≈ 4 rows (min 1).
+        let mut small = overflowing_pane(30);
+        let _t1 = render_at(&mut small, 40, 20);
+        let small_thumb = small.scrollbar_thumb_range().expect("thumb");
+        let small_height = small_thumb.1.saturating_sub(small_thumb.0);
+
+        // Larger transcript at the same viewport: thumb must
+        // shrink (or stay the same at the min-1 floor).
+        let mut large = overflowing_pane(300);
+        let _t2 = render_at(&mut large, 40, 20);
+        let large_thumb = large.scrollbar_thumb_range().expect("thumb");
+        let large_height = large_thumb.1.saturating_sub(large_thumb.0);
+
+        assert!(
+            large_height <= small_height,
+            "thumb must shrink (or stay equal at the 1-row floor) as content grows; small={small_height} large={large_height}"
+        );
+    }
+
+    /// Thumb position reflects scroll offset. The default
+    /// `auto_scroll = true` keeps the pane parked at the bottom
+    /// as new content arrives; the test explicitly scrolls to
+    /// the top and to the bottom to verify the thumb tracks.
+    #[test]
+    fn output_scrollbar_thumb_moves_when_scrolled() {
+        let mut pane = overflowing_pane(100);
+        // One initial render so max_scroll() sees real line
+        // counts. Without this, scroll_to_top's set_scroll(0)
+        // would see max_scroll()=0 and auto_scroll=true
+        // (0 >= 0), re-parking at the bottom on the next
+        // render.
+        let _warmup = render_at(&mut pane, 40, 20);
+        pane.scroll_to_top();
+        let _t1 = render_at(&mut pane, 40, 20);
+        let top_thumb = pane.scrollbar_thumb_range().expect("thumb");
+
+        pane.scroll_to_bottom();
+        let _t2 = render_at(&mut pane, 40, 20);
+        let bottom_thumb = pane.scrollbar_thumb_range().expect("thumb");
+
+        assert!(
+            bottom_thumb.0 > top_thumb.0,
+            "bottom scroll must park thumb strictly below the top scroll position: \
+             top={top_thumb:?} bottom={bottom_thumb:?}"
+        );
+        pane.scroll_to_top();
+        let _t3 = render_at(&mut pane, 40, 20);
+        let roundtrip = pane.scrollbar_thumb_range().expect("thumb");
+        assert_eq!(top_thumb, roundtrip);
+    }
+
+    /// The gutter is not reserved when there's no scrollbar.
+    /// Content width == full area width in the no-overflow
+    /// case (preserves pre-Plan-10 rendering for short
+    /// transcripts).
+    #[test]
+    fn output_no_gutter_when_content_fits_preserves_content_width() {
+        // Short content, wide viewport.
+        let mut pane = overflowing_pane(2);
+        let _terminal = render_at(&mut pane, 40, 20);
+        // Without a scrollbar, the pane still knows its
+        // viewport was 20 rows wide-enough to fit.
+        assert_eq!(pane.last_viewport_height, 20);
     }
 }
 

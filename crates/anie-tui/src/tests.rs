@@ -714,12 +714,20 @@ fn single_long_wrapped_assistant_message_is_navigable() {
         reasoning_details: None,
     })]);
 
-    let mut terminal = Terminal::new(TestBackend::new(20, 8)).expect("test terminal");
+    // Plan 10 PR-A reserves the rightmost column for the
+    // in-pane scrollbar when content overflows the viewport.
+    // That means the effective wrap width is `terminal_width -
+    // 1`. Keep the test terminal wide enough that "FINAL-SUFFIX"
+    // lands intact on the tail line — 24 cols gives 23-col
+    // content area, which keeps the 12-char marker on a single
+    // wrapped line regardless of exactly where the preceding
+    // text ends.
+    let mut terminal = Terminal::new(TestBackend::new(24, 8)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw initial frame");
     let initial = render_to_string(terminal.backend());
-    assert!(initial.contains("FINAL-SUFFIX"));
+    assert!(initial.contains("FINAL-SUFFIX"), "{initial}");
     assert!(!initial.contains("BEGIN-"));
 
     app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
