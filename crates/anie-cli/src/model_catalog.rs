@@ -340,17 +340,19 @@ pub(crate) fn resolve_requested_model(
     current_provider: &str,
     catalog: &[Model],
 ) -> Result<Model> {
+    // Plan 08 PR-C finding #28: the previous shape walked the
+    // catalog up to three times for a provider-prefixed
+    // request ("provider:id") — once to verify the provider
+    // existed, once for the full match, and once more to
+    // actually extract the found model. Collapse to a single
+    // pass: `find` returns the match directly; Option handling
+    // distinguishes "match found" from "no such provider:id".
     if let Some((provider, model_id)) = requested.split_once(':')
-        && catalog.iter().any(|model| model.provider == provider)
-        && catalog
-            .iter()
-            .any(|model| model.provider == provider && model.id == model_id)
-    {
-        return catalog
+        && let Some(model) = catalog
             .iter()
             .find(|model| model.provider == provider && model.id == model_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("no model named '{model_id}' for provider '{provider}'"));
+    {
+        return Ok(model.clone());
     }
 
     catalog
