@@ -105,26 +105,38 @@ impl Tool for ReadTool {
         }
 
         let raw_text = String::from_utf8_lossy(&bytes).into_owned();
-        let lines: Vec<&str> = raw_text.lines().collect();
-        let start_index = offset.saturating_sub(1).min(lines.len());
+        // Plan 07 PR-F: stream lines rather than collecting
+        // the whole file into Vec<&str>. We still need the
+        // total line count for the "remaining" footer, but
+        // `lines().count()` walks once without materializing
+        // the slice. For a 10 k-line file that's one O(n)
+        // pass instead of an O(n) Vec<&str> allocation plus
+        // an O(m) iteration.
+        let total_lines = raw_text.lines().count();
+        let start_index = offset.saturating_sub(1).min(total_lines);
         let requested_end = limit
-            .map(|count| start_index.saturating_add(count).min(lines.len()))
-            .unwrap_or(lines.len());
-        let requested_lines = &lines[start_index..requested_end];
+            .map(|count| start_index.saturating_add(count).min(total_lines))
+            .unwrap_or(total_lines);
+        let requested_count = requested_end.saturating_sub(start_index);
 
         let mut shown_lines = Vec::new();
         let mut bytes_used = 0usize;
         let mut truncated = false;
         let mut partial_line_truncated = false;
 
-        for (index, line) in requested_lines.iter().enumerate() {
+        for (index, line) in raw_text
+            .lines()
+            .skip(start_index)
+            .take(requested_count)
+            .enumerate()
+        {
             if index >= MAX_READ_LINES {
                 truncated = true;
                 break;
             }
 
             let candidate = if shown_lines.is_empty() {
-                (*line).to_string()
+                line.to_string()
             } else {
                 format!("\n{line}")
             };
@@ -139,16 +151,16 @@ impl Tool for ReadTool {
                 break;
             }
             bytes_used += candidate.len();
-            shown_lines.push((*line).to_string());
+            shown_lines.push(line.to_string());
         }
 
-        if shown_lines.len() < requested_lines.len() {
+        if shown_lines.len() < requested_count {
             truncated = true;
         }
 
         let mut text = shown_lines.join("\n");
         if truncated {
-            let remaining = requested_lines.len().saturating_sub(shown_lines.len())
+            let remaining = requested_count.saturating_sub(shown_lines.len())
                 + usize::from(partial_line_truncated);
             if !text.is_empty() {
                 text.push('\n');
@@ -158,12 +170,18 @@ impl Tool for ReadTool {
             ));
         }
 
+        // Plan 07 PR-F: capture length + count before moving
+        // `text` into `text_result`. The previous shape cloned
+        // the whole text string just to read `text.len()` in
+        // the details payload — zero need for that.
+        let text_len = text.len();
+        let shown_count = shown_lines.len();
         Ok(text_result(
-            text.clone(),
+            text,
             serde_json::json!({
                 "path": path,
-                "lines": shown_lines.len(),
-                "bytes": text.len(),
+                "lines": shown_count,
+                "bytes": text_len,
                 "truncated": truncated,
                 "offset": offset,
             }),
@@ -172,10 +190,16 @@ impl Tool for ReadTool {
 }
 
 fn is_image_path(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|extension| extension.to_str()).map(|extension| extension.to_ascii_lowercase()),
-        Some(extension) if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
-    )
+    // Plan 07 PR-G: case-insensitive extension match without
+    // allocating a lowercased copy. `eq_ignore_ascii_case`
+    // compares byte-by-byte folded; zero allocation.
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["png", "jpg", "jpeg", "gif", "webp"]
+                .iter()
+                .any(|expected| extension.eq_ignore_ascii_case(expected))
+        })
 }
 
 fn image_media_type(path: &Path) -> &'static str {
