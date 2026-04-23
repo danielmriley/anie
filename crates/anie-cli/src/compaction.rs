@@ -119,16 +119,39 @@ impl MessageSummarizer for CompactionStrategy {
 }
 
 fn join_assistant_text(message: &AssistantMessage) -> String {
-    let text = message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
-            ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Plan 08 PR-A: the previous shape cloned every visible
+    // text / thinking fragment into a `Vec<String>` and then
+    // `.join`'d. Replaced with a single-allocation sized-up
+    // direct-buffer build that borrows the fragments instead
+    // of cloning them.
+    let mut total = 0usize;
+    let mut first = true;
+    for block in &message.content {
+        let fragment = match block {
+            ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
+            _ => continue,
+        };
+        if !first {
+            total += 1;
+        }
+        total += fragment.len();
+        first = false;
+    }
+    let mut text = String::with_capacity(total);
+    let mut first = true;
+    for block in &message.content {
+        let fragment = match block {
+            ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
+            _ => continue,
+        };
+        if !first {
+            text.push('\n');
+        }
+        text.push_str(fragment);
+        first = false;
+    }
     if text.is_empty() {
         message
             .error_message

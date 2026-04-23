@@ -176,12 +176,29 @@ fn tool_hint(args: &serde_json::Value) -> String {
 }
 
 fn assistant_text(content: &[ContentBlock]) -> String {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    // Plan 08 PR-A: direct-buffer join — skip the intermediate
+    // Vec<&str>. Sizing pass + write pass, one allocation.
+    let mut total = 0usize;
+    let mut first = true;
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            if !first {
+                total += 1;
+            }
+            total += text.len();
+            first = false;
+        }
+    }
+    let mut out = String::with_capacity(total);
+    let mut first = true;
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            if !first {
+                out.push('\n');
+            }
+            out.push_str(text);
+            first = false;
+        }
+    }
+    out
 }

@@ -19,15 +19,33 @@ use anie_provider::LlmMessage;
 pub(super) fn assistant_message_to_openai_llm_message(
     assistant_message: &AssistantMessage,
 ) -> Option<LlmMessage> {
-    let text = assistant_message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Plan 08 PR-A: direct-buffer join — two-pass single-
+    // allocation build instead of Vec<&str> + join.
+    let text = {
+        let mut total = 0usize;
+        let mut count = 0usize;
+        for block in &assistant_message.content {
+            if let ContentBlock::Text { text } = block {
+                if count > 0 {
+                    total += 1; // '\n' separator
+                }
+                total += text.len();
+                count += 1;
+            }
+        }
+        let mut out = String::with_capacity(total);
+        let mut first = true;
+        for block in &assistant_message.content {
+            if let ContentBlock::Text { text } = block {
+                if !first {
+                    out.push('\n');
+                }
+                out.push_str(text);
+                first = false;
+            }
+        }
+        out
+    };
     let tool_calls = assistant_message
         .content
         .iter()
