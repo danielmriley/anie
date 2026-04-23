@@ -9,7 +9,7 @@ use ratatui::{
 
 use anie_provider::ModelInfo;
 
-use crate::widgets::fuzzy::fuzzy_score;
+use crate::widgets::fuzzy::fuzzy_score_lowered;
 
 /// Outcome of processing a key in the model picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,22 +325,33 @@ impl ModelPickerPane {
         if search.is_empty() {
             self.filtered_indices = (0..self.models.len()).collect();
         } else {
-            // Score every model by id and name; keep the better of
-            // the two scores. Sort best-first. Ties fall back to
-            // the original catalog order so the picker is stable
-            // between keystrokes that don't change the ranking.
+            // Plan 05 PR-B: tokenized search — split the query
+            // on whitespace and require every token to match
+            // either the model id or the model name. Lowercase
+            // the query once per filter pass rather than 2×N
+            // times inside the loop (plan 05 PR-A).
+            let search_lower = search.to_ascii_lowercase();
+            let tokens: Vec<&str> = search_lower.split_whitespace().collect();
             let mut scored: Vec<(u32, usize)> = self
                 .models
                 .iter()
                 .enumerate()
                 .filter_map(|(index, model)| {
-                    let id_score = fuzzy_score(search, &model.id);
-                    let name_score = fuzzy_score(search, &model.name);
-                    id_score
-                        .into_iter()
-                        .chain(name_score)
-                        .max()
-                        .map(|score| (score, index))
+                    // Every token must match at least one of
+                    // the id or name. Score is the sum of the
+                    // per-token best-of-two scores so a query
+                    // that hits multiple strong signals beats
+                    // one that hits only a single token well.
+                    let mut total: u32 = 0;
+                    for token in &tokens {
+                        let id_score = fuzzy_score_lowered(token, &model.id);
+                        let name_score = fuzzy_score_lowered(token, &model.name);
+                        match id_score.into_iter().chain(name_score).max() {
+                            Some(s) => total = total.saturating_add(s),
+                            None => return None,
+                        }
+                    }
+                    Some((total, index))
                 })
                 .collect();
             scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
@@ -592,6 +603,42 @@ mod tests {
     fn empty_search_shows_all_models() {
         let picker = ModelPickerPane::new(models(), "ollama".into(), "qwen3:32b".into(), None);
         assert_eq!(picker.filtered_indices.len(), 3);
+    }
+
+    /// Plan 05 PR-B: a multi-token query requires every token
+    /// to match either the model id or the name. Matching any
+    /// token is not enough — all tokens must hit.
+    #[test]
+    fn tokenized_query_requires_all_tokens() {
+        let mut picker =
+            ModelPickerPane::new(models(), "ollama".into(), "qwen3:32b".into(), None);
+        // "qwen 32b": "qwen" matches all 3 models (two qwen3
+        // variants + the gpt model probably won't match qwen).
+        // "32b" only matches qwen3:32b. Combined → only the
+        // 32b model.
+        for ch in "qwen 32b".chars() {
+            let _ = picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(picker.filtered_indices.len(), 1);
+        assert_eq!(
+            picker.selected_model().expect("selected").id,
+            "qwen3:32b"
+        );
+    }
+
+    /// Plan 05 PR-B: any token without a match causes the
+    /// entire candidate to be filtered out. Pure "any-token-
+    /// matches" would keep a model that only hit some tokens,
+    /// which is worse picker ergonomics.
+    #[test]
+    fn tokenized_query_rejects_candidate_when_any_token_misses() {
+        let mut picker =
+            ModelPickerPane::new(models(), "ollama".into(), "qwen3:32b".into(), None);
+        // "qwen xyz" — "xyz" matches nothing. Result must be empty.
+        for ch in "qwen xyz".chars() {
+            let _ = picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(picker.filtered_indices.is_empty());
     }
 
     #[test]

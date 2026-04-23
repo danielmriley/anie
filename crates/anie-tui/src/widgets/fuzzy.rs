@@ -30,22 +30,46 @@
 //! These match the delimiters OpenRouter and other aggregators use
 //! in model ids.
 
-/// Score a candidate against a lowercased query.
+/// Score a candidate against a query. Convenience wrapper that
+/// lowercases the query on every call; prefer the lowered-query
+/// variant in hot loops.
 ///
 /// Returns `None` when the candidate doesn't match. Higher score =
 /// better match; callers sort descending by score.
+///
+/// Retained for tests and non-hot callers after Plan 05 PR-A
+/// moved the model picker to `fuzzy_score_lowered` directly.
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn fuzzy_score(query: &str, candidate: &str) -> Option<u32> {
     if query.is_empty() {
         return Some(0);
     }
     let query_lower = query.to_ascii_lowercase();
+    fuzzy_score_lowered(&query_lower, candidate)
+}
+
+/// Score a candidate against a query that has already been
+/// lowercased by the caller. Hot-path variant — filters over N
+/// candidates at a single query lowercase the query once instead
+/// of N times. Plan 05 PR-A.
+///
+/// `query_lower` must already be ASCII-lowercased. The candidate
+/// is lowercased here since each candidate is unique.
+///
+/// Returns `None` when the candidate doesn't match. Higher score =
+/// better match; callers sort descending by score.
+#[must_use]
+pub(crate) fn fuzzy_score_lowered(query_lower: &str, candidate: &str) -> Option<u32> {
+    if query_lower.is_empty() {
+        return Some(0);
+    }
     let candidate_lower = candidate.to_ascii_lowercase();
 
     if candidate_lower == query_lower {
         return Some(scored(1_000_000, candidate_lower.len(), 0));
     }
-    if let Some(position) = candidate_lower.find(&query_lower) {
+    if let Some(position) = candidate_lower.find(query_lower) {
         if position == 0 {
             return Some(scored(500_000, candidate_lower.len(), 0));
         }
@@ -55,7 +79,7 @@ pub(crate) fn fuzzy_score(query: &str, candidate: &str) -> Option<u32> {
         return Some(scored(100_000, candidate_lower.len(), position));
     }
 
-    subsequence_score(&query_lower, &candidate_lower)
+    subsequence_score(query_lower, &candidate_lower)
 }
 
 /// `true` when the byte-position `position` in `text` sits at the
@@ -235,5 +259,41 @@ mod tests {
                 "separator {sep:?} should mark a word start"
             );
         }
+    }
+
+    /// Plan 05 PR-A: `fuzzy_score_lowered` produces the same
+    /// ranking as `fuzzy_score` for a pre-lowercased query.
+    /// Pins the wrapper/lowered-variant equivalence.
+    #[test]
+    fn fuzzy_score_lowered_matches_existing_single_token_rankings() {
+        let cases = [
+            ("claude", "claude"),
+            ("claude", "claude-sonnet-4"),
+            ("claude", "anthropic/claude-3-haiku"),
+            ("sonnet", "anthropic/claude-sonnet"),
+            ("CLAUDE", "anthropic/CLAUDE-SONNET"),
+            ("acs", "anthropic/claude-sonnet"),
+            ("xyz", "anthropic/claude-sonnet-4"),
+        ];
+        for (query, candidate) in cases {
+            let wrapper = fuzzy_score(query, candidate);
+            let lowered = fuzzy_score_lowered(&query.to_ascii_lowercase(), candidate);
+            assert_eq!(
+                wrapper, lowered,
+                "wrapper vs lowered disagreed for ({query:?}, {candidate:?}): {wrapper:?} vs {lowered:?}"
+            );
+        }
+    }
+
+    /// The lowered variant trusts its caller to pre-lowercase.
+    /// Passing mixed-case yields "no match" even though the
+    /// wrapper would have found one — documents the contract.
+    #[test]
+    fn fuzzy_score_lowered_requires_lowercase_query_input() {
+        // "CLAUDE" passed to the lowered variant does not match
+        // lowercase "claude" — contract violation on purpose,
+        // to demonstrate the requirement.
+        assert_eq!(fuzzy_score_lowered("CLAUDE", "claude"), None);
+        assert!(fuzzy_score_lowered("claude", "CLAUDE").is_some());
     }
 }
