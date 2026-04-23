@@ -61,7 +61,15 @@ impl TaggedReasoningSplitter {
 
                     if let Some(open_index) = self.pending.find('<') {
                         if open_index > 0 {
-                            let text = self.pending.drain(..open_index).collect::<String>();
+                            // Plan 06 PR-D: move-based split.
+                            // `split_off` hands back the
+                            // [open_index..] suffix; `mem::replace`
+                            // swaps it into `self.pending`, leaving
+                            // the [..open_index] prefix as an owned
+                            // String without the char-by-char
+                            // `drain().collect()` iteration.
+                            let tail = self.pending.split_off(open_index);
+                            let text = std::mem::replace(&mut self.pending, tail);
                             Self::push_part(&mut parts, StreamContentPart::Text(text));
                             continue;
                         }
@@ -94,7 +102,11 @@ impl TaggedReasoningSplitter {
 
                     if let Some(close_index) = self.pending.find('<') {
                         if close_index > 0 {
-                            let thinking = self.pending.drain(..close_index).collect::<String>();
+                            // Plan 06 PR-D: move-based split (see
+                            // Text mode above).
+                            let tail = self.pending.split_off(close_index);
+                            let thinking =
+                                std::mem::replace(&mut self.pending, tail);
                             Self::push_part(&mut parts, StreamContentPart::Thinking(thinking));
                             continue;
                         }
