@@ -71,12 +71,6 @@ pub struct App {
     /// ms), idle-tick redraws are suppressed so the spinner
     /// freezes rather than eating CPU. Plan 06 PR-B.
     last_streaming_delta_at: Option<Instant>,
-    /// Active scrollbar-thumb drag gesture, if any. `Some` from
-    /// the moment the user presses the mouse button down on
-    /// the thumb until they release it; drag events in between
-    /// update `OutputPane::scroll_offset` proportionally. Plan
-    /// 10 PR-B.
-    scrollbar_drag: Option<crate::output::ScrollbarDrag>,
 }
 
 // The ModelPicker variant is intentionally large; the enum holds at most
@@ -287,7 +281,6 @@ impl App {
             worker_rx,
             commands,
             last_streaming_delta_at: None,
-            scrollbar_drag: None,
         }
     }
 
@@ -851,43 +844,15 @@ impl App {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 self.handle_left_click(mouse.row, mouse.column);
             }
-            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                // Plan 10 PR-B: forward only if a scrollbar
-                // drag is in progress. Non-drag-state drags
-                // (e.g., text selection attempts) are ignored.
-                if let Some(drag) = self.scrollbar_drag {
-                    self.output_pane.apply_scrollbar_drag(mouse.row, &drag);
-                }
-            }
-            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                self.scrollbar_drag = None;
-            }
             _ => {}
         }
     }
 
-    /// Handle a left-click in the output pane. Priority order:
-    ///  1. scrollbar hit (thumb begins drag, track pages up/down)
-    ///  2. URL hit (open in default browser)
-    ///  3. ignored (clicks on prose are inert — users expect
-    ///     text regions to do nothing in a TUI with mouse
-    ///     capture).
+    /// Handle a left-click in the output pane — currently only
+    /// used for clickable URL hit-testing. Clicks on prose are
+    /// inert; users expect text regions to do nothing in a TUI
+    /// with mouse capture.
     fn handle_left_click(&mut self, row: u16, col: u16) {
-        match self.output_pane.scrollbar_mouse_target(row, col) {
-            crate::output::ScrollbarHit::Thumb => {
-                self.scrollbar_drag = Some(self.output_pane.begin_scrollbar_drag(row));
-                return;
-            }
-            crate::output::ScrollbarHit::TrackAbove => {
-                self.output_pane.scrollbar_page_up();
-                return;
-            }
-            crate::output::ScrollbarHit::TrackBelow => {
-                self.output_pane.scrollbar_page_down();
-                return;
-            }
-            crate::output::ScrollbarHit::None => {}
-        }
         if let Some(url) = self
             .output_pane
             .url_at_terminal_position(row, col)
@@ -1691,13 +1656,17 @@ pub async fn run_tui(
 ) -> Result<()> {
     let mut term_events = EventStream::new();
     // Request-based rendering: handlers set `dirty` when they
-    // change visible state; the render below actually draws only
-    // once the frame budget has elapsed. Multiple dirty-marks
-    // between draws collapse into one paint. See
+    // change visible state; the render below draws as soon as
+    // the constraints allow. See
     // docs/tui_responsiveness/01_render_scheduling.md.
     let mut dirty = true;
-    // Pretend the last render happened a full frame ago so the
-    // first real draw fires immediately instead of waiting 33 ms.
+    // Typed input needs sub-frame-budget response or the user
+    // feels lag. Set when a terminal event (keystroke, paste,
+    // focus change) arrived — we bypass FRAME_BUDGET for
+    // exactly one render cycle so every keystroke paints
+    // immediately. Streaming / tick paths still respect the
+    // budget for coalescing.
+    let mut input_urgent = false;
     let mut last_render_at = Instant::now()
         .checked_sub(FRAME_BUDGET)
         .unwrap_or_else(Instant::now);
@@ -1707,14 +1676,15 @@ pub async fn run_tui(
     let mut last_resize_at: Option<Instant> = None;
 
     loop {
-        // Two gates: the frame budget (don't render more than
-        // ~30 fps) AND the resize debounce (don't render mid-
-        // drag). Both must pass before a paint fires.
+        // Two gates: frame budget (coalesce streaming bursts)
+        // AND resize debounce (skip mid-drag paints). Both
+        // gated on `!input_urgent` so typing skips them.
         let resize_ready = match last_resize_at {
             Some(t) => t.elapsed() >= RESIZE_DEBOUNCE,
             None => true,
         };
-        if dirty && last_render_at.elapsed() >= FRAME_BUDGET && resize_ready {
+        let budget_ready = input_urgent || last_render_at.elapsed() >= FRAME_BUDGET;
+        if dirty && budget_ready && resize_ready {
             let frame = crate::render_debug::RenderFrame::begin();
             // Wrap in DECSET 2026 synchronized output so modern
             // GPU terminals composite each frame atomically. No-op
@@ -1723,6 +1693,7 @@ pub async fn run_tui(
             crate::terminal::draw_synchronized(terminal, |f| app.render(f))?;
             frame.end(app.output_pane.blocks().len());
             dirty = false;
+            input_urgent = false;
             last_render_at = Instant::now();
             last_resize_at = None;
         }
@@ -1747,6 +1718,7 @@ pub async fn run_tui(
             Some(Ok(event)) = term_events.next() => {
                 let mut affects_render = event_dirties_render(&event);
                 let mut saw_resize = matches!(event, Event::Resize(_, _));
+                let mut saw_key = matches!(event, Event::Key(_) | Event::Paste(_));
                 app.handle_terminal_event(event)?;
                 // Drain any terminal events already buffered in
                 // the stream. Mouse-motion tracking fires at
@@ -1763,10 +1735,20 @@ pub async fn run_tui(
                     if matches!(event, Event::Resize(_, _)) {
                         saw_resize = true;
                     }
+                    if matches!(event, Event::Key(_) | Event::Paste(_)) {
+                        saw_key = true;
+                    }
                     app.handle_terminal_event(event)?;
                 }
                 if saw_resize {
                     last_resize_at = Some(Instant::now());
+                }
+                if saw_key {
+                    // Typed input needs immediate paint; bypass
+                    // FRAME_BUDGET for exactly one frame so the
+                    // keystroke lands on screen without waiting
+                    // out the 33 ms coalescing budget.
+                    input_urgent = true;
                 }
                 if affects_render {
                     dirty = true;

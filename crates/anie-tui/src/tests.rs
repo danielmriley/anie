@@ -714,15 +714,10 @@ fn single_long_wrapped_assistant_message_is_navigable() {
         reasoning_details: None,
     })]);
 
-    // Plan 10 PR-A reserves the rightmost column for the
-    // in-pane scrollbar when content overflows the viewport.
-    // That means the effective wrap width is `terminal_width -
-    // 1`. Keep the test terminal wide enough that "FINAL-SUFFIX"
-    // lands intact on the tail line — 24 cols gives 23-col
-    // content area, which keeps the 12-char marker on a single
-    // wrapped line regardless of exactly where the preceding
-    // text ends.
-    let mut terminal = Terminal::new(TestBackend::new(24, 8)).expect("test terminal");
+    // 32-col terminal keeps `FINAL-SUFFIX` (12 chars) on a
+    // single wrapped line regardless of where the preceding
+    // prose happens to break.
+    let mut terminal = Terminal::new(TestBackend::new(32, 8)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw initial frame");
