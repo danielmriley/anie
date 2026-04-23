@@ -13,7 +13,7 @@ conflict-minimizing multi-agent assignment layout.
 | 01 | Tool registry + schema validation | **landed** | 3/3 PRs shipped as Phase 1.2/1.3 of the refactor worklist |
 | 02 | Agent turn ownership + event payloads | pending | clone-heavy run-loop cleanup |
 | 03 | Session indexing + context construction | pending | single-index session simplification |
-| 04 | TUI output hot path | pending | overlaps `docs/tui_responsiveness/` |
+| 04 | TUI output hot path | **landed** | 6/6 PRs shipped; scroll_static_600: 3.16 ms → 296 µs (10.7×) |
 | 05 | Picker search + fuzzy matching | pending | pi tokenized fuzzy ideas land here |
 | 06 | Provider streaming + local models | pending | correctness-sensitive Anthropic work inside |
 | 07 | Tool read/grep/bash/edit + truncation | pending | shared truncation helper likely starts here |
@@ -42,10 +42,10 @@ conflict-minimizing multi-agent assignment layout.
 | 03 | F | session-local helper sweep | pending | — |
 | 04 | A | render scheduling cross-link / landing | **landed** (no-op — already shipped via `tui_responsiveness/`) | `3fb113d` |
 | 04 | B | Arc-backed output cache storage | **landed** | `3fb113d` |
-| 04 | C | cache read-side cleanup + invalidation audit | pending | — |
-| 04 | D | `wrap_plain_text` rewrite | pending | — |
-| 04 | E | `wrap_spans` rewrite | pending | — |
-| 04 | F | render helper cleanup | pending | — |
+| 04 | C | cache read-side cleanup + invalidation audit | **landed** — 10.7× scroll speedup | `26f6e8a` |
+| 04 | D | `wrap_plain_text` rewrite | **landed** | `458aea5` |
+| 04 | E | `wrap_spans` rewrite | **landed** (both output.rs + layout.rs variants) | `646de92` |
+| 04 | F | render helper cleanup | **landed** | `c058f51` |
 | 05 | A | lowered-query scorer API | pending | — |
 | 05 | B | tokenized model-picker filtering | pending | — |
 | 05 | C | autocomplete lowercase caches | pending | — |
