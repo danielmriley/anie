@@ -506,29 +506,64 @@ impl OutputPane {
     ) {
         // Plan 10 PR-A: the scrollbar lives in the rightmost
         // column of the output area, reserved only when the
-        // content actually overflows the viewport. We build
-        // lines at full width first; if total > viewport, we
-        // rebuild at width-1 and draw the scrollbar in the
-        // reclaimed column. No-overflow content pays no gutter
-        // cost, matching terminal-emulator behavior users
-        // already expect.
-        self.rebuild_flat_cache(area.width.max(1), spinner_frame);
-        let full_width_total = self.flat_lines.len();
+        // content actually overflows the viewport.
+        //
+        // Performance: the naive "build at full width, check
+        // overflow, maybe rebuild at narrow width" pattern
+        // invalidates the flat cache every frame — the cache
+        // ends each frame at narrow width; next frame builds
+        // at full width, then back to narrow. Two full
+        // rebuilds per frame.
+        //
+        // Optimization: when the last render reserved the
+        // gutter, try the narrower width FIRST. Steady-state
+        // scrolling through an overflowing transcript hits
+        // the cache once per frame. Two rebuilds happen only
+        // on transition frames (overflow ↔ fit).
         let viewport_h = area.height.max(1) as usize;
-        let needs_scrollbar = area.width >= 2 && full_width_total > viewport_h;
-        let content_area = if needs_scrollbar {
-            let new_rect = ratatui::layout::Rect {
-                width: area.width - 1,
-                ..area
-            };
-            // Rebuild at the narrower width so wrap boundaries
-            // match the reduced content area. Invalidates the
-            // flat cache so the rebuild happens.
-            self.flat_cache_valid = false;
-            self.rebuild_flat_cache(new_rect.width.max(1), spinner_frame);
-            new_rect
+        let gutter_capable = area.width >= 2;
+        let narrow_width = if gutter_capable {
+            area.width - 1
         } else {
-            area
+            area.width.max(1)
+        };
+        let (content_area, needs_scrollbar) = if self.last_scrollbar_col.is_some()
+            && gutter_capable
+        {
+            // Last frame drew a scrollbar; try the narrow
+            // width first. Fast path when the transcript is
+            // still overflowing (the common case during a
+            // scroll gesture).
+            self.rebuild_flat_cache(narrow_width, spinner_frame);
+            if self.flat_lines.len() > viewport_h {
+                let new_rect = ratatui::layout::Rect {
+                    width: narrow_width,
+                    ..area
+                };
+                (new_rect, true)
+            } else {
+                // Transcript shrank below the viewport since
+                // last frame. Rebuild at full width to reclaim
+                // the gutter column.
+                self.flat_cache_valid = false;
+                self.rebuild_flat_cache(area.width.max(1), spinner_frame);
+                (area, false)
+            }
+        } else {
+            // No scrollbar last frame. Build at full width;
+            // if content now overflows, rebuild at narrow.
+            self.rebuild_flat_cache(area.width.max(1), spinner_frame);
+            if gutter_capable && self.flat_lines.len() > viewport_h {
+                self.flat_cache_valid = false;
+                self.rebuild_flat_cache(narrow_width, spinner_frame);
+                let new_rect = ratatui::layout::Rect {
+                    width: narrow_width,
+                    ..area
+                };
+                (new_rect, true)
+            } else {
+                (area, false)
+            }
         };
 
         self.last_total_lines = u16::try_from(self.flat_lines.len()).unwrap_or(u16::MAX);
