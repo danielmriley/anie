@@ -491,9 +491,23 @@ pub(crate) fn upsert_model(models: &mut Vec<Model>, model: &Model) {
 /// discovery) may overlap; this normalizes the catalog so every
 /// entry is uniquely addressable.
 pub(crate) fn dedupe_models(models: &mut Vec<Model>) {
-    let mut seen = HashSet::new();
+    // Plan 08 PR-C finding #29: the previous shape built a
+    // `(String, String)` key per model for the HashSet,
+    // cloning provider + id. With a typical 500+ model
+    // OpenRouter catalog that's ~1000 String clones. The
+    // composite key is only consumed for hash/equality
+    // during `retain`, so we can concat the two strings
+    // into a single key separated by a byte that can't
+    // appear in a valid provider/id — `\0` works.
+    let mut seen: HashSet<String> = HashSet::new();
     models.reverse();
-    models.retain(|model| seen.insert((model.provider.clone(), model.id.clone())));
+    models.retain(|model| {
+        let mut key = String::with_capacity(model.provider.len() + 1 + model.id.len());
+        key.push_str(&model.provider);
+        key.push('\0');
+        key.push_str(&model.id);
+        seen.insert(key)
+    });
     models.reverse();
 }
 
