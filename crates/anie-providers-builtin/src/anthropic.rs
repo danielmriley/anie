@@ -117,12 +117,22 @@ impl AnthropicProvider {
         context: &LlmContext,
         options: &StreamOptions,
     ) -> serde_json::Value {
+        // Plan 06 PR-A: compute `thinking_config` exactly once
+        // and use the stored value at both insertion points.
+        // The second insertion at the bottom re-asserts the
+        // `temperature = 1.0` contract AFTER an optional user
+        // temperature override — deleting that re-assertion
+        // would break Anthropic's requirement that thinking
+        // requests send temperature=1. Per-request savings:
+        // one `ThinkingConfig::serialize` pass.
+        let thinking = thinking_config(options, model);
+
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(model.id));
         let base_max = options.max_tokens.unwrap_or(model.max_tokens);
-        if let Some((effective_max, thinking)) = thinking_config(options, model) {
-            body.insert("max_tokens".into(), json!(effective_max));
-            body.insert("thinking".into(), thinking);
+        if let Some((effective_max, thinking_value)) = thinking.as_ref() {
+            body.insert("max_tokens".into(), json!(*effective_max));
+            body.insert("thinking".into(), thinking_value.clone());
             body.insert("temperature".into(), json!(1.0));
         } else {
             body.insert("max_tokens".into(), json!(base_max));
@@ -160,8 +170,12 @@ impl AnthropicProvider {
         if let Some(temperature) = options.temperature {
             body.insert("temperature".into(), json!(temperature));
         }
-        if let Some(thinking) = thinking_config(options, model) {
-            body.insert("thinking".into(), thinking.1);
+        // Re-assert thinking's temperature contract AFTER the
+        // optional user-temperature override above. Must stay
+        // after `options.temperature` so user values don't
+        // leak into thinking requests.
+        if let Some((_, thinking_value)) = thinking {
+            body.insert("thinking".into(), thinking_value);
             body.insert("temperature".into(), json!(1.0));
         }
 
@@ -1486,5 +1500,100 @@ mod tests {
         assert_eq!(eff, 8_192);
         assert!(high_small["budget_tokens"].as_u64().unwrap() < eff);
         assert_eq!(high_small["budget_tokens"], json!(8_192 - 1_024));
+    }
+
+    /// Plan 06 PR-A: compute thinking_config exactly once but
+    /// preserve the end-of-body re-assertion so a user-supplied
+    /// temperature doesn't leak through into a thinking request.
+    /// Pins the correctness-sensitive ordering.
+    #[test]
+    fn anthropic_thinking_request_reasserts_temperature_after_user_override() {
+        fn model_with(max_tokens: u64) -> Model {
+            Model {
+                id: "claude-haiku-4-5-20251001".into(),
+                name: "Haiku".into(),
+                provider: "anthropic".into(),
+                api: anie_provider::ApiKind::AnthropicMessages,
+                base_url: "https://api.anthropic.com".into(),
+                context_window: 200_000,
+                max_tokens,
+                supports_reasoning: true,
+                reasoning_capabilities: None,
+                supports_images: true,
+                cost_per_million: anie_provider::CostPerMillion::zero(),
+                replay_capabilities: None,
+                compat: ModelCompat::None,
+            }
+        }
+        let model = model_with(64_000);
+        let context = LlmContext {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        // User tries to set temperature to 0.7 alongside a
+        // thinking request. Anthropic requires temperature=1
+        // when thinking is active; the provider must
+        // re-assert that requirement after the user's value.
+        let options = StreamOptions {
+            thinking: ThinkingLevel::High,
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body =
+            AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
+        // Post-override, temperature must read 1.0, not 0.7.
+        assert_eq!(
+            body["temperature"], json!(1.0),
+            "thinking request must force temperature=1 even when user set it: {body}"
+        );
+        // Thinking block must be present and well-formed.
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+        assert!(body["thinking"]["budget_tokens"].is_u64());
+    }
+
+    /// No thinking request + user temperature: the user value
+    /// must pass through untouched.
+    #[test]
+    fn anthropic_non_thinking_request_preserves_user_temperature() {
+        fn model_with(max_tokens: u64) -> Model {
+            Model {
+                id: "claude-haiku-4-5-20251001".into(),
+                name: "Haiku".into(),
+                provider: "anthropic".into(),
+                api: anie_provider::ApiKind::AnthropicMessages,
+                base_url: "https://api.anthropic.com".into(),
+                context_window: 200_000,
+                max_tokens,
+                supports_reasoning: true,
+                reasoning_capabilities: None,
+                supports_images: true,
+                cost_per_million: anie_provider::CostPerMillion::zero(),
+                replay_capabilities: None,
+                compat: ModelCompat::None,
+            }
+        }
+        let model = model_with(64_000);
+        let context = LlmContext {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            thinking: ThinkingLevel::Off,
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body =
+            AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
+        // f32 → serde_json::Value goes through f64, so
+        // `0.7_f32` serializes as `0.6999…`. Compare with a
+        // tolerance rather than byte-identical JSON.
+        let temp = body["temperature"].as_f64().expect("temperature f64");
+        assert!(
+            (temp - 0.7).abs() < 1e-4,
+            "expected ~0.7, got {temp}"
+        );
+        assert!(body.get("thinking").is_none());
     }
 }
