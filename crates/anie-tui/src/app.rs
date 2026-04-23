@@ -318,6 +318,15 @@ impl App {
         self
     }
 
+    /// Set the interactive-transcript tool-output display mode
+    /// at startup. See `OutputPane::set_tool_output_mode` for
+    /// semantics.
+    #[must_use]
+    pub fn with_tool_output_mode(mut self, mode: anie_config::ToolOutputMode) -> Self {
+        self.output_pane.set_tool_output_mode(mode);
+        self
+    }
+
     /// Record detected terminal capabilities so markdown
     /// rendering can tailor hyperlink / image emission to the
     /// terminal.
@@ -334,6 +343,20 @@ impl App {
     /// `/markdown on|off` slash command.
     pub fn set_markdown_enabled(&mut self, enabled: bool) {
         self.output_pane.set_markdown_enabled(enabled);
+    }
+
+    /// Runtime flip for the tool-output display mode. Used by
+    /// the `/tool-output verbose|compact` slash command. Like
+    /// `/markdown`, this is UI-only: no controller action
+    /// dispatches.
+    pub fn set_tool_output_mode(&mut self, mode: anie_config::ToolOutputMode) {
+        self.output_pane.set_tool_output_mode(mode);
+    }
+
+    /// Current tool-output display mode.
+    #[must_use]
+    pub fn tool_output_mode(&self) -> anie_config::ToolOutputMode {
+        self.output_pane.tool_output_mode()
     }
 
     /// Read-only view of the current agent UI state. Primarily

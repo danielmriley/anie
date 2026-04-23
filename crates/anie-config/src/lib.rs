@@ -50,6 +50,30 @@ pub struct UiConfig {
     /// the toggle only affects already-finalized blocks.
     #[serde(default = "default_markdown_enabled")]
     pub markdown_enabled: bool,
+    /// How successful `bash` / `read` tool results render in the
+    /// interactive transcript. `Verbose` shows the full body
+    /// inside the boxed tool block (today's default). `Compact`
+    /// shows only the tool title (e.g. `$ <command>` or
+    /// `read <path>`). Errors always render their body so
+    /// debugging stays available. See
+    /// `docs/code_review_performance_2026-04-21/09_tool_output_display_modes.md`.
+    #[serde(default = "default_tool_output_mode")]
+    pub tool_output_mode: ToolOutputMode,
+}
+
+/// Display mode for successful `bash` / `read` tool output in
+/// the interactive transcript. UI-only: never affects what the
+/// agent, provider, or session storage see.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolOutputMode {
+    /// Render the full tool-result body inside the boxed tool
+    /// block. Today's default.
+    Verbose,
+    /// Hide successful `bash` and `read` bodies; keep the
+    /// one-line title. `edit`, `write`, and other tools remain
+    /// fully visible. Errors always show their body.
+    Compact,
 }
 
 impl Default for UiConfig {
@@ -57,12 +81,17 @@ impl Default for UiConfig {
         Self {
             slash_command_popup_enabled: true,
             markdown_enabled: default_markdown_enabled(),
+            tool_output_mode: default_tool_output_mode(),
         }
     }
 }
 
 fn default_markdown_enabled() -> bool {
     true
+}
+
+fn default_tool_output_mode() -> ToolOutputMode {
+    ToolOutputMode::Verbose
 }
 
 /// Default model selection.
@@ -621,6 +650,34 @@ mod tests {
             config.model.and_then(|model| model.id),
             Some("gpt-4o".into())
         );
+    }
+
+    /// Plan 09 PR-A: the new `tool_output_mode` setting
+    /// defaults to `Verbose` so today's behavior is preserved
+    /// for every user who doesn't opt in.
+    #[test]
+    fn ui_config_tool_output_mode_defaults_to_verbose() {
+        assert_eq!(UiConfig::default().tool_output_mode, ToolOutputMode::Verbose);
+    }
+
+    /// Forward-compat: a user's config written before the
+    /// field existed must still load cleanly, with the default
+    /// filled in.
+    #[test]
+    fn ui_config_without_tool_output_mode_loads_with_default() {
+        let toml_str = "slash_command_popup_enabled = true\nmarkdown_enabled = true\n";
+        let config: UiConfig = toml::from_str(toml_str).expect("parse legacy UiConfig");
+        assert_eq!(config.tool_output_mode, ToolOutputMode::Verbose);
+    }
+
+    /// `tool_output_mode = "compact"` round-trips through
+    /// serde; the lowercase rename is stable so any user who
+    /// opts into compact survives a restart.
+    #[test]
+    fn ui_config_tool_output_mode_compact_roundtrips() {
+        let toml_str = "slash_command_popup_enabled = true\nmarkdown_enabled = true\ntool_output_mode = \"compact\"\n";
+        let config: UiConfig = toml::from_str(toml_str).expect("parse compact");
+        assert_eq!(config.tool_output_mode, ToolOutputMode::Compact);
     }
 
     #[test]

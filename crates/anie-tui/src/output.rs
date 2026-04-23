@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anie_config::ToolOutputMode;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -91,6 +92,11 @@ struct RenderContext {
     markdown_enabled: bool,
     capabilities: TerminalCapabilities,
     theme: MarkdownTheme,
+    /// How successful `bash` / `read` tool results render. Full
+    /// body in `Verbose`, title-only in `Compact`. Errors and
+    /// other tools are unaffected. See
+    /// `docs/code_review_performance_2026-04-21/09_tool_output_display_modes.md`.
+    tool_output_mode: ToolOutputMode,
 }
 
 impl Default for RenderContext {
@@ -99,6 +105,7 @@ impl Default for RenderContext {
             markdown_enabled: true,
             capabilities: TerminalCapabilities::default(),
             theme: MarkdownTheme::default_dark(),
+            tool_output_mode: ToolOutputMode::Verbose,
         }
     }
 }
@@ -185,6 +192,24 @@ impl OutputPane {
     #[must_use]
     pub fn markdown_enabled(&self) -> bool {
         self.render_context.markdown_enabled
+    }
+
+    /// Set the `bash` / `read` body display mode and invalidate
+    /// caches so the next render picks up the new choice.
+    /// Mirrors `set_markdown_enabled` — the pane is treated as a
+    /// reactive UI component, not a passive sink.
+    pub fn set_tool_output_mode(&mut self, mode: ToolOutputMode) {
+        if self.render_context.tool_output_mode == mode {
+            return;
+        }
+        self.render_context.tool_output_mode = mode;
+        self.invalidate_all_caches();
+    }
+
+    /// Current tool-output display mode.
+    #[must_use]
+    pub fn tool_output_mode(&self) -> ToolOutputMode {
+        self.render_context.tool_output_mode
     }
 
     /// Record detected terminal capabilities. Today this only
