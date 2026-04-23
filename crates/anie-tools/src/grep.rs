@@ -368,26 +368,67 @@ impl<'a> MatchCollector<'a> {
         }
         let line = String::from_utf8_lossy(line_bytes);
         let line = line.trim_end_matches('\n').trim_end_matches('\r');
-        let truncated_line = if line.chars().count() > LINE_CHAR_CAP {
-            let cut: String = line.chars().take(LINE_CHAR_CAP).collect();
-            format!("{cut}…")
-        } else {
-            line.to_string()
-        };
-        let new_content = format!(
-            "{prefix}{path}:{line_number}:{truncated_line}\n",
-            path = self.display_path,
-        );
-        if self.output.len() + new_content.len() > self.byte_limit {
+        // Plan 07 PR-A+B: use the shared truncation helper —
+        // zero-copy `Cow::Borrowed` when the line already
+        // fits under LINE_CHAR_CAP, one `String` allocation
+        // when truncation applies. No intermediate
+        // `truncated_line` String either way.
+        let (truncated_line, _truncated) =
+            crate::shared::truncate_line_to_chars(line, LINE_CHAR_CAP);
+
+        // Estimate byte cost of the formatted line without
+        // actually formatting it. `prefix` is one char
+        // (context marker) which fits in a single byte; the
+        // path + ":" + line-number + ":" + content + "\n".
+        let line_number_len = line_number_digit_count(line_number);
+        let addition_len = 1 // prefix
+            + self.display_path.len()
+            + 1 // colon
+            + line_number_len
+            + 1 // colon
+            + truncated_line.len()
+            + 1; // trailing newline
+
+        if crate::shared::would_exceed_byte_limit(
+            self.output.len(),
+            addition_len,
+            self.byte_limit,
+        ) {
             if self.truncated_reason.is_none() {
                 *self.truncated_reason =
                     Some("50 KB byte limit reached. Narrow the pattern or path.".to_string());
             }
             return false;
         }
-        self.output.push_str(&new_content);
+        // Plan 07 PR-B: write directly into self.output —
+        // the previous shape built a `new_content` String
+        // with `format!` then pushed it; we skip that
+        // intermediate via `writeln!`.
+        use std::fmt::Write as _;
+        // Writing into a String never errors; the ignored
+        // result is safe here.
+        let _ = writeln!(
+            self.output,
+            "{prefix}{path}:{line_number}:{truncated_line}",
+            path = self.display_path,
+        );
         true
     }
+}
+
+/// Decimal digit count for a `u64`. Used by `append_line` to
+/// size the byte-budget estimate without allocating.
+fn line_number_digit_count(n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    let mut value = n;
+    while value > 0 {
+        count += 1;
+        value /= 10;
+    }
+    count
 }
 
 impl<'a> Sink for MatchCollector<'a> {

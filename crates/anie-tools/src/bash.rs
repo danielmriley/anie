@@ -286,21 +286,26 @@ impl OutputCollector {
     }
 
     fn render(&self) -> String {
-        let mut output = self.tail.clone();
-        if output.len() > MAX_READ_BYTES {
-            let keep_from = output.len() - MAX_READ_BYTES;
+        // Plan 07 PR-C: slice directly from `self.tail`
+        // without cloning the full tail string first. The
+        // final `lines[start..].join("\n")` still allocates
+        // the output, but we save the intermediate tail-clone
+        // which was up to 2×MAX_READ_BYTES (100 KB) on busy
+        // shells.
+        let tail_slice: &str = if self.tail.len() > MAX_READ_BYTES {
+            let keep_from = self.tail.len() - MAX_READ_BYTES;
             let mut boundary = keep_from;
-            while boundary < output.len() && !output.is_char_boundary(boundary) {
+            while boundary < self.tail.len() && !self.tail.is_char_boundary(boundary) {
                 boundary += 1;
             }
-            output = output[boundary..].to_string();
-        }
+            &self.tail[boundary..]
+        } else {
+            &self.tail
+        };
 
-        let mut lines: Vec<&str> = output.lines().collect();
-        if lines.len() > MAX_READ_LINES {
-            lines = lines[lines.len() - MAX_READ_LINES..].to_vec();
-        }
-        let mut rendered = lines.join("\n");
+        let lines: Vec<&str> = tail_slice.lines().collect();
+        let start = lines.len().saturating_sub(MAX_READ_LINES);
+        let mut rendered = lines[start..].join("\n");
         if self.was_truncated() {
             if !rendered.is_empty() {
                 rendered.push('\n');
