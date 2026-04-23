@@ -644,27 +644,46 @@ impl<'a> LineBuilder<'a> {
     /// minimum of 1 character). Alignment per column comes from
     /// the GFM `| :-- | :-: | --: |` separator row, passed in
     /// via `Tag::Table(alignments)`.
+    ///
+    /// Plan 10 PR-C: tables now fit the available viewport
+    /// width by compressing columns proportionally and wrapping
+    /// cell contents across multiple rendered rows. When the
+    /// viewport is too narrow for a stable table (every column
+    /// would need to shrink below `MIN_COL_WIDTH`), the table
+    /// falls back to a raw wrapped-markdown rendering so users
+    /// still see the data, just not in a table frame.
     fn emit_table(&mut self, state: TableState) {
         let cols = state.alignments.len();
         if cols == 0 {
             return;
         }
 
-        let mut widths: Vec<usize> = vec![1; cols];
+        // Natural widths — the column size each cell would
+        // prefer if we had infinite viewport space.
+        let mut natural: Vec<usize> = vec![1; cols];
         if let Some(header) = state.header.as_ref() {
             for (idx, cell) in header.iter().enumerate() {
                 if idx < cols {
-                    widths[idx] = widths[idx].max(cell.chars().count());
+                    natural[idx] = natural[idx].max(cell.chars().count());
                 }
             }
         }
         for row in &state.rows {
             for (idx, cell) in row.iter().enumerate() {
                 if idx < cols {
-                    widths[idx] = widths[idx].max(cell.chars().count());
+                    natural[idx] = natural[idx].max(cell.chars().count());
                 }
             }
         }
+
+        let available = self.width.max(1) as usize;
+        let Some(widths) = compute_column_widths(&natural, available) else {
+            // Fallback: render the table as wrapped raw
+            // markdown text. Less pretty, but readable on
+            // narrow terminals and pipelines.
+            self.emit_table_as_raw_text(&state);
+            return;
+        };
 
         let border_style = self.theme.table_border;
         let header_style = self.theme.table_header;
@@ -673,28 +692,60 @@ impl<'a> LineBuilder<'a> {
         self.lines
             .push(table_border_line(&widths, '┌', '┬', '┐', border_style));
         if let Some(header) = state.header.as_ref() {
-            self.lines.push(table_data_row(
-                header,
-                &widths,
-                &state.alignments,
-                border_style,
-                header_style,
-            ));
+            for wrapped_row in wrap_table_row(header, &widths) {
+                self.lines.push(table_data_row(
+                    &wrapped_row,
+                    &widths,
+                    &state.alignments,
+                    border_style,
+                    header_style,
+                ));
+            }
             self.lines
                 .push(table_border_line(&widths, '├', '┼', '┤', border_style));
         }
         for row in &state.rows {
-            self.lines.push(table_data_row(
-                row,
-                &widths,
-                &state.alignments,
-                border_style,
-                cell_style,
-            ));
+            for wrapped_row in wrap_table_row(row, &widths) {
+                self.lines.push(table_data_row(
+                    &wrapped_row,
+                    &widths,
+                    &state.alignments,
+                    border_style,
+                    cell_style,
+                ));
+            }
         }
         self.lines
             .push(table_border_line(&widths, '└', '┴', '┘', border_style));
         // Spacer after the table, outside the frame.
+        self.lines.push(Line::default());
+    }
+
+    /// Fallback rendering when the viewport is too narrow to
+    /// draw a stable table frame. Emits each row as a pipe-
+    /// joined line of the natural cell text, wrapped to the
+    /// viewport width via the usual text-wrap pipeline. Users
+    /// lose the box-drawing frame but keep the data.
+    fn emit_table_as_raw_text(&mut self, state: &TableState) {
+        let style = self.theme.table_cell;
+        let header_style = self.theme.table_header;
+        if let Some(header) = state.header.as_ref() {
+            let raw = header.join(" | ");
+            let wrapped = wrap_plain_text_cell(&raw, self.width.max(1) as usize);
+            for line in wrapped {
+                self.lines
+                    .push(Line::from(Span::styled(line, header_style)));
+            }
+        }
+        for row in &state.rows {
+            let raw = row.join(" | ");
+            let wrapped = wrap_plain_text_cell(&raw, self.width.max(1) as usize);
+            for line in wrapped {
+                self.lines.push(Line::from(Span::styled(line, style)));
+            }
+        }
+        // Spacer so subsequent content isn't glued to the
+        // fallback block.
         self.lines.push(Line::default());
     }
 
@@ -806,14 +857,172 @@ fn table_data_row(
     Line::from(spans)
 }
 
+/// Minimum per-column budget before falling back to raw
+/// wrapped markdown. Three characters per column is enough
+/// to show at least a letter and a space, which readers can
+/// still scan; anything narrower isn't a stable table.
+const MIN_COL_WIDTH: usize = 3;
+
+/// Compute per-column content widths that fit the available
+/// viewport width. Returns `None` when every column would
+/// need to shrink below `MIN_COL_WIDTH` — callers should fall
+/// back to raw wrapped markdown in that case. Plan 10 PR-C.
+fn compute_column_widths(natural: &[usize], available: usize) -> Option<Vec<usize>> {
+    let cols = natural.len();
+    if cols == 0 {
+        return Some(Vec::new());
+    }
+    // Frame cost: `│ cell │ cell │` — each column contributes
+    // 2 spaces of padding, plus one border glyph between
+    // columns, plus two outer borders.
+    let overhead = cols * 2 + (cols + 1);
+    if available <= overhead {
+        return None;
+    }
+    let budget = available - overhead;
+    let natural_total: usize = natural.iter().sum();
+    if natural_total <= budget {
+        return Some(natural.to_vec());
+    }
+    // Too wide — shrink. Reject when even min-per-column
+    // won't fit so callers hit the fallback.
+    if cols * MIN_COL_WIDTH > budget {
+        return None;
+    }
+    // Proportional distribution (floored), then shave excess
+    // off the largest column until the sum matches budget.
+    let mut widths: Vec<usize> = natural
+        .iter()
+        .map(|&n| ((n * budget) / natural_total.max(1)).max(MIN_COL_WIDTH))
+        .collect();
+    let mut sum: usize = widths.iter().sum();
+    while sum > budget {
+        // Shave 1 from the widest column that's above the min.
+        let idx = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > MIN_COL_WIDTH)
+            .max_by_key(|(_, w)| **w)
+            .map(|(i, _)| i);
+        match idx {
+            Some(i) => {
+                widths[i] -= 1;
+                sum -= 1;
+            }
+            None => break, // every column at min; caller should fall back
+        }
+    }
+    if sum > budget {
+        return None;
+    }
+    // If we still have spare budget (floor division losses),
+    // distribute it back to the widest-natural columns so the
+    // table doesn't leave whitespace on the right.
+    while sum < budget {
+        let idx = natural
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, n)| (**n, widths[*i]))
+            .map(|(i, _)| i);
+        match idx {
+            Some(i) => {
+                widths[i] += 1;
+                sum += 1;
+            }
+            None => break,
+        }
+    }
+    Some(widths)
+}
+
+/// Wrap each cell in a row to its column width. Returns a
+/// vector of row slices — one per wrapped line — where each
+/// slice has `widths.len()` cells. The shortest-cell rows
+/// pad empty strings for alignment. Plan 10 PR-C.
+fn wrap_table_row(cells: &[String], widths: &[usize]) -> Vec<Vec<String>> {
+    let ncols = widths.len();
+    let wrapped: Vec<Vec<String>> = widths
+        .iter()
+        .enumerate()
+        .map(|(idx, w)| {
+            let content = cells.get(idx).map(String::as_str).unwrap_or("");
+            wrap_plain_text_cell(content, *w)
+        })
+        .collect();
+    let rows = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    (0..rows)
+        .map(|r| {
+            (0..ncols)
+                .map(|c| wrapped[c].get(r).cloned().unwrap_or_default())
+                .collect()
+        })
+        .collect()
+}
+
+/// Wrap a single piece of cell text to a maximum column
+/// width, returning owned `String`s. Word-break aware —
+/// breaks at whitespace when possible; otherwise at the
+/// character boundary. Plan 10 PR-C.
+fn wrap_plain_text_cell(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for word in text.split_whitespace() {
+        let word_chars = word.chars().count();
+        let need_space = !current.is_empty();
+        let space_cost = if need_space { 1 } else { 0 };
+        if current_chars + space_cost + word_chars > width {
+            // Flush current line before placing the new word.
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_chars = 0;
+            }
+            if word_chars > width {
+                // Single long token exceeds column width —
+                // hard-break it at character boundaries.
+                let mut chars_iter = word.chars().peekable();
+                while chars_iter.peek().is_some() {
+                    let mut chunk = String::with_capacity(width);
+                    for _ in 0..width {
+                        match chars_iter.next() {
+                            Some(c) => chunk.push(c),
+                            None => break,
+                        }
+                    }
+                    if chars_iter.peek().is_some() {
+                        lines.push(chunk);
+                    } else {
+                        current = chunk;
+                        current_chars = current.chars().count();
+                    }
+                }
+                continue;
+            }
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_chars += 1;
+        }
+        current.push_str(word);
+        current_chars += word_chars;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn pad_cell(content: &str, width: usize, alignment: Alignment) -> String {
     let content_width = content.chars().count();
     if content_width >= width {
-        // Long cells overflow the column. A real fix wraps the
-        // cell across multiple rows; that's a notable TUI feature
-        // but out of scope for PR C.2. Truncation would drop data
-        // silently, so we let the row get wider than the nominal
-        // column.
+        // Cell is wider than the column budget. After PR-C
+        // this only happens on the fallback path; the normal
+        // render path wraps cells to `width` via
+        // `wrap_table_row` before calling `pad_cell`.
         return content.to_string();
     }
     let padding = width - content_width;
@@ -1455,6 +1664,145 @@ mod tests {
         let out = render_plain(md, 80);
         assert!(out.iter().any(|l| l.contains('┌')));
         assert!(out.iter().any(|l| l.contains('└')));
+    }
+
+    // Plan 10 PR-C — width-aware table tests.
+
+    /// `compute_column_widths` keeps natural widths when the
+    /// table fits the viewport.
+    #[test]
+    fn compute_column_widths_keeps_natural_when_fits() {
+        let widths = compute_column_widths(&[5, 5, 5], 80).expect("fits");
+        assert_eq!(widths, vec![5, 5, 5]);
+    }
+
+    /// When the table overflows, columns compress proportionally
+    /// — the widest column gives up the most, never dropping
+    /// below `MIN_COL_WIDTH`.
+    #[test]
+    fn compute_column_widths_compresses_when_overflowing() {
+        // Two-column table at natural widths 30+10. Viewport 40
+        // (budget 30 after borders). Proportional split: 30 →
+        // ~23, 10 → ~7, sum 30.
+        let widths = compute_column_widths(&[30, 10], 40).expect("fits");
+        assert!(widths.iter().all(|w| *w >= MIN_COL_WIDTH));
+        let overhead = 2 * 2 + (2 + 1);
+        assert!(
+            widths.iter().sum::<usize>() + overhead <= 40,
+            "compressed widths exceed available: {widths:?}"
+        );
+        assert!(
+            widths[0] > widths[1],
+            "widest natural column must stay widest: {widths:?}"
+        );
+    }
+
+    /// Very narrow viewport → fallback signal. Plan 10 PR-C's
+    /// "too narrow for a stable table" path.
+    #[test]
+    fn compute_column_widths_returns_none_for_too_narrow_viewport() {
+        // Three columns × MIN_COL_WIDTH = 9 content + overhead
+        // (6 pad + 4 border) = 19. Viewport 15 is too narrow.
+        assert!(compute_column_widths(&[10, 10, 10], 15).is_none());
+        // Pathological: viewport smaller than the overhead alone.
+        assert!(compute_column_widths(&[1, 1, 1], 5).is_none());
+    }
+
+    /// Wide markdown table wraps cells into the viewport rather
+    /// than pushing the right border off-screen.
+    #[test]
+    fn markdown_table_wraps_cells_to_fit_viewport_width() {
+        let md = "| Name | Description |\n\
+                  | --- | --- |\n\
+                  | short | This is a much longer description that needs wrapping |";
+        let out = render_plain(md, 40);
+        // Every table line must fit within 40 columns. Use
+        // chars().count() to match the wrap metric.
+        for line in &out {
+            if line.starts_with('│') || line.starts_with('┌') || line.starts_with('└') {
+                assert!(
+                    line.chars().count() <= 40,
+                    "table line exceeds viewport width: {line:?} (len={})",
+                    line.chars().count()
+                );
+            }
+        }
+        // The long description must still be present — its
+        // wrapped fragments across multiple rows should cover
+        // each key word individually.
+        let joined = out.join("\n");
+        for fragment in ["much", "longer", "description", "wrapping"] {
+            assert!(
+                joined.contains(fragment),
+                "expected '{fragment}' to survive wrap: {out:?}"
+            );
+        }
+    }
+
+    /// When the terminal is too narrow for a stable table, fall
+    /// back to raw-wrapped markdown so data isn't lost.
+    #[test]
+    fn markdown_table_too_narrow_falls_back_to_wrapped_raw_markdown() {
+        let md = "| A | B | C | D |\n| --- | --- | --- | --- |\n| a1 | b1 | c1 | d1 |";
+        // 8 cols: four columns × MIN_COL_WIDTH (3) = 12 content
+        // + 4*2 padding + 5 borders = 25. Viewport 10 is too
+        // narrow → fallback.
+        let out = render_plain(md, 10);
+        // Fallback path: no box-drawing characters.
+        let joined = out.join("\n");
+        assert!(
+            !joined.contains('┌'),
+            "too-narrow table should not render box-drawing: {out:?}"
+        );
+        // Data still present.
+        assert!(joined.contains("a1") && joined.contains("b1"));
+    }
+
+    /// Right-alignment survives the wrap path. Regression guard
+    /// that the new multi-row render doesn't drop alignment.
+    #[test]
+    fn table_alignment_is_preserved_after_wrapping() {
+        let md = "| Short | Long numeric |\n| ---: | ---: |\n| 1 | 99999 |";
+        let out = render_plain(md, 40);
+        let joined = out.join("\n");
+        // Body row: "1" right-aligned within the "Short"
+        // column width, and "99999" right-aligned in the
+        // "Long numeric" column. Both end with a trailing
+        // space-then-border.
+        assert!(
+            joined.contains("│     1"),
+            "expected right-aligned '1': {out:?}"
+        );
+    }
+
+    /// `wrap_plain_text_cell` wraps a word at the character
+    /// boundary when the word alone exceeds the column width.
+    /// Regression: long URLs and identifiers mustn't silently
+    /// overflow.
+    #[test]
+    fn wrap_plain_text_cell_hard_breaks_oversized_tokens() {
+        let wrapped = wrap_plain_text_cell("supercalifragilisticexpialidocious", 10);
+        assert!(wrapped.len() >= 3);
+        for line in &wrapped {
+            assert!(line.chars().count() <= 10, "{line:?}");
+        }
+    }
+
+    /// Multi-word text wraps at whitespace when possible.
+    #[test]
+    fn wrap_plain_text_cell_word_wraps_when_possible() {
+        // "hello world" = 11 chars, "there friend" = 12 chars.
+        // Width 12 fits both pairs on one line each.
+        let wrapped = wrap_plain_text_cell("hello world there friend", 12);
+        assert_eq!(wrapped, vec!["hello world", "there friend"]);
+    }
+
+    /// Width exactly at a word boundary doesn't lose chars.
+    /// "abc def" at width 3 wraps to ["abc", "def"].
+    #[test]
+    fn wrap_plain_text_cell_preserves_all_characters_on_tight_fit() {
+        let wrapped = wrap_plain_text_cell("abc def", 3);
+        assert_eq!(wrapped, vec!["abc", "def"]);
     }
 
     #[test]
