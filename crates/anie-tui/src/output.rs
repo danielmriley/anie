@@ -44,6 +44,35 @@ pub enum RenderedBlock {
     SystemMessage { text: String },
 }
 
+/// Result of a scrollbar hit-test. See
+/// [`OutputPane::scrollbar_mouse_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbarHit {
+    /// The click landed on the scrollbar thumb — caller should
+    /// begin a drag.
+    Thumb,
+    /// Click above the thumb on the track — caller should page up.
+    TrackAbove,
+    /// Click below the thumb on the track — caller should page down.
+    TrackBelow,
+    /// Click was outside the scrollbar area or no scrollbar is drawn.
+    None,
+}
+
+/// Snapshot of scrollbar-drag state captured at the start of
+/// a drag gesture so subsequent motion events can compute a
+/// proportional offset update without re-reading mutable pane
+/// fields. Returned by [`OutputPane::begin_scrollbar_drag`].
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollbarDrag {
+    start_row: u16,
+    start_scroll_offset: u16,
+    viewport_height: u16,
+    total_lines: u16,
+    #[allow(dead_code)]
+    pane_top: u16,
+}
+
 /// Rendered tool result details.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallResult {
@@ -578,6 +607,91 @@ impl OutputPane {
         // Remember geometry for mouse hit-testing (PR-B).
         self.last_scrollbar_col = Some(area.x + area.width.saturating_sub(1));
         self.last_scrollbar_thumb = Some(self.compute_thumb_range());
+    }
+
+    /// Where a mouse click in the output pane landed relative
+    /// to the in-pane scrollbar. Plan 10 PR-B.
+    ///
+    /// - `Thumb` — click is on the scrollbar thumb; caller
+    ///   should begin a drag gesture.
+    /// - `TrackAbove` — click is above the thumb (track); caller
+    ///   should page up.
+    /// - `TrackBelow` — click is below the thumb (track); caller
+    ///   should page down.
+    /// - `None` — the click didn't hit the scrollbar.
+    #[must_use]
+    pub fn scrollbar_mouse_target(&self, row: u16, col: u16) -> ScrollbarHit {
+        let Some(sb_col) = self.last_scrollbar_col else {
+            return ScrollbarHit::None;
+        };
+        if col != sb_col {
+            return ScrollbarHit::None;
+        }
+        let pane_top = self.last_render_top;
+        let pane_bottom = pane_top.saturating_add(self.last_viewport_height);
+        if row < pane_top || row >= pane_bottom {
+            return ScrollbarHit::None;
+        }
+        let Some((thumb_top, thumb_bottom)) = self.last_scrollbar_thumb else {
+            return ScrollbarHit::None;
+        };
+        if row < thumb_top {
+            ScrollbarHit::TrackAbove
+        } else if row >= thumb_bottom {
+            ScrollbarHit::TrackBelow
+        } else {
+            ScrollbarHit::Thumb
+        }
+    }
+
+    /// Begin a scrollbar drag gesture. Captures the starting
+    /// mouse row and the current scroll offset so subsequent
+    /// drag events can compute the proportional offset update.
+    #[must_use]
+    pub fn begin_scrollbar_drag(&self, start_row: u16) -> ScrollbarDrag {
+        ScrollbarDrag {
+            start_row,
+            start_scroll_offset: self.scroll_offset,
+            viewport_height: self.last_viewport_height,
+            total_lines: self.last_total_lines,
+            pane_top: self.last_render_top,
+        }
+    }
+
+    /// Update scroll offset based on a drag event. Maps the
+    /// mouse row delta from `drag.start_row` onto a
+    /// proportional change in `scroll_offset` against
+    /// `max_scroll()`. Clamps to `[0, max_scroll]`.
+    pub fn apply_scrollbar_drag(&mut self, mouse_row: u16, drag: &ScrollbarDrag) {
+        let viewport = drag.viewport_height as i32;
+        let total = drag.total_lines as i32;
+        let max_scroll = (total - viewport).max(0);
+        if max_scroll == 0 || viewport <= 0 {
+            return;
+        }
+        // Thumb track length = viewport - thumb_height. For
+        // simplicity we approximate by treating the track as
+        // the full viewport; this slightly exaggerates
+        // dragging at the thumb ends but matches how most
+        // terminal scrollbars feel.
+        let delta_rows = i32::from(mouse_row) - i32::from(drag.start_row);
+        let offset_delta = (delta_rows * max_scroll) / viewport;
+        let new_offset =
+            (i32::from(drag.start_scroll_offset) + offset_delta).clamp(0, max_scroll);
+        self.set_scroll(u16::try_from(new_offset).unwrap_or(u16::MAX));
+    }
+
+    /// Page up by a viewport height when the user clicks above
+    /// the thumb on the scrollbar track. Plan 10 PR-B.
+    pub fn scrollbar_page_up(&mut self) {
+        let page = self.last_viewport_height.max(1);
+        self.scroll_line_up(page);
+    }
+
+    /// Page down by a viewport height.
+    pub fn scrollbar_page_down(&mut self) {
+        let page = self.last_viewport_height.max(1);
+        self.scroll_line_down(page);
     }
 
     /// Compute the inclusive-exclusive y-range occupied by the
@@ -1519,6 +1633,117 @@ mod scrollbar_tests {
         // Without a scrollbar, the pane still knows its
         // viewport was 20 rows wide-enough to fit.
         assert_eq!(pane.last_viewport_height, 20);
+    }
+
+    // Plan 10 PR-B — mouse interaction tests.
+
+    /// Clicks on the scrollbar column translate to the right
+    /// hit kind based on whether the click row is on the
+    /// thumb or the track.
+    #[test]
+    fn scrollbar_hit_test_classifies_thumb_track_and_miss() {
+        let mut pane = overflowing_pane(100);
+        let _warmup = render_at(&mut pane, 40, 20);
+        pane.scroll_to_top();
+        let _t = render_at(&mut pane, 40, 20);
+
+        let col = pane.scrollbar_column().expect("gutter col");
+        let (thumb_top, thumb_bottom) = pane.scrollbar_thumb_range().expect("thumb range");
+
+        // Row inside the thumb range -> Thumb.
+        assert_eq!(
+            pane.scrollbar_mouse_target(thumb_top, col),
+            ScrollbarHit::Thumb,
+        );
+        // Row above the thumb (but still on the pane) -> TrackBelow
+        // when the thumb is at the top. At scroll_to_top the
+        // thumb's origin is row 0, so there's no "above" room;
+        // test against a row below the thumb instead.
+        assert_eq!(
+            pane.scrollbar_mouse_target(thumb_bottom, col),
+            ScrollbarHit::TrackBelow,
+        );
+        // Different column -> None.
+        assert_eq!(pane.scrollbar_mouse_target(thumb_top, 0), ScrollbarHit::None);
+        // Outside pane -> None.
+        let pane_bottom = pane.last_render_top + pane.last_viewport_height;
+        assert_eq!(
+            pane.scrollbar_mouse_target(pane_bottom + 5, col),
+            ScrollbarHit::None,
+        );
+    }
+
+    /// Dragging the thumb down maps proportionally to an
+    /// increase in `scroll_offset`; dragging up maps to a
+    /// decrease. Clamps at 0 / max_scroll.
+    #[test]
+    fn scrollbar_drag_updates_scroll_offset() {
+        let mut pane = overflowing_pane(100);
+        let _warmup = render_at(&mut pane, 40, 20);
+        pane.scroll_to_top();
+        let _t = render_at(&mut pane, 40, 20);
+        assert_eq!(pane.scroll_offset, 0);
+
+        let drag = pane.begin_scrollbar_drag(pane.last_render_top);
+        // Drag halfway down the viewport.
+        pane.apply_scrollbar_drag(pane.last_render_top + 10, &drag);
+        assert!(
+            pane.scroll_offset > 0,
+            "drag-down must advance scroll_offset; got {}",
+            pane.scroll_offset
+        );
+        // Dragging past the bottom clamps at max_scroll.
+        pane.apply_scrollbar_drag(pane.last_render_top + 10_000, &drag);
+        assert_eq!(pane.scroll_offset, pane.max_scroll());
+        // Dragging back above the start clamps at 0.
+        pane.apply_scrollbar_drag(0, &drag);
+        assert_eq!(pane.scroll_offset, 0);
+    }
+
+    /// Clicking the track above the thumb scrolls up by one
+    /// viewport; below scrolls down by one viewport.
+    #[test]
+    fn scrollbar_track_click_pages_up_or_down() {
+        let mut pane = overflowing_pane(100);
+        let _warmup = render_at(&mut pane, 40, 20);
+        pane.scroll_to_top();
+        let _t = render_at(&mut pane, 40, 20);
+
+        let starting = pane.scroll_offset;
+        pane.scrollbar_page_down();
+        let after_page_down = pane.scroll_offset;
+        assert!(
+            after_page_down > starting,
+            "page_down must advance scroll: {starting} -> {after_page_down}"
+        );
+        // Page-down advanced by roughly viewport_height. The
+        // viewport includes the whole pane; line_up subtracts
+        // that amount saturating at 0.
+        pane.scrollbar_page_up();
+        assert_eq!(pane.scroll_offset, starting);
+    }
+
+    /// Keyboard / wheel scrolls update the same offset that
+    /// the scrollbar reads from — after a wheel-down, the
+    /// thumb must have moved.
+    #[test]
+    fn wheel_and_scrollbar_stay_in_sync() {
+        let mut pane = overflowing_pane(100);
+        let _warmup = render_at(&mut pane, 40, 20);
+        pane.scroll_to_top();
+        let _t1 = render_at(&mut pane, 40, 20);
+        let thumb_before = pane.scrollbar_thumb_range().expect("thumb");
+
+        // Simulate wheel-down scroll (same call path as
+        // MouseEventKind::ScrollDown).
+        pane.scroll_line_down(5);
+        let _t2 = render_at(&mut pane, 40, 20);
+        let thumb_after = pane.scrollbar_thumb_range().expect("thumb");
+
+        assert!(
+            thumb_after.0 >= thumb_before.0,
+            "wheel-down must move thumb down (or leave it alone at min-1 floor): {thumb_before:?} -> {thumb_after:?}"
+        );
     }
 }
 

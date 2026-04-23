@@ -71,6 +71,12 @@ pub struct App {
     /// ms), idle-tick redraws are suppressed so the spinner
     /// freezes rather than eating CPU. Plan 06 PR-B.
     last_streaming_delta_at: Option<Instant>,
+    /// Active scrollbar-thumb drag gesture, if any. `Some` from
+    /// the moment the user presses the mouse button down on
+    /// the thumb until they release it; drag events in between
+    /// update `OutputPane::scroll_offset` proportionally. Plan
+    /// 10 PR-B.
+    scrollbar_drag: Option<crate::output::ScrollbarDrag>,
 }
 
 // The ModelPicker variant is intentionally large; the enum holds at most
@@ -281,6 +287,7 @@ impl App {
             worker_rx,
             commands,
             last_streaming_delta_at: None,
+            scrollbar_drag: None,
         }
     }
 
@@ -844,16 +851,43 @@ impl App {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 self.handle_left_click(mouse.row, mouse.column);
             }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                // Plan 10 PR-B: forward only if a scrollbar
+                // drag is in progress. Non-drag-state drags
+                // (e.g., text selection attempts) are ignored.
+                if let Some(drag) = self.scrollbar_drag {
+                    self.output_pane.apply_scrollbar_drag(mouse.row, &drag);
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                self.scrollbar_drag = None;
+            }
             _ => {}
         }
     }
 
-    /// Check whether the click landed on a rendered URL in the
-    /// output pane and, if so, open it in the user's default
-    /// browser. Non-URL clicks (prose, status bar, input) are
-    /// silently ignored — users expect text regions to be
-    /// inert to clicks in a TUI with mouse capture.
+    /// Handle a left-click in the output pane. Priority order:
+    ///  1. scrollbar hit (thumb begins drag, track pages up/down)
+    ///  2. URL hit (open in default browser)
+    ///  3. ignored (clicks on prose are inert — users expect
+    ///     text regions to do nothing in a TUI with mouse
+    ///     capture).
     fn handle_left_click(&mut self, row: u16, col: u16) {
+        match self.output_pane.scrollbar_mouse_target(row, col) {
+            crate::output::ScrollbarHit::Thumb => {
+                self.scrollbar_drag = Some(self.output_pane.begin_scrollbar_drag(row));
+                return;
+            }
+            crate::output::ScrollbarHit::TrackAbove => {
+                self.output_pane.scrollbar_page_up();
+                return;
+            }
+            crate::output::ScrollbarHit::TrackBelow => {
+                self.output_pane.scrollbar_page_down();
+                return;
+            }
+            crate::output::ScrollbarHit::None => {}
+        }
         if let Some(url) = self
             .output_pane
             .url_at_terminal_position(row, col)
