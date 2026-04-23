@@ -1002,6 +1002,37 @@ impl App {
                     ));
                 }
             },
+            "tool-output" => match arg {
+                None => {
+                    // Report current state, same shape as /markdown.
+                    let state = match self.output_pane.tool_output_mode() {
+                        anie_config::ToolOutputMode::Verbose => "verbose",
+                        anie_config::ToolOutputMode::Compact => "compact",
+                    };
+                    self.output_pane
+                        .add_system_message(format!("Tool output mode is {state}."));
+                }
+                Some("verbose") => {
+                    self.output_pane
+                        .set_tool_output_mode(anie_config::ToolOutputMode::Verbose);
+                    self.output_pane.add_system_message(
+                        "Tool output mode set to verbose (full bodies).".to_string(),
+                    );
+                }
+                Some("compact") => {
+                    self.output_pane
+                        .set_tool_output_mode(anie_config::ToolOutputMode::Compact);
+                    self.output_pane.add_system_message(
+                        "Tool output mode set to compact (titles only for bash/read)."
+                            .to_string(),
+                    );
+                }
+                Some(other) => {
+                    self.output_pane.add_system_message(format!(
+                        "Unknown /tool-output argument: {other}. Expected verbose|compact."
+                    ));
+                }
+            },
             "login" => match arg {
                 Some(provider) => {
                     // OAuth login needs a browser callback server

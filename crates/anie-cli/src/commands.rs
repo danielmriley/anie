@@ -31,6 +31,9 @@ pub(crate) const SESSION_SUBCOMMANDS: &[&str] = &["list"];
 /// Accepted values for `/markdown`.
 pub(crate) const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
 
+/// Accepted values for `/tool-output`. Plan 09 PR-C.
+pub(crate) const TOOL_OUTPUT_MODES: &[&str] = &["verbose", "compact"];
+
 /// Providers that expose OAuth login (and are valid arguments
 /// to `/login` / `/logout`). Mirrors the registry in
 /// `anie-cli::login_command::build_oauth_provider`.
@@ -265,6 +268,15 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
             Some("[on|off]"),
         ),
         SlashCommandInfo::builtin_with_args(
+            "tool-output",
+            "Set tool-output display mode (verbose or compact)",
+            ArgumentSpec::Enumerated {
+                values: TOOL_OUTPUT_MODES,
+                required: false,
+            },
+            Some("[verbose|compact]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
             "login",
             "Show instructions for OAuth login against a provider",
             ArgumentSpec::Enumerated {
@@ -448,6 +460,7 @@ mod tests {
             "reload",
             "copy",
             "markdown",
+            "tool-output",
             "login",
             "logout",
             "help",
@@ -478,6 +491,9 @@ mod tests {
             }),
             ("markdown", |spec| {
                 matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == MARKDOWN_SWITCHES)
+            }),
+            ("tool-output", |spec| {
+                matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == TOOL_OUTPUT_MODES)
             }),
             ("login", |spec| {
                 matches!(spec, ArgumentSpec::Enumerated { values, required: true } if *values == OAUTH_PROVIDERS)

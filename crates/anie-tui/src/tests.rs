@@ -1633,6 +1633,7 @@ fn long_thinking_does_not_bleed_past_gutter_boundary() {
 fn phase_c_catalog() -> Vec<SlashCommandInfo> {
     const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
     const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
+    const TOOL_OUTPUT_MODES: &[&str] = &["verbose", "compact"];
     const OAUTH_PROVIDERS: &[&str] = &[
         "anthropic",
         "openai-codex",
@@ -1658,6 +1659,15 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
                 required: false,
             },
             Some("[on|off]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "tool-output",
+            "Set tool-output display mode",
+            ArgumentSpec::Enumerated {
+                values: TOOL_OUTPUT_MODES,
+                required: false,
+            },
+            Some("[verbose|compact]"),
         ),
         SlashCommandInfo::builtin_with_args(
             "login",
@@ -1803,6 +1813,76 @@ fn slash_markdown_invalid_arg_is_rejected() {
     // the /markdown dispatch arm.
     assert!(msg.contains("maybe"), "{msg}");
     assert!(msg.contains("on") && msg.contains("off"), "{msg}");
+}
+
+// Plan 09 PR-C — `/tool-output [verbose|compact]` tests.
+
+#[test]
+fn slash_tool_output_reports_current_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output");
+
+    let msg = last_system_message(&app).expect("expected status message");
+    assert!(msg.contains("Tool output mode is"), "{msg}");
+    // Default is Verbose.
+    assert!(msg.contains("verbose"), "{msg}");
+}
+
+#[test]
+fn slash_tool_output_compact_is_ui_only() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output compact");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("compact"), "{msg}");
+    // /tool-output is UI-only; no UiAction should reach the controller.
+    assert!(
+        action_rx.try_recv().is_err(),
+        "/tool-output must not dispatch controller work"
+    );
+    assert_eq!(
+        app.tool_output_mode(),
+        anie_config::ToolOutputMode::Compact,
+        "OutputPane mode must reflect the slash-command change"
+    );
+}
+
+#[test]
+fn slash_tool_output_verbose_restores_default_mode() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output compact");
+    submit_line(&mut app, "/tool-output verbose");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("verbose"), "{msg}");
+    assert_eq!(
+        app.tool_output_mode(),
+        anie_config::ToolOutputMode::Verbose,
+    );
+}
+
+#[test]
+fn slash_tool_output_invalid_arg_is_rejected() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output maybe");
+
+    let msg = last_system_message(&app).expect("expected rejection");
+    assert!(msg.contains("maybe"), "{msg}");
+    // The enumerated-arg validator enumerates the allowed
+    // values in its error so the user sees what's accepted.
+    assert!(msg.contains("verbose") && msg.contains("compact"), "{msg}");
 }
 
 #[test]
