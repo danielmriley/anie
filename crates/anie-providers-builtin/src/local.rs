@@ -36,17 +36,37 @@ fn prompt_only_reasoning_capabilities() -> ReasoningCapabilities {
     }
 }
 
-fn is_local_host(provider: &str, base_url: &str) -> bool {
-    let provider = provider.to_ascii_lowercase();
-    let base_url = base_url.to_ascii_lowercase();
+/// Pre-normalized provider + base-URL inputs for the local-
+/// reasoning helpers. Hoisting these out of a per-model loop
+/// avoids re-lowercasing the same strings once per model.
+/// Plan 06 PR-F.
+pub struct LocalProbeInputs {
+    provider_lower: String,
+    base_url_lower: String,
+}
 
-    matches!(provider.as_str(), "ollama" | "lmstudio" | "vllm")
-        || base_url.starts_with("http://localhost")
-        || base_url.starts_with("https://localhost")
-        || base_url.starts_with("http://127.0.0.1")
-        || base_url.starts_with("https://127.0.0.1")
-        || base_url.starts_with("http://[::1]")
-        || base_url.starts_with("https://[::1]")
+impl LocalProbeInputs {
+    /// Compute lowercase copies of the invariant probe inputs.
+    /// Call once per discovery response, then pass by reference
+    /// into [`default_local_reasoning_capabilities_normalized`]
+    /// for each model entry.
+    #[must_use]
+    pub fn new(provider: &str, base_url: &str) -> Self {
+        Self {
+            provider_lower: provider.to_ascii_lowercase(),
+            base_url_lower: base_url.to_ascii_lowercase(),
+        }
+    }
+}
+
+fn is_local_host_normalized(provider_lower: &str, base_url_lower: &str) -> bool {
+    matches!(provider_lower, "ollama" | "lmstudio" | "vllm")
+        || base_url_lower.starts_with("http://localhost")
+        || base_url_lower.starts_with("https://localhost")
+        || base_url_lower.starts_with("http://127.0.0.1")
+        || base_url_lower.starts_with("https://127.0.0.1")
+        || base_url_lower.starts_with("http://[::1]")
+        || base_url_lower.starts_with("https://[::1]")
 }
 
 fn is_reasoning_capable_family(model_id: &str) -> bool {
@@ -56,18 +76,21 @@ fn is_reasoning_capable_family(model_id: &str) -> bool {
         .any(|family| model_id.contains(family))
 }
 
-/// Conservative default reasoning profile for local OpenAI-compatible models.
+/// Plan 06 PR-F: normalized variant of
+/// [`default_local_reasoning_capabilities`]. Accepts pre-
+/// lowercased provider + base URL so the per-model loop in
+/// local server discovery doesn't lowercase the same
+/// invariant inputs N times.
 #[must_use]
-pub fn default_local_reasoning_capabilities(
-    provider: &str,
-    base_url: &str,
+pub fn default_local_reasoning_capabilities_normalized(
+    inputs: &LocalProbeInputs,
     model_id: &str,
 ) -> Option<ReasoningCapabilities> {
-    if !is_local_host(provider, base_url) {
+    if !is_local_host_normalized(&inputs.provider_lower, &inputs.base_url_lower) {
         return None;
     }
-
-    let provider = provider.to_ascii_lowercase();
+    let provider = inputs.provider_lower.as_str();
+    let base_url = inputs.base_url_lower.as_str();
     let known_native_backend = provider == "ollama"
         || provider == "lmstudio"
         || provider == "vllm"
@@ -84,6 +107,21 @@ pub fn default_local_reasoning_capabilities(
     } else {
         Some(prompt_only_reasoning_capabilities())
     }
+}
+
+/// Conservative default reasoning profile for local OpenAI-compatible models.
+/// Convenience wrapper around
+/// [`default_local_reasoning_capabilities_normalized`] that
+/// computes `LocalProbeInputs` per call — prefer the
+/// normalized variant in loops.
+#[must_use]
+pub fn default_local_reasoning_capabilities(
+    provider: &str,
+    base_url: &str,
+    model_id: &str,
+) -> Option<ReasoningCapabilities> {
+    let inputs = LocalProbeInputs::new(provider, base_url);
+    default_local_reasoning_capabilities_normalized(&inputs, model_id)
 }
 
 /// Detect commonly-used local model servers using the OpenAI-compatible `/v1/models` route.
@@ -136,6 +174,13 @@ pub async fn probe_openai_compatible(
     }
 
     let body: serde_json::Value = response.json().await.ok()?;
+    // Plan 06 PR-F: hoist the invariants out of the per-model
+    // filter_map. The trimmed + /v1-suffixed URLs, and the
+    // lowercased probe inputs, are all identical for every
+    // model in a single /v1/models response.
+    let trimmed_base_url = base_url.trim_end_matches('/').to_string();
+    let v1_base_url = format!("{trimmed_base_url}/v1");
+    let probe_inputs = LocalProbeInputs::new(name, base_url);
     let models = body
         .get("data")?
         .as_array()?
@@ -147,11 +192,12 @@ pub async fn probe_openai_compatible(
                 name: id.to_string(),
                 provider: name.to_string(),
                 api: ApiKind::OpenAICompletions,
-                base_url: format!("{}/v1", base_url.trim_end_matches('/')),
+                base_url: v1_base_url.clone(),
                 context_window: 32_768,
                 max_tokens: 8_192,
                 supports_reasoning: false,
-                reasoning_capabilities: default_local_reasoning_capabilities(name, base_url, id),
+                reasoning_capabilities:
+                    default_local_reasoning_capabilities_normalized(&probe_inputs, id),
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),
                 replay_capabilities: None,
@@ -165,7 +211,7 @@ pub async fn probe_openai_compatible(
 
     Some(LocalServer {
         name: name.to_string(),
-        base_url: base_url.trim_end_matches('/').to_string(),
+        base_url: trimmed_base_url,
         models,
     })
 }
