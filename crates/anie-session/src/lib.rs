@@ -433,8 +433,12 @@ pub struct SessionManager {
     path: PathBuf,
     header: SessionHeader,
     entries: Vec<SessionEntry>,
+    /// Plan 03 PR-A: `by_id` is the single membership index.
+    /// The previous separate `id_set: HashSet<String>` was
+    /// redundant — every insert/remove had to mirror both.
+    /// Removed so contains-check flows through
+    /// `by_id.contains_key(...)` only.
     by_id: HashMap<String, usize>,
-    id_set: HashSet<String>,
     leaf_id: Option<String>,
     file_handle: File,
 }
@@ -466,7 +470,7 @@ impl SessionManager {
             }
         }
 
-        let session_id = generate_unique_id(&existing);
+        let session_id = generate_unique_id(|id| existing.contains(id));
         let path = sessions_dir.join(format!("{session_id}.jsonl"));
         let header = SessionHeader {
             entry_type: "session".into(),
@@ -499,7 +503,6 @@ impl SessionManager {
             header,
             entries: Vec::new(),
             by_id: HashMap::new(),
-            id_set: HashSet::new(),
             leaf_id: None,
             file_handle,
         })
@@ -530,13 +533,11 @@ impl SessionManager {
         }
 
         let mut by_id = HashMap::new();
-        let mut id_set = HashSet::new();
         let mut leaf_id = None;
 
         for (index, entry) in entries.iter().enumerate() {
             let id = entry.base().id.clone();
             by_id.insert(id.clone(), index);
-            id_set.insert(id.clone());
             leaf_id = Some(id);
         }
 
@@ -551,7 +552,6 @@ impl SessionManager {
             header,
             entries,
             by_id,
-            id_set,
             leaf_id,
             file_handle,
         })
@@ -602,7 +602,7 @@ impl SessionManager {
 
     /// Point the active branch at an earlier entry to allow a new branch.
     pub fn fork(&mut self, from_entry_id: &str) -> Result<()> {
-        if !self.id_set.contains(from_entry_id) {
+        if !self.by_id.contains_key(from_entry_id) {
             return Err(anyhow!("entry {from_entry_id} was not found"));
         }
         self.leaf_id = Some(from_entry_id.to_string());
@@ -634,7 +634,7 @@ impl SessionManager {
         let mut appended_ids = Vec::with_capacity(entries.len());
         for entry in entries {
             if let Some(parent_id) = &entry.base().parent_id
-                && !self.id_set.contains(parent_id)
+                && !self.by_id.contains_key(parent_id)
             {
                 return Err(anyhow!("parent ID {parent_id} was not found"));
             }
@@ -648,7 +648,6 @@ impl SessionManager {
             let index = self.entries.len();
             let id = entry.base().id.clone();
             self.by_id.insert(id.clone(), index);
-            self.id_set.insert(id.clone());
             self.leaf_id = Some(id.clone());
             self.entries.push(entry);
             appended_ids.push(id);
@@ -998,7 +997,7 @@ impl SessionManager {
     }
 
     fn generate_id(&self) -> String {
-        generate_unique_id(&self.id_set)
+        generate_unique_id(|id| self.by_id.contains_key(id))
     }
 
     async fn compact_internal(
@@ -1401,10 +1400,16 @@ fn detect_split_turn(
     })
 }
 
-fn generate_unique_id(existing: &HashSet<String>) -> String {
+/// Plan 03 PR-A: closure-based existence predicate so this
+/// helper decouples from any particular membership container.
+/// Callers pass a closure backed by `HashSet::contains` (for
+/// the filesystem-scan path in `new_session_with_parent`) or
+/// by `HashMap::contains_key` (for the in-memory path in
+/// `generate_id`).
+fn generate_unique_id(exists: impl Fn(&str) -> bool) -> String {
     for _ in 0..100 {
         let id = Uuid::new_v4().simple().to_string()[..8].to_string();
-        if !existing.contains(&id) {
+        if !exists(&id) {
             return id;
         }
     }
