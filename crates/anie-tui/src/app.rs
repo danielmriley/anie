@@ -461,6 +461,67 @@ impl App {
     }
 
     /// Handle an incoming agent/controller event.
+    /// Process a drained batch of agent events, coalescing
+    /// consecutive `MessageDelta::TextDelta` /
+    /// `MessageDelta::ThinkingDelta` runs into a single
+    /// append per run. For fast streams this cuts the cache-
+    /// invalidation rate from "once per delta" to "once per
+    /// contiguous delta run" — saving `flat_cache_valid`
+    /// bool flips and `invalidate_last` calls on the hot path.
+    pub fn handle_agent_event_batch(&mut self, events: Vec<AgentEvent>) -> Result<()> {
+        // Per-run accumulators; flushed when a non-delta
+        // event arrives, when the delta kind changes, or at
+        // the end of the batch.
+        let mut pending_text = String::new();
+        let mut pending_thinking = String::new();
+
+        for event in events {
+            match event {
+                AgentEvent::MessageDelta {
+                    delta: StreamDelta::TextDelta(text),
+                } => {
+                    if !pending_thinking.is_empty() {
+                        self.output_pane
+                            .append_thinking_to_last_assistant(&pending_thinking);
+                        pending_thinking.clear();
+                    }
+                    pending_text.push_str(&text);
+                }
+                AgentEvent::MessageDelta {
+                    delta: StreamDelta::ThinkingDelta(text),
+                } => {
+                    if !pending_text.is_empty() {
+                        self.output_pane.append_to_last_assistant(&pending_text);
+                        pending_text.clear();
+                    }
+                    pending_thinking.push_str(&text);
+                }
+                // Any other event flushes both accumulators
+                // first so message-level ordering is preserved.
+                other => {
+                    if !pending_text.is_empty() {
+                        self.output_pane.append_to_last_assistant(&pending_text);
+                        pending_text.clear();
+                    }
+                    if !pending_thinking.is_empty() {
+                        self.output_pane
+                            .append_thinking_to_last_assistant(&pending_thinking);
+                        pending_thinking.clear();
+                    }
+                    self.handle_agent_event(other)?;
+                }
+            }
+        }
+        if !pending_text.is_empty() {
+            self.output_pane.append_to_last_assistant(&pending_text);
+        }
+        if !pending_thinking.is_empty() {
+            self.output_pane
+                .append_thinking_to_last_assistant(&pending_thinking);
+        }
+        Ok(())
+    }
+
     pub fn handle_agent_event(&mut self, event: AgentEvent) -> Result<()> {
         match event {
             AgentEvent::AgentStart => {
@@ -1538,17 +1599,25 @@ pub async fn run_tui(
                 }
             }
             Some(event) = app.event_rx.recv() => {
-                app.handle_agent_event(event)?;
                 // Drain any additional agent events that piled up
                 // while we were busy — without this, a burst of
                 // N TextDelta events during fast streaming forces
-                // N full redraws, each walking the entire
-                // transcript. One coalesced redraw per burst
+                // N full redraws. One coalesced redraw per burst
                 // keeps keystroke latency bounded even when the
                 // agent is emitting tokens at hundreds/sec.
-                while let Ok(event) = app.event_rx.try_recv() {
-                    app.handle_agent_event(event)?;
+                //
+                // Phase 3.1 (tui_perf 04 PR-A): consecutive text
+                // and thinking deltas inside the drained batch
+                // collapse into a single `append_to_last_assistant`
+                // call each, so the block cache invalidates once
+                // per contiguous delta-run rather than once per
+                // delta.
+                let mut events: Vec<AgentEvent> = Vec::with_capacity(8);
+                events.push(event);
+                while let Ok(next) = app.event_rx.try_recv() {
+                    events.push(next);
                 }
+                app.handle_agent_event_batch(events)?;
                 dirty = true;
             }
             _ = tokio::time::sleep(timeout) => {

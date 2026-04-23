@@ -2140,3 +2140,110 @@ fn slash_exit_alias_still_quits_even_without_catalog_entry() {
     assert!(matches!(action, crate::UiAction::Quit));
     assert!(app.should_quit());
 }
+
+/// Phase 3.1: `handle_agent_event_batch` collapses
+/// consecutive TextDelta events into a single append, and
+/// preserves mixed-kind and non-delta event ordering.
+#[test]
+fn handle_agent_event_batch_coalesces_consecutive_text_deltas() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: Message::Assistant(AssistantMessage {
+            content: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        }),
+    })
+    .expect("assistant start");
+
+    // Five text deltas in one burst. After batch processing
+    // the streaming assistant must show the full concatenation.
+    let events = vec![
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("hel".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("lo ".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("wor".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("ld".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("!".into()),
+        },
+    ];
+    app.handle_agent_event_batch(events).expect("batch");
+
+    // The last assistant text is fully assembled.
+    let text = app
+        .output_blocks()
+        .iter()
+        .rev()
+        .find_map(|b| match b {
+            RenderedBlock::AssistantMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("assistant block");
+    assert_eq!(text, "hello world!");
+}
+
+/// Mixed TextDelta / ThinkingDelta runs flush at kind
+/// boundaries so the two streams don't cross-contaminate.
+#[test]
+fn handle_agent_event_batch_flushes_on_kind_change() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: Message::Assistant(AssistantMessage {
+            content: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        }),
+    })
+    .expect("assistant start");
+
+    let events = vec![
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("a".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::ThinkingDelta("b".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("c".into()),
+        },
+    ];
+    app.handle_agent_event_batch(events).expect("batch");
+
+    let (text, thinking) = app
+        .output_blocks()
+        .iter()
+        .rev()
+        .find_map(|b| match b {
+            RenderedBlock::AssistantMessage { text, thinking, .. } => {
+                Some((text.clone(), thinking.clone()))
+            }
+            _ => None,
+        })
+        .expect("assistant block");
+    assert_eq!(text, "ac");
+    assert_eq!(thinking, "b");
+}
