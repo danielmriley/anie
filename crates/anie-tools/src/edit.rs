@@ -184,6 +184,13 @@ fn parse_edits(args: &serde_json::Value) -> Result<Vec<Edit>, ToolError> {
 
 fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<(String, String), ToolError> {
     let mut matched = Vec::with_capacity(edits.len());
+    // Plan 07 PR-D: lazily compute the normalized content +
+    // index map at most once per edit batch. Most batches
+    // hit the exact-match fast path on every edit and never
+    // need fuzzy normalization; the first fuzzy fallback
+    // materializes the cache, and subsequent fuzzy edits in
+    // the same batch reuse it.
+    let mut fuzzy_cache: Option<(String, Vec<usize>)> = None;
 
     for (index, edit) in edits.iter().enumerate() {
         if edit.old_text.is_empty() {
@@ -209,7 +216,14 @@ fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<(String, Str
             continue;
         }
 
-        let fuzzy_matches = fuzzy_find_all_occurrences(content, &edit.old_text);
+        let fuzzy_cache = fuzzy_cache
+            .get_or_insert_with(|| normalize_for_fuzzy_match(content));
+        let fuzzy_matches = fuzzy_find_all_occurrences_in_normalized(
+            &fuzzy_cache.0,
+            &fuzzy_cache.1,
+            content.len(),
+            &edit.old_text,
+        );
         if fuzzy_matches.is_empty() {
             return Err(ToolError::ExecutionFailed(format!(
                 "edit #{index} for {path} did not match anything",
@@ -257,8 +271,12 @@ fn find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn fuzzy_find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)> {
-    let (normalized_content, index_map) = normalize_for_fuzzy_match(content);
+fn fuzzy_find_all_occurrences_in_normalized(
+    normalized_content: &str,
+    index_map: &[usize],
+    original_content_len: usize,
+    needle: &str,
+) -> Vec<(usize, usize)> {
     let normalized_needle = normalize_fuzzy_pattern(needle);
     if normalized_needle.is_empty() {
         return Vec::new();
@@ -274,7 +292,7 @@ fn fuzzy_find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)
             let end = if end_char < index_map.len() {
                 index_map[end_char]
             } else {
-                content.len()
+                original_content_len
             };
             (start, end)
         })
