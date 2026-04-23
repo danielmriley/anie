@@ -15,7 +15,7 @@ conflict-minimizing multi-agent assignment layout.
 | 03 | Session indexing + context construction | **partial** | PR-A (remove id_set) + PR-D (trim CutPoint.kept) landed; B/C/E/F deferred. |
 | 04 | TUI output hot path | **landed** | 6/6 PRs shipped; scroll_static_600: 3.16 ms → 296 µs (10.7×) |
 | 05 | Picker search + fuzzy matching | **landed** | 4/4 PRs shipped as Phase 6.1-6.4 |
-| 06 | Provider streaming + local models | pending | correctness-sensitive Anthropic work inside |
+| 06 | Provider streaming + local models | **landed** | 7/7 PRs shipped as Phase 8.1-8.7 |
 | 07 | Tool read/grep/bash/edit + truncation | pending | shared truncation helper likely starts here |
 | 08 | Low-risk helper sweep | pending | land last |
 | 09 | Tool output display modes | **landed** | 3/3 PRs shipped as Phase 5.1-5.3 |
@@ -50,13 +50,13 @@ conflict-minimizing multi-agent assignment layout.
 | 05 | B | tokenized model-picker filtering | **landed** | `189c6ed` |
 | 05 | C | autocomplete lowercase caches | **landed** | `c22266c` |
 | 05 | D | text-field helpers | **landed** (cursor_x cleaned; render_value deferred per plan) | `5a09649` |
-| 06 | A | Anthropic request-body ordering | pending | — |
-| 06 | B | Anthropic empty-delta cleanup | pending | — |
-| 06 | C | OpenAI empty-delta cleanup | pending | — |
-| 06 | D | tagged reasoning splitter cleanup | pending | — |
-| 06 | E | model-discovery cache ownership | pending | — |
-| 06 | F | local probe normalization | pending | — |
-| 06 | G | provider helper sweep | pending | — |
+| 06 | A | Anthropic request-body ordering | **landed** | `4c0b657` |
+| 06 | B | Anthropic empty-delta cleanup | **landed** | `5bbcea6` |
+| 06 | C | OpenAI empty-delta cleanup | **landed** | `5bbcea6` |
+| 06 | D | tagged reasoning splitter cleanup | **landed** | `1837952` |
+| 06 | E | model-discovery cache ownership | **landed** | `97ee40e` |
+| 06 | F | local probe normalization | **landed** | `0b52586` |
+| 06 | G | provider helper sweep | **landed** | `0b52586` |
 | 07 | A | shared truncation helper scaffold | pending | — |
 | 07 | B | grep direct-write path | pending | — |
 | 07 | C | bash tail rendering cleanup | pending | — |
