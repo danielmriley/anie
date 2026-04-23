@@ -14,16 +14,18 @@ perf trajectory is readable at a glance.
 | 02 | synchronized output | **landed** | commit `f524233` | DECSET 2026 wrap around the main `terminal.draw`; unit tests use CrosstermBackend<Arc<Mutex<Vec<u8>>>> adapter. |
 | 03 | PR-A (Arc-wrap cache) | not started | — | |
 | 03 | PR-B (wrap_spans rewrite) | not started | — | |
-| 03 | PR-C (helper sweep) | not started | — | |
+| 03 | PR-A (Arc-wrap cache) | **landed** (as part of Plan 04 PR-B) | commit `3fb113d` | |
+| 03 | PR-B (wrap_spans rewrite) | **landed** (as part of Plan 04 PR-E) | commit `646de92` | |
+| 03 | PR-C (helper sweep) | **landed** (as part of Plan 04 PR-F) | commit `c058f51` | |
 | 04 | PR-A (drain-batch deltas) | **landed** | commit `38eda8e` | Coalesces consecutive TextDelta/ThinkingDelta runs into one append per run. |
 | 04 | PR-B (bounded channel) | **landed** (pre-existing) | — | Agent→UI channel was already `mpsc::channel(256)` with awaiting sends in `anie-cli/src/{interactive_mode,print_mode}.rs`. Producer-side `send_event` in `anie-agent/src/agent_loop.rs` uses `.send().await` so backpressure naturally applies. No code change needed. |
 | 08 | PR-A/B/C (streaming collector) | **deferred** | — | Gate from `docs/refactor_worklist_2026-04-22.md`: 3.1+3.2 + Phase 2 reduced `stream_into_static_600` from 3.35 ms → 2.19 ms, well under the 33 ms budget. Collector is not needed for current sluggishness; revisit if long-stream performance regresses. |
-| 05 | PR-A (BlockRender merge) | not started | — | |
-| 05 | PR-B (per-block link cache) | not started | — | |
-| 05 | PR-C (resize debounce) | not started | — | |
+| 05 | PR-A (BlockRender merge) | **subsumed** (Phase 2 PR-C) | — | Arc-backed `LineCache` already holds lines + links side-by-side. Separate `BlockRender` struct is unnecessary. |
+| 05 | PR-B (per-block link cache) | **subsumed** (pre-existing behavior) | — | `find_link_ranges` already runs only on cache-miss and is stored in the Arc-backed `LineCache.links`, reused on hit. |
+| 05 | PR-C (resize debounce) | **landed** | commit `4f0329d` | 50 ms debounce in the main `run_tui` loop; drag-in-progress skips intermediate paints. |
 | 06 | PR-A (autocomplete debounce) | **landed** | commit `162d414` | 80 ms debounce, eager-on-first, popup-consumer flush, test-only `flush_pending_autocomplete_for_test` helper. |
-| 06 | PR-B (stall-aware spinner) | not started | — | |
-| 06 | PR-C (mouse motion trace) | not started | — | |
+| 06 | PR-B (stall-aware spinner) | **landed** | commit `4f0329d` | 500 ms stream-stall window; `needs_tick_redraw` suppresses spinner redraws when a stream is stuck. |
+| 06 | PR-C (mouse motion trace) | **deferred** | — | Investigation-only; no real-user report of mouse starvation. Can open if data surfaces via the existing `ANIE_PERF_TRACE` output. |
 | 08 | PR-A (collector struct + tests) | not started | — | Codex-style streaming |
 | 08 | PR-B (wire into OutputPane) | not started | — | |
 | 08 | PR-C (finalize-flush + width change) | not started | — | |
