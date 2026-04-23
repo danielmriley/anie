@@ -18,8 +18,8 @@ conflict-minimizing multi-agent assignment layout.
 | 06 | Provider streaming + local models | pending | correctness-sensitive Anthropic work inside |
 | 07 | Tool read/grep/bash/edit + truncation | pending | shared truncation helper likely starts here |
 | 08 | Low-risk helper sweep | pending | land last |
-| 09 | Tool output display modes | pending | UI-only `verbose` / `compact` transcript toggle for bash/read |
-| 10 | TUI scrolling + markdown overflow | pending | app scrollbar + pi-style width-aware markdown table handling |
+| 09 | Tool output display modes | **landed** | 3/3 PRs shipped as Phase 5.1-5.3 |
+| 10 | TUI scrolling + markdown overflow | **landed** | 3/4 PRs shipped (A/B/C); PR-D horizontal pan deferred per plan gate |
 
 ## PR breakdown
 
@@ -69,13 +69,13 @@ conflict-minimizing multi-agent assignment layout.
 | 08 | B | token-estimation helper cleanup | pending | — |
 | 08 | C | model-catalog cleanup | pending | — |
 | 08 | D | remaining TUI/CLI helpers | pending | — |
-| 09 | A | config + pane plumbing | pending | — |
-| 09 | B | compact rendering for `bash` / `read` | pending | — |
-| 09 | C | `/tool-output` runtime toggle | pending | — |
-| 10 | A | render a real transcript scrollbar | pending | — |
-| 10 | B | scrollbar mouse interaction | pending | — |
-| 10 | C | width-aware markdown tables | pending | — |
-| 10 | D | horizontal overflow follow-up (optional) | pending | — |
+| 09 | A | config + pane plumbing | **landed** | `597d702` |
+| 09 | B | compact rendering for `bash` / `read` | **landed** | `e33724d` |
+| 09 | C | `/tool-output` runtime toggle | **landed** | `15d48c8` |
+| 10 | A | render a real transcript scrollbar | **landed** | `58f1203` |
+| 10 | B | scrollbar mouse interaction | **landed** | `ec14168` |
+| 10 | C | width-aware markdown tables | **landed** | `976f0f5` |
+| 10 | D | horizontal overflow follow-up (optional) | **deferred** | — | Gate: PR-C resolved the reported table-overflow case. Re-evaluate only if a concrete non-wrappable block (e.g., code fence) still needs pan. |
 
 ## Suggested landing order
 
