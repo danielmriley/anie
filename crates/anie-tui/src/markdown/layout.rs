@@ -848,63 +848,75 @@ fn heading_style(level: HeadingLevel, theme: &MarkdownTheme) -> Style {
 fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let mut span_guard = PerfSpan::enter(PerfSpanKind::WrapSpans);
     let spans_in = spans.len();
-    let width_u = width.max(1) as usize;
+    let width = width.max(1) as usize;
 
-    // Flatten `(char, style)` so wrapping can respect cell
-    // widths without losing style information. `char` here means
-    // USV; multi-codepoint grapheme clusters are NOT merged, but
-    // wrap widths approximate what ratatui actually renders for
-    // common ASCII + Latin + CJK.
-    let mut cells: Vec<(char, Style)> = Vec::new();
+    // PR-E (Plan 04): previously this function flattened every
+    // input char into a single `Vec<(char, Style)>` sized to the
+    // whole input, then walked it. For a 5,000-char paragraph at
+    // width=120 that's a 5,000-entry Vec that dies at function
+    // end. New shape walks each input span in place and
+    // maintains only a *single line's* worth of cells at a time
+    // (roughly `width` entries) — O(width) working memory,
+    // regardless of input size.
+    //
+    // Word-break semantics are unchanged: when the current line
+    // fills, break at the last whitespace if one exists;
+    // otherwise break at the char boundary. Trailing whitespace
+    // is dropped from the flushed line. Preserves char-count
+    // (USV) wrap counting per Plan 04's explicit deferral of
+    // Unicode display-width correctness.
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_cells: Vec<(char, Style)> = Vec::with_capacity(width);
+    let mut any_input = false;
+    let mut char_count: usize = 0;
+
     for span in spans {
         let style = span.style;
         let text = span.content.into_owned();
+        // Empty-span guard per the review: never flush a line
+        // we didn't actually contribute to.
+        if text.is_empty() {
+            continue;
+        }
+        any_input = true;
         for ch in text.chars() {
-            cells.push((ch, style));
+            char_count += 1;
+            if ch == '\n' {
+                lines.push(cells_to_line(std::mem::take(&mut current_cells)));
+                continue;
+            }
+            if current_cells.len() >= width {
+                let break_at = current_cells
+                    .iter()
+                    .rposition(|(c, _)| c.is_whitespace());
+                match break_at {
+                    Some(idx) if idx + 1 < current_cells.len() => {
+                        let remainder = current_cells.split_off(idx + 1);
+                        // Drop the whitespace cell itself from
+                        // the flushed line's tail.
+                        while current_cells
+                            .last()
+                            .is_some_and(|(c, _)| c.is_whitespace())
+                        {
+                            current_cells.pop();
+                        }
+                        lines.push(cells_to_line(std::mem::take(&mut current_cells)));
+                        current_cells = remainder;
+                    }
+                    _ => {
+                        lines.push(cells_to_line(std::mem::take(&mut current_cells)));
+                    }
+                }
+            }
+            current_cells.push((ch, style));
         }
     }
-    let char_count = cells.len();
-    let width = width_u;
 
-    if cells.is_empty() {
+    if !any_input {
         return vec![Line::default()];
     }
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current_cells: Vec<(char, Style)> = Vec::new();
-
-    for (ch, style) in cells {
-        if ch == '\n' {
-            lines.push(cells_to_line(std::mem::take(&mut current_cells)));
-            continue;
-        }
-        if current_cells.len() >= width {
-            // Try to break at the last whitespace; otherwise
-            // break at the character boundary.
-            let break_at = current_cells
-                .iter()
-                .rposition(|(c, _)| c.is_whitespace());
-            match break_at {
-                Some(idx) if idx + 1 < current_cells.len() => {
-                    let remainder = current_cells.split_off(idx + 1);
-                    // Drop the whitespace cell itself from the
-                    // flushed line's tail.
-                    while current_cells
-                        .last()
-                        .is_some_and(|(c, _)| c.is_whitespace())
-                    {
-                        current_cells.pop();
-                    }
-                    lines.push(cells_to_line(std::mem::take(&mut current_cells)));
-                    current_cells = remainder;
-                }
-                _ => {
-                    lines.push(cells_to_line(std::mem::take(&mut current_cells)));
-                }
-            }
-        }
-        current_cells.push((ch, style));
-    }
     if !current_cells.is_empty() {
         lines.push(cells_to_line(current_cells));
     }

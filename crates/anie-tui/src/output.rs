@@ -1082,26 +1082,56 @@ fn wrap_plain_text(text: &str, width: u16) -> Vec<String> {
 
 fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
-    let mut flattened = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_char_count = 0usize;
+
+    // PR-E (Plan 04): the previous shape flattened every input
+    // span into a `Vec<(char, Style)>` and then emitted one
+    // `Span` per char, rebuilding a `String` via `ch.to_string()`
+    // for every single character. A 5,000-char streaming response
+    // allocated 10,000+ Strings/frame that way.
+    //
+    // New shape walks each input span in place, tracking the
+    // running char count into the current line, and emits one
+    // `Span` per (style, byte-range) run. Output is identical at
+    // the rendered-cell level (ratatui draws each char with its
+    // style); same-style consecutive runs just fold into a
+    // single Span instead of N tiny ones. Char-count (USV) wrap
+    // boundaries are preserved.
     for span in spans {
         let style = span.style;
         let text = span.content.into_owned();
         if text.is_empty() {
             continue;
         }
-        flattened.extend(text.chars().map(|ch| (ch, style)));
-    }
-
-    let mut lines = Vec::new();
-    let mut current = Vec::new();
-    for (index, (ch, style)) in flattened.into_iter().enumerate() {
-        current.push(Span::styled(ch.to_string(), style));
-        if (index + 1) % width == 0 {
-            lines.push(Line::from(std::mem::take(&mut current)));
+        let mut byte_start: usize = 0;
+        for (byte_idx, _ch) in text.char_indices() {
+            if current_char_count == width {
+                // Wrap boundary. Emit whatever portion of this
+                // span has accumulated up to byte_idx, then
+                // flush the line.
+                if byte_start < byte_idx {
+                    current_spans.push(Span::styled(
+                        text[byte_start..byte_idx].to_string(),
+                        style,
+                    ));
+                    byte_start = byte_idx;
+                }
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+                current_char_count = 0;
+            }
+            current_char_count += 1;
+        }
+        if byte_start < text.len() {
+            current_spans.push(Span::styled(
+                text[byte_start..].to_string(),
+                style,
+            ));
         }
     }
-    if !current.is_empty() {
-        lines.push(Line::from(current));
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
     }
     if lines.is_empty() {
         vec![Line::default()]
