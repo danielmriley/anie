@@ -33,6 +33,15 @@ pub struct AnieConfig {
     /// Interactive TUI preferences.
     #[serde(default)]
     pub ui: UiConfig,
+    /// True if a loaded config file (`~/.anie/config.toml` or
+    /// a project-local `.anie/config.toml`) explicitly set the
+    /// `[model]` section. Lets callers distinguish "the user
+    /// declared a preferred model" from "we fell back to the
+    /// built-in default" so the resolver doesn't let
+    /// `state.json`'s last-used model override a user's
+    /// declared default. Not persisted — derived at load time.
+    #[serde(skip)]
+    pub model_explicitly_set: bool,
 }
 
 /// Interactive-TUI-only preferences. None of these affect the
@@ -531,6 +540,15 @@ fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
 
 fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
     if let Some(model) = partial.model {
+        // A file that has *any* `[model]` field counts as an
+        // explicit user preference. We only set the flag when
+        // at least one field was provided — a `[model]` section
+        // with no sub-keys is unusual but would otherwise trick
+        // us into treating an effectively-empty declaration as
+        // explicit.
+        if model.provider.is_some() || model.id.is_some() || model.thinking.is_some() {
+            config.model_explicitly_set = true;
+        }
         if let Some(provider) = model.provider {
             config.model.provider = provider;
         }

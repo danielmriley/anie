@@ -158,19 +158,37 @@ pub(crate) fn resolve_initial_selection(
     let runtime_model = runtime_state.model.clone();
     let runtime_provider = runtime_state.provider.clone();
 
+    // Priority chain:
+    //   1. CLI flag (most specific intent)
+    //   2. Session context (resuming → keep the session's model)
+    //   3. Explicit `[model]` in config.toml (user's declared
+    //      preference — must win over state.json so editing
+    //      config.toml actually takes effect).
+    //   4. Runtime state (last-used model persistence, filled
+    //      in across fresh sessions when the user hasn't
+    //      declared a default in config.toml).
+    //   5. `ModelConfig::default()` (hardcoded final fallback).
+    let config_provider =
+        config.model_explicitly_set.then(|| config.model.provider.clone());
+    let config_model = config.model_explicitly_set.then(|| config.model.id.clone());
+    let config_thinking = config.model_explicitly_set.then_some(config.model.thinking);
+
     let preferred_provider = cli_provider
         .clone()
         .or_else(|| session_model.as_ref().map(|(provider, _)| provider.clone()))
+        .or(config_provider)
         .or(runtime_provider)
         .unwrap_or_else(|| config.model.provider.clone());
     let preferred_model = cli_model
         .clone()
         .or_else(|| session_model.as_ref().map(|(_, model)| model.clone()))
+        .or(config_model)
         .or(runtime_model)
         .unwrap_or_else(|| config.model.id.clone());
     let thinking = cli
         .thinking
         .or(session_context.thinking_level)
+        .or(config_thinking)
         .or(runtime_state.thinking)
         .unwrap_or(config.model.thinking);
 
@@ -691,5 +709,89 @@ mod tests {
         )
         .expect("resolve selection");
         assert_eq!(selection.model.provider, "ollama");
+    }
+
+    fn default_cli() -> Cli {
+        Cli {
+            command: None,
+            interactive: true,
+            print: false,
+            rpc: false,
+            no_tools: false,
+            prompt: Vec::new(),
+            model: None,
+            provider: None,
+            api_key: None,
+            thinking: None,
+            resume: None,
+            cwd: None,
+        }
+    }
+
+    /// Regression: when the user puts an explicit `[model]`
+    /// section in `config.toml`, that declared preference must
+    /// override a stale entry in `state.json`. Before the fix,
+    /// resolution preferred `runtime_state` over config, so
+    /// editing config.toml had no effect — users saw the old
+    /// persisted model every launch.
+    #[test]
+    fn explicit_config_model_overrides_stale_runtime_state() {
+        let cli = default_cli();
+        let mut config = AnieConfig::default();
+        config.model.provider = "ollama".into();
+        config.model.id = "qwen3:32b".into();
+        config.model_explicitly_set = true;
+
+        let runtime_state = RuntimeState {
+            provider: Some("openai".into()),
+            model: Some("gpt-4o".into()),
+            thinking: None,
+            last_session_id: None,
+        };
+        let session_context = SessionContext::empty();
+        let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
+
+        let selection = resolve_initial_selection(
+            &cli,
+            &config,
+            &runtime_state,
+            &session_context,
+            &models,
+            true,
+        )
+        .expect("resolve selection");
+        assert_eq!(selection.model.provider, "ollama");
+        assert_eq!(selection.model.id, "qwen3:32b");
+    }
+
+    /// Contract: when the user has NOT declared a `[model]`
+    /// section in config.toml, `runtime_state` still wins over
+    /// the hardcoded `ModelConfig::default()` fallback — so the
+    /// "last model used" persistence keeps working for users
+    /// who never customize the config file.
+    #[test]
+    fn runtime_state_still_wins_when_config_has_no_explicit_model() {
+        let cli = default_cli();
+        let config = AnieConfig::default(); // model_explicitly_set = false
+        let runtime_state = RuntimeState {
+            provider: Some("ollama".into()),
+            model: Some("qwen3:32b".into()),
+            thinking: None,
+            last_session_id: None,
+        };
+        let session_context = SessionContext::empty();
+        let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
+
+        let selection = resolve_initial_selection(
+            &cli,
+            &config,
+            &runtime_state,
+            &session_context,
+            &models,
+            true,
+        )
+        .expect("resolve selection");
+        assert_eq!(selection.model.provider, "ollama");
+        assert_eq!(selection.model.id, "qwen3:32b");
     }
 }
