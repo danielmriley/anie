@@ -69,11 +69,36 @@ fn is_local_host_normalized(provider_lower: &str, base_url_lower: &str) -> bool 
         || base_url_lower.starts_with("https://[::1]")
 }
 
+/// Model-id families known to support leveled thinking (Ollama's
+/// native `think: "low"|"medium"|"high"`). Kept in sync with the
+/// lists in `model_discovery::reasoning_family` and
+/// `model_discovery::infer_reasoning`.
+const REASONING_FAMILIES: &[&str] = &["qwen3", "qwq", "deepseek-r1", "gpt-oss"];
+
+/// True when `id` equals `family`, or starts with `family:` or
+/// `family-` — i.e., `family` is the leading segment of the id
+/// delimited by a tag/variant separator.
+///
+/// Substring matching on `contains(family)` used to mis-classify
+/// `qwen3.5:9b` (which does not support leveled thinking) as the
+/// `qwen3` family, causing Ollama to 400 the request with
+/// `think value "low" is not supported for this model`. See
+/// `docs/ollama_capability_discovery/README.md` PR 1.
+fn id_matches_reasoning_family(id: &str, family: &str) -> bool {
+    if id == family {
+        return true;
+    }
+    match id.strip_prefix(family) {
+        Some(rest) => matches!(rest.chars().next(), Some(':' | '-')),
+        None => false,
+    }
+}
+
 fn is_reasoning_capable_family(model_id: &str) -> bool {
-    let model_id = model_id.to_ascii_lowercase();
-    ["qwen3", "qwq", "deepseek-r1", "gpt-oss"]
+    let id = model_id.to_ascii_lowercase();
+    REASONING_FAMILIES
         .iter()
-        .any(|family| model_id.contains(family))
+        .any(|family| id_matches_reasoning_family(&id, family))
 }
 
 /// Plan 06 PR-F: normalized variant of
@@ -320,6 +345,71 @@ mod tests {
             default_local_reasoning_capabilities("openai", "https://api.openai.com/v1", "o4-mini"),
             None
         );
+    }
+
+    #[test]
+    fn qwen3_5_is_not_classified_as_reasoning_capable_family() {
+        // Regression: `"qwen3.5:9b".contains("qwen3")` used to
+        // mis-classify qwen3.5 as a leveled-thinking model,
+        // producing HTTP 400 `think value "low" is not supported
+        // for this model` from Ollama. See
+        // docs/ollama_capability_discovery/README.md PR 1.
+        assert!(!is_reasoning_capable_family("qwen3.5:9b"));
+        assert!(!is_reasoning_capable_family("qwen3.5"));
+        assert!(!is_reasoning_capable_family("qwen35:7b"));
+        // local-reasoning-capabilities should now return the
+        // conservative prompt-steering profile, matching the
+        // fall-through for unknown local models.
+        assert_eq!(
+            default_local_reasoning_capabilities(
+                "ollama",
+                "http://localhost:11434/v1",
+                "qwen3.5:9b"
+            ),
+            Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Prompt),
+                output: None,
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::PromptSteering),
+            })
+        );
+    }
+
+    #[test]
+    fn qwen3_32b_remains_classified_as_reasoning_capable_family() {
+        // Guardrail: the fix above must not regress the genuine
+        // qwen3 variants.
+        assert!(is_reasoning_capable_family("qwen3:32b"));
+        assert!(is_reasoning_capable_family("qwen3:8b"));
+        assert!(is_reasoning_capable_family("qwen3-coder"));
+        assert!(is_reasoning_capable_family("qwen3"));
+    }
+
+    #[test]
+    fn gpt_oss_remains_classified() {
+        assert!(is_reasoning_capable_family("gpt-oss:20b"));
+        assert!(is_reasoning_capable_family("gpt-oss-large"));
+        assert!(is_reasoning_capable_family("gpt-oss"));
+        // Not a gpt-oss model.
+        assert!(!is_reasoning_capable_family("gpt-oss.1:7b"));
+    }
+
+    #[test]
+    fn qwq_remains_classified() {
+        assert!(is_reasoning_capable_family("qwq:32b"));
+        assert!(is_reasoning_capable_family("qwq-preview"));
+        assert!(is_reasoning_capable_family("qwq"));
+    }
+
+    #[test]
+    fn deepseek_r1_remains_classified() {
+        assert!(is_reasoning_capable_family("deepseek-r1:7b"));
+        assert!(is_reasoning_capable_family("deepseek-r1-distill-qwen-7b"));
+        assert!(is_reasoning_capable_family("deepseek-r1"));
+        // Conservative: deepseek-r1.5 is a hypothetical future
+        // variant that should NOT inherit the leveled-thinking
+        // assumption without explicit config.
+        assert!(!is_reasoning_capable_family("deepseek-r1.5:14b"));
     }
 
     #[tokio::test]

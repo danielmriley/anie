@@ -692,6 +692,25 @@ fn infer_openai_images(
         })
 }
 
+/// Model-id families known to support leveled thinking (Ollama's
+/// native `think: "low"|"medium"|"high"`). Kept in sync with
+/// `local::REASONING_FAMILIES`.
+const REASONING_FAMILIES: &[&str] = &["qwen3", "qwq", "deepseek-r1", "gpt-oss"];
+
+/// True when `id` equals `family`, or starts with `family:` or
+/// `family-`. See `local::id_matches_reasoning_family` for the
+/// rationale (the substring match used to mis-classify
+/// `qwen3.5:9b` as the `qwen3` family).
+fn id_matches_reasoning_family(id: &str, family: &str) -> bool {
+    if id == family {
+        return true;
+    }
+    match id.strip_prefix(family) {
+        Some(rest) => matches!(rest.chars().next(), Some(':' | '-')),
+        None => false,
+    }
+}
+
 fn infer_reasoning(
     provider_name: &str,
     model_id: &str,
@@ -714,10 +733,9 @@ fn infer_reasoning(
             let model_id = model_id.to_ascii_lowercase();
             let reasoning = model_id.contains("reason")
                 || model_id.starts_with('o')
-                || model_id.contains("qwen3")
-                || model_id.contains("qwq")
-                || model_id.contains("deepseek-r1")
-                || model_id.contains("gpt-oss")
+                || REASONING_FAMILIES
+                    .iter()
+                    .any(|family| id_matches_reasoning_family(&model_id, family))
                 || provider_name == "anthropic";
             Some(reasoning)
         })
@@ -725,10 +743,9 @@ fn infer_reasoning(
 
 fn reasoning_family(family: &str) -> bool {
     let family = family.to_ascii_lowercase();
-    family.contains("qwen3")
-        || family.contains("qwq")
-        || family.contains("deepseek-r1")
-        || family.contains("gpt-oss")
+    REASONING_FAMILIES
+        .iter()
+        .any(|canonical| id_matches_reasoning_family(&family, canonical))
 }
 
 fn ollama_display_name(id: &str, details: Option<&OllamaTagDetails>) -> String {
@@ -1467,6 +1484,69 @@ mod tests {
         .expect("discover openai models");
 
         assert_eq!(models.len(), 2);
+    }
+
+    #[test]
+    fn qwen3_5_is_not_classified_as_reasoning_family() {
+        // Regression: see docs/ollama_capability_discovery/README.md
+        // PR 1. Both the raw-id and Ollama-family-metadata call
+        // sites must reject `qwen3.5`-style inputs.
+        assert!(!reasoning_family("qwen3.5:9b"));
+        assert!(!reasoning_family("qwen3.5"));
+        assert!(!reasoning_family("qwen35"));
+    }
+
+    #[test]
+    fn qwen3_32b_remains_classified_as_reasoning_family() {
+        assert!(reasoning_family("qwen3:32b"));
+        assert!(reasoning_family("qwen3-coder"));
+        assert!(reasoning_family("qwen3"));
+    }
+
+    #[test]
+    fn reasoning_family_accepts_known_families_rejects_unknowns() {
+        assert!(reasoning_family("qwq:32b"));
+        assert!(reasoning_family("qwq"));
+        assert!(reasoning_family("deepseek-r1:7b"));
+        assert!(reasoning_family("deepseek-r1-distill-qwen-7b"));
+        assert!(reasoning_family("deepseek-r1"));
+        assert!(reasoning_family("gpt-oss:20b"));
+        assert!(reasoning_family("gpt-oss-large"));
+        assert!(reasoning_family("gpt-oss"));
+        // Unknowns stay unclassified.
+        assert!(!reasoning_family("llama3.1:8b"));
+        assert!(!reasoning_family("gemma3:1b"));
+        assert!(!reasoning_family("mistral:7b"));
+        // Conservative on hypothetical future variants.
+        assert!(!reasoning_family("deepseek-r1.5:14b"));
+        assert!(!reasoning_family("gpt-oss.1:7b"));
+    }
+
+    #[test]
+    fn infer_reasoning_fallback_respects_family_boundaries() {
+        // Capability-less path: the heuristic fallback in
+        // `infer_reasoning` must use the same tightened
+        // family-prefix rule. No `capabilities`, no
+        // `supported_parameters` — the lowest-priority fallback.
+        assert_eq!(
+            infer_reasoning("ollama", "qwen3.5:9b", None, None),
+            Some(false),
+        );
+        assert_eq!(
+            infer_reasoning("ollama", "qwen3:32b", None, None),
+            Some(true),
+        );
+        // `model_id.contains("reason")` and `starts_with('o')`
+        // still apply — they're independent of the family rule.
+        assert_eq!(
+            infer_reasoning("openai", "o4-mini", None, None),
+            Some(true),
+        );
+        // Anthropic provider short-circuit still applies.
+        assert_eq!(
+            infer_reasoning("anthropic", "claude-sonnet-4-6", None, None),
+            Some(true),
+        );
     }
 
     #[tokio::test]
