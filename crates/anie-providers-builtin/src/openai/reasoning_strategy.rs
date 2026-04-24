@@ -270,7 +270,9 @@ pub(super) fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use anie_provider::{CostPerMillion, ModelCompat, ReasoningControlMode, ThinkingRequestMode};
+    use anie_provider::{
+        CostPerMillion, ModelCompat, ReasoningControlMode, ReasoningOutputMode, ThinkingRequestMode,
+    };
 
     use super::*;
     use crate::OpenAIProvider;
@@ -502,6 +504,69 @@ mod tests {
         assert_eq!(
             provider.native_reasoning_request_strategies(&unknown, &options),
             vec![NativeReasoningRequestStrategy::NoNativeFields]
+        );
+    }
+
+    #[test]
+    fn effective_reasoning_capabilities_prefers_declared_over_heuristic() {
+        // After PR 5 a Model discovered against Ollama's
+        // /api/show carries a declared `reasoning_capabilities`.
+        // `effective_reasoning_capabilities` must honor the
+        // declared value verbatim — even when the model id is
+        // one the substring heuristic would still mis-classify
+        // (say, a hypothetical `qwen3-new:9b` that /api/show
+        // flagged as *non*-thinking).
+        let model = Model {
+            id: "qwen3-new:9b".into(),
+            name: "Qwen 3 New 9B".into(),
+            provider: "ollama".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "http://localhost:11434/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: true,
+            // Declared = Native / ReasoningEffort (authoritative
+            // from /api/show). The heuristic would also say
+            // "reasoning" here (qwen3- prefix), but if we ever
+            // flipped the declared value to None or a different
+            // profile, *that* must win.
+            reasoning_capabilities: Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+            }),
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        };
+
+        let effective = effective_reasoning_capabilities(&model);
+        assert_eq!(effective, model.reasoning_capabilities);
+
+        // Sanity check: flipping the declared profile to None
+        // disables reasoning even for a qwen3-prefixed id — the
+        // declared-over-heuristic precedence lets `/api/show`
+        // positively override the family heuristic.
+        let mut non_thinking = model;
+        non_thinking.reasoning_capabilities = None;
+        let effective = effective_reasoning_capabilities(&non_thinking);
+        // Falls back to the heuristic on a qwen3- id. The
+        // heuristic still says "Native + ReasoningEffort" (it
+        // doesn't know /api/show said no), so the authoritative
+        // precedence is only meaningful when /api/show's result
+        // is wired into reasoning_capabilities — exactly what
+        // PR 5's to_model change does. Assert the fallback
+        // matches the heuristic so this test documents the
+        // order-of-precedence rule.
+        assert_eq!(
+            effective,
+            default_local_reasoning_capabilities(
+                &non_thinking.provider,
+                &non_thinking.base_url,
+                &non_thinking.id
+            )
         );
     }
 

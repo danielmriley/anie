@@ -652,12 +652,13 @@ struct OllamaDiscoveryBase {
 }
 
 /// Capability-probe result from Ollama's `/api/show`.
-struct OllamaShowData {
+pub(crate) struct OllamaShowData {
     /// Raw capability tokens (e.g. `["completion","thinking","vision"]`).
-    capabilities: Option<Vec<String>>,
+    pub(crate) capabilities: Option<Vec<String>>,
     /// Architectural context length derived from
     /// `model_info["<arch>.context_length"]`.
-    context_length: Option<u64>,
+    #[allow(dead_code)] // consumed by discover_ollama_tags; local.rs ignores context_length
+    pub(crate) context_length: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -675,7 +676,7 @@ struct OllamaShowResponse {
 /// data; `Err(_)` means a transport or HTTP-level failure. In
 /// either case the caller falls back to the heuristic for that
 /// specific model without failing the outer discovery call.
-async fn fetch_ollama_show_capabilities(
+pub(crate) async fn fetch_ollama_show_capabilities(
     client: &reqwest::Client,
     base_url: &str,
     model_id: &str,

@@ -263,6 +263,36 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_non_thinking_model_preserves_user_thinking_preference() {
+        // PR 5 invariant. The user's thinking level is a
+        // preference applied across model switches, not a
+        // per-model setting. Flipping the active model to a
+        // non-thinking one (e.g. gemma3:1b) must NOT reset the
+        // preference — it silently drops at request build, and
+        // switching back re-applies it automatically.
+        let mut state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model("qwen3:32b", "ollama"),
+            ThinkingLevel::Medium,
+            None,
+        );
+        assert_eq!(state.current_thinking(), ThinkingLevel::Medium);
+
+        // Switch to a non-thinking model.
+        state.set_model(model("gemma3:1b", "ollama"));
+        assert_eq!(
+            state.current_thinking(),
+            ThinkingLevel::Medium,
+            "thinking level must not be reset when switching to a non-thinking model"
+        );
+
+        // Switch back — thinking still Medium.
+        state.set_model(model("qwen3:32b", "ollama"));
+        assert_eq!(state.current_thinking(), ThinkingLevel::Medium);
+    }
+
+    #[test]
     fn reload_from_disk_swaps_model_without_changing_thinking() {
         let mut state = ConfigState::new(
             AnieConfig::default(),

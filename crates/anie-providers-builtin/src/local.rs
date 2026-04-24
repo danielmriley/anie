@@ -5,6 +5,8 @@ use anie_provider::{
     ReasoningOutputMode, ThinkingRequestMode,
 };
 
+use crate::model_discovery::fetch_ollama_show_capabilities;
+
 /// A detected local OpenAI-compatible server.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalServer {
@@ -206,7 +208,7 @@ pub async fn probe_openai_compatible(
     let trimmed_base_url = base_url.trim_end_matches('/').to_string();
     let v1_base_url = format!("{trimmed_base_url}/v1");
     let probe_inputs = LocalProbeInputs::new(name, base_url);
-    let models = body
+    let mut models = body
         .get("data")?
         .as_array()?
         .iter()
@@ -236,11 +238,73 @@ pub async fn probe_openai_compatible(
         return None;
     }
 
+    // When the probed server is Ollama, upgrade heuristic
+    // capabilities with authoritative `/api/show` data — same
+    // pipeline as `discover_ollama_tags` in PR 3, applied here so
+    // the local-server-detection path during onboarding /
+    // bootstrap gets the authoritative signal too. Per-model
+    // failure logs and keeps the heuristic for that model.
+    // See `docs/ollama_capability_discovery/README.md` PR 5.
+    if is_ollama_probe_target(name, &trimmed_base_url) {
+        let show_futures = models
+            .iter()
+            .map(|model| fetch_ollama_show_capabilities(client, &trimmed_base_url, &model.id));
+        let show_results = futures::future::join_all(show_futures).await;
+        for (model, result) in models.iter_mut().zip(show_results) {
+            match result {
+                Ok(Some(show)) => {
+                    let caps_lower: Vec<String> = show
+                        .capabilities
+                        .as_ref()
+                        .map(|caps| caps.iter().map(|cap| cap.to_ascii_lowercase()).collect())
+                        .unwrap_or_default();
+                    let has_thinking = caps_lower.iter().any(|cap| cap == "thinking");
+                    let has_vision = caps_lower.iter().any(|cap| cap == "vision");
+                    model.supports_reasoning = has_thinking;
+                    model.supports_images = has_vision;
+                    // Authoritative: thinking-capable → native
+                    // ReasoningEffort profile; non-thinking →
+                    // clear any heuristic-inferred profile so the
+                    // user's thinking level is silently dropped
+                    // (see invariant tests in PR 5).
+                    model.reasoning_capabilities = if has_thinking {
+                        Some(ReasoningCapabilities {
+                            control: Some(ReasoningControlMode::Native),
+                            output: Some(ReasoningOutputMode::Separated),
+                            tags: None,
+                            request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+                        })
+                    } else {
+                        None
+                    };
+                }
+                Ok(None) => {
+                    // Keep heuristic defaults from the filter_map
+                    // above.
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        model = %model.id,
+                        %error,
+                        "Ollama /api/show probe failed during local detection; keeping heuristic"
+                    );
+                }
+            }
+        }
+    }
+
     Some(LocalServer {
         name: name.to_string(),
         base_url: trimmed_base_url,
         models,
     })
+}
+
+/// True when the `(name, base_url)` pair identifies an Ollama
+/// server that should be probed via `/api/show`. Matches the
+/// detection used in `model_discovery::should_try_ollama_tags`.
+fn is_ollama_probe_target(name: &str, base_url: &str) -> bool {
+    name.eq_ignore_ascii_case("ollama") || base_url.contains(":11434")
 }
 
 #[cfg(test)]
@@ -410,6 +474,106 @@ mod tests {
         // variant that should NOT inherit the leveled-thinking
         // assumption without explicit config.
         assert!(!is_reasoning_capable_family("deepseek-r1.5:14b"));
+    }
+
+    #[tokio::test]
+    async fn local_probe_attaches_show_capabilities_for_ollama() {
+        // PR 5 mirror of PR 3: when the local probe detects
+        // Ollama (name == "ollama"), it follows up with
+        // `/api/show` per model and upgrades the heuristic
+        // capabilities to the authoritative Native+ReasoningEffort
+        // profile (thinking) or clears them entirely (non-thinking).
+        use std::sync::{Arc, Mutex};
+
+        // Per-connection handler: first connection is
+        // `/v1/models`, all subsequent are `/api/show`.
+        let call_count = Arc::new(Mutex::new(0u32));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local server");
+        let address = listener.local_addr().expect("local addr");
+        let counter = Arc::clone(&call_count);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request_buffer = vec![0u8; 8192];
+                let Ok(_read) = socket.read(&mut request_buffer).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request_buffer);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/v1/models" => {
+                        let mut n = counter.lock().expect("counter");
+                        *n += 1;
+                        r#"{"data":[{"id":"qwen3:32b"},{"id":"gemma3:1b"}]}"#.to_string()
+                    }
+                    "/api/show" => {
+                        let mut n = counter.lock().expect("counter");
+                        *n += 1;
+                        // Return thinking for qwen3:32b and not
+                        // for gemma3:1b. We can't peek at the
+                        // POSTed body reliably through this
+                        // minimal mock, so we alternate: first
+                        // /api/show call → thinking, second →
+                        // no thinking. Both models will probe
+                        // in the order returned by /v1/models.
+                        if *n == 2 {
+                            r#"{"capabilities":["completion","thinking"]}"#.to_string()
+                        } else {
+                            r#"{"capabilities":["completion"]}"#.to_string()
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"))
+            .await
+            .expect("detected local server");
+
+        assert_eq!(detected.models.len(), 2);
+        let qwen = detected
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3:32b")
+            .expect("qwen");
+        let gemma = detected
+            .models
+            .iter()
+            .find(|m| m.id == "gemma3:1b")
+            .expect("gemma");
+        assert!(qwen.supports_reasoning);
+        assert!(!gemma.supports_reasoning);
+        assert_eq!(
+            qwen.reasoning_capabilities,
+            Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+            })
+        );
+        // Non-thinking model → cleared so the silent-drop
+        // invariant kicks in.
+        assert_eq!(gemma.reasoning_capabilities, None);
     }
 
     #[tokio::test]

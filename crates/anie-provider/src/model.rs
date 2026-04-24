@@ -395,12 +395,38 @@ impl ModelInfo {
             context_window,
             max_tokens,
             supports_reasoning: self.supports_reasoning.unwrap_or(false),
-            reasoning_capabilities: None,
+            reasoning_capabilities: self.derive_ollama_reasoning_capabilities(),
             supports_images: self.supports_images.unwrap_or(false),
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
             compat: ModelCompat::None,
         }
+    }
+
+    /// Derive `ReasoningCapabilities` directly from authoritative
+    /// Ollama `/api/show` data carried in `provider_capabilities`.
+    /// Returns `None` when the provider isn't Ollama or when
+    /// `"thinking"` isn't among the reported capabilities — in
+    /// either case the downstream `effective_reasoning_capabilities`
+    /// path falls back to the heuristic (see
+    /// `docs/ollama_capability_discovery/README.md` PR 5).
+    fn derive_ollama_reasoning_capabilities(&self) -> Option<ReasoningCapabilities> {
+        if !self.provider.eq_ignore_ascii_case("ollama") {
+            return None;
+        }
+        let capabilities = self.provider_capabilities.as_deref()?;
+        let has_thinking = capabilities
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case("thinking"));
+        if !has_thinking {
+            return None;
+        }
+        Some(ReasoningCapabilities {
+            control: Some(ReasoningControlMode::Native),
+            output: Some(ReasoningOutputMode::Separated),
+            tags: None,
+            request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+        })
     }
 }
 
@@ -448,6 +474,64 @@ mod tests {
         let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
         assert_eq!(model.max_tokens, 262_144);
         assert_eq!(model.context_window, 262_144);
+    }
+
+    #[test]
+    fn to_model_populates_reasoning_capabilities_from_ollama_thinking_capability() {
+        // Authoritative path: when the discovered ModelInfo
+        // carries `thinking` in provider_capabilities, to_model
+        // emits the full Native + ReasoningEffort profile so
+        // `effective_reasoning_capabilities` no longer needs the
+        // substring heuristic.
+        let info = ModelInfo {
+            id: "qwen3:32b".into(),
+            name: "Qwen 3 32B".into(),
+            provider: "ollama".into(),
+            context_length: Some(32_768),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec![
+                "completion".into(),
+                "tools".into(),
+                "thinking".into(),
+            ]),
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        assert_eq!(
+            model.reasoning_capabilities,
+            Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+            })
+        );
+    }
+
+    #[test]
+    fn to_model_leaves_reasoning_capabilities_none_when_thinking_absent() {
+        // Same Ollama provider but `/api/show` did not report
+        // `thinking`. Must produce `reasoning_capabilities = None`
+        // so downstream falls back to the heuristic (and the
+        // heuristic in turn — post-PR 1 — rejects false positives
+        // like qwen3.5).
+        let info = ModelInfo {
+            id: "gemma3:1b".into(),
+            name: "Gemma 3 1B".into(),
+            provider: "ollama".into(),
+            context_length: Some(8_192),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec!["completion".into()]),
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        assert_eq!(model.reasoning_capabilities, None);
     }
 
     #[test]

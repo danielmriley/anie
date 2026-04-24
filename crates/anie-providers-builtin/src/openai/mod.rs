@@ -968,6 +968,102 @@ mod tests {
         assert!(body.get("reasoning").is_none());
     }
 
+    #[test]
+    fn non_thinking_ollama_model_silently_drops_user_thinking_level() {
+        // PR 5 invariant. A non-thinking Ollama model (say,
+        // `gemma3:1b` with `/api/show` capabilities =
+        // `["completion"]`) surfaces as a `Model` with
+        // `reasoning_capabilities = None` and
+        // `supports_reasoning = false`. The user's thinking
+        // level (`ThinkingLevel::Low` below) must be silently
+        // dropped — no reasoning_effort, no reasoning block, no
+        // enable_thinking, no chat_template_kwargs, no error,
+        // no warning.
+        let provider = OpenAIProvider::new();
+        let model = Model {
+            id: "gemma3:1b".into(),
+            name: "gemma3:1b".into(),
+            provider: "ollama".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "http://localhost:11434/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: anie_provider::CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        };
+        let options = StreamOptions {
+            thinking: ThinkingLevel::Low,
+            ..StreamOptions::default()
+        };
+        let strategies = provider.native_reasoning_request_strategies(&model, &options);
+        let body = provider.build_request_body_with_native_reasoning_strategy(
+            &model,
+            &LlmContext {
+                system_prompt: String::new(),
+                messages: vec![],
+                tools: vec![],
+            },
+            &options,
+            true,
+            strategies[0],
+        );
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn non_thinking_hosted_model_silently_drops_user_thinking_level() {
+        // Sibling invariant for hosted (non-local) models. A
+        // refactor that condition-gated solely on
+        // `is_local_openai_compatible_target` would let this case
+        // through; guarded here so the silent-drop invariant
+        // holds for both local and hosted non-thinking models.
+        let provider = OpenAIProvider::new();
+        let model = Model {
+            id: "gpt-3.5-turbo".into(),
+            name: "GPT-3.5 Turbo".into(),
+            provider: "openai".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://api.openai.com/v1".into(),
+            context_window: 16_385,
+            max_tokens: 4_096,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: anie_provider::CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        };
+        let options = StreamOptions {
+            thinking: ThinkingLevel::High,
+            ..StreamOptions::default()
+        };
+        let strategies = provider.native_reasoning_request_strategies(&model, &options);
+        let body = provider.build_request_body_with_native_reasoning_strategy(
+            &model,
+            &LlmContext {
+                system_prompt: String::new(),
+                messages: vec![],
+                tools: vec![],
+            },
+            &options,
+            true,
+            strategies[0],
+        );
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
     /// Hosted model that declares `NestedReasoning` — e.g. an
     /// OpenRouter catalog entry routed to an upstream that
     /// normalizes via the nested `reasoning` object.
