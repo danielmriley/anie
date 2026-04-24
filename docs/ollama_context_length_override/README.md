@@ -44,13 +44,15 @@ sessions is the right surface.
 ## Requirements
 
 - `/context-length` (no args) — report the current model's
-  **effective** `num_ctx`, plus its source (discovered via
-  `/api/show`, user override, or the 32 k fallback).
+  **effective** `num_ctx`. If a runtime override is active,
+  show both the override and the baseline
+  (`Model.context_window`) so the user can see what `reset`
+  would restore.
 - `/context-length <N>` — set an override for the current
   model. `N` is a positive integer in a reasonable range
   (2 048 ≤ N ≤ 1 048 576). Applied on the next request.
 - `/context-length reset` — clear the override for the current
-  model. Falls back to discovered → fallback order.
+  model. Falls back to `Model.context_window`.
 - Non-Ollama (hosted) models reject the command with a
   friendly message: "`/context-length` only applies to Ollama
   models — selected model '{id}' is served by provider
@@ -87,32 +89,43 @@ still win if the user wants to hard-pin a value —
 
 ### Effective-value resolution
 
-Precedence, highest first:
+**Runtime override wins unconditionally over the baseline.** The
+baseline (`Model.context_window`) already bakes in whichever
+of config-pinned / discovered / fallback applies; the slash
+command is a short-term adjustment on top. This is simpler than
+the four-tier ladder I first sketched, and it matches user
+intent: "I ran `/context-length 16 384` — honor that, even if
+config.toml once pinned a different value for this model."
 
-1. **Config override**: if
-   `[[providers.<name>.models]]` for this model has
-   `context_window = N`, use `N`. (Existing behavior — user-
-   authored config already wins at load time.)
-2. **Runtime override**: if
+Two tiers, short-circuit in order:
+
+1. **Runtime override**:
    `RuntimeState::ollama_num_ctx_overrides["{provider}:{id}"]`
-   exists, use that value.
-3. **Discovered**: use `Model.context_window` (populated from
-   `/api/show` by Plan 1 PR 6).
-4. **Fallback**: 32 768.
+   → provider receives `Some(value)`.
+2. **Baseline**: no runtime override → provider receives
+   `None`, falls back to `Model.context_window` (which is
+   already whichever of config-pinned / discovered / 32 k
+   applies, per Plan 1's catalog-load path).
 
-The override is resolved in the controller just before it
-calls `Provider::stream`: the controller owns both
-`ConfigState` and `RuntimeState`, so it's the one place that
-can see config-pinned values, runtime overrides, and
-discovered values together. The resolved value flows into
+Resolved in the controller just before it calls
+`Provider::stream`: the controller owns both `ConfigState` and
+`RuntimeState`, so it's the one place that can read the
+override map. The resolved value flows into
 `OllamaChatProvider` via a new
 `StreamOptions::num_ctx_override: Option<u64>` field. The
 provider stays stateless — no map lookups, no controller
 pointers — it just reads one `Option<u64>` and writes it to
-the body if set, otherwise falls back to
-`Model.context_window`. This keeps the provider contract clean
-and makes the precedence chain unit-testable in one place
-(the controller).
+the body if set, otherwise uses `Model.context_window`.
+Unit-testable in one place (the resolver).
+
+**Persistence model for a user who wants a permanent change:**
+edit `~/.anie/config.toml` and set
+`[[providers.ollama.models]] context_window = N` for the
+model. That bakes into the catalog's `Model.context_window`,
+so the baseline moves. Clear the runtime override (with
+`/context-length reset`) to stop it shadowing the new
+baseline. Explained in PR 3's no-arg `/context-length`
+message.
 
 ### Command wiring
 
@@ -151,10 +164,12 @@ Optional but recommended. The status bar already carries
 `StatusBarState`); extend with a computed `context_window`
 string for Ollama models:
 
-- Discovered unchanged → `ctx 32 768`
-- Discovered via `/api/show` → `ctx 262 144 (discovered)`
-- Runtime override → `ctx 16 384 (override)`
-- Config-pinned → `ctx 8 192 (config)`
+- No override → `ctx 32 768` (value alone; source is
+  "baseline" whether that's config, discovery, or fallback —
+  the distinction requires inspecting the raw `AnieConfig`
+  and `ModelInfo.context_length` from the status-bar path,
+  which isn't worth the plumbing for a cosmetic hint).
+- Runtime override set → `ctx 16 384 (override)`.
 
 Non-Ollama models show nothing extra.
 
@@ -244,16 +259,18 @@ stateless.
   }
   ```
 
-  Precedence:
-  1. User-edited config: if config pins `context_window` for
-     this model, it's already baked into
-     `Model.context_window` via the catalog-load path →
-     return `None` so the provider uses that value directly.
-     The catalog *is* the config surface here.
-  2. Runtime override (`RuntimeState::ollama_num_ctx_overrides["{provider}:{id}"]`)
-     → return `Some(value)`.
-  3. Otherwise → return `None` (provider falls back to
-     `Model.context_window` which already reflects discovery).
+  Rule: runtime override wins unconditionally.
+
+  ```rust
+  let key = format!("{}:{}", self.current_model().provider,
+                    self.current_model().id);
+  runtime_state.ollama_num_ctx_overrides.get(&key).copied()
+  ```
+
+  Config-pinned and discovered values live in
+  `Model.context_window` (baked in at catalog load); the
+  provider reads those when the override is `None`. No
+  four-tier ladder, no second lookup into `AnieConfig`.
 
 - Controller populates the field just before
   `Provider::stream` at
@@ -318,9 +335,12 @@ and PR 2 (consume).
 - Persist immediately via the existing
   `ConfigState::persist_runtime_state` path.
 - `/context-length` with no args emits a system message:
-  `"Current context window: 262 144 (discovered via /api/show)"`
-  or `"Current context window: 16 384 (runtime override)"` —
-  format mirrors `/thinking`'s feedback.
+  `"Current context window: 16 384 (runtime override; baseline 262 144)"`
+  when an override is active, or
+  `"Current context window: 262 144"` when no override is set.
+  The "baseline" in the override message is
+  `Model.context_window`; the user can `/context-length reset`
+  to return to it. Format mirrors `/thinking`'s feedback.
 
 **Tests:**
 
@@ -354,9 +374,8 @@ and PR 2 (consume).
 
 **Tests:**
 
-- `status_bar_shows_discovered_context_window_for_ollama`
-- `status_bar_shows_override_source_when_runtime_override_active`
-- `status_bar_shows_config_source_when_config_pinned`
+- `status_bar_shows_context_window_value_for_ollama_without_override`
+- `status_bar_shows_override_marker_when_runtime_override_active`
 - `status_bar_omits_context_window_hint_for_non_ollama_models`
 
 ## Test plan
@@ -397,12 +416,15 @@ Per-PR tests above. Cross-cutting manual smoke:
   silently loses the override behavior (the field is ignored
   by default serde). Not a regression because pre-plan also
   had no override. Documented as expected.
-- **Config file's `context_window` beats runtime override.**
-  Intentional, but could confuse a user who set a config
-  value years ago and forgot. PR 3's no-arg
-  `/context-length` output should note the effective source
-  ("config", "override", "discovered", "fallback") so the
-  user can see at a glance why their override didn't stick.
+- **Runtime override shadows a config-pinned value.** A user
+  who set `context_window` in `config.toml` years ago and then
+  runs `/context-length 16384` today will see 16 384 — not the
+  config value. Intentional (the slash command is the
+  foreground control) but could surprise someone who forgot
+  about the config. Mitigation: PR 3's no-arg
+  `/context-length` output distinguishes "override" from
+  "baseline" explicitly so the user can tell at a glance.
+  `/context-length reset` always returns to the baseline.
 - **Tool autocomplete list grows.** Minor — one more entry.
   Well within the existing UI budget.
 

@@ -201,8 +201,12 @@ Notes:
   it directly, no string accumulation needed.
 - **Tool call id / index**: Ollama does NOT emit an `id` on the
   tool call. We synthesize one (`toolu_<timestamp>_<index>`) at
-  the state-machine layer to preserve the trait's invariant that
-  every `ToolCall` has a non-empty id.
+  the state-machine layer to keep downstream consumers (session
+  persistence, replay sanitization, TUI rendering) honest — they
+  all treat id as non-empty. Crucially: **the synthesized id is
+  bookkeeping only.** Ollama's `/api/chat` matches tool results
+  by `function.name`, not id, so our synthesized ids never need
+  to round-trip back to the server. A fresh id on replay is fine.
 - **`done_reason` values observed** (to verify on PR 3):
   `stop` · `tool_calls` · `length` · `load` · others? PR 3 must
   probe and document each. The mapping to `StopReason` mirrors
@@ -212,6 +216,14 @@ Notes:
   the sum. This lets the compaction token estimator keep working
   unchanged — it reads `Usage::input_tokens` / `output_tokens` /
   `total_tokens` the same way regardless of provider.
+- **Images are out of scope.** Ollama's `/api/chat` accepts
+  per-message images via a top-level `images: ["<base64>"]`
+  field, distinct from OpenAI's embedded-parts array. anie does
+  not currently pass images to local providers (local.rs pins
+  `supports_images: false` except where `/api/show` reports
+  otherwise, and the wire-layer plumbing for image content
+  lives in the OpenAI-compat path). Wiring Ollama's `images`
+  shape is deferred — see "Deferred" below.
 
 ### Error shape
 
@@ -219,13 +231,24 @@ Ollama errors come in two forms:
 
 - **HTTP 4xx/5xx with a plain JSON body.** Example from the
   parent plan: `{"error":{"message":"think value \"low\" is
-  not supported for this model","type":"api_error"}}`. The same
-  classifier we added in `ollama_caps/PR2`
-  (`looks_like_native_reasoning_compat_body` in
-  [`reasoning_strategy.rs:201-220`](../../crates/anie-providers-builtin/src/openai/reasoning_strategy.rs))
-  needs a sibling in the new module — but much simpler, because
-  `/api/chat` has less retry-overlap surface. PR 6 addresses
-  this.
+  not supported for this model","type":"api_error"}}`.
+
+  Important: **the `ollama_caps/PR2` retry safety net does NOT
+  cover this path.** That safety net lives in
+  [`OpenAIProvider::send_stream_request`](../../crates/anie-providers-builtin/src/openai/mod.rs)
+  (at the strategies loop) — it's OpenAI-provider-specific and
+  the new `OllamaChatProvider` never enters it. So the native
+  path needs its own classifier + its own retry. PR 3 lands a
+  baseline `classify_ollama_error_body` in `ollama_chat/mod.rs`
+  that maps `/api/chat` error bodies to typed `ProviderError`
+  variants (`ProviderError::Auth` on 401/403,
+  `ProviderError::RateLimited` on 429, and
+  `ProviderError::NativeReasoningUnsupported` when the body
+  matches any of the PR 2 think/thinking patterns). PR 4 adds a
+  same-request retry that drops the `think` field if the
+  primary attempt returns `NativeReasoningUnsupported`,
+  paralleling the OpenAI strategies loop but one-strategy-deep.
+
 - **HTTP 200 with `{error: "…"}` inline in the NDJSON stream**
   before `done:true`. Example: `{"error":"model \"foo\" not
   found, try pulling it first"}`. The streaming parser must
@@ -310,8 +333,14 @@ impl Provider for OllamaChatProvider {
     ) -> Result<ProviderStream, ProviderError> { … }
 
     fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage> {
-        // Same shape as OpenAI's convert_messages for now —
-        // ollama accepts the OpenAI role vocabulary verbatim.
+        // Role vocabulary matches OpenAI (`user` · `assistant` ·
+        // `system` · `tool`). Content shape differs: Ollama's
+        // `/api/chat` expects `content` as a plain string per
+        // message, NOT OpenAI's array-of-parts for multimodal.
+        // For text-only (the scope of this plan) that means
+        // `serde_json::Value::String(text)`. Images, if ever
+        // wired, would go into a sibling `images:
+        // ["<base64>"]` field on each message — see "Deferred".
     }
 }
 ```
@@ -373,7 +402,8 @@ Event emission rules (mirrors openai/streaming.rs semantics):
   `classify_ollama_error_body`.
 
 Empty-content guard mirrors
-[`openai/streaming.rs:278-281`](../../crates/anie-providers-builtin/src/openai/streaming.rs):
+[`openai/streaming.rs:245-259`](../../crates/anie-providers-builtin/src/openai/streaming.rs)
+(reading the `has_meaningful_content` helper at `:278`):
 if the stream finishes with no text and no tool calls,
 distinguish `done_reason == "length"` (route to
 `ProviderError::ResponseTruncated`) from genuine
@@ -477,17 +507,18 @@ All documented in "Deferred" below.
 | `crates/anie-providers-builtin/src/ollama_chat/mod.rs` | 2 | Scaffold `OllamaChatProvider` returning `FeatureUnsupported` |
 | `crates/anie-providers-builtin/src/lib.rs` | 2 | Register under `ApiKind::OllamaChatApi` |
 | `crates/anie-providers-builtin/src/ollama_chat/ndjson.rs` | 3 | Line splitter over `bytes_stream()` |
-| `crates/anie-providers-builtin/src/ollama_chat/convert.rs` | 3 | Request-body building (messages, stream flag) |
+| `crates/anie-providers-builtin/src/ollama_chat/convert.rs` | 3 | Request-body building: messages, stream flag, **`options.num_ctx = model.context_window`** |
 | `crates/anie-providers-builtin/src/ollama_chat/streaming.rs` | 3 | `OllamaChatStreamState::process_line`, text-only path |
+| `crates/anie-providers-builtin/src/ollama_chat/mod.rs` | 3 | `Provider::stream` plumbing; `bearer_auth` when `api_key` is set; `classify_ollama_error_body` |
 | `crates/anie-providers-builtin/src/tool_schema.rs` | 4 | Extract `openai_function_schema(&[ToolDef]) -> Vec<Value>` from `openai/mod.rs:488-502` into a free helper |
 | `crates/anie-providers-builtin/src/openai/mod.rs` | 4 | Replace `OpenAIProvider::convert_tools` body with a call to `tool_schema::openai_function_schema` |
 | `crates/anie-providers-builtin/src/ollama_chat/convert.rs` | 4 | Add `think` field + tool serialisation via the new helper |
 | `crates/anie-providers-builtin/src/ollama_chat/streaming.rs` | 4 | Thinking deltas, tool-call lifecycle, usage from `done:true` |
+| `crates/anie-providers-builtin/src/ollama_chat/mod.rs` | 4 | One-strategy retry: drop `think` if first attempt returns `NativeReasoningUnsupported` |
 | `crates/anie-providers-builtin/src/model_discovery.rs` | 5 | Tag discovered Ollama models with `OllamaChatApi` |
 | `crates/anie-providers-builtin/src/local.rs` | 5 | Same, for the probe path |
 | `crates/anie-config/src/lib.rs` | 5 | Log a deprecation warning when a `[[providers.ollama.models]]` block declares `api = "OpenAICompletions"` |
 | `crates/anie-provider/src/model.rs` (`to_model`) | 6 | Flip context-window regression guard for `OllamaChatApi` |
-| `crates/anie-providers-builtin/src/ollama_chat/mod.rs` | 6 | Send `options.num_ctx = model.context_window` |
 
 ## Phased PRs
 
@@ -507,13 +538,14 @@ reference the variant. No behavior change anywhere.
 - Add a serde round-trip test that the new variant survives
   `to_string` → `from_str` unchanged and round-trips through
   a `Model` serialized to TOML.
-- Add a forward-compat test: an older-schema serialized `Model`
-  with `api = "OpenAICompletions"` still loads.
 
 **Tests:**
 
 - `ollama_chat_api_variant_round_trips_serde_name`
-- `forward_compat_old_openai_completions_models_still_load`
+- `api_kind_exhaustive_match_still_compiles`
+  (trivial guard: explicit match over `ApiKind` including
+  the new variant — catches the case where a downstream match
+  inadvertently forgets to handle `OllamaChatApi`).
 
 ### PR 2 — Scaffold `OllamaChatProvider` placeholder
 
@@ -587,33 +619,65 @@ first discipline CLAUDE.md §3 requires for pi comparisons.
 **Scope:**
 
 - `ollama_chat/ndjson.rs`: line splitter over `bytes_stream()`
-  with partial-line buffering. Tests: multi-byte UTF-8
+  with partial-line buffering. Yields `Result<String,
+  ProviderError>` — bytes are expected to be UTF-8 (Ollama
+  emits JSON); invalid UTF-8 is surfaced as a typed error
+  rather than silently lossy. Tests: multi-byte UTF-8
   boundary crossing chunks; a chunk containing multiple lines;
   a trailing incomplete line; `\r\n` and `\n` both accepted.
-- `ollama_chat/convert.rs`: build request body (no thinking,
-  no tools, no num_ctx yet). Tests: request body shape
-  for a minimal `{system, user}` context; pass through of
-  `serde_json::Value` content from `LlmMessage`.
+- `ollama_chat/convert.rs`: build request body with
+  `{model, messages, stream: true, options: {num_ctx: N}}`
+  where `N = model.context_window`. No thinking, no tools
+  yet. **Wiring `num_ctx` here (not in PR 6)** matters: PR 5
+  will flip discovery so the native path becomes live for
+  Ollama, and between PR 5 landing and PR 6 landing, Ollama
+  would otherwise default to its 4 k `num_ctx` and silently
+  truncate anything past that. By sending `num_ctx` from PR 3
+  onward (initially the 32 k regression-guard value), the
+  user never sees truncation smaller than what anie thinks
+  the context is. PR 6's job shrinks to flipping `to_model`'s
+  guard so the discovered value flows through.
 - `ollama_chat/streaming.rs`: `OllamaChatStreamState` handling
   `message.content` deltas and the final `done:true` line.
   No thinking. No tool calls. `done_reason` mapped to StopReason
   via a simple match (known values documented from the curl
   probes above).
-- `ollama_chat/mod.rs`: plumb everything together. `stream()`
-  constructs the body via `convert`, posts, wraps the response
-  in `ndjson::NdjsonLines`, drives `OllamaChatStreamState` per
-  line, emits `ProviderEvent`s to the `ProviderStream`.
+- `ollama_chat/mod.rs`:
+  - `Provider::stream` plumbs everything together: build body
+    via `convert`, POST with `bearer_auth(options.api_key)` if
+    `options.api_key` is set (parity with
+    [`OpenAIProvider::send_request`](../../crates/anie-providers-builtin/src/openai/mod.rs) —
+    lets remote-Ollama-behind-a-reverse-proxy users attach a
+    header), wrap the response in `ndjson::NdjsonLines`, drive
+    `OllamaChatStreamState` per line, emit `ProviderEvent`s to
+    the `ProviderStream`.
+  - New `classify_ollama_error_body(status, body) -> ProviderError`
+    local to the module. Maps: 401/403 → `Auth`;
+    429 → `RateLimited { retry_after_ms }` (re-uses
+    `parse_retry_after` from `util.rs`); body containing any
+    of `"think "`, `"thinking"`, `"does not support"` → 
+    `NativeReasoningUnsupported` (the
+    `ollama_caps/PR2`-shaped detection, copied inline — PR 4
+    will use this to retry with `think` dropped); otherwise
+    falls through to the generic `classify_http_error`.
 - Remove the placeholder `FeatureUnsupported` return from PR 2.
 
 **Tests:**
 
-- `request_body_contains_model_stream_and_messages_only`
+- `request_body_contains_model_stream_messages_and_num_ctx`
+- `request_body_num_ctx_equals_model_context_window`
+- `request_body_attaches_bearer_auth_when_api_key_present`
+- `request_body_omits_bearer_auth_when_api_key_absent`
 - `ndjson_splitter_handles_chunks_split_across_boundaries`
 - `ndjson_splitter_handles_utf8_across_chunk_boundaries`
+- `ndjson_splitter_surfaces_invalid_utf8_as_provider_error`
 - `streaming_state_emits_text_deltas_then_done`
 - `streaming_state_routes_done_reason_length_to_response_truncated`
 - `streaming_state_routes_inline_error_to_provider_error`
 - `empty_assistant_response_surfaces_as_typed_error`
+- `classify_ollama_error_body_routes_think_wording_to_native_reasoning_unsupported`
+- `classify_ollama_error_body_routes_401_to_auth_error`
+- `classify_ollama_error_body_routes_429_to_rate_limited_with_retry_after`
 
 ### PR 4 — Thinking + tool calls + usage
 
@@ -653,6 +717,16 @@ PR 3 machinery.
   - Parse usage from the final `done:true` line:
     `prompt_eval_count` → `input_tokens`,
     `eval_count` → `output_tokens`, sum → `total_tokens`.
+- `ollama_chat/mod.rs`: when the first request attempt returns
+  `ProviderError::NativeReasoningUnsupported` (the PR 3
+  classifier already recognises the shape), retry the request
+  **once** with the `think` field omitted from the body. This
+  is the native-path parallel of the OpenAI strategies loop —
+  one-strategy-deep because `/api/chat` has fewer toggles than
+  `/v1/chat/completions`. Covers pre-0.5 Ollama servers and
+  any stale catalog entry where a model's thinking capability
+  was wrongly inferred. Idempotent: if the second attempt also
+  fails, the error bubbles up unchanged.
 
 **Tests:**
 
@@ -669,6 +743,8 @@ PR 3 machinery.
 - `streaming_state_emits_tool_call_lifecycle_for_arguments_object`
 - `streaming_state_populates_usage_from_done_line`
 - `tool_call_id_is_synthesized_when_ollama_omits_it`
+- `native_reasoning_unsupported_error_triggers_second_attempt_without_think`
+- `native_reasoning_unsupported_on_second_attempt_surfaces_original_error`
 
 ### PR 5 — Discovery + probe tag Ollama as `OllamaChatApi`
 
@@ -703,7 +779,9 @@ every load and naturally follows PR 5's tagging change.
 
 - `ollama_discovery_tags_models_as_ollama_chat_api_after_pr5`
 - `local_probe_tags_ollama_models_as_ollama_chat_api_after_pr5`
-- `lmstudio_probe_still_uses_openai_completions`
+- `non_ollama_local_probes_still_use_openai_completions`
+  (covers lmstudio and vllm in one test — both remain on the
+  OpenAI-compat path).
 - `config_toml_with_legacy_ollama_api_logs_warning_but_loads_unchanged`
 - `state_json_with_legacy_provider_model_resolves_to_new_api_kind_via_catalog`
   (regression guard: a state.json written before this plan,
@@ -711,12 +789,14 @@ every load and naturally follows PR 5's tagging change.
   fine and the resolved `Model` carries `OllamaChatApi` because
   the catalog tagged it that way).
 
-### PR 6 — Honor discovered `context_length` + send `num_ctx` on the wire
+### PR 6 — Flip the `to_model` context-window guard for `OllamaChatApi`
 
-**Why last:** the final mile of the Symptom-2 fix. Only safe to
-land after PR 5: we need `OllamaChatApi` to be the default
-routing path for Ollama so the old wire layer (which silently
-drops `num_ctx`) can't receive the new context-window value.
+**Why last:** only safe to land after PR 5 has tagged Ollama
+catalog entries as `OllamaChatApi`. PR 3 already wires
+`num_ctx` from `Model.context_window`, so this PR's job is
+narrow: stop clamping `Model.context_window` to 32 768 for
+Ollama-native models so the value propagates to the request
+body.
 
 **Scope:**
 
@@ -731,22 +811,25 @@ drops `num_ctx`) can't receive the new context-window value.
   };
   ```
 
-- `ollama_chat/convert.rs`: set
-  `options.num_ctx = model.context_window` on every request.
-  Document that Ollama only reloads when the value changes
-  across consecutive requests.
-- Update the comment at the PR 3/5 regression-guard tests
-  in `model.rs` to reflect that the native-path case now
+  Legacy `OpenAICompletions` + Ollama keeps the 32 k guard
+  because that wire layer still silently drops `num_ctx` —
+  propagating a larger value would re-introduce the silent-
+  truncation regression for users on the legacy path.
+- Update the comment / tests at the PR 3/5 regression-guard
+  tests in `model.rs` to reflect that the native-path case now
   propagates.
 
 **Tests:**
 
 - `to_model_propagates_ollama_context_length_under_ollama_chat_api`
 - `to_model_retains_32k_guard_for_legacy_openai_completions_ollama`
-- `ollama_chat_request_body_contains_num_ctx_equal_to_context_window`
-- `ollama_chat_request_body_does_not_override_num_ctx_across_calls`
-  (same model, two calls → both bodies have identical `num_ctx`
-  so Ollama does not reload).
+- `ollama_chat_request_body_num_ctx_reflects_discovered_context_length_after_pr6`
+  (integration with PR 3 wiring: under `OllamaChatApi`, a model
+  with `context_length = 262_144` from discovery produces a
+  request body with `num_ctx: 262_144`).
+- `ollama_chat_request_body_num_ctx_identical_across_consecutive_calls`
+  (regression guard: two identical calls → two identical
+  `num_ctx` values so Ollama doesn't reload the model).
 
 ## Test plan
 
@@ -769,12 +852,12 @@ Per-PR tests as enumerated above. Cross-cutting:
 - **`/api/chat` server-version gating.** The endpoint has
   existed since Ollama 0.1.x and the `think` parameter since
   0.5.x. Pre-0.5 Ollama will 400 on `think:false`. Mitigated
-  by ollama_caps/PR2's retry safety net catching the "not
-  supported for this model"-shaped message; the retry drops
-  reasoning fields and proceeds. Document in the PR 3 body.
-  If pre-0.5 becomes a real support burden we add explicit
-  version gating at discovery time (query `/api/version`); for
-  now we rely on the runtime retry.
+  by PR 4's own retry-without-`think` loop, not by the
+  `ollama_caps/PR2` OpenAI-path safety net (which never fires
+  on the native path — different provider impl, different
+  send function). If pre-0.5 becomes a real support burden we
+  add explicit version gating at discovery time (query
+  `/api/version`); for now we rely on the runtime retry.
 
 - **Tool-call shape variance across Ollama versions.** Tool
   calling on Ollama has been evolving. Older versions may emit
@@ -849,6 +932,16 @@ Per-PR tests as enumerated above. Cross-cutting:
   OpenAI-compat plumbing (`StreamOptions::temperature`,
   `options.max_tokens`); wiring them through is a follow-up
   plan once this codepath is stable.
+- **Image input via `message.images`.** Ollama's native shape
+  is `{"role": "user", "content": "describe this",
+  "images": ["<base64 jpeg>"]}` — a sibling field, not the
+  embedded-parts array OpenAI uses. anie's existing `LlmMessage`
+  content is `serde_json::Value`, so the content shape itself
+  isn't a blocker, but the `images` field has no
+  `Provider::convert_messages` counterpart yet. Multimodal
+  Ollama users stay on the OpenAI-compat layer (which
+  accepts the embedded-parts array) until we wire a proper
+  image adapter.
 - **`/api/generate` (legacy, non-chat).** Some Ollama users
   script against it. Out of scope.
 - **`/api/embed`.** anie does not currently use embeddings;
