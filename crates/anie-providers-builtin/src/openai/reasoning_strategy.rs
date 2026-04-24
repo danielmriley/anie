@@ -205,7 +205,18 @@ fn looks_like_native_reasoning_compat_body(body: &str) -> bool {
         || body.contains("\"reasoning\"")
         || body.contains("'reasoning'")
         || body.contains("reasoning")
-        || body.contains(" field required") && body.contains("reasoning");
+        || body.contains(" field required") && body.contains("reasoning")
+        // Ollama's native `/api/chat` errors surface through the
+        // OpenAI-compat endpoint using the word `think` / `thinking`
+        // rather than `reasoning`, e.g.
+        //   `think value "low" is not supported for this model`
+        //   `"gemma3:1b" does not support thinking`
+        // Recognize both so `send_stream_request` retries with
+        // `NoNativeFields`. See docs/ollama_capability_discovery
+        // PR 2.
+        || body.contains("thinking")
+        || body.contains("think value")
+        || body.contains("think field");
     let indicates_compatibility_failure = body.contains("unknown")
         || body.contains("unsupported")
         || body.contains("unexpected")
@@ -214,7 +225,11 @@ fn looks_like_native_reasoning_compat_body(body: &str) -> bool {
         || body.contains("not permitted")
         || body.contains("additional properties")
         || body.contains("invalid")
-        || body.contains("bad request");
+        || body.contains("bad request")
+        // Ollama phrasings — "is not supported for this model",
+        // "does not support thinking".
+        || body.contains("not supported")
+        || body.contains("does not support");
 
     mentions_reasoning_field && indicates_compatibility_failure
 }
@@ -379,6 +394,55 @@ mod tests {
 
         let err = classify_openai_http_error(reqwest::StatusCode::UNAUTHORIZED, "nope", None);
         assert!(matches!(err, ProviderError::Auth(_)));
+    }
+
+    #[test]
+    fn classify_openai_http_error_recognizes_ollama_leveled_think_rejection() {
+        // Ollama reports non-thinking-capable models rejecting a
+        // leveled `think` value with this exact body. Must upgrade
+        // to NativeReasoningUnsupported so the caller retries with
+        // `NoNativeFields`.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"think value \"low\" is not supported for this model","type":"api_error"}}"#,
+            None,
+        );
+        assert!(
+            matches!(err, ProviderError::NativeReasoningUnsupported(_)),
+            "expected NativeReasoningUnsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_openai_http_error_recognizes_ollama_no_thinking_capability() {
+        // Alternate Ollama wording for models lacking the
+        // `thinking` capability entirely.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"\"gemma3:1b\" does not support thinking","type":"api_error"}}"#,
+            None,
+        );
+        assert!(
+            matches!(err, ProviderError::NativeReasoningUnsupported(_)),
+            "expected NativeReasoningUnsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_openai_http_error_does_not_misclassify_unrelated_400s() {
+        // Negative: a 400 body about a genuinely-unrelated field
+        // must stay a plain Http error so the caller surfaces the
+        // underlying mistake instead of retrying into a
+        // reasoning-compat fallback.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"missing required field \"messages\"","type":"api_error"}}"#,
+            None,
+        );
+        assert!(
+            matches!(err, ProviderError::Http { .. }),
+            "expected Http {{ .. }}, got {err:?}"
+        );
     }
 
     #[test]
