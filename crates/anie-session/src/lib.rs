@@ -753,7 +753,11 @@ impl SessionManager {
                 first_kept_entry_id,
                 details,
                 ..
-            } => Some((summary.clone(), first_kept_entry_id.clone(), details.clone())),
+            } => Some((
+                summary.clone(),
+                first_kept_entry_id.clone(),
+                details.clone(),
+            )),
             _ => None,
         });
 
@@ -1028,14 +1032,10 @@ impl SessionManager {
         let prose = if let Some(split) = &cut_point.split_turn {
             let (main_messages, prefix_messages) =
                 partition_split_turn(&cut_point.discarded, split);
-            let main_source: Vec<Message> = main_messages
-                .iter()
-                .map(|m| m.message.clone())
-                .collect();
-            let prefix_source: Vec<Message> = prefix_messages
-                .iter()
-                .map(|m| m.message.clone())
-                .collect();
+            let main_source: Vec<Message> =
+                main_messages.iter().map(|m| m.message.clone()).collect();
+            let prefix_source: Vec<Message> =
+                prefix_messages.iter().map(|m| m.message.clone()).collect();
             // futures::try_join! short-circuits on the first
             // error; matches pi's Promise.all semantics so one
             // failed summarization aborts the compaction. We
@@ -1339,12 +1339,12 @@ pub fn find_cut_point(
 fn partition_split_turn<'a>(
     discarded: &'a [SessionContextMessage],
     split: &SplitTurn,
-) -> (Vec<&'a SessionContextMessage>, Vec<&'a SessionContextMessage>) {
-    let prefix_ids: std::collections::HashSet<&str> = split
-        .prefix_entry_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
+) -> (
+    Vec<&'a SessionContextMessage>,
+    Vec<&'a SessionContextMessage>,
+) {
+    let prefix_ids: std::collections::HashSet<&str> =
+        split.prefix_entry_ids.iter().map(String::as_str).collect();
     let mut main: Vec<&SessionContextMessage> = Vec::new();
     let mut prefix: Vec<&SessionContextMessage> = Vec::new();
     for entry in discarded {
@@ -1375,10 +1375,7 @@ pub fn join_split_turn_prose(main_prose: &str, prefix_prose: &str) -> String {
 /// message followed by Assistant responses + tool results).
 /// Returns `Some(SplitTurn)` when the kept side starts with a
 /// non-User message, `None` on clean turn-boundary cuts.
-fn detect_split_turn(
-    messages: &[SessionContextMessage],
-    cut_index: usize,
-) -> Option<SplitTurn> {
+fn detect_split_turn(messages: &[SessionContextMessage], cut_index: usize) -> Option<SplitTurn> {
     if cut_index == 0 || cut_index >= messages.len() {
         return None;
     }
@@ -1387,9 +1384,9 @@ fn detect_split_turn(
         return None;
     }
     // Walk back to the User that started the straddling turn.
-    let turn_start_idx = (0..cut_index).rev().find(|idx| {
-        matches!(messages[*idx].message, Message::User(_))
-    })?;
+    let turn_start_idx = (0..cut_index)
+        .rev()
+        .find(|idx| matches!(messages[*idx].message, Message::User(_)))?;
     let prefix_entry_ids = messages[turn_start_idx..cut_index]
         .iter()
         .map(|m| m.entry_id.clone())
@@ -1630,7 +1627,9 @@ mod tests {
         session
             .append_message(&user_message("hello", 1))
             .expect("append user");
-        session.append_message(&assistant).expect("append assistant");
+        session
+            .append_message(&assistant)
+            .expect("append assistant");
         drop(session);
 
         let session_path = sessions_dir
@@ -1804,11 +1803,7 @@ mod tests {
         );
     }
 
-    fn assistant_message_with_usage(
-        text: &str,
-        timestamp: u64,
-        total_tokens: u64,
-    ) -> Message {
+    fn assistant_message_with_usage(text: &str, timestamp: u64, total_tokens: u64) -> Message {
         let usage = Usage {
             input_tokens: total_tokens / 2,
             output_tokens: total_tokens - total_tokens / 2,
@@ -1860,10 +1855,7 @@ mod tests {
         // "hello" = 5 chars → 1 token via chars/4; "hi there"
         // = 8 chars → 2 tokens. Both heuristic.
         let got = estimate_context_tokens(&context);
-        let expected_heuristic: u64 = context
-            .iter()
-            .map(|m| estimate_tokens(&m.message))
-            .sum();
+        let expected_heuristic: u64 = context.iter().map(|m| estimate_tokens(&m.message)).sum();
         assert_eq!(got, expected_heuristic);
         assert!(got > 0);
     }
@@ -1917,7 +1909,9 @@ mod tests {
             assistant_message_with_usage("a1", 2, 3_000),
             user_message("q2", 3),
             Message::Assistant(AssistantMessage {
-                content: vec![ContentBlock::Text { text: "error".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "error".into(),
+                }],
                 usage: Usage::default(),
                 stop_reason: StopReason::Error,
                 error_message: Some("err".into()),
@@ -1927,8 +1921,7 @@ mod tests {
                 reasoning_details: None,
             }),
         ]);
-        let trailing = estimate_tokens(&context[2].message)
-            + estimate_tokens(&context[3].message);
+        let trailing = estimate_tokens(&context[2].message) + estimate_tokens(&context[3].message);
         assert_eq!(estimate_context_tokens(&context), 3_000 + trailing);
     }
 
@@ -2015,8 +2008,7 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("project");
         fs::create_dir_all(&cwd).expect("cwd");
-        let session =
-            SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
+        let session = SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
         assert_eq!(session.header.version, CURRENT_SESSION_SCHEMA_VERSION);
     }
 
@@ -2128,10 +2120,7 @@ mod tests {
                 ],
                 2,
             ),
-            assistant_with_tool_calls(
-                vec![("edit", serde_json::json!({"path": "src/c.rs"}))],
-                3,
-            ),
+            assistant_with_tool_calls(vec![("edit", serde_json::json!({"path": "src/c.rs"}))], 3),
         ];
         let details = extract_compaction_details(&messages);
         assert_eq!(details.read_files, vec!["src/a.rs"]);
@@ -2149,14 +2138,8 @@ mod tests {
                 ],
                 1,
             ),
-            assistant_with_tool_calls(
-                vec![("edit", serde_json::json!({"path": "src/a.rs"}))],
-                2,
-            ),
-            assistant_with_tool_calls(
-                vec![("edit", serde_json::json!({"path": "src/a.rs"}))],
-                3,
-            ),
+            assistant_with_tool_calls(vec![("edit", serde_json::json!({"path": "src/a.rs"}))], 2),
+            assistant_with_tool_calls(vec![("edit", serde_json::json!({"path": "src/a.rs"}))], 3),
         ];
         let details = extract_compaction_details(&messages);
         assert_eq!(details.read_files, vec!["src/a.rs", "src/b.rs"]);
@@ -2247,8 +2230,7 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("proj");
         fs::create_dir_all(&cwd).expect("cwd");
-        let mut session =
-            SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("new session");
 
         let first = session
             .append_message(&user_message("a", 1))
@@ -2811,9 +2793,7 @@ mod tests {
         fs::create_dir_all(&cwd).expect("cwd");
         let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
 
-        let first = session
-            .append_message(&user_message("u", 1))
-            .expect("u1");
+        let first = session.append_message(&user_message("u", 1)).expect("u1");
         session
             .add_entries(vec![SessionEntry::Compaction {
                 base: EntryBase {
@@ -2865,10 +2845,7 @@ mod tests {
             .append_message(&assistant_message("tail", 5))
             .expect("a3");
 
-        let summarizer = PerCallSummarizer::with_responses(vec![
-            "MAIN_SUMMARY",
-            "PREFIX_SUMMARY",
-        ]);
+        let summarizer = PerCallSummarizer::with_responses(vec!["MAIN_SUMMARY", "PREFIX_SUMMARY"]);
 
         session
             .auto_compact(
@@ -2900,7 +2877,10 @@ mod tests {
         assert!(summary.contains("MAIN_SUMMARY"), "{summary}");
         assert!(summary.contains("PREFIX_SUMMARY"), "{summary}");
         assert!(summary.contains("---"), "{summary}");
-        assert!(summary.contains("**Turn Context (split turn):**"), "{summary}");
+        assert!(
+            summary.contains("**Turn Context (split turn):**"),
+            "{summary}"
+        );
     }
 
     #[tokio::test]
@@ -2922,10 +2902,8 @@ mod tests {
             .append_message(&user_message("short prompt", 3))
             .expect("u2");
 
-        let summarizer = PerCallSummarizer::with_responses(vec![
-            "ONLY_SUMMARY",
-            "UNEXPECTED_SECOND",
-        ]);
+        let summarizer =
+            PerCallSummarizer::with_responses(vec!["ONLY_SUMMARY", "UNEXPECTED_SECOND"]);
 
         session
             .auto_compact(

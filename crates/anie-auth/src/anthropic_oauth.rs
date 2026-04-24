@@ -52,8 +52,7 @@ const CALLBACK_PATH: &str = "/callback";
 /// OAuth scopes pi requests. `user:inference` is the key one
 /// that lets Claude Code use the API; the rest cover profile +
 /// session management.
-const SCOPES: &str =
-    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /// Anthropic OAuth provider implementation.
 ///
@@ -83,11 +82,7 @@ impl AnthropicOAuthProvider {
     /// point the provider at a wiremock server; production
     /// code calls `new()`.
     #[must_use]
-    pub fn with_endpoints(
-        authorize_url: String,
-        token_url: String,
-        redirect_uri: String,
-    ) -> Self {
+    pub fn with_endpoints(authorize_url: String, token_url: String, redirect_uri: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             authorize_url,
@@ -100,8 +95,7 @@ impl AnthropicOAuthProvider {
         let bytes = STANDARD
             .decode(CLIENT_ID_B64)
             .map_err(|err| anyhow!("internal: failed to decode client id: {err}"))?;
-        String::from_utf8(bytes)
-            .map_err(|err| anyhow!("internal: client id not utf-8: {err}"))
+        String::from_utf8(bytes).map_err(|err| anyhow!("internal: client id not utf-8: {err}"))
     }
 }
 
@@ -123,7 +117,10 @@ impl OAuthProvider for AnthropicOAuthProvider {
     }
 
     async fn begin_login(&self) -> Result<LoginFlow> {
-        let PkcePair { verifier, challenge } = generate_pkce();
+        let PkcePair {
+            verifier,
+            challenge,
+        } = generate_pkce();
         let client_id = Self::client_id()?;
 
         // Build the authorize URL. Matches pi's anthropic.ts:
@@ -162,7 +159,8 @@ impl OAuthProvider for AnthropicOAuthProvider {
         let flow = flow.as_auth_code().ok_or_else(|| {
             anyhow!("Anthropic uses authorization-code flow; device flow not supported")
         })?;
-        let code = code.ok_or_else(|| anyhow!("Anthropic login requires the authorization code"))?;
+        let code =
+            code.ok_or_else(|| anyhow!("Anthropic login requires the authorization code"))?;
         let client_id = Self::client_id()?;
         let body = serde_json::json!({
             "grant_type": "authorization_code",
@@ -260,10 +258,7 @@ mod tests {
     fn default_redirect_uri_matches_pi_callback_port() {
         // Regression: if this port ever changes, Anthropic's
         // registered callback breaks. Keep it pinned.
-        assert_eq!(
-            default_redirect_uri(),
-            "http://localhost:53692/callback"
-        );
+        assert_eq!(default_redirect_uri(), "http://localhost:53692/callback");
     }
 
     #[tokio::test]
@@ -371,8 +366,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/oauth/token"))
             .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_string("{\"error\":\"invalid_grant\"}"),
+                ResponseTemplate::new(400).set_body_string("{\"error\":\"invalid_grant\"}"),
             )
             .mount(&server)
             .await;
@@ -382,11 +376,8 @@ mod tests {
             format!("{}/v1/oauth/token", server.uri()),
             "http://localhost:53692/callback".into(),
         );
-        let prior = OAuthCredentialData::new(
-            "old".into(),
-            "old".into(),
-            "2026-04-20T00:00:00Z".into(),
-        );
+        let prior =
+            OAuthCredentialData::new("old".into(), "old".into(), "2026-04-20T00:00:00Z".into());
         // `{err:#}` flattens the anyhow context chain so the
         // inner HTTP-status + body strings surface in the output.
         let err = format!("{:#}", provider.refresh(&prior).await.unwrap_err());

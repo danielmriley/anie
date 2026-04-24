@@ -610,8 +610,7 @@ mod tests {
     /// token is not enough — all tokens must hit.
     #[test]
     fn tokenized_query_requires_all_tokens() {
-        let mut picker =
-            ModelPickerPane::new(models(), "ollama".into(), "qwen3:32b".into(), None);
+        let mut picker = ModelPickerPane::new(models(), "ollama".into(), "qwen3:32b".into(), None);
         // "qwen 32b": "qwen" matches all 3 models (two qwen3
         // variants + the gpt model probably won't match qwen).
         // "32b" only matches qwen3:32b. Combined → only the
@@ -620,10 +619,7 @@ mod tests {
             let _ = picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         assert_eq!(picker.filtered_indices.len(), 1);
-        assert_eq!(
-            picker.selected_model().expect("selected").id,
-            "qwen3:32b"
-        );
+        assert_eq!(picker.selected_model().expect("selected").id, "qwen3:32b");
     }
 
     /// Plan 05 PR-B: any token without a match causes the
@@ -632,8 +628,7 @@ mod tests {
     /// which is worse picker ergonomics.
     #[test]
     fn tokenized_query_rejects_candidate_when_any_token_misses() {
-        let mut picker =
-            ModelPickerPane::new(models(), "ollama".into(), "qwen3:32b".into(), None);
+        let mut picker = ModelPickerPane::new(models(), "ollama".into(), "qwen3:32b".into(), None);
         // "qwen xyz" — "xyz" matches nothing. Result must be empty.
         for ch in "qwen xyz".chars() {
             let _ = picker.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));

@@ -184,7 +184,9 @@ mod tests {
     #[test]
     fn command_name_at_line_start_with_prefix() {
         let catalog = catalog();
-        let ctx = parse_context("/thi", len("/thi"), |name| catalog.iter().any(|info| info.name == name));
+        let ctx = parse_context("/thi", len("/thi"), |name| {
+            catalog.iter().any(|info| info.name == name)
+        });
         assert_eq!(
             ctx,
             Context::CommandName {
@@ -197,22 +199,23 @@ mod tests {
     fn command_name_at_line_start_with_cursor_mid_prefix() {
         let catalog = catalog();
         // Cursor between / and h: "/|thi"
-        let ctx = parse_context("/thi", 1, |name| catalog.iter().any(|info| info.name == name));
-        assert_eq!(
-            ctx,
-            Context::CommandName {
-                prefix: "/".into()
-            }
-        );
+        let ctx = parse_context("/thi", 1, |name| {
+            catalog.iter().any(|info| info.name == name)
+        });
+        assert_eq!(ctx, Context::CommandName { prefix: "/".into() });
     }
 
     #[test]
     fn slash_not_at_line_start_disables_context() {
         let catalog = catalog();
-        let ctx = parse_context("hello /thi", len("hello /thi"), |name| catalog.iter().any(|info| info.name == name));
+        let ctx = parse_context("hello /thi", len("hello /thi"), |name| {
+            catalog.iter().any(|info| info.name == name)
+        });
         assert_eq!(ctx, Context::None);
 
-        let ctx = parse_context("   /thi", len("   /thi"), |name| catalog.iter().any(|info| info.name == name));
+        let ctx = parse_context("   /thi", len("   /thi"), |name| {
+            catalog.iter().any(|info| info.name == name)
+        });
         assert_eq!(ctx, Context::None);
     }
 
@@ -220,7 +223,9 @@ mod tests {
     fn argument_context_after_known_command_with_prefix() {
         let catalog = catalog();
         let line = "/thinking me";
-        let ctx = parse_context(line, len(line), |name| catalog.iter().any(|info| info.name == name));
+        let ctx = parse_context(line, len(line), |name| {
+            catalog.iter().any(|info| info.name == name)
+        });
         assert_eq!(
             ctx,
             Context::ArgumentValue {
@@ -234,7 +239,9 @@ mod tests {
     fn argument_context_empty_prefix_when_cursor_after_space() {
         let catalog = catalog();
         let line = "/thinking ";
-        let ctx = parse_context(line, len(line), |name| catalog.iter().any(|info| info.name == name));
+        let ctx = parse_context(line, len(line), |name| {
+            catalog.iter().any(|info| info.name == name)
+        });
         assert_eq!(
             ctx,
             Context::ArgumentValue {
@@ -248,25 +255,25 @@ mod tests {
     fn argument_context_returns_none_for_unknown_command() {
         let catalog = catalog();
         let line = "/unknown arg";
-        let ctx = parse_context(line, len(line), |name| catalog.iter().any(|info| info.name == name));
+        let ctx = parse_context(line, len(line), |name| {
+            catalog.iter().any(|info| info.name == name)
+        });
         assert_eq!(ctx, Context::None);
     }
 
     #[test]
     fn empty_input_returns_none() {
         let catalog = catalog();
-        assert_eq!(parse_context("", 0, |name| catalog.iter().any(|info| info.name == name)), Context::None);
+        assert_eq!(
+            parse_context("", 0, |name| catalog.iter().any(|info| info.name == name)),
+            Context::None
+        );
     }
 
     #[test]
     fn cursor_at_slash_only_matches_command_name() {
         let catalog = catalog();
         let ctx = parse_context("/", 1, |name| catalog.iter().any(|info| info.name == name));
-        assert_eq!(
-            ctx,
-            Context::CommandName {
-                prefix: "/".into()
-            }
-        );
+        assert_eq!(ctx, Context::CommandName { prefix: "/".into() });
     }
 }

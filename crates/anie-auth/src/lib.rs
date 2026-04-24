@@ -12,15 +12,15 @@ pub mod refresh;
 mod store;
 
 pub use anthropic_oauth::AnthropicOAuthProvider;
+pub use callback::{Callback, CallbackError, await_callback, await_callback_on_path};
 pub use github_copilot_oauth::GithubCopilotOAuthProvider;
 pub use google_antigravity_oauth::GoogleAntigravityOAuthProvider;
 pub use google_gemini_cli_oauth::GeminiCliOAuthProvider;
-pub use openai_codex_oauth::OpenAICodexOAuthProvider;
-pub use callback::{Callback, CallbackError, await_callback, await_callback_on_path};
 pub use oauth::{
     AuthCodeFlow, DeviceCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair,
     generate_pkce, parse_expires_at,
 };
+pub use openai_codex_oauth::OpenAICodexOAuthProvider;
 pub use refresh::{CredentialPersistence, OAuthRefresher, RefreshError, default_lock_dir};
 
 use std::{
@@ -248,14 +248,11 @@ impl AuthResolver {
                 "no OAuth client registered for provider '{provider_name}'"
             ))
         })?;
-        let auth_file = self
-            .credential_store
-            .json_fallback_path()
-            .ok_or_else(|| {
-                ProviderError::Auth(
-                    "OAuth refresh requires a JSON auth file; none is configured".into(),
-                )
-            })?;
+        let auth_file = self.credential_store.json_fallback_path().ok_or_else(|| {
+            ProviderError::Auth(
+                "OAuth refresh requires a JSON auth file; none is configured".into(),
+            )
+        })?;
         let lock_dir = refresh::default_lock_dir(auth_file);
         let refresher =
             OAuthRefresher::new(oauth_provider.as_ref(), &self.credential_store, lock_dir);
@@ -283,10 +280,7 @@ pub fn oauth_request_headers(provider_name: &str) -> HashMap<String, String> {
     if provider_name == "github-copilot" {
         headers.insert("User-Agent".into(), "GitHubCopilotChat/0.35.0".into());
         headers.insert("Editor-Version".into(), "vscode/1.107.0".into());
-        headers.insert(
-            "Editor-Plugin-Version".into(),
-            "copilot-chat/0.35.0".into(),
-        );
+        headers.insert("Editor-Plugin-Version".into(), "copilot-chat/0.35.0".into());
         headers.insert("Copilot-Integration-Id".into(), "vscode-chat".into());
     }
     headers
@@ -627,7 +621,10 @@ mod tests {
             "save must refuse to run against a corrupt store"
         );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("quarantined"), "error must mention quarantine: {err}");
+        assert!(
+            err.contains("quarantined"),
+            "error must mention quarantine: {err}"
+        );
 
         // Original must be untouched.
         assert_eq!(
@@ -787,31 +784,22 @@ mod tests {
         let auth_path = tempdir.path().join("auth.json");
         save_credential_at(&auth_path, "anthropic", sample_oauth()).expect("save");
 
-        let store = CredentialStore::with_config("anie-test", Some(auth_path))
-            .without_native_keyring();
-        assert_eq!(
-            store.get("anthropic").as_deref(),
-            Some("sk-ant-oat01-abc")
-        );
-        assert_eq!(
-            store.get_credential("anthropic"),
-            Some(sample_oauth())
-        );
+        let store =
+            CredentialStore::with_config("anie-test", Some(auth_path)).without_native_keyring();
+        assert_eq!(store.get("anthropic").as_deref(), Some("sk-ant-oat01-abc"));
+        assert_eq!(store.get_credential("anthropic"), Some(sample_oauth()));
     }
 
     #[test]
     fn credential_store_set_credential_persists_oauth() {
         let tempdir = tempdir().expect("tempdir");
         let auth_path = tempdir.path().join("auth.json");
-        let store = CredentialStore::with_config("anie-test", Some(auth_path))
-            .without_native_keyring();
+        let store =
+            CredentialStore::with_config("anie-test", Some(auth_path)).without_native_keyring();
         store
             .set_credential("anthropic", sample_oauth())
             .expect("set oauth");
-        assert_eq!(
-            store.get_credential("anthropic"),
-            Some(sample_oauth())
-        );
+        assert_eq!(store.get_credential("anthropic"), Some(sample_oauth()));
     }
 
     #[test]

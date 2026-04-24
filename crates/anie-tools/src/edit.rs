@@ -216,8 +216,7 @@ fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<(String, Str
             continue;
         }
 
-        let fuzzy_cache = fuzzy_cache
-            .get_or_insert_with(|| normalize_for_fuzzy_match(content));
+        let fuzzy_cache = fuzzy_cache.get_or_insert_with(|| normalize_for_fuzzy_match(content));
         let fuzzy_matches = fuzzy_find_all_occurrences_in_normalized(
             &fuzzy_cache.0,
             &fuzzy_cache.1,

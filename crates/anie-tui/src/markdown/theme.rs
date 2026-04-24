@@ -37,15 +37,9 @@ impl MarkdownTheme {
     #[must_use]
     pub const fn default_dark() -> Self {
         Self {
-            h1: Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            h2: Style::new()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-            h3: Style::new()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            h1: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            h2: Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            h3: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             h4_plus: Style::new().add_modifier(Modifier::BOLD),
             strong: Style::new().add_modifier(Modifier::BOLD),
             emphasis: Style::new().add_modifier(Modifier::ITALIC),
@@ -60,9 +54,7 @@ impl MarkdownTheme {
             blockquote_body: Style::new().add_modifier(Modifier::ITALIC),
             horizontal_rule: Style::new().fg(Color::DarkGray),
             table_border: Style::new().fg(Color::DarkGray),
-            table_header: Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            table_header: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             table_cell: Style::new(),
             link_text: Style::new()
                 .fg(Color::Blue)

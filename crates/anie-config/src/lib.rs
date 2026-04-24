@@ -675,7 +675,10 @@ mod tests {
     /// for every user who doesn't opt in.
     #[test]
     fn ui_config_tool_output_mode_defaults_to_verbose() {
-        assert_eq!(UiConfig::default().tool_output_mode, ToolOutputMode::Verbose);
+        assert_eq!(
+            UiConfig::default().tool_output_mode,
+            ToolOutputMode::Verbose
+        );
     }
 
     /// Forward-compat: a user's config written before the
@@ -769,10 +772,11 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        let has_temp = entries
-            .iter()
-            .any(|name| name.starts_with(".out.txt.tmp."));
-        assert!(!has_temp, "temp file must be cleaned after rename: {entries:?}");
+        let has_temp = entries.iter().any(|name| name.starts_with(".out.txt.tmp."));
+        assert!(
+            !has_temp,
+            "temp file must be cleaned after rename: {entries:?}"
+        );
     }
 
     #[test]

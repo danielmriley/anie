@@ -1309,11 +1309,7 @@ mod tests {
     #[test]
     fn classifies_replay_fidelity_400_on_thinking_signature() {
         let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.thinking.signature: Field required"}}"#;
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, body, None);
         assert!(matches!(
             err,
             ProviderError::ReplayFidelity {
@@ -1326,22 +1322,14 @@ mod tests {
     #[test]
     fn classifies_replay_fidelity_400_on_redacted_thinking() {
         let body = r#"{"error":{"message":"redacted_thinking required"}}"#;
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, body, None);
         assert!(matches!(err, ProviderError::ReplayFidelity { .. }));
     }
 
     #[test]
     fn generic_400_falls_through_to_http() {
         let body = "missing required field messages";
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, body, None);
         assert!(matches!(err, ProviderError::Http { status: 400, .. }));
     }
 
@@ -1354,11 +1342,7 @@ mod tests {
     #[test]
     fn replay_fidelity_detail_is_truncated() {
         let body = "messages.0.content.0.thinking.signature: Field required. ".repeat(50);
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            &body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, &body, None);
         if let ProviderError::ReplayFidelity { detail, .. } = err {
             assert!(detail.len() <= 500);
         } else {
@@ -1540,11 +1524,11 @@ mod tests {
             temperature: Some(0.7),
             ..Default::default()
         };
-        let body =
-            AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
+        let body = AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
         // Post-override, temperature must read 1.0, not 0.7.
         assert_eq!(
-            body["temperature"], json!(1.0),
+            body["temperature"],
+            json!(1.0),
             "thinking request must force temperature=1 even when user set it: {body}"
         );
         // Thinking block must be present and well-formed.
@@ -1584,16 +1568,12 @@ mod tests {
             temperature: Some(0.7),
             ..Default::default()
         };
-        let body =
-            AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
+        let body = AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
         // f32 → serde_json::Value goes through f64, so
         // `0.7_f32` serializes as `0.6999…`. Compare with a
         // tolerance rather than byte-identical JSON.
         let temp = body["temperature"].as_f64().expect("temperature f64");
-        assert!(
-            (temp - 0.7).abs() < 1e-4,
-            "expected ~0.7, got {temp}"
-        );
+        assert!((temp - 0.7).abs() < 1e-4, "expected ~0.7, got {temp}");
         assert!(body.get("thinking").is_none());
     }
 }

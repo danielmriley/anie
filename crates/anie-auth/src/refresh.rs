@@ -312,9 +312,8 @@ fn is_near_expiry(expires_at: &str, provider: &str) -> Result<bool, RefreshError
         source,
     })?;
     let now = OffsetDateTime::now_utc();
-    let margin = time::Duration::seconds(
-        i64::try_from(REFRESH_SAFETY_MARGIN.as_secs()).unwrap_or(30),
-    );
+    let margin =
+        time::Duration::seconds(i64::try_from(REFRESH_SAFETY_MARGIN.as_secs()).unwrap_or(30));
     Ok(deadline - now <= margin)
 }
 
@@ -358,11 +357,7 @@ mod tests {
 
     impl CredentialPersistence for InMemoryPersistence {
         fn load(&self, provider: &str) -> Option<AuthCredential> {
-            self.0
-                .lock()
-                .expect("load lock")
-                .get(provider)
-                .cloned()
+            self.0.lock().expect("load lock").get(provider).cloned()
         }
 
         fn save(&self, provider: &str, credential: AuthCredential) -> Result<()> {
@@ -431,10 +426,8 @@ mod tests {
 
     #[tokio::test]
     async fn valid_token_returns_without_calling_refresh() {
-        let persistence = InMemoryPersistence::with(
-            "anthropic",
-            oauth("still-good", &rfc3339_in(3_600)),
-        );
+        let persistence =
+            InMemoryPersistence::with("anthropic", oauth("still-good", &rfc3339_in(3_600)));
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingProvider {
             refresh_calls: refresh_calls.clone(),
@@ -451,10 +444,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_token_triggers_refresh_and_persists_result() {
-        let persistence = InMemoryPersistence::with(
-            "anthropic",
-            oauth("expired", &rfc3339_in(-60)),
-        );
+        let persistence =
+            InMemoryPersistence::with("anthropic", oauth("expired", &rfc3339_in(-60)));
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingProvider {
             refresh_calls: refresh_calls.clone(),
@@ -487,10 +478,8 @@ mod tests {
         // 20 s until expiry — inside the 30 s anie-specific
         // refresh margin, so we refresh even though the token
         // technically still works.
-        let persistence = InMemoryPersistence::with(
-            "anthropic",
-            oauth("almost-expired", &rfc3339_in(20)),
-        );
+        let persistence =
+            InMemoryPersistence::with("anthropic", oauth("almost-expired", &rfc3339_in(20)));
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingProvider {
             refresh_calls: refresh_calls.clone(),
@@ -508,10 +497,8 @@ mod tests {
         // Two concurrent calls against one expired credential
         // must only produce ONE refresh call — the second sees
         // a freshly-refreshed credential after the lock frees.
-        let persistence = InMemoryPersistence::with(
-            "anthropic",
-            oauth("expired", &rfc3339_in(-60)),
-        );
+        let persistence =
+            InMemoryPersistence::with("anthropic", oauth("expired", &rfc3339_in(-60)));
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let provider = CountingProvider {
             refresh_calls: refresh_calls.clone(),

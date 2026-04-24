@@ -143,8 +143,8 @@ async fn configured_requests(
         else {
             continue;
         };
-        let Some(base_url) = api_base_url
-            .or_else(|| oauth_provider_default_base_url(&provider_name))
+        let Some(base_url) =
+            api_base_url.or_else(|| oauth_provider_default_base_url(&provider_name))
         else {
             continue;
         };
@@ -230,7 +230,6 @@ fn oauth_provider_default_base_url(provider_name: &str) -> Option<String> {
     }
 }
 
-
 fn print_models_table(rows: &[(String, ModelInfo)]) {
     let provider_width = rows
         .iter()
@@ -290,7 +289,6 @@ mod tests {
     use anie_config::AnieConfig;
     use tempfile::tempdir;
 
-
     #[tokio::test]
     async fn configured_requests_picks_up_oauth_providers_without_config_entry() {
         // Seed an auth store with a Copilot OAuth credential
@@ -298,8 +296,8 @@ mod tests {
         // though config.toml has nothing under providers.
         let tempdir = tempdir().expect("tempdir");
         let auth_path = tempdir.path().join("auth.json");
-        let store = CredentialStore::with_config("anie-test", Some(auth_path))
-            .without_native_keyring();
+        let store =
+            CredentialStore::with_config("anie-test", Some(auth_path)).without_native_keyring();
         store
             .set_credential(
                 "github-copilot",
@@ -332,8 +330,8 @@ mod tests {
         // configured_requests).
         let tempdir = tempdir().expect("tempdir");
         let auth_path = tempdir.path().join("auth.json");
-        let store = CredentialStore::with_config("anie-test", Some(auth_path))
-            .without_native_keyring();
+        let store =
+            CredentialStore::with_config("anie-test", Some(auth_path)).without_native_keyring();
         store
             .set_credential(
                 "github-copilot",

@@ -138,11 +138,7 @@ fn resolve_syntax<'a>(
 /// One ratatui `Line` per source line with no style applied.
 fn plain_text_lines(code: &str) -> Vec<Line<'static>> {
     LinesWithEndings::from(code)
-        .map(|line| {
-            Line::from(Span::raw(
-                line.trim_end_matches('\n').to_string(),
-            ))
-        })
+        .map(|line| Line::from(Span::raw(line.trim_end_matches('\n').to_string())))
         .collect()
 }
 

@@ -88,9 +88,9 @@ impl ToolRegistry {
         let name = definition.name.clone();
         let validator_state = match jsonschema::validator_for(&definition.parameters) {
             Ok(validator) => ValidatorState::Ready(Arc::new(validator)),
-            Err(error) => ValidatorState::Invalid(format!(
-                "Tool schema compilation failed: {error}"
-            )),
+            Err(error) => {
+                ValidatorState::Invalid(format!("Tool schema compilation failed: {error}"))
+            }
         };
         self.validators.insert(name.clone(), validator_state);
         self.tools.insert(name, tool);

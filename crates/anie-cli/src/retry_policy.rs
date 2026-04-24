@@ -276,11 +276,7 @@ mod tests {
     fn feature_unsupported_gives_up_immediately() {
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
-            policy.decide(
-                &ProviderError::FeatureUnsupported("x".into()),
-                0,
-                false,
-            ),
+            policy.decide(&ProviderError::FeatureUnsupported("x".into()), 0, false,),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }

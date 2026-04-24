@@ -194,7 +194,14 @@ fn redact_state(value: &str) -> String {
         return value.to_string();
     }
     let prefix: String = value.chars().take(4).collect();
-    let suffix: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{prefix}…{suffix}")
 }
 
@@ -248,9 +255,9 @@ fn translate_callback_error(err: CallbackError) -> anyhow::Error {
              Another instance of `anie login` may already be running, \
              or the port is in use by something else."
         ),
-        CallbackError::ProviderError(message) => anyhow!(
-            "provider rejected the login request: {message}"
-        ),
+        CallbackError::ProviderError(message) => {
+            anyhow!("provider rejected the login request: {message}")
+        }
         other => anyhow!("{other}"),
     }
 }

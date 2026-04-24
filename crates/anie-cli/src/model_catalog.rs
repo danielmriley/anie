@@ -67,15 +67,11 @@ pub(crate) async fn build_model_catalog(config: &AnieConfig) -> (Vec<Model>, boo
 fn oauth_placeholder_models(store: &CredentialStore) -> Vec<Model> {
     let mut out = Vec::new();
     for provider_name in store.list_providers() {
-        let Some(AuthCredential::OAuth {
-            api_base_url,
-            ..
-        }) = store.get_credential(&provider_name)
+        let Some(AuthCredential::OAuth { api_base_url, .. }) = store.get_credential(&provider_name)
         else {
             continue;
         };
-        let Some(placeholder) =
-            oauth_placeholder_model(&provider_name, api_base_url.as_deref())
+        let Some(placeholder) = oauth_placeholder_model(&provider_name, api_base_url.as_deref())
         else {
             continue;
         };
@@ -168,8 +164,9 @@ pub(crate) fn resolve_initial_selection(
     //      in across fresh sessions when the user hasn't
     //      declared a default in config.toml).
     //   5. `ModelConfig::default()` (hardcoded final fallback).
-    let config_provider =
-        config.model_explicitly_set.then(|| config.model.provider.clone());
+    let config_provider = config
+        .model_explicitly_set
+        .then(|| config.model.provider.clone());
     let config_model = config.model_explicitly_set.then(|| config.model.id.clone());
     let config_thinking = config.model_explicitly_set.then_some(config.model.thinking);
 
@@ -327,13 +324,9 @@ fn exact_or_fabricate(
     }
 
     // Step 2: fabricate from config / OAuth credential.
-    if let Some(model) = fallback_model_from_provider(
-        provider,
-        preferred_model,
-        config,
-        catalog,
-        credential_store,
-    ) {
+    if let Some(model) =
+        fallback_model_from_provider(provider, preferred_model, config, catalog, credential_store)
+    {
         return Ok(model);
     }
 
@@ -613,11 +606,8 @@ mod tests {
         // mismatched --model would silently fall back to the
         // first catalog entry. Now we error instead.
         let config = AnieConfig::default();
-        let store = anie_auth::CredentialStore::with_config(
-            "anie-test-g",
-            None,
-        )
-        .without_native_keyring();
+        let store =
+            anie_auth::CredentialStore::with_config("anie-test-g", None).without_native_keyring();
         let catalog = vec![
             model("claude-sonnet-4-6", "anthropic"),
             model("gpt-4o", "openai"),
@@ -644,11 +634,8 @@ mod tests {
         // credential's api_base_url (per-user endpoint).
         let tempdir = tempfile::tempdir().expect("tempdir");
         let auth_path = tempdir.path().join("auth.json");
-        let store = anie_auth::CredentialStore::with_config(
-            "anie-test-g",
-            Some(auth_path),
-        )
-        .without_native_keyring();
+        let store = anie_auth::CredentialStore::with_config("anie-test-g", Some(auth_path))
+            .without_native_keyring();
         store
             .set_credential(
                 "github-copilot",

@@ -158,15 +158,27 @@ pub async fn await_callback_on_path(
         // `/favicon.ico` — browsers fire these) get 404 and we
         // keep listening.
         let Some((path, query)) = split_target(&target) else {
-            write_http_response(&mut stream, 404, "Not Found", "text/plain; charset=utf-8", "not found")
-                .await
-                .ok();
+            write_http_response(
+                &mut stream,
+                404,
+                "Not Found",
+                "text/plain; charset=utf-8",
+                "not found",
+            )
+            .await
+            .ok();
             continue;
         };
         if path != expected_path {
-            write_http_response(&mut stream, 404, "Not Found", "text/plain; charset=utf-8", "not found")
-                .await
-                .ok();
+            write_http_response(
+                &mut stream,
+                404,
+                "Not Found",
+                "text/plain; charset=utf-8",
+                "not found",
+            )
+            .await
+            .ok();
             continue;
         }
 
@@ -174,20 +186,38 @@ pub async fn await_callback_on_path(
 
         if let Some((_, err_value)) = params.iter().find(|(k, _)| k == "error") {
             let html = error_html(err_value);
-            write_http_response(&mut stream, 400, "Bad Request", "text/html; charset=utf-8", &html)
-                .await
-                .ok();
+            write_http_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                "text/html; charset=utf-8",
+                &html,
+            )
+            .await
+            .ok();
             return Err(CallbackError::ProviderError(err_value.clone()));
         }
 
-        let code = params.iter().find(|(k, _)| k == "code").map(|(_, v)| v.clone());
-        let state = params.iter().find(|(k, _)| k == "state").map(|(_, v)| v.clone());
+        let code = params
+            .iter()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.clone());
+        let state = params
+            .iter()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.clone());
 
         match (code, state) {
             (Some(code), Some(state)) => {
-                write_http_response(&mut stream, 200, "OK", "text/html; charset=utf-8", SUCCESS_HTML)
-                    .await
-                    .ok();
+                write_http_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "text/html; charset=utf-8",
+                    SUCCESS_HTML,
+                )
+                .await
+                .ok();
                 return Ok(Callback { code, state });
             }
             (None, _) => {
@@ -283,7 +313,8 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = BlockingTcpStream::connect(("127.0.0.1", port)).expect("connect");
-            let request = "GET /callback?code=the-code&state=the-state HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let request =
+                "GET /callback?code=the-code&state=the-state HTTP/1.1\r\nHost: localhost\r\n\r\n";
             stream.write_all(request.as_bytes()).expect("write");
             // Read the response so the server writes back without panicking.
             use std::io::Read;
@@ -364,9 +395,7 @@ mod tests {
             // Then the real /callback. Server should pick this up.
             let mut stream = BlockingTcpStream::connect(("127.0.0.1", port)).expect("connect 2");
             stream
-                .write_all(
-                    b"GET /callback?code=c&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n",
-                )
+                .write_all(b"GET /callback?code=c&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .expect("write 2");
             let _ = stream.read(&mut buf);
         })

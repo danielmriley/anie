@@ -196,8 +196,10 @@ pub async fn probe_openai_compatible(
                 context_window: 32_768,
                 max_tokens: 8_192,
                 supports_reasoning: false,
-                reasoning_capabilities:
-                    default_local_reasoning_capabilities_normalized(&probe_inputs, id),
+                reasoning_capabilities: default_local_reasoning_capabilities_normalized(
+                    &probe_inputs,
+                    id,
+                ),
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),
                 replay_capabilities: None,

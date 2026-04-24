@@ -83,9 +83,7 @@ impl Tool for LsTool {
             .and_then(serde_json::Value::as_u64)
             .map(|value| usize::try_from(value).unwrap_or(DEFAULT_LS_LIMIT))
             .unwrap_or(DEFAULT_LS_LIMIT);
-        let path = self.resolve_path(
-            args.get("path").and_then(serde_json::Value::as_str),
-        );
+        let path = self.resolve_path(args.get("path").and_then(serde_json::Value::as_str));
 
         let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
             ToolError::ExecutionFailed(format!("cannot stat {}: {error}", path.display()))
@@ -179,7 +177,8 @@ mod tests {
         args: serde_json::Value,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let tool = LsTool::new(cwd);
-        tool.execute("call", args, CancellationToken::new(), None).await
+        tool.execute("call", args, CancellationToken::new(), None)
+            .await
     }
 
     fn text_body(result: &anie_protocol::ToolResult) -> String {
@@ -199,7 +198,9 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         std::fs::write(tempdir.path().join("file.txt"), "").expect("file");
         std::fs::create_dir(tempdir.path().join("subdir")).expect("subdir");
-        let result = run_ls(tempdir.path(), serde_json::json!({})).await.expect("ls");
+        let result = run_ls(tempdir.path(), serde_json::json!({}))
+            .await
+            .expect("ls");
         let body = text_body(&result);
         assert!(body.contains("file.txt"), "{body}");
         assert!(body.contains("subdir/"), "{body}");
@@ -211,7 +212,9 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         std::fs::write(tempdir.path().join("visible.txt"), "").expect("file");
         std::fs::write(tempdir.path().join(".hidden"), "").expect("hidden");
-        let result = run_ls(tempdir.path(), serde_json::json!({})).await.expect("ls");
+        let result = run_ls(tempdir.path(), serde_json::json!({}))
+            .await
+            .expect("ls");
         let body = text_body(&result);
         assert!(body.contains("visible.txt"));
         assert!(!body.contains(".hidden"));
@@ -221,12 +224,9 @@ mod tests {
     async fn ls_show_hidden_true_includes_dotfiles() {
         let tempdir = tempdir().expect("tempdir");
         std::fs::write(tempdir.path().join(".hidden"), "").expect("hidden");
-        let result = run_ls(
-            tempdir.path(),
-            serde_json::json!({ "show_hidden": true }),
-        )
-        .await
-        .expect("ls");
+        let result = run_ls(tempdir.path(), serde_json::json!({ "show_hidden": true }))
+            .await
+            .expect("ls");
         assert!(text_body(&result).contains(".hidden"));
     }
 
@@ -246,12 +246,9 @@ mod tests {
     async fn ls_non_directory_errors() {
         let tempdir = tempdir().expect("tempdir");
         std::fs::write(tempdir.path().join("file.txt"), "").expect("file");
-        let err = run_ls(
-            tempdir.path(),
-            serde_json::json!({ "path": "file.txt" }),
-        )
-        .await
-        .expect_err("should error");
+        let err = run_ls(tempdir.path(), serde_json::json!({ "path": "file.txt" }))
+            .await
+            .expect_err("should error");
         assert!(matches!(err, ToolError::ExecutionFailed(msg) if msg.contains("not a directory")));
     }
 
@@ -259,15 +256,11 @@ mod tests {
     async fn ls_limit_truncates() {
         let tempdir = tempdir().expect("tempdir");
         for i in 0..20 {
-            std::fs::write(tempdir.path().join(format!("f{i:02}.txt")), "")
-                .expect("write");
+            std::fs::write(tempdir.path().join(format!("f{i:02}.txt")), "").expect("write");
         }
-        let result = run_ls(
-            tempdir.path(),
-            serde_json::json!({ "limit": 5 }),
-        )
-        .await
-        .expect("ls");
+        let result = run_ls(tempdir.path(), serde_json::json!({ "limit": 5 }))
+            .await
+            .expect("ls");
         assert_eq!(result.details["count"], 5);
         assert_eq!(result.details["truncated"], true);
         assert!(text_body(&result).contains("5 entries limit reached"));
@@ -295,7 +288,9 @@ mod tests {
         let mut perms = std::fs::metadata(&bin).expect("metadata").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).expect("chmod");
-        let result = run_ls(tempdir.path(), serde_json::json!({})).await.expect("ls");
+        let result = run_ls(tempdir.path(), serde_json::json!({}))
+            .await
+            .expect("ls");
         assert!(text_body(&result).contains("runme.sh*"));
     }
 }

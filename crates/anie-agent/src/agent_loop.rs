@@ -1406,7 +1406,9 @@ mod tests {
                 2,
             )),
             Message::Assistant(assistant_message(
-                vec![ContentBlock::Text { text: "keep".into() }],
+                vec![ContentBlock::Text {
+                    text: "keep".into(),
+                }],
                 StopReason::Stop,
                 3,
             )),

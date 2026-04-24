@@ -140,10 +140,7 @@ pub fn restore_terminal(guard: &mut TerminalGuard) -> Result<()> {
 /// Errors on `Begin`/`End` are forwarded — if the terminal
 /// write has failed at this point, the frame itself is
 /// already broken and surfacing it loudly is correct.
-pub fn draw_synchronized<B, F>(
-    terminal: &mut Terminal<B>,
-    render_callback: F,
-) -> io::Result<()>
+pub fn draw_synchronized<B, F>(terminal: &mut Terminal<B>, render_callback: F) -> io::Result<()>
 where
     B: Backend + io::Write,
     F: FnOnce(&mut Frame),
@@ -180,10 +177,7 @@ where
 /// latency over atomic composition. Streaming paints,
 /// scroll redraws, and resize-final paints still want
 /// `draw_synchronized`.
-pub fn draw_urgent<B, F>(
-    terminal: &mut Terminal<B>,
-    render_callback: F,
-) -> io::Result<()>
+pub fn draw_urgent<B, F>(terminal: &mut Terminal<B>, render_callback: F) -> io::Result<()>
 where
     B: Backend + io::Write,
     F: FnOnce(&mut Frame),

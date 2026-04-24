@@ -201,7 +201,12 @@ impl InteractiveController {
                         }
                     }
                 }
-            } else if let PendingRetry::Armed { deadline, attempt, already_compacted } = self.pending_retry {
+            } else if let PendingRetry::Armed {
+                deadline,
+                attempt,
+                already_compacted,
+            } = self.pending_retry
+            {
                 tokio::select! {
                     maybe_action = self.ui_action_rx.recv() => {
                         match maybe_action {
@@ -683,9 +688,7 @@ impl ControllerState {
         // instead of a silent pause followed by both the start
         // and end messages at once.
         let tokens_before = self.session.inner().estimate_context_tokens();
-        let threshold = config
-            .context_window
-            .saturating_sub(config.reserve_tokens);
+        let threshold = config.context_window.saturating_sub(config.reserve_tokens);
         if tokens_before <= threshold {
             return Ok(());
         }

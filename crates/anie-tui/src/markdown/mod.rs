@@ -112,9 +112,7 @@ fn extract_url_from_fallback(content: &str) -> Option<String> {
     // link_url style is either a future variant or a collision
     // with an unrelated style; don't open arbitrary text in a
     // browser.
-    if inner.starts_with("http://")
-        || inner.starts_with("https://")
-        || inner.starts_with("mailto:")
+    if inner.starts_with("http://") || inner.starts_with("https://") || inner.starts_with("mailto:")
     {
         Some(inner.to_string())
     } else {

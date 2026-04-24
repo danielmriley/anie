@@ -428,7 +428,10 @@ async fn valid_thinking_level_emits_success_message_and_updates_state() {
         msg.contains("Thinking level set to high"),
         "expected success confirmation, got: {msg}"
     );
-    assert_eq!(controller.state.config.current_thinking(), ThinkingLevel::High);
+    assert_eq!(
+        controller.state.config.current_thinking(),
+        ThinkingLevel::High
+    );
 }
 
 #[tokio::test]
@@ -648,12 +651,11 @@ async fn retry_backoff_polls_ui_actions() {
     // UI action during the backoff window arrives and is
     // processed promptly. If this test ever hangs, the
     // non-blocking backoff isn't in place.
-    ui_tx
-        .send(UiAction::GetState)
-        .expect("send GetState");
-    wait_for_event(&mut event_rx, |event| {
-        matches!(event, AgentEvent::SystemMessage { text } if text.contains("Session:"))
-    })
+    ui_tx.send(UiAction::GetState).expect("send GetState");
+    wait_for_event(
+        &mut event_rx,
+        |event| matches!(event, AgentEvent::SystemMessage { text } if text.contains("Session:")),
+    )
     .await;
 
     // Clean up: advance time past the retry deadline so the
@@ -831,8 +833,7 @@ async fn unbounded_action_channel_accepts_burst_without_drops() {
     let mut processed = 0;
     while processed < BURST {
         let event = event_rx.recv().await.expect("event");
-        if matches!(event, AgentEvent::SystemMessage { ref text } if text.starts_with("Session:"))
-        {
+        if matches!(event, AgentEvent::SystemMessage { ref text } if text.starts_with("Session:")) {
             processed += 1;
         }
     }

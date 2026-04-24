@@ -336,10 +336,7 @@ async fn discover_openai_compatible_models(
     // agent stores has no `/v1`. Every other OpenAI-compatible
     // provider normalizes to `<base>/v1/models`.
     let url = if request.provider_name.eq_ignore_ascii_case("github-copilot") {
-        format!(
-            "{}/models",
-            request.base_url.trim().trim_end_matches('/')
-        )
+        format!("{}/models", request.base_url.trim().trim_end_matches('/'))
     } else {
         format!("{}/models", normalize_openai_base_url(&request.base_url))
     };
@@ -367,12 +364,11 @@ async fn discover_openai_compatible_models(
             if !provider_is_openrouter {
                 return true;
             }
-            entry
-                .supported_parameters
-                .as_deref()
-                .is_some_and(|params| {
-                    params.iter().any(|param| param.eq_ignore_ascii_case("tools"))
-                })
+            entry.supported_parameters.as_deref().is_some_and(|params| {
+                params
+                    .iter()
+                    .any(|param| param.eq_ignore_ascii_case("tools"))
+            })
         })
         .filter(|entry| {
             // GitHub Copilot's /models response is a mixed bag:
@@ -387,12 +383,10 @@ async fn discover_openai_compatible_models(
             if !provider_is_copilot {
                 return true;
             }
-            let endpoints_ok = entry
-                .supported_endpoints
-                .as_deref()
-                .is_some_and(|eps| {
-                    eps.iter().any(|ep| ep.eq_ignore_ascii_case("/chat/completions"))
-                });
+            let endpoints_ok = entry.supported_endpoints.as_deref().is_some_and(|eps| {
+                eps.iter()
+                    .any(|ep| ep.eq_ignore_ascii_case("/chat/completions"))
+            });
             let type_ok = entry
                 .model_type
                 .as_deref()
@@ -1407,10 +1401,7 @@ mod tests {
             }]
         }"#;
 
-        let server = spawn_mock_server(move |_path, _headers| {
-            MockResponse::ok_json(fixture)
-        })
-        .await;
+        let server = spawn_mock_server(move |_path, _headers| MockResponse::ok_json(fixture)).await;
 
         let models = discover_models(&request(
             "github-copilot",
@@ -1439,10 +1430,7 @@ mod tests {
             "data": [{"id": "gpt-4o"}]
         }"#;
 
-        let server = spawn_mock_server(move |_path, _headers| {
-            MockResponse::ok_json(fixture)
-        })
-        .await;
+        let server = spawn_mock_server(move |_path, _headers| MockResponse::ok_json(fixture)).await;
 
         let models = discover_models(&request(
             "openai",
@@ -1467,10 +1455,7 @@ mod tests {
             ]
         }"#;
 
-        let server = spawn_mock_server(move |_path, _headers| {
-            MockResponse::ok_json(fixture)
-        })
-        .await;
+        let server = spawn_mock_server(move |_path, _headers| MockResponse::ok_json(fixture)).await;
 
         let models = discover_models(&request(
             "openai",
@@ -1486,10 +1471,8 @@ mod tests {
 
     #[tokio::test]
     async fn openrouter_discovery_falls_back_when_fetch_fails() {
-        let server = spawn_mock_server(|_path, _headers| {
-            MockResponse::status(401, "invalid api key")
-        })
-        .await;
+        let server =
+            spawn_mock_server(|_path, _headers| MockResponse::status(401, "invalid api key")).await;
 
         let error = discover_models(&request(
             "openrouter",

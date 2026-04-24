@@ -98,7 +98,10 @@ impl OAuthProvider for OpenAICodexOAuthProvider {
     }
 
     async fn begin_login(&self) -> Result<LoginFlow> {
-        let PkcePair { verifier, challenge } = generate_pkce();
+        let PkcePair {
+            verifier,
+            challenge,
+        } = generate_pkce();
         let state = generate_state();
 
         let params = [
@@ -136,9 +139,8 @@ impl OAuthProvider for OpenAICodexOAuthProvider {
         let flow = flow.as_auth_code().ok_or_else(|| {
             anyhow!("OpenAI Codex uses authorization-code flow; device flow not supported")
         })?;
-        let code = code.ok_or_else(|| {
-            anyhow!("OpenAI Codex login requires the authorization code")
-        })?;
+        let code =
+            code.ok_or_else(|| anyhow!("OpenAI Codex login requires the authorization code"))?;
 
         let form = [
             ("grant_type", "authorization_code"),
@@ -147,10 +149,9 @@ impl OAuthProvider for OpenAICodexOAuthProvider {
             ("code_verifier", flow.verifier.as_str()),
             ("redirect_uri", flow.redirect_uri.as_str()),
         ];
-        let response: CodexTokenResponse =
-            post_form(&self.client, &self.token_url, &form)
-                .await
-                .context("authorization_code exchange failed")?;
+        let response: CodexTokenResponse = post_form(&self.client, &self.token_url, &form)
+            .await
+            .context("authorization_code exchange failed")?;
 
         Ok(build_credential(response, None)?)
     }
@@ -161,10 +162,9 @@ impl OAuthProvider for OpenAICodexOAuthProvider {
             ("refresh_token", credential.refresh_token.as_str()),
             ("client_id", CLIENT_ID),
         ];
-        let response: CodexTokenResponse =
-            post_form(&self.client, &self.token_url, &form)
-                .await
-                .context("refresh_token exchange failed")?;
+        let response: CodexTokenResponse = post_form(&self.client, &self.token_url, &form)
+            .await
+            .context("refresh_token exchange failed")?;
 
         // Preserve the account label across refresh — the token
         // endpoint returns a fresh JWT that also carries the
@@ -284,7 +284,10 @@ mod tests {
 
     #[test]
     fn default_redirect_uri_matches_registered_codex_route() {
-        assert_eq!(default_redirect_uri(), "http://localhost:1455/auth/callback");
+        assert_eq!(
+            default_redirect_uri(),
+            "http://localhost:1455/auth/callback"
+        );
     }
 
     #[test]
@@ -412,11 +415,8 @@ mod tests {
             format!("{}/oauth/token", server.uri()),
             default_redirect_uri(),
         );
-        let prior = OAuthCredentialData::new(
-            "old".into(),
-            "old".into(),
-            "2026-04-20T00:00:00Z".into(),
-        );
+        let prior =
+            OAuthCredentialData::new("old".into(), "old".into(), "2026-04-20T00:00:00Z".into());
         let refreshed = provider.refresh(&prior).await.expect("refresh");
         assert_eq!(refreshed.account.as_deref(), Some("acct_from_new_jwt"));
     }
@@ -440,7 +440,10 @@ mod tests {
         let flow = provider.begin_login().await.expect("begin");
         let err = format!(
             "{:#}",
-            provider.complete_login(&flow, Some("bad")).await.unwrap_err()
+            provider
+                .complete_login(&flow, Some("bad"))
+                .await
+                .unwrap_err()
         );
         assert!(err.contains("HTTP 400"), "{err}");
         assert!(err.contains("invalid_grant"), "{err}");

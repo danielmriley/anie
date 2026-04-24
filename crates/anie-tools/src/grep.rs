@@ -135,9 +135,7 @@ impl Tool for GrepTool {
             run_search(&cwd, &search_root, &options, &cancel_flag)
         })
         .await
-        .map_err(|error| {
-            ToolError::ExecutionFailed(format!("grep task join error: {error}"))
-        })??;
+        .map_err(|error| ToolError::ExecutionFailed(format!("grep task join error: {error}")))??;
         watcher_handle.abort();
 
         let details = serde_json::json!({
@@ -389,11 +387,8 @@ impl<'a> MatchCollector<'a> {
             + truncated_line.len()
             + 1; // trailing newline
 
-        if crate::shared::would_exceed_byte_limit(
-            self.output.len(),
-            addition_len,
-            self.byte_limit,
-        ) {
+        if crate::shared::would_exceed_byte_limit(self.output.len(), addition_len, self.byte_limit)
+        {
             if self.truncated_reason.is_none() {
                 *self.truncated_reason =
                     Some("50 KB byte limit reached. Narrow the pattern or path.".to_string());
@@ -434,11 +429,7 @@ fn line_number_digit_count(n: u64) -> usize {
 impl<'a> Sink for MatchCollector<'a> {
     type Error = std::io::Error;
 
-    fn matched(
-        &mut self,
-        _searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         self.file_had_match = true;
         let line_number = mat.line_number().unwrap_or(0);
         for line in mat.lines() {
@@ -513,7 +504,8 @@ mod tests {
         args: serde_json::Value,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let tool = GrepTool::new(cwd);
-        tool.execute("call", args, CancellationToken::new(), None).await
+        tool.execute("call", args, CancellationToken::new(), None)
+            .await
     }
 
     fn text_body(result: &anie_protocol::ToolResult) -> String {
@@ -538,12 +530,9 @@ mod tests {
                 ("b.txt", "beta\ndelta\n"),
             ],
         );
-        let result = run_grep(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "beta" }),
-        )
-        .await
-        .expect("grep");
+        let result = run_grep(tempdir.path(), serde_json::json!({ "pattern": "beta" }))
+            .await
+            .expect("grep");
         let body = text_body(&result);
         assert!(body.contains("a.txt:2:beta"), "{body}");
         assert!(body.contains("b.txt:1:beta"), "{body}");
@@ -555,12 +544,9 @@ mod tests {
     async fn grep_ignore_case_flag() {
         let tempdir = tempdir().expect("tempdir");
         make_tree(tempdir.path(), &[("a.txt", "Beta\nGamma\n")]);
-        let strict = run_grep(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "beta" }),
-        )
-        .await
-        .expect("strict");
+        let strict = run_grep(tempdir.path(), serde_json::json!({ "pattern": "beta" }))
+            .await
+            .expect("strict");
         assert_eq!(strict.details["match_count"], 0);
         let loose = run_grep(
             tempdir.path(),
@@ -576,12 +562,9 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         make_tree(tempdir.path(), &[("a.txt", "a.b.c\naXb\n")]);
         // `.` is a regex wildcard by default → matches both lines.
-        let regex = run_grep(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "a.b" }),
-        )
-        .await
-        .expect("regex");
+        let regex = run_grep(tempdir.path(), serde_json::json!({ "pattern": "a.b" }))
+            .await
+            .expect("regex");
         assert_eq!(regex.details["match_count"], 2);
         // Literal → only the line with the literal `a.b` matches.
         let literal = run_grep(
@@ -607,12 +590,9 @@ mod tests {
         // Initialize as a git repo so the ignore crate treats
         // .gitignore as a ripgrep-style source of truth.
         std::fs::create_dir_all(tempdir.path().join(".git")).expect("mkdir .git");
-        let result = run_grep(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "beta" }),
-        )
-        .await
-        .expect("grep");
+        let result = run_grep(tempdir.path(), serde_json::json!({ "pattern": "beta" }))
+            .await
+            .expect("grep");
         let body = text_body(&result);
         assert!(body.contains("visible.txt"));
         assert!(!body.contains("ignored.txt"));
@@ -659,10 +639,7 @@ mod tests {
     #[tokio::test]
     async fn grep_includes_context_lines_when_requested() {
         let tempdir = tempdir().expect("tempdir");
-        make_tree(
-            tempdir.path(),
-            &[("a.txt", "before\nmatchline\nafter\n")],
-        );
+        make_tree(tempdir.path(), &[("a.txt", "before\nmatchline\nafter\n")]);
         let result = run_grep(
             tempdir.path(),
             serde_json::json!({ "pattern": "matchline", "context": 1 }),
@@ -678,12 +655,9 @@ mod tests {
     #[tokio::test]
     async fn grep_empty_pattern_errors() {
         let tempdir = tempdir().expect("tempdir");
-        let err = run_grep(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "" }),
-        )
-        .await
-        .expect_err("empty pattern should error");
+        let err = run_grep(tempdir.path(), serde_json::json!({ "pattern": "" }))
+            .await
+            .expect_err("empty pattern should error");
         assert!(matches!(err, ToolError::ExecutionFailed(msg) if msg.contains("empty")));
     }
 
@@ -691,12 +665,9 @@ mod tests {
     async fn grep_no_matches_returns_zero_count() {
         let tempdir = tempdir().expect("tempdir");
         make_tree(tempdir.path(), &[("a.txt", "nothing here\n")]);
-        let result = run_grep(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "xyz" }),
-        )
-        .await
-        .expect("grep");
+        let result = run_grep(tempdir.path(), serde_json::json!({ "pattern": "xyz" }))
+            .await
+            .expect("grep");
         assert_eq!(result.details["match_count"], 0);
         assert!(text_body(&result).contains("No matches"));
     }
@@ -707,12 +678,9 @@ mod tests {
         let long = "a".repeat(1_000);
         let content = format!("{long}match\n");
         make_tree(tempdir.path(), &[("a.txt", content.as_str())]);
-        let result = run_grep(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "match" }),
-        )
-        .await
-        .expect("grep");
+        let result = run_grep(tempdir.path(), serde_json::json!({ "pattern": "match" }))
+            .await
+            .expect("grep");
         let body = text_body(&result);
         assert!(body.contains('…'), "long line should be truncated: {body}");
     }

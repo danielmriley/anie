@@ -105,8 +105,7 @@ impl TaggedReasoningSplitter {
                             // Plan 06 PR-D: move-based split (see
                             // Text mode above).
                             let tail = self.pending.split_off(close_index);
-                            let thinking =
-                                std::mem::replace(&mut self.pending, tail);
+                            let thinking = std::mem::replace(&mut self.pending, tail);
                             Self::push_part(&mut parts, StreamContentPart::Thinking(thinking));
                             continue;
                         }

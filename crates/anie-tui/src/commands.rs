@@ -214,7 +214,10 @@ mod tests {
     fn validate_none_rejects_trailing_argument() {
         let info = SlashCommandInfo::builtin("quit", "Quit anie");
         let err = info.validate(Some("now")).expect_err("reject");
-        assert!(err.contains("/quit") && err.contains("no arguments"), "{err}");
+        assert!(
+            err.contains("/quit") && err.contains("no arguments"),
+            "{err}"
+        );
     }
 
     #[test]

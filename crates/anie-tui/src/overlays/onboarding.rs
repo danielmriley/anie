@@ -1120,8 +1120,7 @@ impl OnboardingScreen {
                 }
             }
             ModelPickerContext::ApiPreset { preset, .. } => {
-                let mut model =
-                    model_info.to_model(preset.model.api, &preset.model.base_url);
+                let mut model = model_info.to_model(preset.model.api, &preset.model.base_url);
                 model.provider = preset.provider_name.to_string();
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
@@ -2226,8 +2225,7 @@ mod tests {
             preset,
             api_key: "sk-or-example".into(),
         };
-        let request =
-            discovery_request_for_context(&context).expect("discovery request");
+        let request = discovery_request_for_context(&context).expect("discovery request");
         assert_eq!(request.provider_name, "openrouter");
         assert_eq!(request.api, ApiKind::OpenAICompletions);
         assert_eq!(request.base_url, "https://openrouter.ai/api/v1");

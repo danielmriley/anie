@@ -54,21 +54,20 @@ impl TerminalCapabilities {
         let any = |keys: &[&str]| keys.iter().any(|k| get(k).is_some());
 
         let inside_multiplexer = get("TMUX").is_some()
-            || get("TERM")
-                .is_some_and(|v| v.starts_with("tmux") || v.starts_with("screen"));
+            || get("TERM").is_some_and(|v| v.starts_with("tmux") || v.starts_with("screen"));
 
         let term_program = get("TERM_PROGRAM").unwrap_or_default();
 
         let is_kitty = any(&["KITTY_WINDOW_ID"])
             || term_program.eq_ignore_ascii_case("ghostty")
             || get("GHOSTTY_RESOURCES_DIR").is_some();
-        let is_iterm = term_program.eq_ignore_ascii_case("iTerm.app")
-            || get("ITERM_SESSION_ID").is_some();
-        let is_wezterm = term_program.eq_ignore_ascii_case("WezTerm")
-            || get("WEZTERM_PANE").is_some();
+        let is_iterm =
+            term_program.eq_ignore_ascii_case("iTerm.app") || get("ITERM_SESSION_ID").is_some();
+        let is_wezterm =
+            term_program.eq_ignore_ascii_case("WezTerm") || get("WEZTERM_PANE").is_some();
         let is_vscode = term_program.eq_ignore_ascii_case("vscode");
-        let is_alacritty = term_program.eq_ignore_ascii_case("alacritty")
-            || get("ALACRITTY_WINDOW_ID").is_some();
+        let is_alacritty =
+            term_program.eq_ignore_ascii_case("alacritty") || get("ALACRITTY_WINDOW_ID").is_some();
 
         // Image protocol: only honored outside multiplexers.
         // Kitty and Ghostty both speak the Kitty protocol. iTerm
@@ -86,9 +85,9 @@ impl TerminalCapabilities {
         // Truecolor: advertised via COLORTERM or implied by
         // terminals we know emit it. VS Code's terminal also
         // supports truecolor.
-        let truecolor = get("COLORTERM")
-            .is_some_and(|v| v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit"))
-            || is_kitty
+        let truecolor = get("COLORTERM").is_some_and(|v| {
+            v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit")
+        }) || is_kitty
             || is_iterm
             || is_wezterm
             || is_vscode

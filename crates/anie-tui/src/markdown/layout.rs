@@ -209,10 +209,8 @@ impl<'a> LineBuilder<'a> {
                 // so the element doesn't silently vanish.
                 self.flush_line();
                 let rule = "─".repeat(self.width.max(1) as usize);
-                self.lines.push(Line::from(Span::styled(
-                    rule,
-                    self.theme.horizontal_rule,
-                )));
+                self.lines
+                    .push(Line::from(Span::styled(rule, self.theme.horizontal_rule)));
                 self.push_blank_separator();
             }
             Event::TaskListMarker(checked) => {
@@ -279,9 +277,7 @@ impl<'a> LineBuilder<'a> {
             }
             Tag::List(start) => {
                 self.flush_line();
-                self.list_stack.push(ListFrame {
-                    next_number: start,
-                });
+                self.list_stack.push(ListFrame { next_number: start });
             }
             Tag::Item => {
                 // Flush whatever was pending from a prior item.
@@ -480,8 +476,7 @@ impl<'a> LineBuilder<'a> {
             return;
         }
 
-        let first_prefix = first_prefix_override
-            .unwrap_or_else(|| self.continuation_prefix());
+        let first_prefix = first_prefix_override.unwrap_or_else(|| self.continuation_prefix());
         let cont_prefix = self.continuation_prefix();
         let first_width = prefix_span_width(&first_prefix);
         let cont_width = prefix_span_width(&cont_prefix);
@@ -775,11 +770,8 @@ impl<'a> LineBuilder<'a> {
         ));
 
         for highlighted in super::syntax::highlight_code(code, state.lang.as_deref()) {
-            self.lines.push(build_code_body_line(
-                highlighted,
-                inner,
-                border_style,
-            ));
+            self.lines
+                .push(build_code_body_line(highlighted, inner, border_style));
         }
 
         self.lines.push(build_bottom_border(width, border_style));
@@ -1112,18 +1104,13 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
                 continue;
             }
             if current_cells.len() >= width {
-                let break_at = current_cells
-                    .iter()
-                    .rposition(|(c, _)| c.is_whitespace());
+                let break_at = current_cells.iter().rposition(|(c, _)| c.is_whitespace());
                 match break_at {
                     Some(idx) if idx + 1 < current_cells.len() => {
                         let remainder = current_cells.split_off(idx + 1);
                         // Drop the whitespace cell itself from
                         // the flushed line's tail.
-                        while current_cells
-                            .last()
-                            .is_some_and(|(c, _)| c.is_whitespace())
-                        {
+                        while current_cells.last().is_some_and(|(c, _)| c.is_whitespace()) {
                             current_cells.pop();
                         }
                         lines.push(cells_to_line(std::mem::take(&mut current_cells)));
@@ -1234,7 +1221,10 @@ fn cells_to_line(cells: Vec<(char, Style)>) -> Line<'static> {
     for (ch, style) in cells {
         if style != current_style {
             if !current_text.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut current_text), current_style));
+                spans.push(Span::styled(
+                    std::mem::take(&mut current_text),
+                    current_style,
+                ));
             }
             current_style = style;
         }
@@ -1279,26 +1269,17 @@ mod tests {
     #[test]
     fn two_paragraphs_are_separated_by_a_blank_line() {
         let out = render_plain("first\n\nsecond", 80);
-        assert_eq!(out, vec!["first".to_string(), String::new(), "second".into()]);
+        assert_eq!(
+            out,
+            vec!["first".to_string(), String::new(), "second".into()]
+        );
     }
 
     #[test]
     fn heading_levels_apply_distinct_styles() {
-        let h1 = render(
-            "# title",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
-        let h2 = render(
-            "## title",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
-        let h3 = render(
-            "### title",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
+        let h1 = render("# title", 80, &MarkdownTheme::default_dark());
+        let h2 = render("## title", 80, &MarkdownTheme::default_dark());
+        let h3 = render("### title", 80, &MarkdownTheme::default_dark());
         // Compare styles on the first (non-blank) span of each.
         let style_of = |lines: &[Line<'static>]| {
             lines
@@ -1314,11 +1295,7 @@ mod tests {
 
     #[test]
     fn inline_bold_applies_bold_modifier() {
-        let lines = render(
-            "foo **bar** baz",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
+        let lines = render("foo **bar** baz", 80, &MarkdownTheme::default_dark());
         let spans: Vec<_> = lines
             .into_iter()
             .flat_map(|line| line.spans.into_iter())
@@ -1346,11 +1323,7 @@ mod tests {
 
     #[test]
     fn inline_strikethrough_applies_crossed_out_modifier() {
-        let lines = render(
-            "x ~~gone~~ y",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
+        let lines = render("x ~~gone~~ y", 80, &MarkdownTheme::default_dark());
         let spans: Vec<_> = lines
             .into_iter()
             .flat_map(|l| l.spans.into_iter())
@@ -1364,11 +1337,7 @@ mod tests {
 
     #[test]
     fn inline_code_is_styled_distinctly() {
-        let lines = render(
-            "run `cargo test` now",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
+        let lines = render("run `cargo test` now", 80, &MarkdownTheme::default_dark());
         let spans: Vec<_> = lines
             .into_iter()
             .flat_map(|l| l.spans.into_iter())
@@ -1440,23 +1409,20 @@ mod tests {
     #[test]
     fn fenced_code_block_embeds_language_label_in_top_border() {
         let out = render_plain("```rust\nfn main() {}\n```", 30);
-        let top = out
-            .iter()
-            .find(|l| l.starts_with('╭'))
-            .expect("top border");
+        let top = out.iter().find(|l| l.starts_with('╭')).expect("top border");
         assert!(top.contains("rust"), "top border missing lang: {top}");
     }
 
     #[test]
     fn bare_code_block_omits_language_label() {
         let out = render_plain("```\nplain\n```", 20);
-        let top = out
-            .iter()
-            .find(|l| l.starts_with('╭'))
-            .expect("top border");
+        let top = out.iter().find(|l| l.starts_with('╭')).expect("top border");
         // Bare block should be just ╭─…─╮ with no embedded text.
         assert!(
-            top.chars().skip(1).take(top.chars().count() - 2).all(|c| c == '─'),
+            top.chars()
+                .skip(1)
+                .take(top.chars().count() - 2)
+                .all(|c| c == '─'),
             "bare top should be all dashes between corners: {top:?}"
         );
     }
@@ -1464,10 +1430,7 @@ mod tests {
     #[test]
     fn fenced_code_block_emits_one_body_line_per_source_line() {
         let out = render_plain("```\nline one\nline two\nline three\n```", 30);
-        let body_lines: Vec<_> = out
-            .iter()
-            .filter(|l| l.starts_with('│'))
-            .collect();
+        let body_lines: Vec<_> = out.iter().filter(|l| l.starts_with('│')).collect();
         assert_eq!(body_lines.len(), 3, "body lines: {out:?}");
     }
 
@@ -1476,10 +1439,7 @@ mod tests {
         // width=20 → inner=16. Each body line should be exactly
         // 20 chars wide including borders (1 + 1 + 16 + 1 + 1 = 20)
         let out = render_plain("```\nx\n```", 20);
-        let body = out
-            .iter()
-            .find(|l| l.starts_with('│'))
-            .expect("body");
+        let body = out.iter().find(|l| l.starts_with('│')).expect("body");
         assert_eq!(body.chars().count(), 20, "width != 20: {body:?}");
     }
 
@@ -1497,10 +1457,7 @@ mod tests {
         // pulldown-cmark passes "rust,ignore" through as-is. We
         // split on comma/space so syntect still finds the lang.
         let out = render_plain("```rust,ignore\nfn main() {}\n```", 30);
-        let top = out
-            .iter()
-            .find(|l| l.starts_with('╭'))
-            .expect("top border");
+        let top = out.iter().find(|l| l.starts_with('╭')).expect("top border");
         assert!(top.contains("rust"), "expected lang=rust: {top}");
         assert!(!top.contains("ignore"), "attr leaked into label: {top}");
     }
@@ -1545,38 +1502,24 @@ mod tests {
 
     #[test]
     fn link_text_is_styled_with_link_text_theme() {
-        let lines = render(
-            "[doc](https://x.io)",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
+        let lines = render("[doc](https://x.io)", 80, &MarkdownTheme::default_dark());
         let text_span = lines
             .iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.as_ref() == "doc")
             .expect("link text span");
-        assert_eq!(
-            text_span.style,
-            MarkdownTheme::default_dark().link_text
-        );
+        assert_eq!(text_span.style, MarkdownTheme::default_dark().link_text);
     }
 
     #[test]
     fn link_trailing_url_is_styled_with_link_url_theme() {
-        let lines = render(
-            "[doc](https://x.io)",
-            80,
-            &MarkdownTheme::default_dark(),
-        );
+        let lines = render("[doc](https://x.io)", 80, &MarkdownTheme::default_dark());
         let url_span = lines
             .iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("(https://x.io)"))
             .expect("url span");
-        assert_eq!(
-            url_span.style,
-            MarkdownTheme::default_dark().link_url
-        );
+        assert_eq!(url_span.style, MarkdownTheme::default_dark().link_url);
     }
 
     #[test]
@@ -1629,10 +1572,7 @@ mod tests {
         let out = render_plain(md, 80);
         // Every row's leftmost cell frame should fit "loooong"
         // with its 1-space padding on each side.
-        let body_rows: Vec<&String> = out
-            .iter()
-            .filter(|l| l.starts_with('│'))
-            .collect();
+        let body_rows: Vec<&String> = out.iter().filter(|l| l.starts_with('│')).collect();
         assert!(!body_rows.is_empty());
         // First data cell in row 0 is "x" padded to 7 chars.
         let header_row = body_rows[0];
@@ -1881,10 +1821,7 @@ mod tests {
     fn long_list_item_wraps_with_continuation_indent() {
         // Width 14 — forces wrapping. Item text is 18 chars.
         let out = render_plain("- alpha beta gamma", 14);
-        let first = out
-            .iter()
-            .find(|l| l.contains("• "))
-            .expect("bullet line");
+        let first = out.iter().find(|l| l.contains("• ")).expect("bullet line");
         let bullet_col = first.find('•').expect("bullet col");
         // A continuation line (no bullet) should start with at
         // least `bullet_col + 2` spaces so wrapped content aligns
@@ -1910,10 +1847,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains('•'))
             .expect("bullet span");
-        assert_eq!(
-            bullet_span.style,
-            MarkdownTheme::default_dark().list_bullet
-        );
+        assert_eq!(bullet_span.style, MarkdownTheme::default_dark().list_bullet);
     }
 
     #[test]

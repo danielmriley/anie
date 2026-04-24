@@ -359,7 +359,9 @@ struct OpenAiToolCallState {
 #[cfg(test)]
 mod tests {
     use anie_protocol::{AssistantMessage, ContentBlock, ToolCall};
-    use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ProviderError, ProviderEvent};
+    use anie_provider::{
+        ApiKind, CostPerMillion, Model, ModelCompat, ProviderError, ProviderEvent,
+    };
 
     use super::*;
 

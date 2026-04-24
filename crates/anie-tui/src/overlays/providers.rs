@@ -1068,12 +1068,10 @@ fn load_provider_entries(
             let provider_config = config.providers.get(&name);
             let builtin_default = builtin_catalog.iter().find(|model| model.provider == name);
             let stored_credential = credential_store.get_credential(&name);
-            let oauth_defaults = stored_credential
-                .as_ref()
-                .and_then(|cred| match cred {
-                    AuthCredential::OAuth { .. } => oauth_provider_display_defaults(&name),
-                    _ => None,
-                });
+            let oauth_defaults = stored_credential.as_ref().and_then(|cred| match cred {
+                AuthCredential::OAuth { .. } => oauth_provider_display_defaults(&name),
+                _ => None,
+            });
             let default_model = if has_any_config && config.model.provider == name {
                 config.model.id.clone()
             } else {
@@ -1088,22 +1086,17 @@ fn load_provider_entries(
             // (Copilot's proxy-ep rewrite). Prefer the stored
             // value so the /providers card shows the user's
             // actual endpoint rather than the generic default.
-            let oauth_base_url = stored_credential
-                .as_ref()
-                .and_then(|cred| match cred {
-                    AuthCredential::OAuth { api_base_url, .. } => api_base_url.clone(),
-                    _ => None,
-                });
+            let oauth_base_url = stored_credential.as_ref().and_then(|cred| match cred {
+                AuthCredential::OAuth { api_base_url, .. } => api_base_url.clone(),
+                _ => None,
+            });
             let base_url = provider_config
                 .and_then(|provider| provider.base_url.clone())
                 .or(oauth_base_url)
                 .or_else(|| builtin_default.map(|model| model.base_url.clone()))
                 .or_else(|| oauth_defaults.map(|(_, url)| url.to_string()));
-            let provider_type = classify_provider_type(
-                &name,
-                base_url.as_deref(),
-                stored_credential.as_ref(),
-            );
+            let provider_type =
+                classify_provider_type(&name, base_url.as_deref(), stored_credential.as_ref());
             ProviderEntry {
                 has_credential: stored_credential.is_some(),
                 is_default: has_any_config && config.model.provider == name,
@@ -1155,9 +1148,10 @@ fn oauth_provider_display_defaults(provider: &str) -> Option<(&'static str, &'st
         )),
         "openai-codex" => Some(("gpt-5", "https://api.openai.com/v1")),
         "google-gemini-cli" => Some(("gemini-2.5-pro", "https://cloudcode-pa.googleapis.com")),
-        "google-antigravity" => {
-            Some(("gemini-3-pro-preview", "https://cloudcode-pa.googleapis.com"))
-        }
+        "google-antigravity" => Some((
+            "gemini-3-pro-preview",
+            "https://cloudcode-pa.googleapis.com",
+        )),
         "anthropic" => Some(("claude-sonnet-4-6", "https://api.anthropic.com")),
         _ => None,
     }

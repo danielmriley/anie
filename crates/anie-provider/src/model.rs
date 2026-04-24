@@ -403,10 +403,7 @@ mod tests {
             pricing: None,
             supported_parameters: None,
         };
-        let model = info.to_model(
-            ApiKind::OpenAICompletions,
-            "https://openrouter.ai/api/v1",
-        );
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
         assert_eq!(model.max_tokens, 262_144);
         assert_eq!(model.context_window, 262_144);
     }
@@ -428,10 +425,7 @@ mod tests {
             pricing: None,
             supported_parameters: None,
         };
-        let model = info.to_model(
-            ApiKind::OpenAICompletions,
-            "https://api.openai.com/v1",
-        );
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://api.openai.com/v1");
         assert_eq!(model.max_tokens, 8_192);
     }
 
@@ -523,14 +517,16 @@ mod tests {
         // Both optional fields should be skipped → the struct
         // serializes as an empty object.
         assert_eq!(json, "{}");
-        let roundtrip: OpenAICompletionsCompat =
-            serde_json::from_str(&json).expect("deserialize");
+        let roundtrip: OpenAICompletionsCompat = serde_json::from_str(&json).expect("deserialize");
         assert!(roundtrip.max_tokens_field.is_none());
     }
 
     #[test]
     fn max_tokens_field_variants_roundtrip() {
-        for variant in [MaxTokensField::MaxTokens, MaxTokensField::MaxCompletionTokens] {
+        for variant in [
+            MaxTokensField::MaxTokens,
+            MaxTokensField::MaxCompletionTokens,
+        ] {
             let compat = OpenAICompletionsCompat {
                 max_tokens_field: Some(variant),
                 ..Default::default()

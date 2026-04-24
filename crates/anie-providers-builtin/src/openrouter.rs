@@ -106,8 +106,7 @@ pub fn apply_openrouter_capabilities(model: &mut Model) {
     if !is_openrouter_target(&model.base_url) {
         return;
     }
-    let (replay, reasoning) =
-        openrouter_capabilities_for(&model.id, model.supports_reasoning);
+    let (replay, reasoning) = openrouter_capabilities_for(&model.id, model.supports_reasoning);
     if replay.is_some() {
         model.replay_capabilities = replay;
     }
@@ -125,12 +124,11 @@ pub fn apply_openrouter_capabilities(model: &mut Model) {
             anie_provider::ModelCompat::OpenAICompletions(compat) => compat,
             anie_provider::ModelCompat::None => anie_provider::OpenAICompletionsCompat::default(),
         };
-        model.compat = anie_provider::ModelCompat::OpenAICompletions(
-            anie_provider::OpenAICompletionsCompat {
+        model.compat =
+            anie_provider::ModelCompat::OpenAICompletions(anie_provider::OpenAICompletionsCompat {
                 max_tokens_field: Some(anie_provider::MaxTokensField::MaxCompletionTokens),
                 ..current_compat
-            },
-        );
+            });
     }
 }
 
@@ -380,7 +378,8 @@ mod tests {
             true,
         )));
         assert!(!needs_anthropic_cache_control(&openrouter_model(
-            "openai/o3", true,
+            "openai/o3",
+            true,
         )));
 
         let mut direct_anthropic = openrouter_model("claude-sonnet-4-6", true);
@@ -421,7 +420,9 @@ mod tests {
             "content": "one-shot question",
         })];
         insert_anthropic_cache_control(&mut messages);
-        let parts = messages[0]["content"].as_array().expect("promoted to array");
+        let parts = messages[0]["content"]
+            .as_array()
+            .expect("promoted to array");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "one-shot question");

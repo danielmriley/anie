@@ -28,17 +28,15 @@
 //! `anie.log.*` rolling-append policy.
 
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static RENDER_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn log_enabled() -> bool {
-    *LOG_ENABLED.get_or_init(|| {
-        std::env::var("ANIE_DEBUG_REDRAW").ok().as_deref() == Some("1")
-    })
+    *LOG_ENABLED.get_or_init(|| std::env::var("ANIE_DEBUG_REDRAW").ok().as_deref() == Some("1"))
 }
 
 /// Scope guard for one paint cycle. Create at the top of the
@@ -305,8 +303,7 @@ mod tests {
             fields: serde_json::Map::new(),
         };
         let line = span.serialize_line(10, 20);
-        let parsed: serde_json::Value =
-            serde_json::from_str(line.trim_end()).expect("valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).expect("valid JSON");
         let obj = parsed.as_object().expect("object");
         assert_eq!(obj.len(), 3, "only kind, elapsed_us, ts_ms expected");
         assert!(obj.contains_key("kind"));
@@ -329,8 +326,7 @@ mod tests {
         span.record("elapsed_us", 999_999_u64);
         span.record("ts_ms", 0_u64);
         let line = span.serialize_line(1, 2);
-        let parsed: serde_json::Value =
-            serde_json::from_str(line.trim_end()).expect("valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).expect("valid JSON");
         assert_eq!(parsed["kind"], "build_lines");
         assert_eq!(parsed["elapsed_us"], 1);
         assert_eq!(parsed["ts_ms"], 2);

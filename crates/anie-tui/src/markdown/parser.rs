@@ -30,8 +30,16 @@ mod tests {
     #[test]
     fn parse_emits_events_for_a_simple_paragraph() {
         let events: Vec<_> = parse("hello world").collect();
-        assert!(events.iter().any(|e| matches!(e, Event::Start(Tag::Paragraph))));
-        assert!(events.iter().any(|e| matches!(e, Event::End(TagEnd::Paragraph))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Start(Tag::Paragraph)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::End(TagEnd::Paragraph)))
+        );
     }
 
     #[test]

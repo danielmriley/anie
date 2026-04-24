@@ -38,8 +38,7 @@ use crate::oauth::{
     generate_pkce,
 };
 
-const CLIENT_ID_B64: &str =
-    "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
+const CLIENT_ID_B64: &str = "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
 const CLIENT_SECRET_B64: &str = "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=";
 
 const DEFAULT_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -137,7 +136,10 @@ impl OAuthProvider for GoogleAntigravityOAuthProvider {
     }
 
     async fn begin_login(&self) -> Result<LoginFlow> {
-        let PkcePair { verifier, challenge } = generate_pkce();
+        let PkcePair {
+            verifier,
+            challenge,
+        } = generate_pkce();
         let client_id = Self::client_id()?;
         let scope = SCOPES.join(" ");
         let params = [
@@ -190,10 +192,9 @@ impl OAuthProvider for GoogleAntigravityOAuthProvider {
             ("code_verifier", flow.verifier.as_str()),
             ("redirect_uri", flow.redirect_uri.as_str()),
         ];
-        let response: GoogleTokenResponse =
-            post_form(&self.client, &self.token_url, &form)
-                .await
-                .context("authorization_code exchange failed")?;
+        let response: GoogleTokenResponse = post_form(&self.client, &self.token_url, &form)
+            .await
+            .context("authorization_code exchange failed")?;
 
         let refresh_token = response.refresh_token.clone().ok_or_else(|| {
             anyhow!(
@@ -207,10 +208,13 @@ impl OAuthProvider for GoogleAntigravityOAuthProvider {
             .await
             .ok()
             .flatten();
-        let project_id =
-            discover_project(&self.client, &self.discovery_endpoints, &response.access_token)
-                .await
-                .unwrap_or_else(|_| DEFAULT_PROJECT_ID.to_string());
+        let project_id = discover_project(
+            &self.client,
+            &self.discovery_endpoints,
+            &response.access_token,
+        )
+        .await
+        .unwrap_or_else(|_| DEFAULT_PROJECT_ID.to_string());
 
         Ok(OAuthCredentialData {
             access_token: response.access_token,
@@ -231,10 +235,9 @@ impl OAuthProvider for GoogleAntigravityOAuthProvider {
             ("client_secret", client_secret.as_str()),
             ("refresh_token", credential.refresh_token.as_str()),
         ];
-        let response: GoogleTokenResponse =
-            post_form(&self.client, &self.token_url, &form)
-                .await
-                .context("refresh_token exchange failed")?;
+        let response: GoogleTokenResponse = post_form(&self.client, &self.token_url, &form)
+            .await
+            .context("refresh_token exchange failed")?;
 
         Ok(OAuthCredentialData {
             access_token: response.access_token,
@@ -281,7 +284,10 @@ async fn fetch_user_email(
         .json()
         .await
         .map_err(|err| anyhow!("userinfo response did not parse: {err}"))?;
-    Ok(json.get("email").and_then(|v| v.as_str()).map(str::to_string))
+    Ok(json
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
 }
 
 /// Call `loadCodeAssist` against each discovery endpoint in
@@ -429,7 +435,10 @@ mod tests {
     #[test]
     fn client_secret_decodes_cleanly() {
         let secret = GoogleAntigravityOAuthProvider::client_secret().expect("decode");
-        assert!(secret.starts_with("GOCSPX-"), "secret must use Google's standard prefix");
+        assert!(
+            secret.starts_with("GOCSPX-"),
+            "secret must use Google's standard prefix"
+        );
         assert!(secret.len() > 10, "secret looks truncated");
     }
 
@@ -467,9 +476,7 @@ mod tests {
         let flow = provider.begin_login().await.expect("begin");
         let auth_code = flow.as_auth_code().expect("auth code");
         assert!(
-            auth_code
-                .authorize_url
-                .starts_with(DEFAULT_AUTHORIZE_URL),
+            auth_code.authorize_url.starts_with(DEFAULT_AUTHORIZE_URL),
             "{}",
             auth_code.authorize_url
         );

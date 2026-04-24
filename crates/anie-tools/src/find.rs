@@ -99,9 +99,7 @@ impl Tool for FindTool {
             .and_then(serde_json::Value::as_u64)
             .map(|value| usize::try_from(value).unwrap_or(DEFAULT_FIND_LIMIT))
             .unwrap_or(DEFAULT_FIND_LIMIT);
-        let search_root = self.resolve_path(
-            args.get("path").and_then(serde_json::Value::as_str),
-        );
+        let search_root = self.resolve_path(args.get("path").and_then(serde_json::Value::as_str));
         let cwd = Arc::clone(&self.cwd);
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -116,9 +114,7 @@ impl Tool for FindTool {
             run_find(&cwd, &search_root, &pattern, limit, &cancel_flag)
         })
         .await
-        .map_err(|error| {
-            ToolError::ExecutionFailed(format!("find task join error: {error}"))
-        })??;
+        .map_err(|error| ToolError::ExecutionFailed(format!("find task join error: {error}")))??;
         watcher_handle.abort();
 
         let details = serde_json::json!({
@@ -236,7 +232,8 @@ mod tests {
         args: serde_json::Value,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let tool = FindTool::new(cwd);
-        tool.execute("call", args, CancellationToken::new(), None).await
+        tool.execute("call", args, CancellationToken::new(), None)
+            .await
     }
 
     fn text_body(result: &anie_protocol::ToolResult) -> String {
@@ -258,12 +255,9 @@ mod tests {
             tempdir.path(),
             &["src/a.rs", "src/nested/b.rs", "docs/readme.md"],
         );
-        let result = run_find_tool(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "**/*.rs" }),
-        )
-        .await
-        .expect("find");
+        let result = run_find_tool(tempdir.path(), serde_json::json!({ "pattern": "**/*.rs" }))
+            .await
+            .expect("find");
         let body = text_body(&result);
         assert!(body.contains("src/a.rs"), "{body}");
         assert!(body.contains("src/nested/b.rs"), "{body}");
@@ -277,12 +271,9 @@ mod tests {
         make_tree(tempdir.path(), &[".gitignore", "target/out.rs", "src/a.rs"]);
         std::fs::write(tempdir.path().join(".gitignore"), "target/\n").expect("write");
         std::fs::create_dir_all(tempdir.path().join(".git")).expect("git dir");
-        let result = run_find_tool(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "**/*.rs" }),
-        )
-        .await
-        .expect("find");
+        let result = run_find_tool(tempdir.path(), serde_json::json!({ "pattern": "**/*.rs" }))
+            .await
+            .expect("find");
         let body = text_body(&result);
         assert!(body.contains("src/a.rs"));
         assert!(!body.contains("target/"));
@@ -312,12 +303,9 @@ mod tests {
     async fn find_no_matches_returns_zero() {
         let tempdir = tempdir().expect("tempdir");
         make_tree(tempdir.path(), &["hello.txt"]);
-        let result = run_find_tool(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "*.rs" }),
-        )
-        .await
-        .expect("find");
+        let result = run_find_tool(tempdir.path(), serde_json::json!({ "pattern": "*.rs" }))
+            .await
+            .expect("find");
         assert_eq!(result.details["count"], 0);
         assert!(text_body(&result).contains("No matches"));
     }
@@ -334,12 +322,9 @@ mod tests {
     #[tokio::test]
     async fn find_invalid_glob_errors_cleanly() {
         let tempdir = tempdir().expect("tempdir");
-        let err = run_find_tool(
-            tempdir.path(),
-            serde_json::json!({ "pattern": "[invalid" }),
-        )
-        .await
-        .expect_err("invalid glob should error");
+        let err = run_find_tool(tempdir.path(), serde_json::json!({ "pattern": "[invalid" }))
+            .await
+            .expect_err("invalid glob should error");
         assert!(matches!(err, ToolError::ExecutionFailed(msg) if msg.contains("glob")));
     }
 }

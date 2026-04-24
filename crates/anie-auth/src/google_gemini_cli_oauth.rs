@@ -39,8 +39,7 @@ use crate::oauth::{
     generate_pkce,
 };
 
-const CLIENT_ID_B64: &str =
-    "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
+const CLIENT_ID_B64: &str = "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
 const CLIENT_SECRET_B64: &str = "R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw=";
 
 const DEFAULT_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -164,7 +163,10 @@ impl OAuthProvider for GeminiCliOAuthProvider {
     }
 
     async fn begin_login(&self) -> Result<LoginFlow> {
-        let PkcePair { verifier, challenge } = generate_pkce();
+        let PkcePair {
+            verifier,
+            challenge,
+        } = generate_pkce();
         let client_id = Self::client_id()?;
         let scope = SCOPES.join(" ");
         let params = [
@@ -198,8 +200,8 @@ impl OAuthProvider for GeminiCliOAuthProvider {
         let flow = flow.as_auth_code().ok_or_else(|| {
             anyhow!("Google Gemini CLI uses authorization-code flow; device flow not supported")
         })?;
-        let code = code
-            .ok_or_else(|| anyhow!("Google Gemini CLI login requires the authorization code"))?;
+        let code =
+            code.ok_or_else(|| anyhow!("Google Gemini CLI login requires the authorization code"))?;
         let client_id = Self::client_id()?;
         let client_secret = Self::client_secret()?;
 
@@ -211,10 +213,9 @@ impl OAuthProvider for GeminiCliOAuthProvider {
             ("code_verifier", flow.verifier.as_str()),
             ("redirect_uri", flow.redirect_uri.as_str()),
         ];
-        let response: GoogleTokenResponse =
-            post_form(&self.client, &self.token_url, &form)
-                .await
-                .context("authorization_code exchange failed")?;
+        let response: GoogleTokenResponse = post_form(&self.client, &self.token_url, &form)
+            .await
+            .context("authorization_code exchange failed")?;
 
         let refresh_token = response.refresh_token.clone().ok_or_else(|| {
             anyhow!(
@@ -251,10 +252,9 @@ impl OAuthProvider for GeminiCliOAuthProvider {
             ("client_secret", client_secret.as_str()),
             ("refresh_token", credential.refresh_token.as_str()),
         ];
-        let response: GoogleTokenResponse =
-            post_form(&self.client, &self.token_url, &form)
-                .await
-                .context("refresh_token exchange failed")?;
+        let response: GoogleTokenResponse = post_form(&self.client, &self.token_url, &form)
+            .await
+            .context("refresh_token exchange failed")?;
 
         Ok(OAuthCredentialData {
             access_token: response.access_token,
@@ -403,9 +403,10 @@ impl GeminiCliOAuthProvider {
         })?;
 
         if !lro.done.unwrap_or(false) {
-            let operation_name = lro.name.clone().ok_or_else(|| {
-                anyhow!("onboardUser returned an unfinished LRO without a name")
-            })?;
+            let operation_name = lro
+                .name
+                .clone()
+                .ok_or_else(|| anyhow!("onboardUser returned an unfinished LRO without a name"))?;
             lro = self.poll_lro(access_token, &operation_name).await?;
         }
 
@@ -574,7 +575,10 @@ async fn fetch_user_email(
         .json()
         .await
         .map_err(|err| anyhow!("userinfo response did not parse: {err}"))?;
-    Ok(json.get("email").and_then(|v| v.as_str()).map(str::to_string))
+    Ok(json
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
 }
 
 async fn post_form<S: AsRef<str>>(
@@ -794,8 +798,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider =
-            GeminiCliOAuthProvider::with_mock_base(&server.uri()).with_env_project(None);
+        let provider = GeminiCliOAuthProvider::with_mock_base(&server.uri()).with_env_project(None);
         let err = format!(
             "{:#}",
             provider.discover_project("access-token").await.unwrap_err()

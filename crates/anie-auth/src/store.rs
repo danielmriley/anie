@@ -8,9 +8,8 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::{
-    AuthCredential, AuthStore, default_auth_file_path, load_auth_store_at, save_api_key_at,
-    save_credential_at,
-    refresh::CredentialPersistence,
+    AuthCredential, AuthStore, default_auth_file_path, load_auth_store_at,
+    refresh::CredentialPersistence, save_api_key_at, save_credential_at,
 };
 
 #[derive(Debug, Clone)]
@@ -260,7 +259,10 @@ impl CredentialStore {
         // the sync happy-path used by `RequestOptionsResolver`
         // today (PR A). PR C will thread the refresh branch in
         // when the resolver is updated.
-        store.providers.get(provider).map(|cred| cred.bearer().to_string())
+        store
+            .providers
+            .get(provider)
+            .map(|cred| cred.bearer().to_string())
     }
 
     /// Retrieve the structured credential (not just the bearer

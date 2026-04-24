@@ -194,9 +194,7 @@ impl AutocompleteProvider for CommandCompletionProvider {
                 Some(SuggestionSet {
                     items,
                     prefix: argument_prefix,
-                    kind: SuggestionKind::ArgumentValue {
-                        command_name: name,
-                    },
+                    kind: SuggestionKind::ArgumentValue { command_name: name },
                 })
             }
         }

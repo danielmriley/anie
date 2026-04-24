@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 /// observable via `PartialOrd` / `Ord` and matches the natural
 /// reasoning-budget progression. If you insert a new level,
 /// preserve this ordering.
-#[derive(
-    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord,
-)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ThinkingLevel {
     /// Disable reasoning-specific features.
     #[default]

@@ -233,7 +233,10 @@ pub fn generate_pkce() -> PkcePair {
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
     let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
-    PkcePair { verifier, challenge }
+    PkcePair {
+        verifier,
+        challenge,
+    }
 }
 
 /// Token-exchange / refresh response shape common to providers

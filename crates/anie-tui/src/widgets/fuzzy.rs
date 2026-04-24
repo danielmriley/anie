@@ -124,7 +124,9 @@ fn subsequence_score(query: &str, candidate: &str) -> Option<u32> {
                 None => {
                     score = score.saturating_add(word_boundary_hits * 500);
                     score = score.saturating_sub(
-                        u32::try_from(candidate.len()).unwrap_or(u32::MAX).min(5_000),
+                        u32::try_from(candidate.len())
+                            .unwrap_or(u32::MAX)
+                            .min(5_000),
                     );
                     return Some(score);
                 }
@@ -140,7 +142,8 @@ fn scored(base: u32, candidate_len: usize, match_position: usize) -> u32 {
     let position_decay = u32::try_from(match_position * 10)
         .unwrap_or(u32::MAX)
         .min(5_000);
-    base.saturating_sub(length_decay).saturating_sub(position_decay)
+    base.saturating_sub(length_decay)
+        .saturating_sub(position_decay)
 }
 
 #[cfg(test)]
@@ -254,10 +257,7 @@ mod tests {
         for sep in ['/', '-', '_', '.', ':', ' '] {
             let candidate = format!("provider{sep}claude-3");
             let s = score("claude", &candidate);
-            assert!(
-                s.is_some(),
-                "separator {sep:?} should mark a word start"
-            );
+            assert!(s.is_some(), "separator {sep:?} should mark a word start");
         }
     }
 

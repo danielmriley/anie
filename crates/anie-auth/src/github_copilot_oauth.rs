@@ -111,8 +111,7 @@ impl GithubCopilotOAuthProvider {
         let bytes = STANDARD
             .decode(CLIENT_ID_B64)
             .map_err(|err| anyhow!("internal: failed to decode client id: {err}"))?;
-        String::from_utf8(bytes)
-            .map_err(|err| anyhow!("internal: client id not utf-8: {err}"))
+        String::from_utf8(bytes).map_err(|err| anyhow!("internal: client id not utf-8: {err}"))
     }
 
     fn device_code_url(&self) -> String {
@@ -129,7 +128,10 @@ impl GithubCopilotOAuthProvider {
 
     fn copilot_token_url(&self) -> String {
         self.copilot_token_url_override.clone().unwrap_or_else(|| {
-            format!("https://{COPILOT_API_PREFIX}{}/copilot_internal/v2/token", self.domain)
+            format!(
+                "https://{COPILOT_API_PREFIX}{}/copilot_internal/v2/token",
+                self.domain
+            )
         })
     }
 
@@ -443,7 +445,8 @@ mod tests {
         matchers::{method, path as match_path},
     };
 
-    const SAMPLE_COPILOT_TOKEN: &str = "tid=abc;exp=9999999999;sku=free;proxy-ep=proxy.individual.githubcopilot.com;u=user";
+    const SAMPLE_COPILOT_TOKEN: &str =
+        "tid=abc;exp=9999999999;sku=free;proxy-ep=proxy.individual.githubcopilot.com;u=user";
 
     fn device_code_body() -> serde_json::Value {
         serde_json::json!({
@@ -475,7 +478,10 @@ mod tests {
     #[test]
     fn extract_api_base_url_rewrites_proxy_to_api() {
         let url = extract_api_base_url(SAMPLE_COPILOT_TOKEN);
-        assert_eq!(url.as_deref(), Some("https://api.individual.githubcopilot.com"));
+        assert_eq!(
+            url.as_deref(),
+            Some("https://api.individual.githubcopilot.com")
+        );
     }
 
     #[test]

@@ -480,25 +480,32 @@ mod tests {
         type SpecCheck = fn(&ArgumentSpec) -> bool;
         let registry = CommandRegistry::with_builtins();
         let expected: &[(&str, SpecCheck)] = &[
-            ("thinking", |spec| {
-                matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == THINKING_LEVELS)
-            }),
+            (
+                "thinking",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == THINKING_LEVELS),
+            ),
             ("model", |spec| {
                 matches!(spec, ArgumentSpec::FreeForm { required: false })
             }),
-            ("session", |spec| {
-                matches!(spec, ArgumentSpec::Subcommands { known } if *known == SESSION_SUBCOMMANDS)
+            (
+                "session",
+                |spec| matches!(spec, ArgumentSpec::Subcommands { known } if *known == SESSION_SUBCOMMANDS),
+            ),
+            (
+                "markdown",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == MARKDOWN_SWITCHES),
+            ),
+            (
+                "tool-output",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == TOOL_OUTPUT_MODES),
+            ),
+            (
+                "login",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: true } if *values == OAUTH_PROVIDERS),
+            ),
+            ("logout", |spec| {
+                matches!(spec, ArgumentSpec::FreeForm { required: true })
             }),
-            ("markdown", |spec| {
-                matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == MARKDOWN_SWITCHES)
-            }),
-            ("tool-output", |spec| {
-                matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == TOOL_OUTPUT_MODES)
-            }),
-            ("login", |spec| {
-                matches!(spec, ArgumentSpec::Enumerated { values, required: true } if *values == OAUTH_PROVIDERS)
-            }),
-            ("logout", |spec| matches!(spec, ArgumentSpec::FreeForm { required: true })),
             ("compact", |spec| matches!(spec, ArgumentSpec::None)),
             ("help", |spec| matches!(spec, ArgumentSpec::None)),
             ("quit", |spec| matches!(spec, ArgumentSpec::None)),

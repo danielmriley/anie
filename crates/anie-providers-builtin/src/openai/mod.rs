@@ -1068,7 +1068,10 @@ mod tests {
 
         let messages = body["messages"].as_array().expect("messages array");
         let last = messages.last().expect("last message");
-        let last_part = last["content"].as_array().expect("content array").last()
+        let last_part = last["content"]
+            .as_array()
+            .expect("content array")
+            .last()
             .expect("last content part")
             .clone();
         assert_eq!(last_part["type"], "text");

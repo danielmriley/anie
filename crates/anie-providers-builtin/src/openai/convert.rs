@@ -317,9 +317,7 @@ mod tests {
             "data": "OPAQUE",
         })];
         let assistant = AssistantMessage {
-            content: vec![ContentBlock::Text {
-                text: "hi".into(),
-            }],
+            content: vec![ContentBlock::Text { text: "hi".into() }],
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
@@ -344,9 +342,7 @@ mod tests {
     fn assistant_message_without_reasoning_details_omits_field() {
         use anie_protocol::{StopReason, Usage};
         let assistant = AssistantMessage {
-            content: vec![ContentBlock::Text {
-                text: "hi".into(),
-            }],
+            content: vec![ContentBlock::Text { text: "hi".into() }],
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
