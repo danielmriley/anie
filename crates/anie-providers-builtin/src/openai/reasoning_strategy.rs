@@ -89,6 +89,14 @@ pub(super) enum NativeReasoningRequestStrategy {
     /// path emits `{ effort: "none" }` for `ThinkingLevel::Off`
     /// so the upstream receives an explicit disable signal.
     NestedReasoning,
+    /// Send `enable_thinking: bool` as a disable-signaling flag.
+    /// `nested = false` emits it at the top level (pi's `zai` /
+    /// `qwen` formats); `nested = true` emits it inside
+    /// `chat_template_kwargs` (pi's `qwen-chat-template`
+    /// format). The boolean is derived from `ThinkingLevel`:
+    /// `Off` → `false`, any other level → `true`. Intended for
+    /// vLLM / SGLang Qwen3+ deployments and Z.ai GLM models.
+    EnableThinkingFlag { nested: bool },
 }
 
 /// Identifies which OpenAI-compatible backend shape `model` targets.

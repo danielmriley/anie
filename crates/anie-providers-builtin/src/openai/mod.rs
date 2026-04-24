@@ -198,6 +198,22 @@ impl OpenAIProvider {
                     body.insert("reasoning_effort".into(), json!(effort));
                 }
             }
+            NativeReasoningRequestStrategy::EnableThinkingFlag { nested } => {
+                // Boolean disable signal for vLLM / SGLang Qwen3+
+                // and Z.ai GLM. `Off` is the only reason to pick
+                // this path on the Off side — it's what lets the
+                // user actually turn thinking off on a capable
+                // model. Any non-Off level sends `true`.
+                let enabled = options.thinking != ThinkingLevel::Off;
+                if nested {
+                    body.insert(
+                        "chat_template_kwargs".into(),
+                        json!({ "enable_thinking": enabled }),
+                    );
+                } else {
+                    body.insert("enable_thinking".into(), json!(enabled));
+                }
+            }
             NativeReasoningRequestStrategy::NoNativeFields => {
                 if let Some(effort) = reasoning_effort(options.thinking)
                     && model.supports_reasoning
@@ -327,6 +343,30 @@ impl OpenAIProvider {
             ];
         }
 
+        // EnableThinkingFlag variants always emit the boolean —
+        // `false` for `Off`, `true` otherwise. They must bypass
+        // the generic Off-short-circuit below so the upstream
+        // (vLLM/SGLang Qwen3+, Z.ai GLM) actually receives the
+        // disable signal instead of an omitted field.
+        if let Some(caps) = capabilities.as_ref()
+            && caps.control == Some(ReasoningControlMode::Native)
+            && caps.request_mode == Some(ThinkingRequestMode::EnableThinkingFlag)
+        {
+            return vec![
+                NativeReasoningRequestStrategy::EnableThinkingFlag { nested: false },
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ];
+        }
+        if let Some(caps) = capabilities.as_ref()
+            && caps.control == Some(ReasoningControlMode::Native)
+            && caps.request_mode == Some(ThinkingRequestMode::ChatTemplateEnableThinking)
+        {
+            return vec![
+                NativeReasoningRequestStrategy::EnableThinkingFlag { nested: true },
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ];
+        }
+
         if options.thinking == ThinkingLevel::Off || !is_local_openai_compatible_target(model) {
             return vec![NativeReasoningRequestStrategy::NoNativeFields];
         }
@@ -345,6 +385,14 @@ impl OpenAIProvider {
             Some(ThinkingRequestMode::NestedReasoning) => {
                 // Handled above; unreachable but kept for completeness.
                 Some(NativeReasoningRequestStrategy::NestedReasoning)
+            }
+            Some(ThinkingRequestMode::EnableThinkingFlag) => {
+                // Handled above; unreachable but kept for completeness.
+                Some(NativeReasoningRequestStrategy::EnableThinkingFlag { nested: false })
+            }
+            Some(ThinkingRequestMode::ChatTemplateEnableThinking) => {
+                // Handled above; unreachable but kept for completeness.
+                Some(NativeReasoningRequestStrategy::EnableThinkingFlag { nested: true })
             }
             Some(ThinkingRequestMode::PromptSteering) => None,
             None => match openai_compatible_backend(model) {
@@ -1003,6 +1051,186 @@ mod tests {
                 "thinking level {level:?} should map to effort {expected}"
             );
         }
+    }
+
+    fn sample_qwen_enable_thinking_model(nested: bool) -> Model {
+        // A vLLM / SGLang-style Qwen3 catalog entry: native
+        // thinking control via the `enable_thinking` boolean
+        // (`nested = false`) or via `chat_template_kwargs`
+        // (`nested = true`).
+        Model {
+            id: "qwen3-32b".into(),
+            name: "Qwen 3 32B".into(),
+            provider: "vllm".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://vllm.example.com/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: true,
+            reasoning_capabilities: Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(if nested {
+                    ThinkingRequestMode::ChatTemplateEnableThinking
+                } else {
+                    ThinkingRequestMode::EnableThinkingFlag
+                }),
+            }),
+            supports_images: false,
+            cost_per_million: anie_provider::CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        }
+    }
+
+    fn enable_thinking_body_for(
+        model: &Model,
+        thinking: ThinkingLevel,
+        nested: bool,
+    ) -> serde_json::Value {
+        let provider = OpenAIProvider::new();
+        let options = StreamOptions {
+            thinking,
+            ..StreamOptions::default()
+        };
+        let strategies = provider.native_reasoning_request_strategies(model, &options);
+        assert_eq!(
+            strategies[0],
+            NativeReasoningRequestStrategy::EnableThinkingFlag { nested },
+            "EnableThinkingFlag strategy should lead for declared enable-thinking models"
+        );
+        provider.build_request_body_with_native_reasoning_strategy(
+            model,
+            &LlmContext {
+                system_prompt: String::new(),
+                messages: vec![],
+                tools: vec![],
+            },
+            &options,
+            true,
+            NativeReasoningRequestStrategy::EnableThinkingFlag { nested },
+        )
+    }
+
+    #[test]
+    fn qwen_enable_thinking_flag_emits_top_level_boolean() {
+        let model = sample_qwen_enable_thinking_model(false);
+        // Off → false (the whole point of this mode: the user's
+        // Off preference actually disables thinking on the wire).
+        let off = enable_thinking_body_for(&model, ThinkingLevel::Off, false);
+        assert_eq!(off["enable_thinking"], json!(false));
+        assert!(off.get("reasoning_effort").is_none());
+        assert!(off.get("reasoning").is_none());
+        assert!(off.get("chat_template_kwargs").is_none());
+
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+        ] {
+            let body = enable_thinking_body_for(&model, level, false);
+            assert_eq!(
+                body["enable_thinking"],
+                json!(true),
+                "level {level:?} should map to true"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_chat_template_enable_thinking_emits_nested_boolean() {
+        let model = sample_qwen_enable_thinking_model(true);
+        let off = enable_thinking_body_for(&model, ThinkingLevel::Off, true);
+        assert_eq!(
+            off["chat_template_kwargs"],
+            json!({ "enable_thinking": false })
+        );
+        assert!(off.get("enable_thinking").is_none());
+        assert!(off.get("reasoning_effort").is_none());
+
+        let high = enable_thinking_body_for(&model, ThinkingLevel::High, true);
+        assert_eq!(
+            high["chat_template_kwargs"],
+            json!({ "enable_thinking": true })
+        );
+    }
+
+    #[test]
+    fn enable_thinking_flag_falls_back_to_no_native_fields_on_400() {
+        // Same retry-with-fallback semantics as other native
+        // strategies: when the primary strategy fails with a
+        // reasoning-compat 400, the outer send loop moves on to
+        // the NoNativeFields fallback.
+        let provider = OpenAIProvider::new();
+        let model = sample_qwen_enable_thinking_model(false);
+        let options = StreamOptions {
+            thinking: ThinkingLevel::Medium,
+            ..StreamOptions::default()
+        };
+        let strategies = provider.native_reasoning_request_strategies(&model, &options);
+        assert_eq!(
+            strategies,
+            vec![
+                NativeReasoningRequestStrategy::EnableThinkingFlag { nested: false },
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ],
+        );
+
+        let model_nested = sample_qwen_enable_thinking_model(true);
+        let strategies_nested =
+            provider.native_reasoning_request_strategies(&model_nested, &options);
+        assert_eq!(
+            strategies_nested,
+            vec![
+                NativeReasoningRequestStrategy::EnableThinkingFlag { nested: true },
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ],
+        );
+    }
+
+    #[test]
+    fn existing_thinking_request_modes_behave_unchanged() {
+        // Forward-compat guardrail: adding
+        // EnableThinkingFlag / ChatTemplateEnableThinking must
+        // not perturb the routing for the three pre-existing
+        // variants.
+        let provider = OpenAIProvider::new();
+        let options = StreamOptions {
+            thinking: ThinkingLevel::Medium,
+            ..StreamOptions::default()
+        };
+
+        // ReasoningEffort → [TopLevelReasoningEffort, NoNativeFields]
+        let ollama = sample_heuristic_local_model("ollama", "http://localhost:11434/v1", "qwen3:32b");
+        assert_eq!(
+            provider.native_reasoning_request_strategies(&ollama, &options),
+            vec![
+                NativeReasoningRequestStrategy::TopLevelReasoningEffort,
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ],
+        );
+
+        // NestedReasoning → [NestedReasoning, NoNativeFields]
+        let nested = sample_nested_hosted_model();
+        assert_eq!(
+            provider.native_reasoning_request_strategies(&nested, &options),
+            vec![
+                NativeReasoningRequestStrategy::NestedReasoning,
+                NativeReasoningRequestStrategy::NoNativeFields,
+            ],
+        );
+
+        // Hosted reasoning model (no request_mode, supports_reasoning)
+        // → [NoNativeFields] (covered already by
+        // existing_reasoning_effort_mode_unchanged_for_hosted_reasoning_models,
+        // asserted here for completeness).
+        let hosted = sample_model();
+        assert_eq!(
+            provider.native_reasoning_request_strategies(&hosted, &options),
+            vec![NativeReasoningRequestStrategy::NoNativeFields],
+        );
     }
 
     #[test]

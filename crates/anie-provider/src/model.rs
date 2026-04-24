@@ -49,6 +49,22 @@ pub enum ThinkingRequestMode {
     ReasoningEffort,
     /// Use a nested `reasoning.effort` field.
     NestedReasoning,
+    /// Top-level `enable_thinking: bool`. Used by vLLM /
+    /// SGLang serving Qwen3+ and by Z.ai's GLM models. Emits
+    /// `true` for any non-`Off` level and `false` for `Off`.
+    /// NOT honored by Ollama's OpenAI-compat layer (verified
+    /// empirically; see `docs/ollama_capability_discovery/README.md`).
+    ///
+    /// anie-specific deviation from pi: pi uses snake_case
+    /// serde renames for this enum (`enable_thinking_flag`).
+    /// anie keeps PascalCase consistent with the existing
+    /// variants so user-facing config values stay uniform.
+    EnableThinkingFlag,
+    /// Nested `chat_template_kwargs.enable_thinking: bool`.
+    /// Used by vLLM with chat-template kwargs forwarding. Same
+    /// semantics as `EnableThinkingFlag` (boolean, derived from
+    /// `Off` vs non-`Off`), different wire placement.
+    ChatTemplateEnableThinking,
 }
 
 /// Explicit opening/closing tags used for tagged reasoning output.
