@@ -544,6 +544,7 @@ mod tests {
                 supports_reasoning: Some(true),
                 pricing: None,
                 supported_parameters: None,
+                provider_capabilities: None,
             },
             ModelInfo {
                 id: "qwen3:8b".into(),
@@ -555,6 +556,7 @@ mod tests {
                 supports_reasoning: Some(true),
                 pricing: None,
                 supported_parameters: None,
+                provider_capabilities: None,
             },
             ModelInfo {
                 id: "gpt-4o".into(),
@@ -566,6 +568,7 @@ mod tests {
                 supports_reasoning: Some(false),
                 pricing: None,
                 supported_parameters: None,
+                provider_capabilities: None,
             },
         ]
     }
@@ -760,6 +763,7 @@ mod tests {
             supports_reasoning: Some(true),
             pricing: None,
             supported_parameters: None,
+            provider_capabilities: None,
         };
         vec![
             mk("meta-llama/llama-3.1-8b-instruct"),

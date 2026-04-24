@@ -455,6 +455,7 @@ async fn discover_openai_compatible_models(
                 supports_reasoning,
                 pricing: entry.pricing.and_then(PricingEntry::into_model_pricing),
                 supported_parameters: entry.supported_parameters,
+                provider_capabilities: None,
             }
         })
         .collect())
@@ -503,6 +504,7 @@ async fn discover_anthropic_models(
             ),
             pricing: None,
             supported_parameters: None,
+            provider_capabilities: None,
         })
         .collect())
 }
@@ -511,7 +513,8 @@ async fn discover_ollama_tags(
     request: &ModelDiscoveryRequest,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
     let client = discovery_http_client()?;
-    let url = format!("{}/api/tags", normalize_root_base_url(&request.base_url));
+    let base_url = normalize_root_base_url(&request.base_url);
+    let url = format!("{base_url}/api/tags");
     let response = send_request(&client, request, url, AuthStyle::Bearer).await?;
     let body = response
         .json::<OllamaTagsResponse>()
@@ -520,39 +523,109 @@ async fn discover_ollama_tags(
             ProviderError::InvalidStreamJson(format!("failed to parse Ollama tag list: {error}"))
         })?;
 
-    Ok(body
+    // Materialize the base entries from `/api/tags` (cheap data:
+    // id, family, display name, plus the substring-heuristic
+    // fallback for `supports_reasoning` / `supports_images`).
+    let bases: Vec<OllamaDiscoveryBase> = body
         .models
         .into_iter()
         .filter_map(|entry| {
             let id = entry.model.or(entry.name)?;
-            let supports_reasoning = Some(
-                entry
-                    .details
-                    .as_ref()
-                    .and_then(|details| {
-                        details.family.as_deref().or_else(|| {
-                            details
-                                .families
-                                .as_ref()
-                                .and_then(|families| families.first().map(String::as_str))
-                        })
+            let heuristic_reasoning = entry
+                .details
+                .as_ref()
+                .and_then(|details| {
+                    details.family.as_deref().or_else(|| {
+                        details
+                            .families
+                            .as_ref()
+                            .and_then(|families| families.first().map(String::as_str))
                     })
-                    .is_some_and(reasoning_family)
-                    || reasoning_family(&id),
-            );
-            let supports_images = Some(
-                entry
-                    .capabilities
-                    .as_ref()
-                    .is_some_and(|caps| caps.iter().any(|cap| cap.eq_ignore_ascii_case("vision"))),
-            );
-            let context_length = entry
+                })
+                .is_some_and(reasoning_family)
+                || reasoning_family(&id);
+            let heuristic_images = entry
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.iter().any(|cap| cap.eq_ignore_ascii_case("vision")));
+            let tags_context_length = entry
                 .details
                 .as_ref()
                 .and_then(|details| details.context_length.or(details.context_window));
             let name = ollama_display_name(&id, entry.details.as_ref());
+            Some(OllamaDiscoveryBase {
+                id,
+                name,
+                heuristic_reasoning,
+                heuristic_images,
+                tags_context_length,
+            })
+        })
+        .collect();
 
-            Some(ModelInfo {
+    // Fan out `/api/show` calls in parallel. Each probe is
+    // independent — per-model failure falls back to the heuristic
+    // without aborting the whole discovery call. This is the
+    // authoritative capability source; `/api/tags` doesn't
+    // populate `capabilities` in practice (verified against local
+    // Ollama), so the show call is the only reliable way to tell
+    // thinking-capable models apart from lookalike IDs.
+    //
+    // See docs/ollama_capability_discovery/README.md PR 3.
+    let show_futures = bases
+        .iter()
+        .map(|base| fetch_ollama_show_capabilities(&client, &base_url, &base.id));
+    let show_results = futures::future::join_all(show_futures).await;
+
+    Ok(bases
+        .into_iter()
+        .zip(show_results)
+        .map(|(base, show_result)| {
+            let OllamaDiscoveryBase {
+                id,
+                name,
+                heuristic_reasoning,
+                heuristic_images,
+                tags_context_length,
+            } = base;
+            let (supports_reasoning, supports_images, provider_capabilities, context_length) =
+                match show_result {
+                    Ok(Some(show)) => {
+                        let caps_lower = show.capabilities.as_ref().map(|caps| {
+                            caps.iter()
+                                .map(|cap| cap.to_ascii_lowercase())
+                                .collect::<Vec<_>>()
+                        });
+                        let thinking = caps_lower
+                            .as_ref()
+                            .is_some_and(|caps| caps.iter().any(|cap| cap == "thinking"));
+                        let vision = caps_lower
+                            .as_ref()
+                            .is_some_and(|caps| caps.iter().any(|cap| cap == "vision"));
+                        let ctx = show.context_length.or(tags_context_length);
+                        (Some(thinking), Some(vision), show.capabilities, ctx)
+                    }
+                    Ok(None) => (
+                        Some(heuristic_reasoning),
+                        Some(heuristic_images),
+                        None,
+                        tags_context_length,
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            model = %id,
+                            %error,
+                            "Ollama /api/show probe failed; falling back to substring heuristic"
+                        );
+                        (
+                            Some(heuristic_reasoning),
+                            Some(heuristic_images),
+                            None,
+                            tags_context_length,
+                        )
+                    }
+                };
+            ModelInfo {
                 id,
                 name,
                 provider: request.provider_name.clone(),
@@ -562,9 +635,84 @@ async fn discover_ollama_tags(
                 supports_reasoning,
                 pricing: None,
                 supported_parameters: None,
-            })
+                provider_capabilities,
+            }
         })
         .collect())
+}
+
+/// Intermediate per-model data assembled from `/api/tags` before
+/// fanning out `/api/show` probes in `discover_ollama_tags`.
+struct OllamaDiscoveryBase {
+    id: String,
+    name: String,
+    heuristic_reasoning: bool,
+    heuristic_images: bool,
+    tags_context_length: Option<u64>,
+}
+
+/// Capability-probe result from Ollama's `/api/show`.
+struct OllamaShowData {
+    /// Raw capability tokens (e.g. `["completion","thinking","vision"]`).
+    capabilities: Option<Vec<String>>,
+    /// Architectural context length derived from
+    /// `model_info["<arch>.context_length"]`.
+    context_length: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    model_info: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// POST `/api/show` for a single model, returning its
+/// authoritative capabilities and architectural context length.
+///
+/// `Ok(None)` means the response parsed but carried no capability
+/// data; `Err(_)` means a transport or HTTP-level failure. In
+/// either case the caller falls back to the heuristic for that
+/// specific model without failing the outer discovery call.
+async fn fetch_ollama_show_capabilities(
+    client: &reqwest::Client,
+    base_url: &str,
+    model_id: &str,
+) -> Result<Option<OllamaShowData>, ProviderError> {
+    let url = format!("{}/api/show", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "name": model_id });
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|error| {
+            ProviderError::Transport(format!("ollama /api/show request failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let retry_after = parse_retry_after(&response);
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_http_error(status, &body, retry_after));
+    }
+    let show: OllamaShowResponse = response.json().await.map_err(|error| {
+        ProviderError::InvalidStreamJson(format!("failed to parse ollama /api/show: {error}"))
+    })?;
+
+    let context_length = show.model_info.as_ref().and_then(|info| {
+        let architecture = info
+            .get("general.architecture")
+            .and_then(serde_json::Value::as_str)?;
+        let key = format!("{architecture}.context_length");
+        info.get(&key).and_then(serde_json::Value::as_u64)
+    });
+
+    Ok(Some(OllamaShowData {
+        capabilities: show.capabilities,
+        context_length,
+    }))
 }
 
 async fn send_request(
@@ -972,11 +1120,20 @@ mod tests {
 
     #[tokio::test]
     async fn ollama_tags_parsing_normalizes_model_info() {
-        let server = spawn_mock_server(|path, _headers| {
-            assert_eq!(path, "/api/tags");
-            MockResponse::ok_json(
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
                 r#"{"models":[{"name":"qwen3:32b","details":{"family":"qwen3","parameter_size":"32B","context_length":32768},"capabilities":["completion","vision"]}]}"#,
-            )
+            ),
+            // After PR 3 discovery always fans out /api/show.
+            // Returning the authoritative capability list keeps
+            // this test exercising the normalize-ModelInfo path
+            // end-to-end, with thinking/vision populated from the
+            // authoritative source rather than the substring
+            // heuristic.
+            "/api/show" => MockResponse::ok_json(
+                r#"{"capabilities":["completion","thinking","vision"]}"#,
+            ),
+            _ => MockResponse::status(404, "not found"),
         })
         .await;
 
@@ -1547,6 +1704,226 @@ mod tests {
             infer_reasoning("anthropic", "claude-sonnet-4-6", None, None),
             Some(true),
         );
+    }
+
+    #[tokio::test]
+    async fn ollama_discovery_uses_show_capabilities_when_available() {
+        // Authoritative path: /api/tags lists the model, /api/show
+        // returns its true capabilities. Must populate
+        // supports_reasoning from `thinking` token,
+        // supports_images from `vision`, provider_capabilities
+        // with the full list.
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[{"name":"qwen3:32b","model":"qwen3:32b","details":{"family":"qwen3"}}]}"#,
+            ),
+            "/api/show" => MockResponse::ok_json(
+                r#"{"capabilities":["completion","tools","thinking","vision"]}"#,
+            ),
+            _ => MockResponse::status(404, "not found"),
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover ollama models");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3:32b");
+        assert_eq!(models[0].supports_reasoning, Some(true));
+        assert_eq!(models[0].supports_images, Some(true));
+        assert_eq!(
+            models[0].provider_capabilities.as_deref(),
+            Some(
+                &[
+                    "completion".to_string(),
+                    "tools".into(),
+                    "thinking".into(),
+                    "vision".into()
+                ][..]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn qwen3_5_via_show_capabilities_is_thinking_capable() {
+        // The real-world case: /api/show for `qwen3.5:9b` returns
+        // `"thinking"` in its capabilities even though PR 1's
+        // tightened heuristic would reject it. Authoritative data
+        // wins: supports_reasoning = Some(true).
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b","details":{"family":"qwen3"}}]}"#,
+            ),
+            "/api/show" => {
+                MockResponse::ok_json(r#"{"capabilities":["completion","thinking"]}"#)
+            }
+            _ => MockResponse::status(404, "not found"),
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover ollama models");
+
+        assert_eq!(models[0].supports_reasoning, Some(true));
+    }
+
+    #[tokio::test]
+    async fn ollama_discovery_falls_back_to_heuristic_when_show_fails() {
+        // /api/tags succeeds, /api/show 500s. The whole discovery
+        // call must still succeed, with that specific model
+        // falling back to the substring heuristic.
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[
+                    {"name":"qwen3:32b","model":"qwen3:32b","details":{"family":"qwen3"}},
+                    {"name":"gemma3:1b","model":"gemma3:1b","details":{"family":"gemma3"}}
+                ]}"#,
+            ),
+            "/api/show" => MockResponse::status(500, "boom"),
+            _ => MockResponse::status(404, "not found"),
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover must succeed even when show fails");
+
+        assert_eq!(models.len(), 2);
+        // Heuristic fallback: qwen3:32b passes family-prefix,
+        // gemma3:1b doesn't.
+        let qwen = models.iter().find(|m| m.id == "qwen3:32b").expect("qwen");
+        let gemma = models.iter().find(|m| m.id == "gemma3:1b").expect("gemma");
+        assert_eq!(qwen.supports_reasoning, Some(true));
+        assert_eq!(gemma.supports_reasoning, Some(false));
+        assert!(qwen.provider_capabilities.is_none());
+        assert!(gemma.provider_capabilities.is_none());
+    }
+
+    #[tokio::test]
+    async fn ollama_show_failure_does_not_fail_overall_discovery() {
+        // Twin of the preceding test named to match the plan's
+        // exit criteria. 500 on /api/show must not propagate as
+        // an outer Err.
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[{"name":"qwen3:32b","model":"qwen3:32b"}]}"#,
+            ),
+            "/api/show" => MockResponse::status(500, "server error"),
+            _ => MockResponse::status(404, "not found"),
+        })
+        .await;
+
+        let result = discover_models(&request(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            None,
+        ))
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "discovery must tolerate /api/show failures, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_capability_token_is_preserved_in_provider_capabilities() {
+        // Forward-compat: a capability token anie doesn't know
+        // today must still round-trip through
+        // provider_capabilities so the catalog can represent it
+        // without a schema bump.
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[{"name":"future:7b","model":"future:7b"}]}"#,
+            ),
+            "/api/show" => MockResponse::ok_json(
+                r#"{"capabilities":["completion","future-capability-xyz"]}"#,
+            ),
+            _ => MockResponse::status(404, "not found"),
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover");
+        assert_eq!(
+            models[0].provider_capabilities.as_deref(),
+            Some(&["completion".to_string(), "future-capability-xyz".into()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_show_extracts_context_length_using_architecture_prefix() {
+        // /api/show.model_info carries context length keyed by
+        // `{general.architecture}.context_length`.
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b"}]}"#,
+            ),
+            "/api/show" => MockResponse::ok_json(
+                r#"{"capabilities":["completion"],"model_info":{"general.architecture":"qwen35","qwen35.context_length":262144}}"#,
+            ),
+            _ => MockResponse::status(404, "not found"),
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover");
+        assert_eq!(models[0].context_length, Some(262_144));
+    }
+
+    #[tokio::test]
+    async fn ollama_show_handles_missing_context_length_field() {
+        // No architecture key, no arch.context_length → the
+        // discovery layer must not panic and context_length
+        // falls back to whatever /api/tags provided (None here).
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b"}]}"#,
+            ),
+            "/api/show" => MockResponse::ok_json(r#"{"capabilities":["completion"]}"#),
+            _ => MockResponse::status(404, "not found"),
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover");
+        assert_eq!(models[0].context_length, None);
     }
 
     #[tokio::test]

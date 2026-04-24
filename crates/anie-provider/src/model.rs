@@ -251,6 +251,14 @@ pub struct ModelInfo {
     /// this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_parameters: Option<Vec<String>>,
+    /// Provider-reported capability tokens (e.g. `"vision"`,
+    /// `"tools"`, `"thinking"`). Populated by Ollama's
+    /// `/api/show.capabilities` array. `None` for endpoints that
+    /// don't expose this. Distinct from `supported_parameters`,
+    /// which is OpenRouter's request-side parameter list. See
+    /// `docs/ollama_capability_discovery/README.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_capabilities: Option<Vec<String>>,
 }
 
 /// Per-token pricing reported by a discovery endpoint. OpenRouter
@@ -344,7 +352,23 @@ impl ModelInfo {
     /// and a simple fallback is used otherwise.
     #[must_use]
     pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
-        let context_window = self.context_length.unwrap_or(32_768);
+        // Regression guard for Ollama: `/api/show` exposes the
+        // model's architectural max context length (e.g. 262 144
+        // for qwen3.5), but Ollama's OpenAI-compat endpoint
+        // defaults `num_ctx` to 4 096 on the wire and silently
+        // ignores attempts to set it. Propagating the discovered
+        // value would make compaction grow conversations to ~250 k
+        // tokens before trimming, and Ollama would silently
+        // truncate the prompt. Keep the conservative 32 k fallback
+        // until the deferred native `/api/chat` codepath can honor
+        // `num_ctx`. The raw discovered length rides along in
+        // `ModelInfo.context_length` so the native plan picks it
+        // up without re-discovering.
+        let context_window = if self.provider.eq_ignore_ascii_case("ollama") {
+            32_768
+        } else {
+            self.context_length.unwrap_or(32_768)
+        };
         let max_tokens = self.max_output_tokens.unwrap_or(8_192);
         Model {
             id: self.id.clone(),
@@ -376,6 +400,7 @@ impl From<&Model> for ModelInfo {
             supports_reasoning: Some(value.supports_reasoning),
             pricing: None,
             supported_parameters: None,
+            provider_capabilities: None,
         }
     }
 }
@@ -402,10 +427,58 @@ mod tests {
             supports_reasoning: Some(true),
             pricing: None,
             supported_parameters: None,
+            provider_capabilities: None,
         };
         let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
         assert_eq!(model.max_tokens, 262_144);
         assert_eq!(model.context_window, 262_144);
+    }
+
+    #[test]
+    fn to_model_does_not_propagate_ollama_context_length_until_native_path() {
+        // Regression guard — see the to_model comment and
+        // docs/ollama_capability_discovery/README.md. Discovery
+        // succeeds (context_length = 262 144 for qwen3.5 from
+        // /api/show), but the Model keeps the 32 k fallback
+        // until the native /api/chat codepath can honor
+        // num_ctx on the wire. If this test starts failing, the
+        // deferred native plan has likely shipped — flip the
+        // assertion to match the discovered value.
+        let info = ModelInfo {
+            id: "qwen3.5:9b".into(),
+            name: "Qwen 3.5 9B".into(),
+            provider: "ollama".into(),
+            context_length: Some(262_144),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec!["completion".into(), "tools".into()]),
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        assert_eq!(model.context_window, 32_768);
+    }
+
+    #[test]
+    fn to_model_propagates_non_ollama_context_length_unchanged() {
+        // Non-Ollama paths must continue to honor the advertised
+        // context length — the wire-layer-default regression only
+        // applies to Ollama's OpenAI-compat endpoint.
+        let info = ModelInfo {
+            id: "x/huge".into(),
+            name: "Huge".into(),
+            provider: "openrouter".into(),
+            context_length: Some(200_000),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: None,
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
+        assert_eq!(model.context_window, 200_000);
     }
 
     #[test]
@@ -424,6 +497,7 @@ mod tests {
             supports_reasoning: Some(false),
             pricing: None,
             supported_parameters: None,
+            provider_capabilities: None,
         };
         let model = info.to_model(ApiKind::OpenAICompletions, "https://api.openai.com/v1");
         assert_eq!(model.max_tokens, 8_192);
@@ -441,6 +515,7 @@ mod tests {
             supports_reasoning: None,
             pricing: None,
             supported_parameters: None,
+            provider_capabilities: None,
         };
 
         let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");

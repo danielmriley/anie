@@ -2308,6 +2308,7 @@ mod tests {
                 supports_reasoning: Some(true),
                 pricing: None,
                 supported_parameters: None,
+                provider_capabilities: None,
             }]),
         });
 
@@ -2374,6 +2375,7 @@ mod tests {
                     supports_reasoning: Some(true),
                     pricing: None,
                     supported_parameters: None,
+                    provider_capabilities: None,
                 }],
                 "ollama".into(),
                 "qwen3:32b".into(),

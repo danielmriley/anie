@@ -1596,6 +1596,7 @@ mod tests {
                 supports_reasoning: Some(false),
                 pricing: None,
                 supported_parameters: None,
+                provider_capabilities: None,
             }]),
         });
         assert!(matches!(
