@@ -71,7 +71,7 @@ fn render_once(pane: &mut OutputPane, terminal: &mut Terminal<TestBackend>) {
     terminal
         .draw(|frame| {
             let area = frame.area();
-            pane.render(area, frame.buffer_mut(), ".");
+            pane.render(area, frame.buffer_mut(), ".", false);
         })
         .expect("draw");
 }

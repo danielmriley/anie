@@ -48,7 +48,9 @@ fn default_test_commands() -> Vec<SlashCommandInfo> {
         SlashCommandInfo::builtin_with_args(
             "session",
             "Session info",
-            ArgumentSpec::Subcommands { known: SESSION_SUBS },
+            ArgumentSpec::Subcommands {
+                known: SESSION_SUBS,
+            },
             Some("[list|<id>]"),
         ),
         SlashCommandInfo::builtin("tools", "List tools"),
@@ -317,6 +319,53 @@ fn streaming_assistant_renders_thinking_above_visible_response() {
     assert!(
         screen.contains("• Thinking\n  └ plan first\n\nfinal answer"),
         "screen was:\n{screen}"
+    );
+}
+
+#[test]
+fn urgent_input_render_reuses_existing_output_snapshot() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::SystemMessage {
+        text: "existing transcript".into(),
+    })
+    .expect("seed transcript");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("initial draw");
+    let builds_before = app.output_flat_build_count();
+
+    app.handle_agent_event(AgentEvent::SystemMessage {
+        text: "pending transcript update".into(),
+    })
+    .expect("queue transcript update");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    )))
+    .expect("type input");
+    terminal
+        .draw(|frame| app.render_urgent_for_test(frame))
+        .expect("urgent draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert_eq!(
+        app.output_flat_build_count(),
+        builds_before,
+        "urgent input paint should reuse the previous output snapshot"
+    );
+    assert_eq!(app.input_pane_contents(), "x");
+    assert!(
+        screen.contains("> x"),
+        "urgent input paint should still show the typed input, screen was:\n{screen}"
+    );
+    assert!(
+        !screen.contains("pending transcript update"),
+        "urgent input paint should reuse the previous transcript snapshot, screen was:\n{screen}"
     );
 }
 
@@ -923,10 +972,7 @@ fn replayed_tool_results_restore_titles_from_details() {
         screen.contains("• Read src/main.rs"),
         "screen was:\n{screen}"
     );
-    assert!(
-        screen.contains("• Ran echo hello"),
-        "screen was:\n{screen}"
-    );
+    assert!(screen.contains("• Ran echo hello"), "screen was:\n{screen}");
 }
 
 #[test]
@@ -973,7 +1019,12 @@ fn diff_rendering_shows_added_and_removed_lines() {
 fn model_command_opens_picker_in_bottom_pane_and_keeps_transcript_visible() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-    let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
     app.handle_agent_event(AgentEvent::MessageStart {
@@ -1074,7 +1125,12 @@ fn picker_selection_sends_resolved_model_action() {
 fn slash_commands_route_actions_and_render_help() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-    let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
 
     for ch in "/model qwen3:32b".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -1434,7 +1490,7 @@ fn render_assistant_block_with_error(
 fn render_output_pane_to_string(pane: &mut OutputPane, width: u16, height: u16) -> String {
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);
-    pane.render(area, &mut buffer, "⠋");
+    pane.render(area, &mut buffer, "⠋", false);
     render_buffer_to_string(&buffer)
 }
 
@@ -1750,18 +1806,27 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
 
 fn submit_line(app: &mut App, line: &str) {
     for ch in line.chars() {
-        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
-            .expect("type char");
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type char");
     }
-    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
-        .expect("submit");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit");
 }
 
 fn last_system_message(app: &App) -> Option<String> {
-    app.output_blocks().iter().rev().find_map(|block| match block {
-        RenderedBlock::SystemMessage { text } => Some(text.clone()),
-        _ => None,
-    })
+    app.output_blocks()
+        .iter()
+        .rev()
+        .find_map(|block| match block {
+            RenderedBlock::SystemMessage { text } => Some(text.clone()),
+            _ => None,
+        })
 }
 
 #[test]
@@ -1819,10 +1884,7 @@ fn slash_markdown_no_arg_reports_current_state() {
     submit_line(&mut app, "/markdown");
 
     let msg = last_system_message(&app).expect("expected status message");
-    assert!(
-        msg.contains("Markdown rendering is"),
-        "{msg}"
-    );
+    assert!(msg.contains("Markdown rendering is"), "{msg}");
     // Default is on.
     assert!(msg.contains("on"), "{msg}");
 }
@@ -1923,10 +1985,7 @@ fn slash_tool_output_verbose_restores_default_mode() {
 
     let msg = last_system_message(&app).expect("expected ack");
     assert!(msg.contains("verbose"), "{msg}");
-    assert_eq!(
-        app.tool_output_mode(),
-        anie_config::ToolOutputMode::Verbose,
-    );
+    assert_eq!(app.tool_output_mode(), anie_config::ToolOutputMode::Verbose,);
 }
 
 #[test]
@@ -1996,8 +2055,11 @@ fn slash_unknown_command_reported_without_dispatch() {
 
 fn type_chars(app: &mut App, s: &str) {
     for ch in s.chars() {
-        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
-            .expect("type");
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type");
         // Autocomplete refreshes are debounced to fire from
         // the render loop. Tests don't drive a render cycle
         // per keystroke, so flush synchronously here to keep

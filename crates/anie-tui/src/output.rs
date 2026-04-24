@@ -78,6 +78,75 @@ struct LineCache {
     links: Arc<Vec<Vec<LinkRange>>>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StreamingAssistantRender {
+    committed_text: String,
+    tail_text: String,
+    cached_committed_width: Option<u16>,
+    cached_committed_markdown_enabled: bool,
+    cached_committed_lines: Vec<Line<'static>>,
+}
+
+impl StreamingAssistantRender {
+    fn append_delta(&mut self, delta: &str) {
+        let mut remaining = delta;
+        let mut committed_changed = false;
+        while let Some(newline_index) = remaining.find('\n') {
+            let (line_chunk, rest) = remaining.split_at(newline_index + 1);
+            self.tail_text.push_str(line_chunk);
+            self.committed_text.push_str(&self.tail_text);
+            self.tail_text.clear();
+            remaining = rest;
+            committed_changed = true;
+        }
+        self.tail_text.push_str(remaining);
+        if committed_changed {
+            self.invalidate_cache();
+        }
+    }
+
+    fn invalidate_cache(&mut self) {
+        self.cached_committed_width = None;
+        self.cached_committed_lines.clear();
+    }
+
+    fn render_lines(&mut self, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
+        let mut out = self.render_committed_lines(width, ctx);
+        if !self.tail_text.is_empty() {
+            out.extend(wrap_text(&self.tail_text, width, Style::default()));
+        }
+        out
+    }
+
+    fn render_committed_lines(&mut self, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
+        if self.committed_text.is_empty() {
+            return Vec::new();
+        }
+        if self.cached_committed_width == Some(width)
+            && self.cached_committed_markdown_enabled == ctx.markdown_enabled
+        {
+            return self.cached_committed_lines.clone();
+        }
+        let rendered = if ctx.markdown_enabled {
+            crate::markdown::render_markdown(&self.committed_text, width, &ctx.theme)
+        } else {
+            wrap_text(&self.committed_text, width, Style::default())
+        };
+        self.cached_committed_width = Some(width);
+        self.cached_committed_markdown_enabled = ctx.markdown_enabled;
+        self.cached_committed_lines = rendered.clone();
+        rendered
+    }
+}
+
+struct AssistantRenderInput<'a> {
+    text: &'a str,
+    thinking: &'a str,
+    is_streaming: bool,
+    error_message: Option<&'a str>,
+    streaming_render: Option<&'a mut StreamingAssistantRender>,
+}
+
 /// Render-time configuration carried alongside the blocks. Kept
 /// on the pane so the public `render()` signature stays
 /// unchanged — the embedding app mutates this via
@@ -119,6 +188,12 @@ pub struct OutputPane {
     /// aligned and invalidate the affected slot — see the
     /// `invalidate_*` helpers below.
     caches: Vec<Option<LineCache>>,
+    /// Parallel to `blocks`. Active only for streaming assistant
+    /// blocks; finalized blocks and non-assistant blocks store
+    /// `None`. Keeps the public `RenderedBlock` shape unchanged
+    /// while giving the live assistant block an incremental
+    /// render path.
+    streaming_assistant_renders: Vec<Option<StreamingAssistantRender>>,
     /// Flattened render output from the last `build_lines`
     /// call. Reused across frames when no block content has
     /// changed and the terminal width hasn't moved — cuts the
@@ -155,6 +230,8 @@ pub struct OutputPane {
     /// invalidates the cache because block → line computations
     /// depend on it.
     render_context: RenderContext,
+    #[cfg(test)]
+    flat_build_count: u64,
 }
 
 impl OutputPane {
@@ -164,6 +241,7 @@ impl OutputPane {
         Self {
             blocks: Vec::new(),
             caches: Vec::new(),
+            streaming_assistant_renders: Vec::new(),
             flat_lines: Vec::new(),
             flat_cache_width: None,
             flat_cache_valid: false,
@@ -174,6 +252,8 @@ impl OutputPane {
             last_total_lines: 0,
             last_viewport_height: 1,
             render_context: RenderContext::default(),
+            #[cfg(test)]
+            flat_build_count: 0,
         }
     }
 
@@ -228,6 +308,11 @@ impl OutputPane {
         for slot in &mut self.caches {
             *slot = None;
         }
+        for state in &mut self.streaming_assistant_renders {
+            if let Some(state) = state.as_mut() {
+                state.invalidate_cache();
+            }
+        }
         self.flat_cache_valid = false;
     }
 
@@ -235,6 +320,7 @@ impl OutputPane {
     pub fn add_block(&mut self, block: RenderedBlock) {
         self.blocks.push(block);
         self.caches.push(None);
+        self.streaming_assistant_renders.push(None);
         self.flat_cache_valid = false;
     }
 
@@ -282,6 +368,9 @@ impl OutputPane {
             timestamp: 0,
             error_message: None,
         });
+        if let Some(slot) = self.streaming_assistant_renders.last_mut() {
+            *slot = Some(StreamingAssistantRender::default());
+        }
     }
 
     /// Append text to the last assistant block.
@@ -289,6 +378,13 @@ impl OutputPane {
         if let Some(RenderedBlock::AssistantMessage { text: content, .. }) = self.blocks.last_mut()
         {
             content.push_str(text);
+            if let Some(state) = self
+                .streaming_assistant_renders
+                .last_mut()
+                .and_then(Option::as_mut)
+            {
+                state.append_delta(text);
+            }
             self.invalidate_last();
         }
     }
@@ -328,6 +424,9 @@ impl OutputPane {
             *is_streaming = false;
             *current_timestamp = timestamp;
             *current_error = error_message;
+            if let Some(slot) = self.streaming_assistant_renders.last_mut() {
+                *slot = None;
+            }
             self.invalidate_last();
         }
     }
@@ -400,6 +499,7 @@ impl OutputPane {
     pub fn clear(&mut self) {
         self.blocks.clear();
         self.caches.clear();
+        self.streaming_assistant_renders.clear();
         self.flat_lines.clear();
         self.flat_cache_valid = false;
         self.flat_cache_width = None;
@@ -461,6 +561,7 @@ impl OutputPane {
         area: ratatui::layout::Rect,
         buf: &mut ratatui::buffer::Buffer,
         spinner_frame: &str,
+        reuse_flat_snapshot: bool,
     ) {
         // Plan 10 PR-A's custom in-pane scrollbar was removed
         // (2026-04-23). Terminals render their own scroll
@@ -469,7 +570,13 @@ impl OutputPane {
         // overhead and complicating cache invalidation.
         // Scrolling still works via wheel, PageUp/PageDown,
         // and Home/End.
-        self.rebuild_flat_cache(area.width.max(1), spinner_frame);
+        if reuse_flat_snapshot {
+            if !self.can_reuse_flat_snapshot(area.width.max(1)) {
+                self.rebuild_flat_cache(area.width.max(1), spinner_frame);
+            }
+        } else {
+            self.rebuild_flat_cache(area.width.max(1), spinner_frame);
+        }
 
         self.last_total_lines = u16::try_from(self.flat_lines.len()).unwrap_or(u16::MAX);
         self.last_viewport_height = area.height.max(1);
@@ -548,11 +655,24 @@ impl OutputPane {
         self.build_flat_lines(width, spinner_frame);
     }
 
+    fn can_reuse_flat_snapshot(&self, width: u16) -> bool {
+        self.flat_cache_width == Some(width) && !self.flat_lines.is_empty()
+    }
+
     fn build_flat_lines(&mut self, width: u16, spinner_frame: &str) {
+        #[cfg(test)]
+        {
+            self.flat_build_count = self.flat_build_count.saturating_add(1);
+        }
         debug_assert_eq!(
             self.blocks.len(),
             self.caches.len(),
             "block and cache vectors must stay parallel",
+        );
+        debug_assert_eq!(
+            self.blocks.len(),
+            self.streaming_assistant_renders.len(),
+            "streaming render state must stay parallel to blocks",
         );
         let mut perf_span = PerfSpan::enter(PerfSpanKind::BuildLines);
         let perf_trace = perf_trace_enabled();
@@ -573,7 +693,8 @@ impl OutputPane {
         self.last_link_map.clear();
         let link_map = &mut self.last_link_map;
         let theme = self.render_context.theme;
-        for (index, block) in self.blocks.iter().enumerate() {
+        for index in 0..self.blocks.len() {
+            let block = &self.blocks[index];
             if !out.is_empty() {
                 out.push(Line::default());
                 link_map.push(Vec::new());
@@ -607,7 +728,15 @@ impl OutputPane {
             let miss_start = perf_trace.then(std::time::Instant::now);
             let computed = {
                 let mut s = PerfSpan::enter(PerfSpanKind::BlockLines);
-                let lines = block_lines(block, width, spinner_frame, &self.render_context);
+                let lines = block_lines(
+                    block,
+                    width,
+                    spinner_frame,
+                    &self.render_context,
+                    self.streaming_assistant_renders
+                        .get_mut(index)
+                        .and_then(Option::as_mut),
+                );
                 if let Some(s) = s.as_mut() {
                     // Use `block_kind` not `kind` — `kind` is a
                     // reserved field name that holds the span type
@@ -641,9 +770,7 @@ impl OutputPane {
             // backing allocation via refcount bumps. Plan 04 PR-B.
             let lines_arc = Arc::new(computed);
             let links_arc = Arc::new(computed_links);
-            if hits_cache
-                && let Some(slot) = self.caches.get_mut(index)
-            {
+            if hits_cache && let Some(slot) = self.caches.get_mut(index) {
                 *slot = Some(LineCache {
                     width,
                     lines: Arc::clone(&lines_arc),
@@ -713,8 +840,7 @@ impl OutputPane {
         }
         let line_index = self
             .scroll_offset
-            .checked_add(row.saturating_sub(pane_top))?
-            as usize;
+            .checked_add(row.saturating_sub(pane_top))? as usize;
         let line_links = self.last_link_map.get(line_index)?;
         line_links
             .iter()
@@ -752,6 +878,11 @@ impl OutputPane {
         self.last_total_lines
             .saturating_sub(self.last_viewport_height)
     }
+
+    #[cfg(test)]
+    pub(crate) fn flat_build_count(&self) -> u64 {
+        self.flat_build_count
+    }
 }
 
 impl Default for OutputPane {
@@ -786,6 +917,7 @@ fn block_lines(
     width: u16,
     spinner_frame: &str,
     ctx: &RenderContext,
+    streaming_render: Option<&mut StreamingAssistantRender>,
 ) -> Vec<Line<'static>> {
     match block {
         RenderedBlock::UserMessage { text, .. } => wrap_spans(
@@ -813,10 +945,13 @@ fn block_lines(
             error_message,
             ..
         } => assistant_block_lines(
-            text,
-            thinking,
-            *is_streaming,
-            error_message.as_deref(),
+            AssistantRenderInput {
+                text,
+                thinking,
+                is_streaming: *is_streaming,
+                error_message: error_message.as_deref(),
+                streaming_render,
+            },
             width,
             spinner_frame,
             ctx,
@@ -836,18 +971,10 @@ fn block_lines(
             // "executing..." spinner regardless of mode.
             let is_error = result.as_ref().is_some_and(|value| value.is_error);
             let body = if let Some(result) = result {
-                if compact_hides_body(
-                    tool_name,
-                    result,
-                    ctx.tool_output_mode,
-                ) {
+                if compact_hides_body(tool_name, result, ctx.tool_output_mode) {
                     String::new()
                 } else if let Some(elapsed) = result.elapsed {
-                    format!(
-                        "{}\n\nTook {:.1}s",
-                        result.content,
-                        elapsed.as_secs_f64(),
-                    )
+                    format!("{}\n\nTook {:.1}s", result.content, elapsed.as_secs_f64(),)
                 } else {
                     result.content.clone()
                 }
@@ -898,39 +1025,40 @@ fn block_lines(
 /// most actionable debugging info in the transcript). `edit`
 /// and `write` keep their body so diffs stay visible; other
 /// tools keep their body for this first pass per plan scope.
-fn compact_hides_body(
-    tool_name: &str,
-    result: &ToolCallResult,
-    mode: ToolOutputMode,
-) -> bool {
+fn compact_hides_body(tool_name: &str, result: &ToolCallResult, mode: ToolOutputMode) -> bool {
     matches!(mode, ToolOutputMode::Compact)
         && !result.is_error
         && (tool_name == "bash" || tool_name == "read")
 }
 
 fn assistant_block_lines(
-    text: &str,
-    thinking: &str,
-    is_streaming: bool,
-    error_message: Option<&str>,
+    assistant: AssistantRenderInput<'_>,
     width: u16,
     spinner_frame: &str,
     ctx: &RenderContext,
 ) -> Vec<Line<'static>> {
     let mut result = Vec::new();
-    let inline_thinking_status = is_streaming && text.is_empty() && !thinking.is_empty();
+    let inline_thinking_status =
+        assistant.is_streaming && assistant.text.is_empty() && !assistant.thinking.is_empty();
 
     append_assistant_section(
         &mut result,
         assistant_thinking_lines(
-            thinking,
+            assistant.thinking,
             width,
             inline_thinking_status.then_some(spinner_frame),
         ),
     );
     append_assistant_section(
         &mut result,
-        assistant_answer_lines(text, width, is_streaming, ctx),
+        if assistant.is_streaming {
+            assistant.streaming_render.map_or_else(
+                || assistant_answer_lines(assistant.text, width, true, ctx),
+                |state| state.render_lines(width, ctx),
+            )
+        } else {
+            assistant_answer_lines(assistant.text, width, false, ctx)
+        },
     );
     // The "responding…" / "thinking…" status indicator used
     // to render a trailing line in the assistant block. That
@@ -944,11 +1072,8 @@ fn assistant_block_lines(
     // sees the reason a turn produced no visible answer. Without
     // this, a thinking-only response would leave the user staring
     // at a thinking block with nothing after it.
-    if let Some(message) = error_message {
-        append_assistant_section(
-            &mut result,
-            assistant_error_lines(message, width),
-        );
+    if let Some(message) = assistant.error_message {
+        append_assistant_section(&mut result, assistant_error_lines(message, width));
     }
 
     if result.is_empty() {
@@ -966,9 +1091,7 @@ fn assistant_error_lines(message: &str, width: u16) -> Vec<Line<'static>> {
         Span::styled("• ".to_string(), Style::default().fg(Color::Red)),
         Span::styled(
             "Error".to_string(),
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     ];
     prefix_lines(
@@ -1007,10 +1130,7 @@ fn assistant_thinking_lines(
     // visible answer yet), swap the bullet for the spinner
     // frame so the active section is the eye-catch.
     let (bullet, bullet_style) = match streaming_spinner {
-        Some(frame) => (
-            format!("{frame} "),
-            Style::default().fg(Color::Yellow),
-        ),
+        Some(frame) => (format!("{frame} "), Style::default().fg(Color::Yellow)),
         None => (
             "• ".to_string(),
             Style::default()
@@ -1037,8 +1157,9 @@ fn assistant_thinking_lines(
     )
 }
 
-/// Render assistant answer text as markdown for both streaming
-/// and finalized turns.
+/// Render assistant answer text as markdown for finalized turns
+/// and as the fallback path for streaming renders that do not
+/// have an incremental streaming state available.
 ///
 /// Earlier revisions split the streaming text at the last
 /// `\n\n` boundary and rendered only the committed prefix as
@@ -1179,10 +1300,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
                 // span has accumulated up to byte_idx, then
                 // flush the line.
                 if byte_start < byte_idx {
-                    current_spans.push(Span::styled(
-                        text[byte_start..byte_idx].to_string(),
-                        style,
-                    ));
+                    current_spans.push(Span::styled(text[byte_start..byte_idx].to_string(), style));
                     byte_start = byte_idx;
                 }
                 lines.push(Line::from(std::mem::take(&mut current_spans)));
@@ -1191,10 +1309,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
             current_char_count += 1;
         }
         if byte_start < text.len() {
-            current_spans.push(Span::styled(
-                text[byte_start..].to_string(),
-                style,
-            ));
+            current_spans.push(Span::styled(text[byte_start..].to_string(), style));
         }
     }
     if !current_spans.is_empty() {
@@ -1451,24 +1566,14 @@ mod tool_output_mode_tests {
         out
     }
 
-    fn pane_with_tool(
-        tool_name: &str,
-        title_arg: &str,
-        body: &str,
-        is_error: bool,
-    ) -> OutputPane {
+    fn pane_with_tool(tool_name: &str, title_arg: &str, body: &str, is_error: bool) -> OutputPane {
         let mut pane = OutputPane::new();
         pane.add_tool_call(
             "call-1".into(),
             tool_name.to_string(),
             title_arg.to_string(),
         );
-        pane.finalize_tool_result(
-            "call-1",
-            body.to_string(),
-            is_error,
-            None,
-        );
+        pane.finalize_tool_result("call-1", body.to_string(), is_error, None);
         pane
     }
 
@@ -1628,11 +1733,7 @@ mod prefix_tool_layout_tests {
         is_error: bool,
     ) -> Vec<Line<'static>> {
         let mut pane = OutputPane::new();
-        pane.add_tool_call(
-            "call".into(),
-            tool_name.to_string(),
-            args.to_string(),
-        );
+        pane.add_tool_call("call".into(), tool_name.to_string(), args.to_string());
         pane.finalize_tool_result("call", body.to_string(), is_error, None);
         pane.build_lines(80, ".")
     }
@@ -1950,21 +2051,11 @@ mod cache_tests {
         pane.add_user_message("first question".into(), 1);
         pane.add_streaming_assistant();
         pane.append_to_last_assistant("an answer");
-        pane.finalize_last_assistant(
-            "an answer".into(),
-            String::new(),
-            2,
-            None,
-        );
+        pane.finalize_last_assistant("an answer".into(), String::new(), 2, None);
         pane.add_user_message("second question".into(), 3);
         pane.add_streaming_assistant();
         pane.append_to_last_assistant("another answer");
-        pane.finalize_last_assistant(
-            "another answer".into(),
-            String::new(),
-            4,
-            None,
-        );
+        pane.finalize_last_assistant("another answer".into(), String::new(), 4, None);
         pane
     }
 
@@ -2001,8 +2092,7 @@ mod cache_tests {
     fn width_change_invalidates_cache_implicitly() {
         // Use text long enough that wrapping changes noticeably
         // between the two widths.
-        let long_answer = "one two three four five six seven eight nine ten "
-            .repeat(8);
+        let long_answer = "one two three four five six seven eight nine ten ".repeat(8);
         let mut pane = OutputPane::new();
         pane.add_user_message("prompt".into(), 1);
         pane.add_streaming_assistant();
@@ -2054,12 +2144,7 @@ mod cache_tests {
         // Streaming blocks skip the cache entirely.
         let last = pane.blocks().len() - 1;
         assert!(!pane.is_cached(last));
-        pane.finalize_last_assistant(
-            "partial answer".into(),
-            String::new(),
-            5,
-            None,
-        );
+        pane.finalize_last_assistant("partial answer".into(), String::new(), 5, None);
         let _ = pane.build_lines(80, ".");
         assert!(
             pane.is_cached(last),
@@ -2133,6 +2218,30 @@ mod cache_tests {
     }
 
     #[test]
+    fn finalized_streaming_markdown_matches_direct_finalized_render() {
+        let body = "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n";
+
+        let mut streamed = OutputPane::new();
+        streamed.add_streaming_assistant();
+        for chunk in [
+            "## Heading\n\n",
+            "- one\n",
+            "- two\n\n```rust\n",
+            "fn main() {}\n",
+            "```\n",
+        ] {
+            streamed.append_to_last_assistant(chunk);
+        }
+        streamed.finalize_last_assistant(body.into(), String::new(), 1, None);
+
+        let mut direct = OutputPane::new();
+        direct.add_streaming_assistant();
+        direct.finalize_last_assistant(body.into(), String::new(), 1, None);
+
+        assert_eq!(streamed.build_lines(80, "."), direct.build_lines(80, "."));
+    }
+
+    #[test]
     fn url_at_terminal_position_hits_the_link_span() {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
@@ -2151,7 +2260,7 @@ mod cache_tests {
         // verify the coordinate translation.
         let area = Rect::new(0, 5, 120, 10);
         let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf, ".");
+        pane.render(area, &mut buf, ".", false);
 
         // Any cell BEFORE the URL fallback starts returns None.
         assert!(pane.url_at_terminal_position(5, 0).is_none());
@@ -2164,8 +2273,7 @@ mod cache_tests {
             .collect::<String>();
         let url_col = top_row
             .find("https://")
-            .expect("URL should appear in rendered output")
-            as u16;
+            .expect("URL should appear in rendered output") as u16;
         let hit = pane.url_at_terminal_position(5, url_col + 5);
         assert_eq!(hit, Some("https://example.com/specific"));
     }
@@ -2178,7 +2286,7 @@ mod cache_tests {
         pane.add_user_message("hi".into(), 1);
         let area = Rect::new(0, 5, 40, 3);
         let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf, ".");
+        pane.render(area, &mut buf, ".", false);
         // Row 4 is above the pane; row 8 is below. Neither
         // should match.
         assert!(pane.url_at_terminal_position(4, 0).is_none());
@@ -2209,12 +2317,12 @@ mod cache_tests {
         let area = Rect::new(0, 0, 80, 5);
         let _backend = TestBackend::new(80, 5);
         let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf, ".");
+        pane.render(area, &mut buf, ".", false);
 
         // Scroll down past the first 10 lines, render again.
         pane.scroll_line_down(10);
         let mut buf = Buffer::empty(area);
-        pane.render(area, &mut buf, ".");
+        pane.render(area, &mut buf, ".", false);
 
         // With scroll_offset ~= 10 and viewport height 5, the
         // top visible cell should render a later message, not
@@ -2271,7 +2379,7 @@ mod cache_tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                pane.render(area, frame.buffer_mut(), ".");
+                pane.render(area, frame.buffer_mut(), ".", false);
             })
             .expect("draw");
 
@@ -2281,7 +2389,7 @@ mod cache_tests {
             terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    pane.render(area, frame.buffer_mut(), ".");
+                    pane.render(area, frame.buffer_mut(), ".", false);
                 })
                 .expect("draw");
         }
@@ -2405,12 +2513,7 @@ Final notes to wrap up the example.
             let mut pane = OutputPane::new();
             pane.add_streaming_assistant();
             pane.append_to_last_assistant(heavy_block);
-            pane.finalize_last_assistant(
-                heavy_block.to_string(),
-                String::new(),
-                1,
-                None,
-            );
+            pane.finalize_last_assistant(heavy_block.to_string(), String::new(), 1, None);
             let _ = pane.build_lines(120, ".");
         }
         let elapsed = start.elapsed();

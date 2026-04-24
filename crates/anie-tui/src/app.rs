@@ -73,6 +73,62 @@ pub struct App {
     last_streaming_delta_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    Full,
+    UrgentInput,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RenderDirty {
+    composer: bool,
+    full: bool,
+}
+
+impl RenderDirty {
+    const fn none() -> Self {
+        Self {
+            composer: false,
+            full: false,
+        }
+    }
+
+    const fn composer() -> Self {
+        Self {
+            composer: true,
+            full: false,
+        }
+    }
+
+    const fn full() -> Self {
+        Self {
+            composer: false,
+            full: true,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.composer |= other.composer;
+        self.full |= other.full;
+    }
+
+    const fn any(self) -> bool {
+        self.composer || self.full
+    }
+
+    fn clear_after_render(&mut self, mode: RenderMode) {
+        match mode {
+            RenderMode::Full => {
+                self.composer = false;
+                self.full = false;
+            }
+            RenderMode::UrgentInput => {
+                self.composer = false;
+            }
+        }
+    }
+}
+
 // The ModelPicker variant is intentionally large; the enum holds at most
 // one pane and is not cloned on a hot path. Plan 02's overlay trait
 // supersedes this shape in time.
@@ -114,9 +170,7 @@ pub enum AgentUiState {
     /// A context compaction is in flight — the LLM is
     /// summarizing the transcript. The wall-clock start is
     /// tracked so the status bar can show elapsed seconds.
-    Compacting {
-        started_at: std::time::Instant,
-    },
+    Compacting { started_at: std::time::Instant },
 }
 
 /// Actions emitted from the TUI to the controller layer.
@@ -256,9 +310,8 @@ impl App {
         let input_pane = if commands.is_empty() {
             InputPane::new()
         } else {
-            InputPane::new().with_autocomplete(Arc::new(CommandCompletionProvider::new(
-                commands.clone(),
-            )))
+            InputPane::new()
+                .with_autocomplete(Arc::new(CommandCompletionProvider::new(commands.clone())))
         };
         Self {
             output_pane: OutputPane::new(),
@@ -331,10 +384,7 @@ impl App {
     /// rendering can tailor hyperlink / image emission to the
     /// terminal.
     #[must_use]
-    pub fn with_terminal_capabilities(
-        mut self,
-        capabilities: crate::TerminalCapabilities,
-    ) -> Self {
+    pub fn with_terminal_capabilities(mut self, capabilities: crate::TerminalCapabilities) -> Self {
         self.output_pane.set_terminal_capabilities(capabilities);
         self
     }
@@ -406,6 +456,10 @@ impl App {
 
     /// Render the full app frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        self.render_with_mode(frame, RenderMode::Full);
+    }
+
+    fn render_with_mode(&mut self, frame: &mut Frame<'_>, mode: RenderMode) {
         // Fire any pending autocomplete refresh whose debounce
         // has elapsed. Cheap (one Option<Instant> comparison)
         // when nothing is pending.
@@ -434,8 +488,12 @@ impl App {
         let (output_area, spinner_area, bottom_area, status_area) =
             layout(frame.area(), bottom_height);
 
-        self.output_pane
-            .render(output_area, frame.buffer_mut(), spinner_frame);
+        self.output_pane.render(
+            output_area,
+            frame.buffer_mut(),
+            spinner_frame,
+            matches!(mode, RenderMode::UrgentInput),
+        );
         render_spinner_row(
             &self.agent_state,
             spinner_frame,
@@ -476,30 +534,42 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn render_urgent_for_test(&mut self, frame: &mut Frame<'_>) {
+        self.render_with_mode(frame, RenderMode::UrgentInput);
+    }
+
     /// Handle an incoming terminal event.
     pub fn handle_terminal_event(&mut self, event: Event) -> Result<()> {
+        self.handle_terminal_event_dirty(event).map(|_| ())
+    }
+
+    fn handle_terminal_event_dirty(&mut self, event: Event) -> Result<RenderDirty> {
         if self.overlay.is_some() {
             match event {
-                Event::Key(key) => self.handle_overlay_key_event(key)?,
-                Event::Resize(_, _) => {}
+                Event::Key(key) => {
+                    self.handle_overlay_key_event(key)?;
+                    return Ok(RenderDirty::full());
+                }
+                Event::Resize(_, _) => return Ok(RenderDirty::full()),
                 _ => {}
             }
-            return Ok(());
+            return Ok(RenderDirty::none());
         }
 
         match event {
             Event::Key(key) => {
                 if matches!(self.bottom_pane, BottomPane::ModelPicker(_)) {
                     self.handle_model_picker_key(key);
+                    Ok(RenderDirty::full())
                 } else {
-                    self.handle_key_event(key);
+                    Ok(self.handle_key_event(key))
                 }
             }
-            Event::Mouse(mouse) => self.handle_mouse_event(mouse),
-            Event::Resize(_, _) => {}
-            _ => {}
+            Event::Mouse(mouse) => Ok(self.handle_mouse_event(mouse)),
+            Event::Resize(_, _) => Ok(RenderDirty::full()),
+            _ => Ok(RenderDirty::none()),
         }
-        Ok(())
     }
 
     /// Handle an incoming agent/controller event.
@@ -776,7 +846,7 @@ impl App {
         true
     }
 
-    fn handle_key_event(&mut self, key: KeyEvent) {
+    fn handle_key_event(&mut self, key: KeyEvent) -> RenderDirty {
         match self.agent_state {
             AgentUiState::Idle => self.handle_idle_key(key),
             AgentUiState::Streaming
@@ -785,40 +855,48 @@ impl App {
         }
     }
 
-    fn handle_idle_key(&mut self, key: KeyEvent) {
+    fn handle_idle_key(&mut self, key: KeyEvent) -> RenderDirty {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
             }
-            (KeyModifiers::NONE, KeyCode::PageUp) => self.output_pane.scroll_page_up(),
-            (KeyModifiers::NONE, KeyCode::PageDown) => self.output_pane.scroll_page_down(),
+            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                self.output_pane.scroll_page_up();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                self.output_pane.scroll_page_down();
+                RenderDirty::full()
+            }
             (KeyModifiers::NONE, KeyCode::Home) if self.input_pane.content().is_empty() => {
-                self.output_pane.scroll_to_top()
+                self.output_pane.scroll_to_top();
+                RenderDirty::full()
             }
             (KeyModifiers::NONE, KeyCode::End) if self.input_pane.content().is_empty() => {
-                self.output_pane.scroll_to_bottom()
+                self.output_pane.scroll_to_bottom();
+                RenderDirty::full()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
                 self.open_model_picker_for_current_provider(None);
+                RenderDirty::full()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.output_pane.clear();
                 let _ = self.action_tx.send(UiAction::ClearOutput);
+                RenderDirty::full()
             }
-            _ => {
-                if let InputAction::Submit(text) = self.input_pane.handle_key(key) {
-                    self.handle_submit(text);
-                }
-            }
+            _ => self.handle_editor_key(key),
         }
     }
 
-    fn handle_active_key(&mut self, key: KeyEvent) {
+    fn handle_active_key(&mut self, key: KeyEvent) -> RenderDirty {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if self
@@ -827,36 +905,59 @@ impl App {
                 {
                     self.should_quit = true;
                     let _ = self.action_tx.send(UiAction::Quit);
+                    RenderDirty::none()
                 } else {
                     self.last_ctrl_c = Some(Instant::now());
                     self.output_pane
                         .add_system_message("Aborting... (press Ctrl+C again to quit)".to_string());
                     let _ = self.action_tx.send(UiAction::Abort);
+                    RenderDirty::full()
                 }
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
             }
-            (KeyModifiers::NONE, KeyCode::PageUp) => self.output_pane.scroll_page_up(),
-            (KeyModifiers::NONE, KeyCode::PageDown) => self.output_pane.scroll_page_down(),
-            (KeyModifiers::NONE, KeyCode::Home) => self.output_pane.scroll_to_top(),
-            (KeyModifiers::NONE, KeyCode::End) => self.output_pane.scroll_to_bottom(),
+            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                self.output_pane.scroll_page_up();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                self.output_pane.scroll_page_down();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::Home) => {
+                self.output_pane.scroll_to_top();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::End) => {
+                self.output_pane.scroll_to_bottom();
+                RenderDirty::full()
+            }
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
                 self.open_model_picker_for_current_provider(None);
+                RenderDirty::full()
             }
-            _ => {}
+            _ => RenderDirty::none(),
         }
     }
 
-    fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) -> RenderDirty {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.output_pane.scroll_line_up(3),
-            MouseEventKind::ScrollDown => self.output_pane.scroll_line_down(3),
+            MouseEventKind::ScrollUp => {
+                self.output_pane.scroll_line_up(3);
+                RenderDirty::full()
+            }
+            MouseEventKind::ScrollDown => {
+                self.output_pane.scroll_line_down(3);
+                RenderDirty::full()
+            }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 self.handle_left_click(mouse.row, mouse.column);
+                RenderDirty::none()
             }
-            _ => {}
+            _ => RenderDirty::none(),
         }
     }
 
@@ -878,13 +979,27 @@ impl App {
         }
     }
 
-    fn handle_submit(&mut self, text: String) {
+    fn handle_submit(&mut self, text: String) -> RenderDirty {
         let trimmed = text.trim();
         if trimmed.starts_with('/') {
             self.handle_slash_command(trimmed);
+            RenderDirty::full()
         } else {
             let _ = self.action_tx.send(UiAction::SubmitPrompt(text));
+            RenderDirty::composer()
         }
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) -> RenderDirty {
+        match self.input_pane.handle_key(key) {
+            InputAction::Submit(text) => self.handle_submit(text),
+            InputAction::None => RenderDirty::composer(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_flat_build_count(&self) -> u64 {
+        self.output_pane.flat_build_count()
     }
 
     fn handle_slash_command(&mut self, command: &str) {
@@ -905,12 +1020,7 @@ impl App {
             return;
         }
 
-        let Some(info) = self
-            .commands
-            .iter()
-            .find(|info| info.name == name)
-            .cloned()
-        else {
+        let Some(info) = self.commands.iter().find(|info| info.name == name).cloned() else {
             self.output_pane.add_system_message(format!(
                 "Unknown command: {raw_cmd}. Type /help for available commands."
             ));
@@ -1034,8 +1144,7 @@ impl App {
                     self.output_pane
                         .set_tool_output_mode(anie_config::ToolOutputMode::Compact);
                     self.output_pane.add_system_message(
-                        "Tool output mode set to compact (titles only for bash/read)."
-                            .to_string(),
+                        "Tool output mode set to compact (titles only for bash/read).".to_string(),
                     );
                 }
                 Some(other) => {
@@ -1621,24 +1730,6 @@ impl App {
 /// we pick 33 ms pending PR 2's cache).
 const FRAME_BUDGET: Duration = Duration::from_millis(33);
 
-/// Whether a terminal event should dirty the render. Mouse moves,
-/// drags, and button press/release are no-ops for us (we only act
-/// on `ScrollUp` / `ScrollDown`), so forcing a redraw for them is
-/// pure waste — and worse, mouse-motion tracking fires at ~100
-/// events/sec while the user moves the cursor, which starves
-/// keystroke processing and makes typing feel laggy. Filter them
-/// at the source.
-fn event_dirties_render(event: &Event) -> bool {
-    match event {
-        Event::Mouse(mouse) => matches!(
-            mouse.kind,
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-        ),
-        Event::Key(_) | Event::Resize(_, _) | Event::Paste(_) | Event::FocusGained
-        | Event::FocusLost => true,
-    }
-}
-
 /// Idle poll interval when nothing is dirty. Matches the previous
 /// behavior so background worker polling cadence is unchanged.
 const IDLE_TICK: Duration = Duration::from_millis(100);
@@ -1671,7 +1762,10 @@ pub async fn run_tui(
     // change visible state; the render below draws as soon as
     // the constraints allow. See
     // docs/tui_responsiveness/01_render_scheduling.md.
-    let mut dirty = true;
+    let mut dirty = RenderDirty {
+        composer: false,
+        full: true,
+    };
     // Typed input needs sub-frame-budget response or the user
     // feels lag. Set when a terminal event (keystroke, paste,
     // focus change) arrived — we bypass FRAME_BUDGET for
@@ -1707,8 +1801,13 @@ pub async fn run_tui(
             None => true,
         };
         let budget_ready = input_urgent || last_render_at.elapsed() >= FRAME_BUDGET;
-        if dirty && budget_ready && resize_ready {
+        if dirty.any() && budget_ready && resize_ready {
             let frame = crate::render_debug::RenderFrame::begin();
+            let render_mode = if input_urgent {
+                RenderMode::UrgentInput
+            } else {
+                RenderMode::Full
+            };
             // Fast-path keystroke paints bypass the DECSET 2026
             // synchronized-output wrap: a single typed char
             // changes only a handful of cells and the tearing
@@ -1717,15 +1816,15 @@ pub async fn run_tui(
             // GPU terminals. Non-urgent paints (streaming,
             // scrolling, resize-final) still wrap for atomic
             // composition.
-            if input_urgent {
-                crate::terminal::draw_urgent(terminal, |f| app.render(f))?;
+            if matches!(render_mode, RenderMode::UrgentInput) {
+                crate::terminal::draw_urgent(terminal, |f| app.render_with_mode(f, render_mode))?;
             } else {
-                crate::terminal::draw_synchronized(terminal, |f| app.render(f))?;
+                crate::terminal::draw_synchronized(terminal, |f| {
+                    app.render_with_mode(f, render_mode)
+                })?;
             }
             frame.end(app.output_pane.blocks().len());
-            if trace_typing
-                && let Some(arrived) = key_arrival_at.take()
-            {
+            if trace_typing && let Some(arrived) = key_arrival_at.take() {
                 let us = arrived.elapsed().as_micros();
                 tracing::info!(
                     target: "anie_tui::input_latency",
@@ -1734,7 +1833,7 @@ pub async fn run_tui(
                     "keystroke paint",
                 );
             }
-            dirty = false;
+            dirty.clear_after_render(render_mode);
             input_urgent = false;
             last_render_at = Instant::now();
             last_resize_at = None;
@@ -1744,7 +1843,7 @@ pub async fn run_tui(
         // dirty) or until the next idle tick (when clean).
         // When resize-debouncing, wait at least until the
         // debounce elapses so the select loop doesn't spin.
-        let timeout = if dirty {
+        let timeout = if dirty.any() {
             let budget_remaining = FRAME_BUDGET.saturating_sub(last_render_at.elapsed());
             if let Some(t) = last_resize_at {
                 let debounce_remaining = RESIZE_DEBOUNCE.saturating_sub(t.elapsed());
@@ -1758,10 +1857,8 @@ pub async fn run_tui(
 
         tokio::select! {
             Some(Ok(event)) = term_events.next() => {
-                let mut affects_render = event_dirties_render(&event);
                 let mut saw_resize = matches!(event, Event::Resize(_, _));
-                let mut saw_key = matches!(event, Event::Key(_) | Event::Paste(_));
-                app.handle_terminal_event(event)?;
+                let mut render_dirty = app.handle_terminal_event_dirty(event)?;
                 // Drain any terminal events already buffered in
                 // the stream. Mouse-motion tracking fires at
                 // ~100 events/sec while the cursor moves; without
@@ -1771,21 +1868,15 @@ pub async fn run_tui(
                 // ones out of the dirty flag.
                 while let Some(Some(next)) = term_events.next().now_or_never() {
                     let event = next?;
-                    if event_dirties_render(&event) {
-                        affects_render = true;
-                    }
                     if matches!(event, Event::Resize(_, _)) {
                         saw_resize = true;
                     }
-                    if matches!(event, Event::Key(_) | Event::Paste(_)) {
-                        saw_key = true;
-                    }
-                    app.handle_terminal_event(event)?;
+                    render_dirty.merge(app.handle_terminal_event_dirty(event)?);
                 }
                 if saw_resize {
                     last_resize_at = Some(Instant::now());
                 }
-                if saw_key {
+                if render_dirty.composer {
                     // Typed input needs immediate paint; bypass
                     // FRAME_BUDGET for exactly one frame so the
                     // keystroke lands on screen without waiting
@@ -1795,9 +1886,7 @@ pub async fn run_tui(
                         key_arrival_at = Some(Instant::now());
                     }
                 }
-                if affects_render {
-                    dirty = true;
-                }
+                dirty.merge(render_dirty);
             }
             Some(event) = app.event_rx.recv() => {
                 // Drain any additional agent events that piled up
@@ -1819,7 +1908,7 @@ pub async fn run_tui(
                     events.push(next);
                 }
                 app.handle_agent_event_batch(events)?;
-                dirty = true;
+                dirty.full = true;
             }
             _ = tokio::time::sleep(timeout) => {
                 app.handle_tick()?;
@@ -1829,7 +1918,7 @@ pub async fn run_tui(
                 // these redraws eliminates 10fps background work
                 // that otherwise scales with transcript size.
                 if app.needs_tick_redraw() {
-                    dirty = true;
+                    dirty.full = true;
                 }
             }
         }
