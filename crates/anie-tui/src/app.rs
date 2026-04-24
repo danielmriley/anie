@@ -416,26 +416,31 @@ impl App {
         let spinner_frame: &'static str = self.spinner.tick();
         let half_height = frame.area().height.saturating_sub(2).max(8) / 2;
         let bottom_height = match &self.bottom_pane {
-            BottomPane::Editor => self
-                .input_pane
-                .preferred_height(frame.area().width)
-                .clamp(3, 8),
+            // +2 so the TOP/BOTTOM border rows the input pane
+            // draws don't eat into the visible text area. The
+            // `preferred_height` return value is the number of
+            // *content* rows we want to show.
+            BottomPane::Editor => {
+                self.input_pane
+                    .preferred_height(frame.area().width)
+                    .clamp(3, 8)
+                    + 2
+            }
             BottomPane::ModelPicker(session) => session
                 .picker
                 .preferred_height(frame.area().width)
                 .clamp(8, half_height.max(8)),
         };
-        let (output_area, status_area, bottom_area) = layout(frame.area(), bottom_height);
+        let (output_area, spinner_area, bottom_area, status_area) =
+            layout(frame.area(), bottom_height);
 
         self.output_pane
             .render(output_area, frame.buffer_mut(), spinner_frame);
-        render_status_bar(
-            &self.status_bar,
+        render_spinner_row(
             &self.agent_state,
-            self.output_pane.is_scrolled(),
-            status_area,
-            frame.buffer_mut(),
             spinner_frame,
+            spinner_area,
+            frame.buffer_mut(),
         );
 
         let cursor = match &mut self.bottom_pane {
@@ -446,6 +451,13 @@ impl App {
                     .render(bottom_area, frame.buffer_mut(), spinner_frame)
             }
         };
+        render_status_bar(
+            &self.status_bar,
+            &self.agent_state,
+            self.output_pane.is_scrolled(),
+            status_area,
+            frame.buffer_mut(),
+        );
         frame.set_cursor_position(cursor);
 
         // Draw the inline autocomplete popup on top of the
@@ -1829,16 +1841,24 @@ pub async fn run_tui(
     Ok(())
 }
 
-fn layout(area: Rect, bottom_height: u16) -> (Rect, Rect, Rect) {
+/// Vertical layout: output transcript takes the flexible top
+/// region; a 1-row spinner strip sits directly above the input
+/// box; the input box (editor or model picker) follows; the
+/// status bar anchors the very bottom. Moving the status row
+/// below the input matches pi's layout — the information that
+/// "belongs" to what you're typing lives under the typing box,
+/// not above it.
+fn layout(area: Rect, bottom_height: u16) -> (Rect, Rect, Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(bottom_height),
+            Constraint::Length(1),
         ])
         .split(area);
-    (chunks[0], chunks[1], chunks[2])
+    (chunks[0], chunks[1], chunks[2], chunks[3])
 }
 
 fn default_provider_context(provider_name: &str) -> Option<ModelPickerContext> {
@@ -1889,15 +1909,18 @@ fn render_status_bar(
     transcript_scrolled: bool,
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
-    spinner_frame: &str,
 ) {
     let used_tokens = state
         .last_known_input_tokens
         .unwrap_or(state.estimated_context_tokens);
-    let agent_indicator = format_agent_indicator(agent_state, spinner_frame);
+    // `responding...` / `compacting Ns` used to live in the
+    // status bar as the leading char of the row. It moved to
+    // `render_spinner_row` so the activity indicator sits
+    // right above the input box (stable position, doesn't
+    // jitter into and out of the persistent info row).
+    let _ = agent_state;
     let status = format!(
-        " {} {}{}:{} │ thinking: {} │ {}/{} │ {}",
-        agent_indicator,
+        " {}{}:{} │ thinking: {} │ {}/{} │ {}",
         if transcript_scrolled {
             "↑ history │ "
         } else {
@@ -1917,19 +1940,41 @@ fn render_status_bar(
     .render(area, buf);
 }
 
-/// Compose the leading agent-state indicator that prefixes the
-/// status bar. During `Compacting`, append the elapsed seconds
-/// so users can see that the (long-running) summarization call
-/// is actually progressing.
-fn format_agent_indicator(agent_state: &AgentUiState, spinner_frame: &str) -> String {
-    match agent_state {
-        AgentUiState::Idle => " ".to_string(),
+/// Render the 1-row activity strip that sits directly above
+/// the input box. Shows the active agent state — streaming,
+/// tool-executing, compacting — or stays blank when idle. The
+/// position is load-bearing: it's what the user's eye is
+/// already anchored to (just above the thing they're typing
+/// in), so the "still working" cue never moves or fights with
+/// the transcript.
+fn render_spinner_row(
+    agent_state: &AgentUiState,
+    spinner_frame: &str,
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+) {
+    let text = match agent_state {
+        AgentUiState::Idle => String::new(),
+        AgentUiState::Streaming => format!("{spinner_frame} Responding..."),
+        AgentUiState::ToolExecuting { tool_name } => {
+            format!("{spinner_frame} Running {tool_name}...")
+        }
         AgentUiState::Compacting { started_at } => {
             let elapsed = started_at.elapsed().as_secs();
             format!("{spinner_frame} compacting {elapsed}s")
         }
-        AgentUiState::Streaming | AgentUiState::ToolExecuting { .. } => spinner_frame.to_string(),
+    };
+    if text.is_empty() {
+        // Still render an empty paragraph so ratatui clears
+        // any previous content in this cell region on a paint.
+        Paragraph::new(Line::default()).render(area, buf);
+        return;
     }
+    Paragraph::new(Line::from(Span::styled(
+        format!(" {text}"),
+        Style::default().fg(Color::Yellow),
+    )))
+    .render(area, buf);
 }
 
 fn format_tokens(tokens: u64) -> String {

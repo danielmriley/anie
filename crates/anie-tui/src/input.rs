@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 
 use crate::autocomplete::{AutocompletePopup, AutocompleteProvider, SuggestionKind};
@@ -272,8 +272,15 @@ impl InputPane {
     }
 
     /// Render the input pane and return the cursor position.
+    ///
+    /// Draws a thin top + bottom border around the editor so
+    /// the input region reads as a discrete box separate from
+    /// the transcript and the status strip — matching pi's and
+    /// Claude Code's input styling.
     pub fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Position {
-        let block = Block::default();
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray));
         let inner = block.inner(area);
         block.render(area, buf);
 

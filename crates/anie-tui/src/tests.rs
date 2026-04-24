@@ -112,7 +112,13 @@ fn static_layout_renders_output_status_and_input() {
 
     assert!(screen.contains("› Fix the bug in main.rs"));
     assert!(screen.contains("anthropic:claude-sonnet-4-6 │ thinking: medium │ 12.4k/200k"));
-    assert!(screen.contains("> "));
+    // `render_to_string` trims trailing spaces per line, so the
+    // `> ` input prompt lands with the space stripped — anchor
+    // to `\n>` to prove the marker shows up on its own line.
+    assert!(
+        screen.contains("\n>"),
+        "input prompt missing, screen was:\n{screen}"
+    );
 }
 
 #[test]
@@ -251,13 +257,13 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
     let thinking_index = screen
-        .find("thinking\n│ plan first")
+        .find("• Thinking\n  └ plan first")
         .expect("thinking section");
     let text_index = screen.find("final answer").expect("visible answer");
 
     assert!(thinking_index < text_index, "screen was:\n{screen}");
     assert!(
-        screen.contains("thinking\n│ plan first\n\nfinal answer"),
+        screen.contains("• Thinking\n  └ plan first\n\nfinal answer"),
         "screen was:\n{screen}"
     );
 }
@@ -292,31 +298,37 @@ fn streaming_assistant_renders_thinking_above_visible_response() {
     })
     .expect("thinking delta");
 
-    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
     let thinking_index = screen
-        .find("thinking\n│ plan first")
+        .find("• Thinking\n  └ plan first")
         .expect("thinking section");
     let text_index = screen.find("final answer").expect("visible answer");
-    let streaming_index = screen.find("responding...").expect("streaming status");
+    // The streaming activity indicator moved out of the
+    // transcript and onto a fixed row above the input box —
+    // `render_spinner_row` renders `⠋ Responding...` there.
+    let streaming_index = screen.find("Responding...").expect("streaming status");
 
     assert!(thinking_index < text_index, "screen was:\n{screen}");
     assert!(text_index < streaming_index, "screen was:\n{screen}");
     assert!(
-        screen.contains("thinking\n│ plan first\n\nfinal answer"),
+        screen.contains("• Thinking\n  └ plan first\n\nfinal answer"),
         "screen was:\n{screen}"
     );
 }
 
 #[test]
 fn wrapped_thinking_lines_keep_their_section_gutter() {
-    let screen = render_assistant_block("done", "abcdefghijklmnop", false, 10, 8);
+    let screen = render_assistant_block("done", "abcdefghijklmnop", false, 14, 8);
 
+    // First body line uses the `  └ ` indent; continuations
+    // use `    ` (four spaces) — both consume 4 chars, so at
+    // width=14 the body wraps to 10-char slices.
     assert!(
-        screen.contains("thinking\n│ abcdefgh\n│ ijklmnop\n\ndone"),
+        screen.contains("• Thinking\n  └ abcdefghij\n    klmnop\n\ndone"),
         "screen was:\n{screen}"
     );
 }
@@ -332,25 +344,41 @@ fn answer_only_assistant_rendering_remains_plain() {
 fn thinking_only_assistant_rendering_remains_grouped() {
     let screen = render_assistant_block("", "plan first", false, 20, 6);
 
-    assert_eq!(non_empty_lines(&screen), vec!["thinking", "│ plan first"]);
+    assert_eq!(
+        non_empty_lines(&screen),
+        vec!["• Thinking", "  └ plan first"]
+    );
 }
 
 #[test]
 fn streaming_assistant_without_visible_answer_reports_thinking_status() {
     let screen = render_assistant_block("", "plan first", true, 20, 6);
 
+    // While thinking is streaming with no visible answer yet,
+    // the `•` bullet swaps to the animated spinner frame — the
+    // header itself is the "still thinking" indicator, so the
+    // old separate `⠋ thinking...` status line is redundant.
     assert!(
-        screen.contains("thinking\n│ plan first\n│ ⠋ thinking..."),
+        screen.contains("⠋ Thinking\n  └ plan first"),
         "screen was:\n{screen}"
     );
     assert!(!screen.contains("responding..."), "screen was:\n{screen}");
 }
 
 #[test]
-fn empty_streaming_assistant_uses_generic_status() {
+fn empty_streaming_assistant_block_renders_blank_in_output_pane() {
+    // The "⠋ streaming..." indicator moved out of the
+    // assistant block and onto the dedicated spinner row
+    // above the input box (rendered by `render_spinner_row`
+    // in `app.rs`). A streaming assistant block with no
+    // content yet therefore contributes nothing to the
+    // transcript — the spinner row is the sole "still
+    // working" cue.
     let screen = render_assistant_block("", "", true, 20, 4);
-
-    assert_eq!(non_empty_lines(&screen), vec!["⠋ streaming..."]);
+    assert!(
+        non_empty_lines(&screen).is_empty(),
+        "expected empty output pane, got: {screen}"
+    );
 }
 
 #[test]
@@ -405,7 +433,10 @@ fn event_to_render_streaming_and_tool_lifecycle() {
     let screen = render_to_string(terminal.backend());
 
     assert!(screen.contains("I'll read the file first."));
-    assert!(screen.contains("┌─ read src/main.rs"));
+    assert!(
+        screen.contains("• Read src/main.rs"),
+        "tool header missing, screen was:\n{screen}"
+    );
     assert!(screen.contains("fn main() {}"));
 }
 
@@ -485,7 +516,10 @@ fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
         .expect("user message");
     }
 
-    let mut terminal = Terminal::new(TestBackend::new(40, 8)).expect("test terminal");
+    // Chrome (spinner row + bordered input + status bar) now
+    // takes ~7 rows. Give the output pane enough room for
+    // the most recent message to be visible without scroll.
+    let mut terminal = Terminal::new(TestBackend::new(40, 14)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw initial frame");
@@ -845,7 +879,10 @@ fn alt_arrow_word_movement_and_bash_title_render() {
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
-    assert!(screen.contains("┌─ $ echo hello world"));
+    assert!(
+        screen.contains("• Ran echo hello world"),
+        "tool header missing, screen was:\n{screen}"
+    );
     assert!(screen.contains("hello world"));
 }
 
@@ -882,8 +919,14 @@ fn replayed_tool_results_restore_titles_from_details() {
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
-    assert!(screen.contains("read src/main.rs"), "screen was:\n{screen}");
-    assert!(screen.contains("$ echo hello"), "screen was:\n{screen}");
+    assert!(
+        screen.contains("• Read src/main.rs"),
+        "screen was:\n{screen}"
+    );
+    assert!(
+        screen.contains("• Ran echo hello"),
+        "screen was:\n{screen}"
+    );
 }
 
 #[test]
@@ -911,7 +954,12 @@ fn diff_rendering_shows_added_and_removed_lines() {
     })
     .expect("tool end");
 
-    let mut terminal = Terminal::new(TestBackend::new(50, 10)).expect("test terminal");
+    // Bordered input (5 rows) + spinner row (1) + status (1)
+    // = 7 rows of chrome. The boxed diff needs 4+ rows to
+    // render its top border, two content rows, and bottom
+    // border — bump the terminal to 14 rows so the full box
+    // fits above the chrome.
+    let mut terminal = Terminal::new(TestBackend::new(50, 14)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw frame");
@@ -1212,26 +1260,29 @@ fn thinking_only_assistant_block_renders_error_footer() {
         10,
     );
     assert!(
-        screen.contains("thinking"),
+        screen.contains("• Thinking"),
         "thinking section should still render:\n{screen}"
     );
     assert!(
         screen.contains("no visible content"),
         "error footer must be visible after a thinking-only turn:\n{screen}"
     );
-    // Belt-and-suspenders: the warning glyph is the cue that
-    // this is an error line, not part of the thinking content.
-    assert!(screen.contains('⚠'), "error line should be flagged:\n{screen}");
+    // The `• Error` header is the cue that this is a provider-error
+    // row, not part of the thinking content.
+    assert!(
+        screen.contains("• Error"),
+        "error header should be flagged:\n{screen}"
+    );
 }
 
 #[test]
 fn assistant_block_without_error_renders_no_error_footer() {
     // Happy-path regression: healthy turns render untouched by
-    // the new error-footer path.
+    // the error-footer path.
     let screen = render_assistant_block("answer text", "a plan", false, 48, 10);
     assert!(
-        !screen.contains('⚠'),
-        "no warning glyph should appear on healthy turns:\n{screen}"
+        !screen.contains("• Error"),
+        "no error header should appear on healthy turns:\n{screen}"
     );
 }
 
@@ -1427,18 +1478,19 @@ fn submit_command(app: &mut App, command: &str) {
 // Thinking block display regression tests
 // ---------------------------------------------------------------------------
 
-/// Thinking text must never appear outside the "thinking" gutter section.
-/// This helper asserts that every occurrence of `thinking_text` in the
-/// rendered screen is inside a `│`-prefixed gutter line or the heading.
+/// Thinking text must never appear outside the `• Thinking`
+/// section. Every occurrence of `thinking_text` in the
+/// rendered screen must be either the header itself or a
+/// `  └ ` / `    ` indented body line.
 fn assert_thinking_text_only_in_gutter(screen: &str, thinking_text: &str) {
     for (line_no, line) in screen.lines().enumerate() {
         if line.contains(thinking_text) {
-            let trimmed = line.trim();
-            let in_gutter = trimmed.starts_with('│');
-            let is_heading = trimmed == "thinking";
+            let trimmed_start = line.trim_start();
+            let in_body = trimmed_start.starts_with("└ ") || line.starts_with("    ");
+            let is_heading = line.trim() == "• Thinking";
             assert!(
-                in_gutter || is_heading,
-                "thinking text '{}' leaked outside gutter at line {}:\n  {}\nfull screen:\n{}",
+                in_body || is_heading,
+                "thinking text '{}' leaked outside thinking section at line {}:\n  {}\nfull screen:\n{}",
                 thinking_text,
                 line_no + 1,
                 line,
@@ -1596,31 +1648,35 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
 #[test]
 fn thinking_only_completed_message_shows_only_gutter() {
     // A completed (non-streaming) message with only thinking and no text
-    // should render just the gutter section, no leaked text
+    // renders as `• Thinking` header + `  └ body` line — no leaked text.
     let screen = render_assistant_block("", "only reasoning here", false, 40, 8);
 
     assert_thinking_text_only_in_gutter(&screen, "only reasoning here");
     let lines = non_empty_lines(&screen);
-    // Should only have "thinking" heading and the gutter line
     assert_eq!(lines.len(), 2, "unexpected lines: {lines:?}");
-    assert_eq!(lines[0], "thinking");
-    assert!(lines[1].starts_with('│'), "line was: {}", lines[1]);
+    assert_eq!(lines[0], "• Thinking");
+    assert!(
+        lines[1].trim_start().starts_with("└ "),
+        "line was: {}",
+        lines[1]
+    );
 }
 
 #[test]
 fn long_thinking_does_not_bleed_past_gutter_boundary() {
-    // A long thinking block that wraps should stay entirely in the gutter
+    // A long thinking block that wraps should stay entirely in the
+    // bulleted body region — every wrapped line starts with `  └ ` or
+    // `    ` continuation indent.
     let long_thinking = "a]b".repeat(50); // 150 chars
     let screen = render_assistant_block("done", &long_thinking, false, 30, 20);
 
     assert!(screen.contains("done"), "screen was:\n{screen}");
-    // Every line containing thinking content must be in gutter
     for line in screen.lines() {
         if line.contains("a]b") {
-            let trimmed = line.trim();
+            let trimmed = line.trim_start();
             assert!(
-                trimmed.starts_with('│'),
-                "wrapped thinking leaked outside gutter: {line}\nfull screen:\n{screen}"
+                trimmed.starts_with("└ ") || line.starts_with("    "),
+                "wrapped thinking leaked outside section: {line}\nfull screen:\n{screen}"
             );
         }
     }

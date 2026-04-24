@@ -834,6 +834,7 @@ fn block_lines(
             // their full body so debugging and diffs stay
             // visible. `is_executing` blocks always show the
             // "executing..." spinner regardless of mode.
+            let is_error = result.as_ref().is_some_and(|value| value.is_error);
             let body = if let Some(result) = result {
                 if compact_hides_body(
                     tool_name,
@@ -851,17 +852,39 @@ fn block_lines(
                     result.content.clone()
                 }
             } else if *is_executing {
-                format!("{spinner_frame} executing...")
+                "executing...".to_string()
             } else {
                 String::new()
             };
-            boxed_lines(
-                format_tool_title(tool_name, args_display),
-                body,
-                width,
-                result.as_ref().is_some_and(|value| value.is_error),
-                *is_executing,
-            )
+            // Dispatch: errors keep the framed box so the red
+            // border is unmissable; edit/write keep the box so
+            // +/- diff lines stay legible; everything else
+            // (bash, read, grep, find, ls, in-flight) renders
+            // flat with the `• Verb` header.
+            if is_error || (!is_executing && uses_boxed_success_layout(tool_name)) {
+                boxed_lines(
+                    format_tool_title(tool_name, args_display),
+                    body,
+                    width,
+                    is_error,
+                    *is_executing,
+                )
+            } else {
+                let header = format_tool_header_spans(
+                    tool_name,
+                    args_display,
+                    is_error,
+                    *is_executing,
+                    spinner_frame,
+                );
+                prefix_lines(
+                    header,
+                    body,
+                    width,
+                    PREFIX_TOOL_BODY_LIMIT,
+                    PrefixBodyStyle::tool_success(),
+                )
+            }
         }
         RenderedBlock::SystemMessage { text } => {
             wrap_text(text, width, Style::default().fg(Color::DarkGray))
@@ -909,17 +932,14 @@ fn assistant_block_lines(
         &mut result,
         assistant_answer_lines(text, width, is_streaming, ctx),
     );
-    append_assistant_section(
-        &mut result,
-        assistant_streaming_lines(
-            text,
-            thinking,
-            is_streaming,
-            inline_thinking_status,
-            width,
-            spinner_frame,
-        ),
-    );
+    // The "responding…" / "thinking…" status indicator used
+    // to render a trailing line in the assistant block. That
+    // cue now lives on the dedicated spinner row directly
+    // above the input box (see `render_spinner_row` in
+    // `app.rs`), so we no longer duplicate it here — the
+    // transcript stays focused on the content itself.
+    let _ = spinner_frame;
+    let _ = inline_thinking_status;
     // Provider errors land at the bottom of the block so the user
     // sees the reason a turn produced no visible answer. Without
     // this, a thinking-only response would leave the user staring
@@ -939,13 +959,27 @@ fn assistant_block_lines(
 }
 
 fn assistant_error_lines(message: &str, width: u16) -> Vec<Line<'static>> {
-    let prefixed = format!("⚠ {message}");
-    wrap_text(
-        &prefixed,
+    // `• Error` header with a red bullet. Matches the tool-
+    // error bullet convention so provider-level failures and
+    // tool-level failures scan the same way.
+    let header = vec![
+        Span::styled("• ".to_string(), Style::default().fg(Color::Red)),
+        Span::styled(
+            "Error".to_string(),
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    prefix_lines(
+        header,
+        message.to_string(),
         width,
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD),
+        usize::MAX,
+        PrefixBodyStyle {
+            indent: Style::default().fg(Color::Red),
+            body: Style::default().fg(Color::Red),
+        },
     )
 }
 
@@ -968,45 +1002,67 @@ fn assistant_thinking_lines(
         return Vec::new();
     }
 
-    let gutter = thinking_gutter(width);
-    let mut lines = wrap_text("thinking", width, thinking_label_style());
-    lines.extend(wrap_prefixed_text(
-        thinking,
+    // `• Thinking` header using the same bullet vocabulary as
+    // tool calls. While thinking is actively streaming (no
+    // visible answer yet), swap the bullet for the spinner
+    // frame so the active section is the eye-catch.
+    let (bullet, bullet_style) = match streaming_spinner {
+        Some(frame) => (
+            format!("{frame} "),
+            Style::default().fg(Color::Yellow),
+        ),
+        None => (
+            "• ".to_string(),
+            Style::default()
+                .fg(Color::Indexed(246))
+                .add_modifier(Modifier::DIM),
+        ),
+    };
+    let header = vec![
+        Span::styled(bullet, bullet_style),
+        Span::styled(
+            "Thinking".to_string(),
+            thinking_label_style().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    prefix_lines(
+        header,
+        thinking.to_string(),
         width,
-        gutter,
-        thinking_gutter_style(),
-        thinking_body_style(),
-    ));
-    if let Some(spinner_frame) = streaming_spinner {
-        lines.extend(wrap_prefixed_text(
-            &format!("{spinner_frame} thinking..."),
-            width,
-            gutter,
-            thinking_gutter_style(),
-            streaming_status_style(),
-        ));
-    }
-    lines
+        usize::MAX,
+        PrefixBodyStyle {
+            indent: thinking_gutter_style(),
+            body: thinking_body_style(),
+        },
+    )
 }
 
-/// Assistant-answer rendering with a streaming-vs-finalized split.
+/// Render assistant answer text as markdown for both streaming
+/// and finalized turns.
 ///
-/// Streaming blocks always render as plain wrapped text — the
-/// block's content changes every delta (potentially every few ms
-/// under fast models), and running a CommonMark parse + syntect
-/// highlight pass per frame would dominate the render loop and
-/// break the block cache that Plan 02 of `tui_responsiveness/`
-/// introduced. Once the block is finalized, we re-render as
-/// markdown and the cache from `build_lines` memoizes it.
+/// Earlier revisions split the streaming text at the last
+/// `\n\n` boundary and rendered only the committed prefix as
+/// markdown — the tail stayed plain until the stream ended.
+/// That produced a visible "snap" at stream-end where the tail
+/// section suddenly reformatted from raw `**bold**` / `# head`
+/// syntax into rendered markdown. Users flagged the transition
+/// as jarring.
 ///
-/// UX implication: during streaming the user sees raw markdown
-/// syntax (`**bold**` literally). When the turn finalizes the
-/// block "settles" into rendered markdown. pi's markdown widget
-/// behaves the same way by construction.
+/// The current shape renders the full text as markdown every
+/// frame. pulldown-cmark is tolerant of incomplete input:
+/// unclosed fences render as code blocks, unbalanced `**` /
+/// `_` render as literal chars, partial headings render with
+/// the text seen so far. Reflow is localized to the block
+/// being typed — no end-of-stream global reformat.
+///
+/// Streaming blocks bypass the block cache (see
+/// `animated_streaming_block_never_caches`), so per-frame
+/// markdown work is already the cost profile. No new cache
+/// pressure.
 fn assistant_answer_lines(
     text: &str,
     width: u16,
-    is_streaming: bool,
+    _is_streaming: bool,
     ctx: &RenderContext,
 ) -> Vec<Line<'static>> {
     if text.is_empty() {
@@ -1015,93 +1071,7 @@ fn assistant_answer_lines(
     if !ctx.markdown_enabled {
         return wrap_text(text, width, Style::default());
     }
-    if !is_streaming {
-        return crate::markdown::render_markdown(text, width, &ctx.theme);
-    }
-    // Streaming + markdown: progressive render. Everything up
-    // to the last safe commit point (a blank line outside any
-    // open code fence) is markdown-rendered; the incomplete
-    // trailing block stays plain until the next commit
-    // boundary. Avoids the "big snap at stream-end" transition
-    // a user sees when the whole message goes from plain to
-    // fully rendered markdown at once.
-    let commit_end = find_last_safe_markdown_boundary(text);
-    if commit_end == 0 {
-        return wrap_text(text, width, Style::default());
-    }
-    let (committed, tail) = text.split_at(commit_end);
-    let mut lines = crate::markdown::render_markdown(committed, width, &ctx.theme);
-    if !tail.is_empty() {
-        lines.extend(wrap_text(tail, width, Style::default()));
-    }
-    lines
-}
-
-/// Return the byte index of the end of the last prefix of
-/// `text` that can be safely rendered as markdown mid-stream.
-///
-/// A "safe" boundary is a blank line (`\n\n`) that sits
-/// outside any open fenced code block. Blank lines inside an
-/// unclosed ``` or ~~~ fence don't count — the fence needs
-/// to close before we can ask pulldown-cmark to render
-/// anything beyond it, or the output will look wrong.
-///
-/// Returns 0 when no safe boundary exists yet (the whole
-/// text is still the "tail" of an in-progress block).
-fn find_last_safe_markdown_boundary(text: &str) -> usize {
-    let mut in_fence = false;
-    let mut last_safe: usize = 0;
-    let mut pos: usize = 0;
-    for line in text.split_inclusive('\n') {
-        let line_end = pos + line.len();
-        let line_text = line.trim_end_matches('\n').trim_end_matches('\r');
-        let trimmed = line_text.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-        }
-        let is_blank = line_text.trim().is_empty();
-        // A blank line outside any fence is the safe commit
-        // point. We include the blank's own `\n` in the
-        // committed prefix so pulldown-cmark sees the
-        // paragraph separator it needs for block layout.
-        if is_blank && !in_fence {
-            last_safe = line_end;
-        }
-        pos = line_end;
-    }
-    last_safe
-}
-
-fn assistant_streaming_lines(
-    text: &str,
-    thinking: &str,
-    is_streaming: bool,
-    inline_thinking_status: bool,
-    width: u16,
-    spinner_frame: &str,
-) -> Vec<Line<'static>> {
-    if !is_streaming || inline_thinking_status {
-        return Vec::new();
-    }
-
-    wrap_text(
-        &format!(
-            "{spinner_frame} {}",
-            assistant_streaming_status_text(text, thinking)
-        ),
-        width,
-        streaming_status_style(),
-    )
-}
-
-fn assistant_streaming_status_text(text: &str, thinking: &str) -> &'static str {
-    if !text.is_empty() {
-        "responding..."
-    } else if !thinking.is_empty() {
-        "thinking..."
-    } else {
-        "streaming..."
-    }
+    crate::markdown::render_markdown(text, width, &ctx.theme)
 }
 
 fn thinking_label_style() -> Style {
@@ -1127,47 +1097,6 @@ fn thinking_body_style() -> Style {
     Style::default()
         .fg(Color::Indexed(248))
         .add_modifier(Modifier::ITALIC | Modifier::DIM)
-}
-
-fn streaming_status_style() -> Style {
-    Style::default().fg(Color::Yellow)
-}
-
-fn thinking_gutter(width: u16) -> &'static str {
-    match width.max(1) {
-        1 => "",
-        2 => "│",
-        _ => "│ ",
-    }
-}
-
-fn wrap_prefixed_text(
-    text: &str,
-    width: u16,
-    prefix: &str,
-    prefix_style: Style,
-    text_style: Style,
-) -> Vec<Line<'static>> {
-    let prefix_width = prefix.chars().count() as u16;
-    let content_width = width.max(1).saturating_sub(prefix_width).max(1);
-
-    wrap_plain_text(text, content_width)
-        .into_iter()
-        .map(|line| {
-            let mut spans = Vec::new();
-            if !prefix.is_empty() {
-                spans.push(Span::styled(prefix.to_string(), prefix_style));
-            }
-            if !line.is_empty() {
-                spans.push(Span::styled(line, text_style));
-            }
-            if spans.is_empty() {
-                Line::default()
-            } else {
-                Line::from(spans)
-            }
-        })
-        .collect::<Vec<_>>()
 }
 
 fn wrap_text(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
@@ -1336,6 +1265,159 @@ fn format_tool_title(tool_name: &str, args_display: &str) -> String {
         }
         _ => tool_name.to_string(),
     }
+}
+
+/// Max body lines we render in the prefix (non-boxed) tool path
+/// before collapsing the tail into `… +N lines`. Codex / Claude
+/// Code both cap around 5–6 here so a chatty `ls` or `grep`
+/// doesn't dominate the transcript.
+const PREFIX_TOOL_BODY_LIMIT: usize = 5;
+const PREFIX_FIRST_INDENT: &str = "  └ ";
+const PREFIX_CONT_INDENT: &str = "    ";
+
+/// Map an anie tool name to a short past-tense verb for the
+/// status-bullet header. Verbs are the convention Claude Code /
+/// Codex use to make tool-call rows scan like a narrative rather
+/// than a log of raw tool names.
+fn tool_verb(tool_name: &str) -> &'static str {
+    match tool_name {
+        "bash" => "Ran",
+        "read" => "Read",
+        "grep" => "Searched",
+        "find" => "Found",
+        "ls" => "Listed",
+        "edit" => "Edited",
+        "write" => "Wrote",
+        _ => "Called",
+    }
+}
+
+/// Header line for a tool call in the prefix (non-boxed) path:
+/// `• <Verb> <args>` with a colored bullet (green = ok, red =
+/// error, yellow + spinner = in-flight). The verb is bold; the
+/// args render dim so the status bullet + verb stay the eye-catch.
+fn format_tool_header_spans(
+    tool_name: &str,
+    args_display: &str,
+    is_error: bool,
+    is_executing: bool,
+    spinner_frame: &str,
+) -> Vec<Span<'static>> {
+    let (bullet, bullet_style) = if is_executing {
+        (
+            format!("{spinner_frame} "),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if is_error {
+        ("• ".to_string(), Style::default().fg(Color::Red))
+    } else {
+        ("• ".to_string(), Style::default().fg(Color::Green))
+    };
+    let verb = tool_verb(tool_name);
+    let mut spans = vec![
+        Span::styled(bullet, bullet_style),
+        Span::styled(
+            verb.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !args_display.is_empty() {
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(
+            args_display.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
+/// Styling for a `prefix_lines` body region.
+///
+/// `indent` styles the `  └ ` / `    ` gutter chars; `body`
+/// styles the wrapped text itself. Split so a caller can
+/// mismatch them — e.g. thinking uses a muted gray indent but
+/// a DIM italic body; errors use a red indent with a bold red
+/// body.
+#[derive(Debug, Clone, Copy)]
+struct PrefixBodyStyle {
+    indent: Style,
+    body: Style,
+}
+
+impl PrefixBodyStyle {
+    fn tool_success() -> Self {
+        Self {
+            indent: Style::default().fg(Color::DarkGray),
+            body: Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        }
+    }
+}
+
+/// Render a block as a bulleted header plus an indented body.
+/// Body wraps to `width - indent` and caps at `max_body_lines`
+/// — the overflow is replaced with a single `… +N lines`
+/// footer so a chatty block doesn't push the rest of the
+/// transcript offscreen. Pass `max_body_lines = usize::MAX` to
+/// skip truncation (e.g. for thinking / error sections where
+/// every line is load-bearing).
+fn prefix_lines(
+    header_spans: Vec<Span<'static>>,
+    body: String,
+    width: u16,
+    max_body_lines: usize,
+    style: PrefixBodyStyle,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(header_spans)];
+    if body.is_empty() {
+        return lines;
+    }
+    let indent_chars = PREFIX_FIRST_INDENT.chars().count() as u16;
+    let body_width = width.saturating_sub(indent_chars).max(1);
+    let wrapped = wrap_plain_text(&body, body_width);
+    // Strip trailing blanks so "Took 0.1s\n\n" doesn't burn a
+    // body slot on a blank line.
+    let mut effective = wrapped;
+    while effective.last().is_some_and(|l| l.trim().is_empty()) {
+        effective.pop();
+    }
+    if effective.is_empty() {
+        return lines;
+    }
+    let total = effective.len();
+    let shown = total.min(max_body_lines);
+    for (idx, text) in effective.iter().take(shown).enumerate() {
+        let prefix = if idx == 0 {
+            PREFIX_FIRST_INDENT
+        } else {
+            PREFIX_CONT_INDENT
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), style.indent),
+            Span::styled(text.clone(), style.body),
+        ]));
+    }
+    if total > shown {
+        let remaining = total - shown;
+        lines.push(Line::from(vec![
+            Span::styled(PREFIX_CONT_INDENT.to_string(), style.indent),
+            Span::styled(
+                format!("… +{remaining} lines"),
+                style.body.add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+    lines
+}
+
+/// Tool kinds whose successful result renders as a framed box
+/// rather than the flat prefix layout. Keeping `edit` and
+/// `write` boxed preserves the diff framing that makes a
+/// multi-line `-/+` patch scan cleanly; a flat DIM body would
+/// bury the +/- colors.
+fn uses_boxed_success_layout(tool_name: &str) -> bool {
+    matches!(tool_name, "edit" | "write")
 }
 
 #[cfg(test)]
@@ -1532,94 +1614,233 @@ mod tool_output_mode_tests {
 }
 
 #[cfg(test)]
+mod prefix_tool_layout_tests {
+    use super::*;
+
+    fn line_to_string(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn tool_block_lines(
+        tool_name: &str,
+        args: &str,
+        body: &str,
+        is_error: bool,
+    ) -> Vec<Line<'static>> {
+        let mut pane = OutputPane::new();
+        pane.add_tool_call(
+            "call".into(),
+            tool_name.to_string(),
+            args.to_string(),
+        );
+        pane.finalize_tool_result("call", body.to_string(), is_error, None);
+        pane.build_lines(80, ".")
+    }
+
+    /// Successful bash renders with the verb header and a
+    /// `  └ ` first-body indent rather than the old `┌─ $ ...`
+    /// frame.
+    #[test]
+    fn successful_bash_uses_prefix_layout_not_box() {
+        let lines = tool_block_lines("bash", "ls /tmp", "file1", false);
+        let text: Vec<String> = lines.iter().map(line_to_string).collect();
+        let joined = text.join("\n");
+        assert!(
+            joined.contains("• Ran ls /tmp"),
+            "header missing:\n{joined}"
+        );
+        assert!(
+            joined.contains("  └ file1"),
+            "first body indent missing:\n{joined}"
+        );
+        assert!(
+            !joined.contains('┌'),
+            "successful bash should not use boxed frame:\n{joined}"
+        );
+    }
+
+    /// Successful read also uses the prefix path.
+    #[test]
+    fn successful_read_uses_prefix_layout() {
+        let lines = tool_block_lines("read", "src/main.rs", "fn main() {}", false);
+        let joined = lines
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("• Read src/main.rs"),
+            "header missing:\n{joined}"
+        );
+        assert!(
+            joined.contains("  └ fn main() {}"),
+            "body indent missing:\n{joined}"
+        );
+    }
+
+    /// Errors keep the framed box so the red border stays the
+    /// primary signal.
+    #[test]
+    fn tool_errors_keep_boxed_layout() {
+        let lines = tool_block_lines("bash", "false", "exit 1", true);
+        let joined = lines
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains('┌') && joined.contains('└'),
+            "errors should stay boxed:\n{joined}"
+        );
+    }
+
+    /// edit/write keep the framed box so diff lines stay
+    /// legible against the frame.
+    #[test]
+    fn edit_tool_keeps_boxed_layout() {
+        let lines = tool_block_lines("edit", "src/main.rs", "- old\n+ new", false);
+        let joined = lines
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("┌─ edit src/main.rs"),
+            "edit should stay boxed:\n{joined}"
+        );
+    }
+
+    /// Body capped at PREFIX_TOOL_BODY_LIMIT lines with a
+    /// `… +N lines` footer. Guards against chatty tools pushing
+    /// the transcript offscreen.
+    #[test]
+    fn prefix_body_truncates_long_output_with_footer() {
+        let body = (1..=12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = tool_block_lines("bash", "gen", &body, false);
+        let joined = lines
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("line 1"),
+            "first body line should render:\n{joined}"
+        );
+        assert!(
+            !joined.contains("line 12"),
+            "last body line should be truncated:\n{joined}"
+        );
+        assert!(
+            joined.contains("… +7 lines"),
+            "truncation footer missing:\n{joined}"
+        );
+    }
+
+    /// Short outputs are not decorated with the truncation
+    /// footer.
+    #[test]
+    fn prefix_body_does_not_add_footer_when_under_limit() {
+        let lines = tool_block_lines("bash", "ok", "a\nb\nc", false);
+        let joined = lines
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("… +"), "spurious footer:\n{joined}");
+    }
+
+    /// In-flight tool block uses the prefix path with the
+    /// spinner frame as the bullet and "executing..." as body.
+    #[test]
+    fn executing_tool_renders_spinner_header_and_placeholder_body() {
+        let mut pane = OutputPane::new();
+        pane.add_tool_call("call".into(), "bash".into(), "sleep 1".into());
+        let lines = pane.build_lines(80, "⠋");
+        let joined = lines
+            .iter()
+            .map(line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("⠋ Ran sleep 1"),
+            "in-flight header missing:\n{joined}"
+        );
+        assert!(
+            joined.contains("  └ executing..."),
+            "in-flight body missing:\n{joined}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod streaming_markdown_tests {
     use super::*;
 
+    /// Streaming and finalized rendering produce identical
+    /// lines for the same text. That's the core of the
+    /// no-jump-at-stream-end guarantee — if the output is
+    /// byte-identical regardless of `is_streaming`, there's
+    /// nothing to snap to at the transition.
     #[test]
-    fn safe_boundary_finds_blank_line_after_paragraph() {
-        // "a\n\nb" — a paragraph, a blank, then in-progress.
-        // Commit point is right after the blank's `\n`.
-        assert_eq!(find_last_safe_markdown_boundary("a\n\nb"), 3);
-    }
-
-    #[test]
-    fn safe_boundary_returns_zero_when_no_blank_line_yet() {
-        assert_eq!(find_last_safe_markdown_boundary("hello"), 0);
-        assert_eq!(find_last_safe_markdown_boundary("line1\nline2\nstill typing"), 0);
-    }
-
-    #[test]
-    fn safe_boundary_empty_input_is_zero() {
-        assert_eq!(find_last_safe_markdown_boundary(""), 0);
-    }
-
-    #[test]
-    fn safe_boundary_ignores_blank_inside_unclosed_fence() {
-        // Paragraph break before the fence opens is committable.
-        // A blank line INSIDE an unclosed fence is not, because
-        // rendering the fence-prefix mid-stream would produce
-        // wrong output.
-        let text = "intro\n\n```rust\n\nlet x = 1;\n[still typing]";
-        //          0      6 7                          — boundary at byte 7
-        assert_eq!(find_last_safe_markdown_boundary(text), 7);
-    }
-
-    #[test]
-    fn safe_boundary_allows_commit_after_fence_closes() {
-        let text = "```\ncode\n```\n\npost-fence paragraph\n\ntail...";
-        // Fence opens+closes; first safe boundary is after the
-        // blank following the fence close, then after the
-        // blank following "post-fence paragraph".
-        let cut = find_last_safe_markdown_boundary(text);
-        // `cut` should land after the second blank line (just
-        // before "tail..."). We assert the committed prefix
-        // ends with `\n\n` and the tail begins with `tail`.
-        assert!(text[..cut].ends_with("\n\n"), "text[..{cut}] = {:?}", &text[..cut]);
-        assert!(text[cut..].starts_with("tail"), "text[{cut}..] = {:?}", &text[cut..]);
-    }
-
-    #[test]
-    fn safe_boundary_recognizes_tilde_fences() {
-        // GFM supports ~~~ fences as well as ```. Both must
-        // suppress mid-fence commits.
-        let text = "before\n\n~~~\nstill inside\n";
-        assert_eq!(find_last_safe_markdown_boundary(text), 8);
-    }
-
-    #[test]
-    fn streaming_answer_lines_split_is_cell_identical_to_full_markdown_at_commit_points() {
-        // At a hard commit boundary (text ends with \n\n\ntail)
-        // the streaming render output differs from a full-text
-        // markdown render only in that the tail portion is
-        // plain-wrapped. But the committed prefix should match
-        // byte-identical to what full-text markdown would
-        // produce for that prefix alone.
+    fn streaming_and_finalized_render_are_cell_identical() {
         let ctx = RenderContext::default();
-        let text = "# Heading\n\nBody paragraph.\n\nIn-progress tail line";
+        let text = "# Heading\n\nBody paragraph.\n\n## Subheading\n\nTrailing line";
         let streaming = assistant_answer_lines(text, 40, true, &ctx);
-        let expected_committed =
-            crate::markdown::render_markdown("# Heading\n\nBody paragraph.\n\n", 40, &ctx.theme);
-        // The streaming output starts with the committed
-        // prefix's rendered lines.
-        assert!(streaming.len() >= expected_committed.len());
-        for (idx, line) in expected_committed.iter().enumerate() {
-            let lhs: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            let rhs: String = streaming[idx]
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect();
-            assert_eq!(lhs, rhs, "committed line {idx} differs");
+        let finalized = assistant_answer_lines(text, 40, false, &ctx);
+        assert_eq!(streaming.len(), finalized.len());
+        for (idx, (a, b)) in streaming.iter().zip(finalized.iter()).enumerate() {
+            let lhs: String = a.spans.iter().map(|s| s.content.as_ref()).collect();
+            let rhs: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(lhs, rhs, "line {idx} differs between streaming/finalized");
         }
     }
 
+    /// A single-line in-progress heading renders as a heading,
+    /// not as plain text with literal `##`. Guard against
+    /// regressing to the old split-boundary behavior.
     #[test]
-    fn streaming_answer_lines_falls_back_to_plain_when_no_boundary_yet() {
-        // A streaming message that hasn't produced a paragraph
-        // break yet renders as plain text — no markdown syntax
-        // should appear as styled output mid-word.
+    fn single_line_heading_renders_as_markdown_mid_stream() {
         let ctx = RenderContext::default();
         let text = "## Title still on the first line";
+        let streaming = assistant_answer_lines(text, 40, true, &ctx);
+        let plain = wrap_text(text, 40, Style::default());
+        // The markdown-rendered heading should NOT equal the
+        // plain-wrapped version (plain keeps the `##` literal;
+        // markdown strips/styles it).
+        let streamed_text: String = streaming
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        let plain_text: String = plain
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_ne!(
+            streamed_text, plain_text,
+            "streaming render should be markdown, not plain"
+        );
+    }
+
+    /// Empty text produces no lines regardless of streaming.
+    #[test]
+    fn empty_streaming_text_produces_no_lines() {
+        let ctx = RenderContext::default();
+        assert!(assistant_answer_lines("", 40, true, &ctx).is_empty());
+        assert!(assistant_answer_lines("", 40, false, &ctx).is_empty());
+    }
+
+    /// When markdown is disabled, streaming falls back to
+    /// plain-wrapped text (no markdown parse).
+    #[test]
+    fn markdown_disabled_renders_plain_during_streaming() {
+        let ctx = RenderContext {
+            markdown_enabled: false,
+            ..RenderContext::default()
+        };
+        let text = "# literal hash";
         let streaming = assistant_answer_lines(text, 40, true, &ctx);
         let plain = wrap_text(text, 40, Style::default());
         assert_eq!(streaming.len(), plain.len());
@@ -1628,6 +1849,34 @@ mod streaming_markdown_tests {
             let rhs: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(lhs, rhs);
         }
+    }
+
+    /// An in-progress code fence (opened, not yet closed) must
+    /// render as a code block — not as literal backtick chars.
+    /// Regression guard against any future re-introduction of
+    /// "skip markdown for tails that look incomplete" logic.
+    #[test]
+    fn unclosed_code_fence_renders_as_code_block_mid_stream() {
+        let ctx = RenderContext::default();
+        let text = "Here is some code:\n\n```rust\nfn main() {\n    println!";
+        let streaming = assistant_answer_lines(text, 60, true, &ctx);
+        let rendered: String = streaming
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        // The literal `` ``` `` fence markers should NOT appear in
+        // the rendered output — pulldown-cmark strips them and
+        // emits a code block. If they leak through, the tail is
+        // being plain-rendered and the old regression is back.
+        assert!(
+            !rendered.contains("```"),
+            "unclosed fence leaked literal backticks:\n{rendered}"
+        );
+        // Code content is still present (just styled as code).
+        assert!(
+            rendered.contains("fn main()"),
+            "code content missing:\n{rendered}"
+        );
     }
 }
 
