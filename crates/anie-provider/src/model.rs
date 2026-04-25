@@ -368,22 +368,16 @@ impl ModelInfo {
     /// and a simple fallback is used otherwise.
     #[must_use]
     pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
-        // Regression guard for Ollama: `/api/show` exposes the
-        // model's architectural max context length (e.g. 262 144
-        // for qwen3.5), but Ollama's OpenAI-compat endpoint
-        // defaults `num_ctx` to 4 096 on the wire and silently
-        // ignores attempts to set it. Propagating the discovered
-        // value would make compaction grow conversations to ~250 k
-        // tokens before trimming, and Ollama would silently
-        // truncate the prompt. Keep the conservative 32 k fallback
-        // until the deferred native `/api/chat` codepath can honor
-        // `num_ctx`. The raw discovered length rides along in
-        // `ModelInfo.context_length` so the native plan picks it
-        // up without re-discovering.
-        let context_window = if self.provider.eq_ignore_ascii_case("ollama") {
-            32_768
-        } else {
-            self.context_length.unwrap_or(32_768)
+        // Regression guard for legacy Ollama OpenAI-compat entries:
+        // `/api/show` exposes the model's architectural max context
+        // length (e.g. 262 144 for qwen3.5), but Ollama's
+        // OpenAI-compat endpoint defaults `num_ctx` to 4 096 on the
+        // wire and silently ignores attempts to set it. Native
+        // `OllamaChatApi` sends `options.num_ctx`, so only the legacy
+        // `OpenAICompletions` path keeps the conservative 32 k guard.
+        let context_window = match (self.provider.eq_ignore_ascii_case("ollama"), api) {
+            (true, ApiKind::OpenAICompletions) => 32_768,
+            _ => self.context_length.unwrap_or(32_768),
         };
         let max_tokens = self.max_output_tokens.unwrap_or(8_192);
         Model {
@@ -535,15 +529,11 @@ mod tests {
     }
 
     #[test]
-    fn to_model_does_not_propagate_ollama_context_length_until_native_path() {
-        // Regression guard — see the to_model comment and
-        // docs/ollama_capability_discovery/README.md. Discovery
+    fn to_model_retains_32k_guard_for_legacy_openai_completions_ollama() {
+        // Regression guard for the legacy wire path: discovery
         // succeeds (context_length = 262 144 for qwen3.5 from
-        // /api/show), but the Model keeps the 32 k fallback
-        // until the native /api/chat codepath can honor
-        // num_ctx on the wire. If this test starts failing, the
-        // deferred native plan has likely shipped — flip the
-        // assertion to match the discovered value.
+        // /api/show), but OpenAI-compat Ollama still cannot honor
+        // num_ctx on the wire, so keep compaction conservative.
         let info = ModelInfo {
             id: "qwen3.5:9b".into(),
             name: "Qwen 3.5 9B".into(),
@@ -558,6 +548,24 @@ mod tests {
         };
         let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
         assert_eq!(model.context_window, 32_768);
+    }
+
+    #[test]
+    fn to_model_propagates_ollama_context_length_under_ollama_chat_api() {
+        let info = ModelInfo {
+            id: "qwen3.5:9b".into(),
+            name: "Qwen 3.5 9B".into(),
+            provider: "ollama".into(),
+            context_length: Some(262_144),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec!["completion".into(), "tools".into()]),
+        };
+        let model = info.to_model(ApiKind::OllamaChatApi, "http://localhost:11434");
+        assert_eq!(model.context_window, 262_144);
     }
 
     #[test]

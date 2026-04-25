@@ -16,7 +16,7 @@ use anie_provider::{
     ApiKind, CostPerMillion, LlmContext, Model, ModelCompat, Provider, ReplayCapabilities,
     StreamOptions,
 };
-use anie_providers_builtin::{AnthropicProvider, OpenAIProvider};
+use anie_providers_builtin::{AnthropicProvider, OllamaChatProvider, OpenAIProvider};
 use serde_json::json;
 
 // ============================================================
@@ -110,6 +110,28 @@ fn openai_model() -> Model {
     }
 }
 
+fn ollama_model_with_context(context_window: u64) -> Model {
+    Model {
+        id: "qwen3.5:9b".into(),
+        name: "Qwen 3.5 9B".into(),
+        provider: "ollama".into(),
+        api: ApiKind::OllamaChatApi,
+        base_url: "http://localhost:11434".into(),
+        context_window,
+        max_tokens: 8_192,
+        supports_reasoning: false,
+        reasoning_capabilities: None,
+        supports_images: false,
+        cost_per_million: CostPerMillion::zero(),
+        replay_capabilities: None,
+        compat: ModelCompat::None,
+    }
+}
+
+fn ollama_model() -> Model {
+    ollama_model_with_context(262_144)
+}
+
 fn build_anthropic_body(messages: Vec<Message>) -> serde_json::Value {
     let provider = AnthropicProvider::new();
     let llm_messages = provider.convert_messages(&messages);
@@ -130,6 +152,21 @@ fn build_openai_body(messages: Vec<Message>) -> serde_json::Value {
         tools: Vec::new(),
     };
     provider.build_request_body_for_test(&openai_model(), &ctx, &StreamOptions::default())
+}
+
+fn build_ollama_body_for_model(model: &Model, messages: Vec<Message>) -> serde_json::Value {
+    let provider = OllamaChatProvider::new();
+    let llm_messages = provider.convert_messages(&messages);
+    let ctx = LlmContext {
+        system_prompt: String::new(),
+        messages: llm_messages,
+        tools: Vec::new(),
+    };
+    provider.build_request_body_for_test(model, &ctx, &StreamOptions::default())
+}
+
+fn build_ollama_body(messages: Vec<Message>) -> serde_json::Value {
+    build_ollama_body_for_model(&ollama_model(), messages)
 }
 
 fn count_cache_control_markers(value: &serde_json::Value) -> usize {
@@ -220,6 +257,41 @@ fn openai_tool_call_id_roundtrips() {
 }
 
 #[test]
+fn ollama_tool_call_replay_uses_native_name_and_arguments_shape() {
+    let body = build_ollama_body(signed_thinking_fixture());
+    let messages = body["messages"].as_array().expect("messages array");
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant turn");
+    let tool_call = &assistant["tool_calls"][0];
+
+    assert_eq!(tool_call["function"]["name"], json!("calculator"));
+    assert_eq!(
+        tool_call["function"]["arguments"],
+        json!({ "op": "add", "a": 2, "b": 2 })
+    );
+    assert!(
+        tool_call["id"].is_null(),
+        "Ollama must not replay synthetic tool-call ids"
+    );
+}
+
+#[test]
+fn ollama_chat_request_body_num_ctx_reflects_discovered_context_length_after_pr6() {
+    let body = build_ollama_body(signed_thinking_fixture());
+    assert_eq!(body["options"]["num_ctx"], json!(262_144));
+}
+
+#[test]
+fn ollama_chat_request_body_num_ctx_identical_across_consecutive_calls() {
+    let model = ollama_model_with_context(262_144);
+    let first = build_ollama_body_for_model(&model, signed_thinking_fixture());
+    let second = build_ollama_body_for_model(&model, signed_thinking_fixture());
+    assert_eq!(first["options"]["num_ctx"], second["options"]["num_ctx"]);
+}
+
+#[test]
 fn openai_request_omits_max_tokens_when_options_does_not_set_it() {
     // Regression: a 262 k-context OpenRouter model 400'd because
     // we were sending `max_tokens = 262_144`. The fix (per pi's
@@ -256,9 +328,11 @@ fn cache_control_marker_count_bounded_across_providers() {
     // guard for the earlier "Found 5" production 400.
     let anthropic_body = build_anthropic_body(signed_thinking_fixture());
     let openai_body = build_openai_body(signed_thinking_fixture());
+    let ollama_body = build_ollama_body(signed_thinking_fixture());
 
     let anthropic_count = count_cache_control_markers(&anthropic_body);
     let openai_count = count_cache_control_markers(&openai_body);
+    let ollama_count = count_cache_control_markers(&ollama_body);
 
     assert!(
         anthropic_count <= 4,
@@ -267,6 +341,10 @@ fn cache_control_marker_count_bounded_across_providers() {
     assert_eq!(
         openai_count, 0,
         "openai must not emit cache_control markers"
+    );
+    assert_eq!(
+        ollama_count, 0,
+        "ollama must not emit cache_control markers"
     );
 }
 
@@ -277,6 +355,8 @@ fn no_null_opaque_field_artifacts_in_serialized_body() {
     // `data`, etc.
     let anthropic_body = build_anthropic_body(signed_thinking_fixture());
     let anthropic_str = serde_json::to_string(&anthropic_body).unwrap();
+    let ollama_body = build_ollama_body(signed_thinking_fixture());
+    let ollama_str = serde_json::to_string(&ollama_body).unwrap();
     assert!(
         !anthropic_str.contains("\"signature\":null"),
         "anthropic emitted a null signature: {anthropic_str}"
@@ -284,6 +364,10 @@ fn no_null_opaque_field_artifacts_in_serialized_body() {
     assert!(
         !anthropic_str.contains("\"data\":null"),
         "anthropic emitted a null data field: {anthropic_str}"
+    );
+    assert!(
+        !ollama_str.contains("\"signature\":null"),
+        "ollama emitted a null signature: {ollama_str}"
     );
 }
 
@@ -332,6 +416,7 @@ fn body_is_valid_json_and_parses_back() {
     for body in [
         build_anthropic_body(signed_thinking_fixture()),
         build_openai_body(signed_thinking_fixture()),
+        build_ollama_body(signed_thinking_fixture()),
     ] {
         let serialized = serde_json::to_string(&body).unwrap();
         let reparsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
@@ -346,6 +431,7 @@ fn conversation_shape_and_roles_preserved_across_providers() {
     // drops thinking, Anthropic keeps it).
     let anthropic_body = build_anthropic_body(signed_thinking_fixture());
     let openai_body = build_openai_body(signed_thinking_fixture());
+    let ollama_body = build_ollama_body(signed_thinking_fixture());
 
     let anthropic_roles: Vec<&str> = anthropic_body["messages"]
         .as_array()
@@ -359,9 +445,17 @@ fn conversation_shape_and_roles_preserved_across_providers() {
         .iter()
         .filter_map(|m| m["role"].as_str())
         .collect();
+    let ollama_roles: Vec<&str> = ollama_body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["role"].as_str())
+        .collect();
 
     // Anthropic: user, assistant, user(tool_result wrapped as user in Anthropic), user
     assert!(anthropic_roles.starts_with(&["user", "assistant"]));
     // OpenAI: user, assistant, tool, user
     assert_eq!(openai_roles, vec!["user", "assistant", "tool", "user"]);
+    // Ollama native: user, assistant, tool, user
+    assert_eq!(ollama_roles, vec!["user", "assistant", "tool", "user"]);
 }
