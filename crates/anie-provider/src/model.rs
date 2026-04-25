@@ -343,6 +343,22 @@ fn is_default_compat(compat: &ModelCompat) -> bool {
     matches!(compat, ModelCompat::None)
 }
 
+/// Apply the optional workspace-wide cap (`[ollama]
+/// default_max_num_ctx`) to a discovered Ollama context window.
+/// `None` cap → discovered value passes through unchanged.
+/// Some(N) → `min(discovered, N)`.
+///
+/// Public so the local-server probe path
+/// (`probe_openai_compatible`) can apply the same clamp without
+/// duplicating the rule. See `docs/ollama_default_num_ctx_cap/README.md`.
+#[must_use]
+pub fn clamp_ollama_context_window(discovered: u64, cap: Option<u64>) -> u64 {
+    match cap {
+        Some(cap) => discovered.min(cap),
+        None => discovered,
+    }
+}
+
 impl Model {
     /// Return the effective replay capabilities for this model,
     /// falling back to `ReplayCapabilities::default()` (all false)
@@ -367,7 +383,12 @@ impl ModelInfo {
     /// `max_output_tokens` is carried through verbatim when present,
     /// and a simple fallback is used otherwise.
     #[must_use]
-    pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
+    pub fn to_model(
+        &self,
+        api: ApiKind,
+        base_url: &str,
+        ollama_default_max_num_ctx: Option<u64>,
+    ) -> Model {
         // Regression guard for legacy Ollama OpenAI-compat entries:
         // `/api/show` exposes the model's architectural max context
         // length (e.g. 262 144 for qwen3.5), but Ollama's
@@ -375,8 +396,19 @@ impl ModelInfo {
         // wire and silently ignores attempts to set it. Native
         // `OllamaChatApi` sends `options.num_ctx`, so only the legacy
         // `OpenAICompletions` path keeps the conservative 32 k guard.
+        //
+        // For `OllamaChatApi`, `ollama_default_max_num_ctx` (the
+        // optional `[ollama] default_max_num_ctx` config knob added
+        // in `docs/ollama_default_num_ctx_cap/` PR 1) caps the
+        // discovered value so users on constrained hardware can
+        // pre-empt the load-failure path. `None` (the default)
+        // preserves the prior behavior — discovered value verbatim.
         let context_window = match (self.provider.eq_ignore_ascii_case("ollama"), api) {
             (true, ApiKind::OpenAICompletions) => 32_768,
+            (_, ApiKind::OllamaChatApi) => clamp_ollama_context_window(
+                self.context_length.unwrap_or(32_768),
+                ollama_default_max_num_ctx,
+            ),
             _ => self.context_length.unwrap_or(32_768),
         };
         let max_tokens = self.max_output_tokens.unwrap_or(8_192);
@@ -465,7 +497,7 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: None,
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1", None);
         assert_eq!(model.max_tokens, 262_144);
         assert_eq!(model.context_window, 262_144);
     }
@@ -493,7 +525,7 @@ mod tests {
                 "thinking".into(),
             ]),
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
         assert_eq!(
             model.reasoning_capabilities,
             Some(ReasoningCapabilities {
@@ -524,7 +556,7 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: Some(vec!["completion".into()]),
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
         assert_eq!(model.reasoning_capabilities, None);
     }
 
@@ -546,7 +578,7 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: Some(vec!["completion".into(), "tools".into()]),
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
         assert_eq!(model.context_window, 32_768);
     }
 
@@ -564,8 +596,111 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: Some(vec!["completion".into(), "tools".into()]),
         };
-        let model = info.to_model(ApiKind::OllamaChatApi, "http://localhost:11434");
+        let model = info.to_model(ApiKind::OllamaChatApi, "http://localhost:11434", None);
         assert_eq!(model.context_window, 262_144);
+    }
+
+    fn ollama_info_with_context(length: u64) -> ModelInfo {
+        ModelInfo {
+            id: "qwen3.5:9b".into(),
+            name: "Qwen 3.5 9B".into(),
+            provider: "ollama".into(),
+            context_length: Some(length),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec!["completion".into()]),
+        }
+    }
+
+    #[test]
+    fn to_model_clamps_ollama_context_window_when_cap_is_set() {
+        // Cap below discovered → clamped to cap.
+        let info = ollama_info_with_context(262_144);
+        let model = info.to_model(ApiKind::OllamaChatApi, "http://localhost:11434", Some(32_768));
+        assert_eq!(
+            model.context_window, 32_768,
+            "discovered=262144, cap=32768 → context_window=32768"
+        );
+    }
+
+    #[test]
+    fn to_model_preserves_discovered_when_cap_exceeds_discovered() {
+        // Cap above discovered → discovered passes through.
+        let info = ollama_info_with_context(40_960);
+        let model = info.to_model(
+            ApiKind::OllamaChatApi,
+            "http://localhost:11434",
+            Some(1_048_576),
+        );
+        assert_eq!(
+            model.context_window, 40_960,
+            "cap above discovered must not increase the value"
+        );
+    }
+
+    #[test]
+    fn to_model_ignores_cap_for_non_ollama_chat_api() {
+        // Cap only applies to OllamaChatApi; non-Ollama paths
+        // (OpenAICompletions, hosted Anthropic, etc.) must
+        // ignore the parameter even if the same provider name
+        // appears.
+        let info = ModelInfo {
+            id: "x/huge".into(),
+            name: "Huge".into(),
+            provider: "openrouter".into(),
+            context_length: Some(200_000),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: None,
+        };
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://openrouter.ai/api/v1",
+            Some(32_768),
+        );
+        assert_eq!(
+            model.context_window, 200_000,
+            "non-OllamaChatApi must ignore the cap"
+        );
+    }
+
+    #[test]
+    fn to_model_ignores_cap_for_legacy_openai_completions_ollama() {
+        // The 32k regression guard for legacy OpenAICompletions
+        // Ollama entries wins over the cap. Legacy entries
+        // can't honor num_ctx on the wire anyway, so the cap
+        // is a no-op there.
+        let info = ollama_info_with_context(262_144);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "http://localhost:11434/v1",
+            Some(16_384),
+        );
+        assert_eq!(
+            model.context_window, 32_768,
+            "legacy OpenAICompletions Ollama always uses the 32k regression guard, not the cap"
+        );
+    }
+
+    #[test]
+    fn clamp_ollama_context_window_helper_handles_none() {
+        assert_eq!(clamp_ollama_context_window(262_144, None), 262_144);
+        assert_eq!(clamp_ollama_context_window(40_960, None), 40_960);
+        assert_eq!(clamp_ollama_context_window(1_024, None), 1_024);
+    }
+
+    #[test]
+    fn clamp_ollama_context_window_helper_takes_min() {
+        assert_eq!(clamp_ollama_context_window(262_144, Some(32_768)), 32_768);
+        assert_eq!(clamp_ollama_context_window(40_960, Some(32_768)), 32_768);
+        assert_eq!(clamp_ollama_context_window(8_192, Some(32_768)), 8_192);
+        assert_eq!(clamp_ollama_context_window(32_768, Some(32_768)), 32_768);
     }
 
     #[test]
@@ -585,7 +720,7 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: None,
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1", None);
         assert_eq!(model.context_window, 200_000);
     }
 
@@ -607,7 +742,7 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: None,
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "https://api.openai.com/v1");
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://api.openai.com/v1", None);
         assert_eq!(model.max_tokens, 8_192);
     }
 
@@ -626,7 +761,7 @@ mod tests {
             provider_capabilities: None,
         };
 
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
         assert_eq!(model.id, "qwen3:32b");
         assert_eq!(model.name, "Qwen 3 32B");
         assert_eq!(model.provider, "ollama");

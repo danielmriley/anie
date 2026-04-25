@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,7 +6,6 @@ use anie_config::ToolOutputMode;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 
 use crate::markdown::{LinkRange, MarkdownTheme, find_link_ranges};
@@ -64,18 +64,19 @@ pub struct ToolCallResult {
 #[derive(Debug, Clone)]
 struct LineCache {
     width: u16,
-    /// `Arc` so cache reads hand out a cheap reference-count
-    /// bump instead of deep-cloning every `Line` + `Span`.
-    /// Writes also avoid an extra clone — the computed vec
-    /// moves into the Arc and the render path borrows via
-    /// `.iter()`.
-    lines: Arc<Vec<Line<'static>>>,
+    /// Per-line `Arc`s so cache reads hand out refcount bumps
+    /// instead of deep-cloning each `Line` + `Span` + `Cow<str>`.
+    /// PR 06 of `docs/tui_perf_2026-04-25/`: previously this was
+    /// `Arc<Vec<Line>>` but the inner Vec still got deep-cloned
+    /// when extending into `flat_lines`. Per-line `Arc` lets
+    /// `flat_lines` itself store shared refs.
+    lines: Vec<Arc<Line<'static>>>,
     /// Link ranges per line, same length as `lines`. Empty
-    /// `Vec<LinkRange>` entries correspond to lines without
-    /// clickable URLs. Cached alongside the lines so cache-
-    /// hit paths don't re-scan. Also `Arc`-shared for the
-    /// same reason as `lines`.
-    links: Arc<Vec<Vec<LinkRange>>>,
+    /// entries correspond to lines without clickable URLs.
+    /// Cached alongside the lines so cache-hit paths don't
+    /// re-scan. `Vec<LinkRange>` is small (usually empty), so
+    /// per-line `Arc` doesn't pay off the same way.
+    links: Vec<Vec<LinkRange>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,6 +85,12 @@ struct StreamingAssistantRender {
     tail_text: String,
     cached_committed_width: Option<u16>,
     cached_committed_markdown_enabled: bool,
+    /// Theme captured at the time the cache was filled. Theme
+    /// changes (e.g., a future light/dark switch) invalidate
+    /// the committed prefix even though width / markdown_enabled
+    /// agree. Without this the cache could serve stale-themed
+    /// lines until the next mutation.
+    cached_committed_theme: Option<MarkdownTheme>,
     cached_committed_lines: Vec<Line<'static>>,
 }
 
@@ -107,6 +114,7 @@ impl StreamingAssistantRender {
 
     fn invalidate_cache(&mut self) {
         self.cached_committed_width = None;
+        self.cached_committed_theme = None;
         self.cached_committed_lines.clear();
     }
 
@@ -124,6 +132,7 @@ impl StreamingAssistantRender {
         }
         if self.cached_committed_width == Some(width)
             && self.cached_committed_markdown_enabled == ctx.markdown_enabled
+            && self.cached_committed_theme == Some(ctx.theme)
         {
             return self.cached_committed_lines.clone();
         }
@@ -134,6 +143,7 @@ impl StreamingAssistantRender {
         };
         self.cached_committed_width = Some(width);
         self.cached_committed_markdown_enabled = ctx.markdown_enabled;
+        self.cached_committed_theme = Some(ctx.theme);
         self.cached_committed_lines = rendered.clone();
         rendered
     }
@@ -200,7 +210,12 @@ pub struct OutputPane {
     /// cache-hit render path from O(total_lines) per-Line
     /// clones to O(visible_lines) per frame. See Plan 04 PR-C.
     /// Invalidation tracked via `flat_cache_valid`.
-    flat_lines: Vec<Line<'static>>,
+    /// Flat per-line view for the visible-region render. Each
+    /// line is stored behind an `Arc` so populating this vec
+    /// from cache hits is a refcount bump per line, not a deep
+    /// `Line + Span + Cow<str>` clone. `Buffer::set_line`
+    /// accepts `&Line`, so we deref the `Arc` at render time.
+    flat_lines: Vec<Arc<Line<'static>>>,
     /// Width that `flat_lines` was built at. `None` before the
     /// first render. When the current render width differs,
     /// we rebuild regardless of `flat_cache_valid` because
@@ -230,6 +245,15 @@ pub struct OutputPane {
     /// invalidates the cache because block → line computations
     /// depend on it.
     render_context: RenderContext,
+    /// Cached count of blocks with active animation (streaming
+    /// assistants + executing tools). Maintained by the four
+    /// state-flip methods (add_streaming_assistant,
+    /// finalize_last_assistant, add_tool_call,
+    /// finalize_tool_result) plus `clear`. Reading is O(1)
+    /// instead of an O(blocks) walk per frame; correctness is
+    /// guarded by `cfg(debug_assertions)` parity assert in
+    /// `has_animated_blocks`.
+    animated_block_count: usize,
     #[cfg(test)]
     flat_build_count: u64,
 }
@@ -252,6 +276,7 @@ impl OutputPane {
             last_total_lines: 0,
             last_viewport_height: 1,
             render_context: RenderContext::default(),
+            animated_block_count: 0,
             #[cfg(test)]
             flat_build_count: 0,
         }
@@ -318,6 +343,9 @@ impl OutputPane {
 
     /// Add a transcript block.
     pub fn add_block(&mut self, block: RenderedBlock) {
+        if block_has_animated_content(&block) {
+            self.animated_block_count = self.animated_block_count.saturating_add(1);
+        }
         self.blocks.push(block);
         self.caches.push(None);
         self.streaming_assistant_renders.push(None);
@@ -421,11 +449,15 @@ impl OutputPane {
         {
             *current_text = text;
             *current_thinking = thinking;
+            let was_streaming = *is_streaming;
             *is_streaming = false;
             *current_timestamp = timestamp;
             *current_error = error_message;
             if let Some(slot) = self.streaming_assistant_renders.last_mut() {
                 *slot = None;
+            }
+            if was_streaming {
+                self.animated_block_count = self.animated_block_count.saturating_sub(1);
             }
             self.invalidate_last();
         }
@@ -485,7 +517,11 @@ impl OutputPane {
                 is_error,
                 elapsed,
             });
+            let was_executing = *is_executing;
             *is_executing = false;
+            if was_executing {
+                self.animated_block_count = self.animated_block_count.saturating_sub(1);
+            }
             self.invalidate_at(index);
         }
     }
@@ -508,6 +544,7 @@ impl OutputPane {
         self.auto_scroll = true;
         self.last_total_lines = 0;
         self.last_viewport_height = 1;
+        self.animated_block_count = 0;
     }
 
     /// Scroll the pane upward by a number of rendered lines.
@@ -602,10 +639,10 @@ impl OutputPane {
         let end = start
             .saturating_add(viewport_height)
             .min(self.flat_lines.len());
-        let visible = if start < end {
-            self.flat_lines[start..end].to_vec()
+        let visible: &[Arc<Line<'static>>] = if start < end {
+            &self.flat_lines[start..end]
         } else {
-            Vec::new()
+            &[]
         };
         let mut paragraph_span = PerfSpan::enter(PerfSpanKind::ParagraphRender);
         if let Some(s) = paragraph_span.as_mut() {
@@ -613,7 +650,23 @@ impl OutputPane {
             s.record("area_w", u64::from(area.width));
             s.record("area_h", u64::from(area.height));
         }
-        Paragraph::new(visible).render(area, buf);
+        // Render the borrowed slice directly via Buffer::set_line.
+        // Skips the ratatui `Paragraph` wrap/scroll/alignment
+        // pipeline (we don't use any of those features — lines
+        // are pre-wrapped during build_flat_lines) and avoids
+        // the per-frame deep clone that `Paragraph::new(Vec<Line>)`
+        // forced before. The `as_ref()` dereferences the Arc to
+        // produce the `&Line<'_>` Buffer::set_line wants.
+        for (row_offset, line) in visible.iter().enumerate() {
+            let Ok(offset_u16) = u16::try_from(row_offset) else {
+                break;
+            };
+            let y = area.y.saturating_add(offset_u16);
+            if y >= area.y.saturating_add(area.height) {
+                break;
+            }
+            buf.set_line(area.x, y, line.as_ref(), area.width);
+        }
         drop(paragraph_span);
     }
 
@@ -621,8 +674,19 @@ impl OutputPane {
     /// (streaming assistant / executing tool). Animated blocks
     /// update their spinner every frame, so the flat cache
     /// cannot be reused when any are present.
+    ///
+    /// Reads `animated_block_count`, maintained by the four
+    /// state-flip methods. A `debug_assertions`-only parity
+    /// check guards against drift; if the count ever disagrees
+    /// with a fresh walk, debug builds panic with a clear
+    /// message. Release builds trust the count.
     fn has_animated_blocks(&self) -> bool {
-        self.blocks.iter().any(block_has_animated_content)
+        debug_assert_eq!(
+            self.animated_block_count,
+            self.blocks.iter().filter(|b| block_has_animated_content(b)).count(),
+            "animated_block_count drifted from the actual block state",
+        );
+        self.animated_block_count > 0
     }
 
     /// Test-only wrapper: rebuilds the flat cache and returns
@@ -633,7 +697,13 @@ impl OutputPane {
     #[cfg(test)]
     fn build_lines(&mut self, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
         self.rebuild_flat_cache(width, spinner_frame);
-        self.flat_lines.clone()
+        // flat_lines holds Arc<Line> after PR 06 — deep-clone
+        // here is a test convenience; production paths borrow
+        // via `set_line(line.as_ref(), ...)` instead.
+        self.flat_lines
+            .iter()
+            .map(|arc| (**arc).clone())
+            .collect()
     }
 
     /// Fast-path the flat cache when nothing has changed.
@@ -696,7 +766,7 @@ impl OutputPane {
         for index in 0..self.blocks.len() {
             let block = &self.blocks[index];
             if !out.is_empty() {
-                out.push(Line::default());
+                out.push(Arc::new(Line::default()));
                 link_map.push(Vec::new());
             }
 
@@ -713,12 +783,10 @@ impl OutputPane {
                 && let Some(cached) = self.caches.get(index).and_then(Option::as_ref)
                 && cached.width == width
             {
-                // Arc-backed cache: `iter().cloned()` still
-                // clones each `Line`, but that's the only way
-                // to push into `out`. The cache itself is not
-                // cloned — we're just borrowing through the
-                // `Arc` deref. The previous shape paid this
-                // cost AND cloned the outer Vec.
+                // Per-line `Arc` cache: `iter().cloned()` here
+                // is `Arc::clone` for each entry — refcount
+                // bump, no `Line` / `Span` / `Cow<str>` deep
+                // copy. PR 06 of `docs/tui_perf_2026-04-25/`.
                 out.extend(cached.lines.iter().cloned());
                 link_map.extend(cached.links.iter().cloned());
                 cache_hits += 1;
@@ -765,24 +833,24 @@ impl OutputPane {
                 }
                 links
             };
-            // Move the computed vecs into `Arc` once; the cache
-            // entry and the output stream now share the same
-            // backing allocation via refcount bumps. Plan 04 PR-B.
-            let lines_arc = Arc::new(computed);
-            let links_arc = Arc::new(computed_links);
+            // Wrap each line in its own `Arc` so the cache slot
+            // and the flat output share the same allocation. The
+            // cache hit path then refcount-bumps; no deep clone.
+            let lines_arcs: Vec<Arc<Line<'static>>> =
+                computed.into_iter().map(Arc::new).collect();
             if hits_cache && let Some(slot) = self.caches.get_mut(index) {
                 *slot = Some(LineCache {
                     width,
-                    lines: Arc::clone(&lines_arc),
-                    links: Arc::clone(&links_arc),
+                    lines: lines_arcs.clone(),
+                    links: computed_links.clone(),
                 });
                 cache_misses += 1;
             }
-            out.extend(lines_arc.iter().cloned());
-            link_map.extend(links_arc.iter().cloned());
+            out.extend(lines_arcs);
+            link_map.extend(computed_links);
         }
         if out.is_empty() {
-            out.push(Line::default());
+            out.push(Arc::new(Line::default()));
             link_map.push(Vec::new());
         }
         debug_assert_eq!(
@@ -1053,11 +1121,11 @@ fn assistant_block_lines(
         &mut result,
         if assistant.is_streaming {
             assistant.streaming_render.map_or_else(
-                || assistant_answer_lines(assistant.text, width, true, ctx),
+                || assistant_answer_lines(assistant.text, width, ctx),
                 |state| state.render_lines(width, ctx),
             )
         } else {
-            assistant_answer_lines(assistant.text, width, false, ctx)
+            assistant_answer_lines(assistant.text, width, ctx)
         },
     );
     // The "responding…" / "thinking…" status indicator used
@@ -1180,12 +1248,7 @@ fn assistant_thinking_lines(
 /// `animated_streaming_block_never_caches`), so per-frame
 /// markdown work is already the cost profile. No new cache
 /// pressure.
-fn assistant_answer_lines(
-    text: &str,
-    width: u16,
-    _is_streaming: bool,
-    ctx: &RenderContext,
-) -> Vec<Line<'static>> {
+fn assistant_answer_lines(text: &str, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -1418,26 +1481,33 @@ fn format_tool_header_spans(
     is_executing: bool,
     spinner_frame: &str,
 ) -> Vec<Span<'static>> {
-    let (bullet, bullet_style) = if is_executing {
+    // Static bullets borrow from string literals; only the
+    // executing path needs a fresh allocation (the spinner
+    // frame rotates each tick, no `&'static str` available).
+    let (bullet, bullet_style): (Cow<'static, str>, Style) = if is_executing {
         (
-            format!("{spinner_frame} "),
+            Cow::Owned(format!("{spinner_frame} ")),
             Style::default().fg(Color::Yellow),
         )
     } else if is_error {
-        ("• ".to_string(), Style::default().fg(Color::Red))
+        (Cow::Borrowed("• "), Style::default().fg(Color::Red))
     } else {
-        ("• ".to_string(), Style::default().fg(Color::Green))
+        (Cow::Borrowed("• "), Style::default().fg(Color::Green))
     };
-    let verb = tool_verb(tool_name);
+    // tool_verb returns &'static str; pass it as Cow::Borrowed
+    // through Span::styled so we don't allocate for the verb.
+    let verb: &'static str = tool_verb(tool_name);
     let mut spans = vec![
         Span::styled(bullet, bullet_style),
         Span::styled(
-            verb.to_string(),
+            Cow::Borrowed(verb),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
     if !args_display.is_empty() {
-        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::raw(Cow::Borrowed(" ")));
+        // args_display is a per-call &str, so the owned
+        // String here is unavoidable for the 'static span.
         spans.push(Span::styled(
             args_display.to_string(),
             Style::default().fg(Color::DarkGray),
@@ -1889,8 +1959,8 @@ mod streaming_markdown_tests {
     fn streaming_and_finalized_render_are_cell_identical() {
         let ctx = RenderContext::default();
         let text = "# Heading\n\nBody paragraph.\n\n## Subheading\n\nTrailing line";
-        let streaming = assistant_answer_lines(text, 40, true, &ctx);
-        let finalized = assistant_answer_lines(text, 40, false, &ctx);
+        let streaming = assistant_answer_lines(text, 40, &ctx);
+        let finalized = assistant_answer_lines(text, 40, &ctx);
         assert_eq!(streaming.len(), finalized.len());
         for (idx, (a, b)) in streaming.iter().zip(finalized.iter()).enumerate() {
             let lhs: String = a.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1906,7 +1976,7 @@ mod streaming_markdown_tests {
     fn single_line_heading_renders_as_markdown_mid_stream() {
         let ctx = RenderContext::default();
         let text = "## Title still on the first line";
-        let streaming = assistant_answer_lines(text, 40, true, &ctx);
+        let streaming = assistant_answer_lines(text, 40, &ctx);
         let plain = wrap_text(text, 40, Style::default());
         // The markdown-rendered heading should NOT equal the
         // plain-wrapped version (plain keeps the `##` literal;
@@ -1929,8 +1999,7 @@ mod streaming_markdown_tests {
     #[test]
     fn empty_streaming_text_produces_no_lines() {
         let ctx = RenderContext::default();
-        assert!(assistant_answer_lines("", 40, true, &ctx).is_empty());
-        assert!(assistant_answer_lines("", 40, false, &ctx).is_empty());
+        assert!(assistant_answer_lines("", 40, &ctx).is_empty());
     }
 
     /// When markdown is disabled, streaming falls back to
@@ -1942,7 +2011,7 @@ mod streaming_markdown_tests {
             ..RenderContext::default()
         };
         let text = "# literal hash";
-        let streaming = assistant_answer_lines(text, 40, true, &ctx);
+        let streaming = assistant_answer_lines(text, 40, &ctx);
         let plain = wrap_text(text, 40, Style::default());
         assert_eq!(streaming.len(), plain.len());
         for (a, b) in streaming.iter().zip(plain.iter()) {
@@ -1960,7 +2029,7 @@ mod streaming_markdown_tests {
     fn unclosed_code_fence_renders_as_code_block_mid_stream() {
         let ctx = RenderContext::default();
         let text = "Here is some code:\n\n```rust\nfn main() {\n    println!";
-        let streaming = assistant_answer_lines(text, 60, true, &ctx);
+        let streaming = assistant_answer_lines(text, 60, &ctx);
         let rendered: String = streaming
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -2039,6 +2108,29 @@ mod wrap_tests {
     #[test]
     fn wrap_plain_text_line_exactly_width_is_one_line() {
         assert_eq!(wrap_plain_text("abcdef", 6), vec!["abcdef"]);
+    }
+
+    /// PR 04 / F-9: bullet, verb, and the leading space between
+    /// verb and args use string literals (Cow::Borrowed). The
+    /// args span still allocates because `args_display` is a
+    /// per-call &str; spinner-frame allocates because it
+    /// rotates each tick. This test guards the static-vs-owned
+    /// classification so a future change can't silently
+    /// reintroduce the per-render allocations.
+    #[test]
+    fn tool_header_static_parts_are_borrowed() {
+        // Non-executing path: bullet "• " is borrowed.
+        let spans = format_tool_header_spans("bash", "ls /tmp", false, false, ".");
+        // [bullet, verb, " ", args]
+        assert!(matches!(spans[0].content, std::borrow::Cow::Borrowed(_)),
+            "bullet should be Cow::Borrowed");
+        assert!(matches!(spans[1].content, std::borrow::Cow::Borrowed(_)),
+            "verb should be Cow::Borrowed");
+        assert!(matches!(spans[2].content, std::borrow::Cow::Borrowed(_)),
+            "space separator should be Cow::Borrowed");
+        // args is per-call &str → unavoidable owned String.
+        assert!(matches!(spans[3].content, std::borrow::Cow::Owned(_)),
+            "args span owns its String (input is &str, not 'static)");
     }
 }
 
@@ -2215,6 +2307,33 @@ mod cache_tests {
         );
         let _ = pane.build_lines(80, ".");
         assert!(pane.is_cached(0));
+    }
+
+    /// Streaming-prefix render cache must be keyed by theme so
+    /// that a theme switch invalidates cached committed lines.
+    /// PR 04 of docs/tui_perf_2026-04-25/.
+    #[test]
+    fn streaming_prefix_cache_invalidates_on_theme_change() {
+        let ctx_dark = RenderContext::default();
+        let mut ctx_light = ctx_dark.clone();
+        // Mutate one style so theme equality fails. We're not
+        // shipping a real light theme here — just a different
+        // one, which is what the cache key needs to detect.
+        ctx_light.theme.h1 = ratatui::style::Style::default()
+            .fg(ratatui::style::Color::Yellow)
+            .add_modifier(ratatui::style::Modifier::BOLD);
+
+        let mut state = StreamingAssistantRender::default();
+        state.append_delta("# heading\n\nbody\n\n");
+        let with_dark = state.render_lines(40, &ctx_dark);
+        let with_light = state.render_lines(40, &ctx_light);
+        // Heading style in the rendered output must differ
+        // because the theme changed; if the cache served the
+        // dark prefix, both renders would be identical.
+        assert_ne!(
+            with_dark, with_light,
+            "theme change must invalidate the streaming prefix cache",
+        );
     }
 
     #[test]

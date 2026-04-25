@@ -27,6 +27,9 @@ description and (where the doc carries one) a reference date.
 | [`phase_detail_plans/`](phase_detail_plans/) | v1.0 milestone phase plans (foundation, providers, TUI, sessions, extensions, hardening). |
 | [`phased_plan_v1-0-1/`](phased_plan_v1-0-1/) | The v1.0.1 reasoning + local-model compatibility steps. |
 | [`prompts/`](prompts/) | Implementation prompts used to drive multi-phase builds. |
+| [`compaction_visibility/`](compaction_visibility/) | Plan 08 — `AgentUiState::Compacting` state + spinner-row elapsed counter (PR A landed `9a9e1e9`). PR B (split-turn label) deferred. |
+| [`markdown_perf/`](markdown_perf/) | Plan 09 — markdown perf regression. Superseded by `tui_perf_architecture/`; the suspected hot spots were fixed there. |
+| [`tui_hyperlinks/`](tui_hyperlinks/) | Plan 10 — clickable hyperlinks. Landed `f051758` via the click-to-open pivot (mouse capture + `opener::open_browser`); OSC 8 wrapping-backend approach abandoned. |
 
 ### Standalone files
 
@@ -44,6 +47,7 @@ description and (where the doc carries one) a reference date.
 | [`runtime_state_integration_plan.md`](runtime_state_integration_plan.md) | Runtime state persistence integration. | — |
 | [`status_report_2026-04-15.md`](status_report_2026-04-15.md) | Early status snapshot; superseded by the 2026-04-17 review. | 2026-04-15 |
 | [`thinking_block_display_bug.md`](thinking_block_display_bug.md) | Bug note fixed by `reasoning_fix_plan.md`. | — |
+| [`tui_input_responsiveness_fix_plan.md`](tui_input_responsiveness_fix_plan.md) | Urgent composer paint + incremental streaming render. PR 1 + PR 2 landed (`c509001`, `b125f98`, `9a57148`); PR 3 (resize hardening) gated, not opened. | 2026-04-23 |
 | [`v1-0-1_review.md`](v1-0-1_review.md) | Post-v1.0.1 review. | — |
 | [`v1_0_milestone_checklist.md`](v1_0_milestone_checklist.md) | v1.0 release sign-off checklist. | — |
 

@@ -1,5 +1,13 @@
 # Plan 08 — compaction visibility
 
+> **Status (2026-04-25):** PR A landed in `9a9e1e9`
+> (`AgentUiState::Compacting { started_at }`, spinner +
+> elapsed counter rendered by `render_spinner_row`). PR B
+> (split-turn label) is **deferred** — `CompactionStart`
+> still has no payload and no user has asked for the "(2
+> summaries)" disclosure. Reopen if split-turn compaction
+> becomes a frequent user-visible delay.
+
 **Polish. Surfaces background work that was silent before.**
 
 After PR 07G's ordering fix, the "Compacting context…" system
@@ -70,11 +78,15 @@ two-LLM-call path is in play. Purely cosmetic but informative.
 4. Status bar renders spinner + elapsed.
 5. Tests: event transitions + status-bar rendering snapshot.
 
-### PR B — split-turn label (optional)
+### PR B — split-turn label (deferred)
 
 1. Thread `split_turn: bool` through `CompactionStart`.
 2. Status bar appends "(2 summaries)" when true.
 3. Test: split-turn emit sets the flag.
+
+Deferred 2026-04-25: optional polish, no user request, and
+the elapsed counter from PR A already covers "is this still
+running?" which was the original gap.
 
 ## Test plan
 

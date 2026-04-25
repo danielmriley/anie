@@ -44,6 +44,11 @@ pub struct AnieConfig {
     /// Built-in tool configuration.
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// Ollama-wide settings. anie-specific (not in pi): pi has
+    /// no native Ollama codepath and never sends `num_ctx`, so
+    /// this whole block has no pi equivalent. Per CLAUDE.md §3.
+    #[serde(default)]
+    pub ollama: OllamaConfig,
     /// True if a loaded config file (`~/.anie/config.toml` or
     /// a project-local `.anie/config.toml`) explicitly set the
     /// `[model]` section. Lets callers distinguish "the user
@@ -53,6 +58,38 @@ pub struct AnieConfig {
     /// declared default. Not persisted — derived at load time.
     #[serde(skip)]
     pub model_explicitly_set: bool,
+}
+
+/// Ollama-specific configuration. Applies workspace-wide to
+/// every model with `ApiKind::OllamaChatApi`.
+///
+/// anie-specific (not in pi): pi uses Ollama's
+/// OpenAI-compatible endpoint and never sends `num_ctx` on the
+/// wire, so this whole block has no pi equivalent. See
+/// `docs/ollama_default_num_ctx_cap/README.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OllamaConfig {
+    /// Hard ceiling on `num_ctx` sent to Ollama, regardless of
+    /// what `/api/show` reports. `None` (the default) means no
+    /// cap; the model's discovered architectural max applies.
+    /// When set, `Model.context_window` for any
+    /// `OllamaChatApi` model is clamped at catalog-load time
+    /// to `min(discovered, default_max_num_ctx)`.
+    ///
+    /// Distinct from `/context-length`'s per-model runtime
+    /// override: this is a workspace-level safety floor, the
+    /// override is a per-model fine-grain control. The runtime
+    /// override always wins over the cap; if the user
+    /// explicitly types `/context-length 65536` on a session
+    /// with `default_max_num_ctx = 32768`, the override
+    /// applies (PR 3 of this plan adds a one-line warning
+    /// when the override exceeds the cap).
+    ///
+    /// Acceptable values: ≥ 2048 (matches `/context-length`'s
+    /// minimum). Configs with smaller values are rejected at
+    /// load time with a clear error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_num_ctx: Option<u64>,
 }
 
 /// Built-in tool configuration. These settings are guardrails and
@@ -469,7 +506,30 @@ pub fn load_config_with_paths(
 
     apply_cli_overrides(&mut config, cli_overrides);
     warn_legacy_ollama_openai_api(&config);
+    validate_ollama_config(&config.ollama)?;
     Ok(config)
+}
+
+/// Lower bound matching the `/context-length` slash command's
+/// minimum (rejected below 2048). The cap must be ≥ this value
+/// so a clamp can never push `Model.context_window` below the
+/// floor an explicit override would accept.
+const OLLAMA_DEFAULT_MAX_NUM_CTX_MIN: u64 = 2_048;
+
+/// Validate `[ollama]` config values at load time. Today only
+/// `default_max_num_ctx` has a constraint (≥ 2048). Any future
+/// numeric `[ollama]` field can grow this function rather than
+/// adding parallel validation paths.
+fn validate_ollama_config(ollama: &OllamaConfig) -> Result<()> {
+    if let Some(value) = ollama.default_max_num_ctx
+        && value < OLLAMA_DEFAULT_MAX_NUM_CTX_MIN
+    {
+        return Err(anyhow::anyhow!(
+            "[ollama] default_max_num_ctx = {value} is below the minimum {OLLAMA_DEFAULT_MAX_NUM_CTX_MIN} \
+             (the /context-length slash command also rejects values below this threshold)"
+        ));
+    }
+    Ok(())
 }
 
 /// Ensure the global config file exists, creating a commented template when missing.
@@ -626,7 +686,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 /// Return the default config template written on first run.
 #[must_use]
 pub fn default_config_template() -> &'static str {
-    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
+    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Ollama-wide settings (only meaningful for OllamaChatApi models).\n# Optional cap on the num_ctx anie sends to Ollama. Useful on\n# constrained hardware: a 16 GB Mac with a 32B+ model can hit\n# load failures at the 262144-token architectural max from\n# /api/show. Setting this lets anie clamp every Ollama model's\n# context window at catalog-load time. Per-model runtime\n# overrides via /context-length still win over this cap.\n# Acceptable values: >= 2048 (matches the /context-length minimum).\n# [ollama]\n# default_max_num_ctx = 32768\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
 }
 
 fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
@@ -712,6 +772,12 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.tools.bash.policy.deny_patterns = deny_patterns;
         }
     }
+
+    if let Some(ollama) = partial.ollama
+        && let Some(value) = ollama.default_max_num_ctx
+    {
+        config.ollama.default_max_num_ctx = Some(value);
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -738,6 +804,13 @@ struct PartialAnieConfig {
     context: Option<PartialContextConfig>,
     #[serde(default)]
     tools: Option<PartialToolsConfig>,
+    #[serde(default)]
+    ollama: Option<PartialOllamaConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialOllamaConfig {
+    default_max_num_ctx: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -967,6 +1040,141 @@ mod tests {
         assert!(config.tools.bash.policy.enabled);
         assert!(config.tools.bash.policy.deny_commands.is_empty());
         assert!(config.tools.bash.policy.deny_patterns.is_empty());
+        assert_eq!(
+            config.ollama.default_max_num_ctx, None,
+            "the cap is opt-in: default state must be None so existing behavior is unchanged"
+        );
+    }
+
+    #[test]
+    fn ollama_config_default_max_num_ctx_round_trips_serde() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [ollama]
+            default_max_num_ctx = 32768
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert_eq!(config.ollama.default_max_num_ctx, Some(32_768));
+    }
+
+    #[test]
+    fn anie_config_loads_when_ollama_block_is_absent() {
+        // Forward-compat: a config file written by any anie
+        // build before this PR (no `[ollama]` block) must load
+        // cleanly with the cap defaulting to None.
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [model]
+            provider = "openai"
+            id = "gpt-4o"
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config without ollama block");
+
+        assert_eq!(config.ollama.default_max_num_ctx, None);
+    }
+
+    #[test]
+    fn anie_config_loads_when_default_max_num_ctx_is_absent() {
+        // Forward-compat boundary: an `[ollama]` block can
+        // exist without `default_max_num_ctx` (future fields
+        // may be added there). The block's mere presence must
+        // not require this specific field.
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [ollama]
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load empty [ollama] block");
+
+        assert_eq!(config.ollama.default_max_num_ctx, None);
+    }
+
+    #[test]
+    fn ollama_default_max_num_ctx_below_minimum_is_rejected() {
+        // The cap must be >= the /context-length command's
+        // minimum, otherwise a clamp at catalog load could push
+        // Model.context_window below what an explicit override
+        // could restore.
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [ollama]
+            default_max_num_ctx = 1024
+            "#,
+        )
+        .expect("write config");
+
+        let result = load_config_with_paths(Some(&config_path), None, CliOverrides::default());
+        let error = result.expect_err("below-minimum cap must reject load");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("default_max_num_ctx") && message.contains("1024"),
+            "error must name the field and the offending value; got:\n{message}"
+        );
+        assert!(
+            message.contains("2048"),
+            "error must name the minimum so the user knows the lower bound; got:\n{message}"
+        );
+    }
+
+    #[test]
+    fn ollama_default_max_num_ctx_at_minimum_is_accepted() {
+        // Boundary: exactly 2048 is acceptable.
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [ollama]
+            default_max_num_ctx = 2048
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("at-minimum cap is accepted");
+        assert_eq!(config.ollama.default_max_num_ctx, Some(2_048));
+    }
+
+    #[test]
+    fn default_template_documents_ollama_block_with_example() {
+        // The template is what `ensure_global_config_exists`
+        // writes when no config file exists. Discoverable
+        // documentation: a user opening
+        // ~/.anie/config.toml should see the [ollama] block as
+        // a commented example.
+        let template = default_config_template();
+        assert!(
+            template.contains("[ollama]"),
+            "template must include [ollama] section header"
+        );
+        assert!(
+            template.contains("default_max_num_ctx"),
+            "template must mention the field name so users can search"
+        );
     }
 
     #[test]

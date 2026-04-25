@@ -1217,7 +1217,7 @@ fn model_for_entry(entry: &ProviderEntry) -> Model {
 fn model_info_to_provider_model(entry: &ProviderEntry, info: &ModelInfo) -> Model {
     let model = model_for_entry(entry);
     let api = discovery_model_api(&entry.name, model.api, &model.base_url);
-    let mut resolved = info.to_model(api, &discovery_model_base_url(api, &model.base_url));
+    let mut resolved = info.to_model(api, &discovery_model_base_url(api, &model.base_url), None);
     resolved.provider = entry.name.clone();
     anie_providers_builtin::apply_openrouter_capabilities(&mut resolved);
     resolved

@@ -30,7 +30,7 @@ use crate::{
     compaction::CompactionStrategy,
     model_catalog::{resolve_requested_model, upsert_model},
     runtime::{ConfigState, SessionHandle, SystemPromptCache},
-    user_error::{HandleError, UserCommandError},
+    user_error::{HandleError, UserCommandError, render_user_facing_provider_error},
 };
 
 const DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day]");
@@ -93,9 +93,14 @@ enum PendingRetry {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ContextLengthMutation {
-    Set,
+    /// Override applied. `above_cap_warning` carries an
+    /// optional message when the value exceeded the
+    /// workspace-wide `[ollama] default_max_num_ctx` cap; the
+    /// caller emits it as a separate system message so the
+    /// user sees both the success and the conflict.
+    Set { above_cap_warning: Option<String> },
     Reset,
 }
 
@@ -188,6 +193,29 @@ impl InteractiveController {
                                         }
                                         RetryDecision::GiveUp { reason } => {
                                             info!(?reason, retry_attempt, error = %error, "not retrying provider error");
+                                            // Surface a user-facing message for variants
+                                            // that carry actionable recovery context
+                                            // (currently: ModelLoadResources →
+                                            // /context-length suggestion). Other
+                                            // variants stay log-only — their default
+                                            // Display is already adequate and the
+                                            // existing no-message-on-give-up behavior
+                                            // is preserved to avoid scope creep.
+                                            // See docs/ollama_load_failure_recovery
+                                            // README PR 3.
+                                            let model = self.state.config.current_model();
+                                            if let Some(message) = render_user_facing_provider_error(
+                                                error,
+                                                model.context_window,
+                                                &model.provider,
+                                                &model.id,
+                                            ) {
+                                                anie_agent::send_event(
+                                                    &self.event_tx,
+                                                    AgentEvent::SystemMessage { text: message },
+                                                )
+                                                .await;
+                                            }
                                             self.state.finish_run(&result).await?;
                                         }
                                     }
@@ -374,7 +402,7 @@ impl InteractiveController {
                     .await;
                 } else if let Some(argument) = argument {
                     match self.state.apply_context_length_argument(&argument) {
-                        Ok(ContextLengthMutation::Set) => {
+                        Ok(ContextLengthMutation::Set { above_cap_warning }) => {
                             anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                             self.send_system_message(&format!(
                                 "Context window set to {}. Ollama will reload the model on the next request (~5-30 s for this model).",
@@ -383,6 +411,13 @@ impl InteractiveController {
                                 ),
                             ))
                             .await;
+                            // Emit the above-cap warning as a
+                            // separate system message so it
+                            // doesn't get lost in the success
+                            // text. Cap PR 3.
+                            if let Some(warning) = above_cap_warning {
+                                self.send_system_message(&warning).await;
+                            }
                             if let Some(warning) = self
                                 .state
                                 .persist_runtime_state_warning("context_length_set")
@@ -409,6 +444,10 @@ impl InteractiveController {
                         Err(message) => self.send_system_message(&message).await,
                     }
                 }
+            }
+            UiAction::ShowState => {
+                let summary = self.state.state_summary_message();
+                self.send_system_message(&summary).await;
             }
             UiAction::Compact => {
                 if self.current_run.is_some() {
@@ -747,18 +786,57 @@ impl ControllerState {
         )
     }
 
+    fn state_summary_message(&self) -> String {
+        format_state_summary(
+            self.config.current_model(),
+            self.config.current_thinking(),
+            self.config.active_ollama_num_ctx_override(),
+            self.config.anie_config().ollama.default_max_num_ctx,
+            self.config.effective_ollama_context_window(),
+            self.session.id(),
+            anie_config::global_config_path(),
+            anie_config::anie_state_json_path(),
+        )
+    }
+
     fn context_length_status_message(&self) -> String {
         let effective = self.config.effective_ollama_context_window();
+        let baseline = self.config.current_model().context_window;
+        let cap = self.config.anie_config().ollama.default_max_num_ctx;
         match self.config.active_ollama_num_ctx_override() {
-            Some(_) => format!(
-                "Current context window: {} (runtime override; baseline {})",
-                format_context_length(effective),
-                format_context_length(self.config.current_model().context_window),
-            ),
-            None => format!(
-                "Current context window: {}",
-                format_context_length(effective)
-            ),
+            Some(value) => {
+                let mut message = format!(
+                    "Current context window: {} (runtime override; baseline {})",
+                    format_context_length(effective),
+                    format_context_length(baseline),
+                );
+                // If the user's runtime override exceeds the
+                // workspace-wide cap, surface that in the same
+                // message so they can see why the wire request
+                // might still hit a load failure even with their
+                // override active. Cap PR 3.
+                if let Some(cap_value) = cap
+                    && value > cap_value
+                {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        message,
+                        "; exceeds [ollama] default_max_num_ctx of {}",
+                        format_context_length(cap_value)
+                    );
+                }
+                message
+            }
+            None => match cap {
+                Some(_) => format!(
+                    "Current context window: {} (workspace cap from [ollama] default_max_num_ctx)",
+                    format_context_length(effective),
+                ),
+                None => format!(
+                    "Current context window: {}",
+                    format_context_length(effective)
+                ),
+            },
         }
     }
 
@@ -782,8 +860,26 @@ impl ControllerState {
             ));
         }
 
+        // Above-cap warning (Cap PR 3): the override still
+        // applies — user intent wins — but the conflict is
+        // surfaced so future load failures aren't a surprise.
+        let above_cap_warning = self
+            .config
+            .anie_config()
+            .ollama
+            .default_max_num_ctx
+            .filter(|cap| value > *cap)
+            .map(|cap| {
+                format!(
+                    "Note: this exceeds [ollama] default_max_num_ctx ({}). The override still applies, but the wire request may hit a load failure on this hardware.",
+                    format_context_length(cap),
+                )
+            });
+
         self.config.set_ollama_num_ctx_override(value);
-        Ok(ContextLengthMutation::Set)
+        Ok(ContextLengthMutation::Set {
+            above_cap_warning,
+        })
     }
 
     /// Build the compaction config + summarizer for the current
@@ -1191,6 +1287,96 @@ fn format_context_length(value: u64) -> String {
             out.push(' ');
         }
         out.push(ch);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_state_summary(
+    model: &Model,
+    thinking: ThinkingLevel,
+    runtime_override: Option<u64>,
+    workspace_cap: Option<u64>,
+    effective: u64,
+    session_id: &str,
+    config_path: Option<PathBuf>,
+    state_path: Option<PathBuf>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    let _ = writeln!(out, "Current model");
+    let _ = writeln!(
+        out,
+        "  {}:{} · {:?}",
+        model.provider, model.id, model.api,
+    );
+    let _ = writeln!(out, "  Thinking: {}", format_thinking(thinking));
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "Context window");
+    if model.api == ApiKind::OllamaChatApi {
+        let suffix = if runtime_override.is_some() {
+            " (runtime override active)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "  Effective:        {} tokens{suffix}",
+            format_context_length(effective),
+        );
+        let _ = writeln!(
+            out,
+            "  Runtime override: {}",
+            match runtime_override {
+                Some(value) => format!("{} (state.json)", format_context_length(value)),
+                None => "(none)".to_string(),
+            },
+        );
+        let _ = writeln!(
+            out,
+            "  Workspace cap:    {}",
+            match workspace_cap {
+                Some(value) => format!(
+                    "{} (config.toml [ollama] default_max_num_ctx)",
+                    format_context_length(value),
+                ),
+                None => "(none)".to_string(),
+            },
+        );
+        let _ = writeln!(
+            out,
+            "  Model baseline:   {} (Model.context_window)",
+            format_context_length(model.context_window),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  Effective: {} tokens",
+            format_context_length(effective),
+        );
+        let _ = writeln!(
+            out,
+            "  (Layered overrides only apply to Ollama /api/chat models)",
+        );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "Session");
+    let _ = writeln!(out, "  Active: {session_id}");
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "Files");
+    if let Some(path) = config_path {
+        let _ = writeln!(out, "  Config: {} (hand-edited)", path.display());
+    }
+    if let Some(path) = state_path {
+        let _ = writeln!(out, "  State:  {} (written by anie)", path.display());
+    }
+
+    while out.ends_with('\n') {
+        out.pop();
     }
     out
 }

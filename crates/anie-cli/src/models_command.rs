@@ -40,8 +40,28 @@ pub async fn run_models_command(provider_filter: Option<&str>, refresh: bool) ->
                 // `Arc<[ModelInfo]>`. Clone each element into the
                 // rows vec since the aggregate needs ownership;
                 // the Arc itself drops when the loop ends.
+                //
+                // Apply the [ollama] default_max_num_ctx cap to
+                // the displayed `context_length` for OllamaChatApi
+                // requests so `anie models` agrees with what the
+                // wire request will send. Without this clamp users
+                // see uncapped values in the catalog listing while
+                // /api/ps shows the capped value — confusing.
+                // Mirrors the `to_model` clamp on
+                // `Model.context_window`.
+                let apply_cap = matches!(request.api, ApiKind::OllamaChatApi)
+                    && config.ollama.default_max_num_ctx.is_some();
                 for model in models.iter() {
-                    rows.push((request.provider_name.clone(), model.clone()));
+                    let mut model = model.clone();
+                    if apply_cap
+                        && let Some(discovered) = model.context_length
+                    {
+                        model.context_length = Some(anie_provider::clamp_ollama_context_window(
+                            discovered,
+                            config.ollama.default_max_num_ctx,
+                        ));
+                    }
+                    rows.push((request.provider_name.clone(), model));
                 }
             }
             Err(error) => errors.push((request.provider_name.clone(), error.to_string())),
@@ -169,7 +189,7 @@ async fn configured_requests(
         );
     }
 
-    for server in detect_local_servers().await {
+    for server in detect_local_servers(config.ollama.default_max_num_ctx).await {
         let api = server
             .models
             .first()

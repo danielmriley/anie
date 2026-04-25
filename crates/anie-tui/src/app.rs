@@ -80,6 +80,17 @@ pub struct App {
     /// ms), idle-tick redraws are suppressed so the spinner
     /// freezes rather than eating CPU. Plan 06 PR-B.
     last_streaming_delta_at: Option<Instant>,
+    /// Workspace-wide cap on Ollama `num_ctx` from
+    /// `[ollama] default_max_num_ctx`. Applied to every
+    /// `ModelInfo::to_model` call the TUI makes when
+    /// converting a freshly-discovered `ModelInfo` into a
+    /// runtime `Model` (model picker, post-discovery
+    /// catalog updates). `None` (the default) preserves
+    /// uncapped behavior. Set via
+    /// `with_ollama_default_max_num_ctx` from
+    /// `interactive_mode.rs` based on the loaded
+    /// `AnieConfig`. See `docs/ollama_default_num_ctx_cap`.
+    ollama_default_max_num_ctx: Option<u64>,
 }
 
 pub(crate) fn drain_agent_event_batch(
@@ -216,6 +227,10 @@ pub enum UiAction {
     SetThinking(String),
     /// Query, set, or reset the Ollama native context-length override.
     ContextLength(Option<String>),
+    /// Show a read-only summary of persistent values affecting the
+    /// current model (effective context window, layered overrides,
+    /// session id, persistent file paths).
+    ShowState,
     /// Clear the output pane.
     ClearOutput,
     /// Request a manual context compaction.
@@ -262,6 +277,12 @@ pub struct StatusBarState {
     pub context_window: u64,
     /// Current working directory label.
     pub cwd: String,
+    /// Cached shortened cwd for the status bar. Recomputed
+    /// only when `cwd` changes between paints — avoids the
+    /// `env::var` + `Vec` allocation that used to fire on
+    /// every render. Skipped during serialization-style
+    /// equality checks since it's a derived view of `cwd`.
+    cached_short_cwd: Option<(String, String)>,
 }
 
 impl Default for StatusBarState {
@@ -275,7 +296,27 @@ impl Default for StatusBarState {
             estimated_context_tokens: 0,
             context_window: 0,
             cwd: String::new(),
+            cached_short_cwd: None,
         }
+    }
+}
+
+impl StatusBarState {
+    /// Return the abbreviated cwd for the status bar, computing
+    /// lazily and caching the (cwd, shortened) pair so repeat
+    /// reads at the same cwd are O(1).
+    fn shortened_cwd(&mut self) -> &str {
+        let stale = self
+            .cached_short_cwd
+            .as_ref()
+            .is_none_or(|(input, _)| input != &self.cwd);
+        if stale {
+            let computed = shorten_path(&self.cwd);
+            self.cached_short_cwd = Some((self.cwd.clone(), computed));
+        }
+        self.cached_short_cwd
+            .as_ref()
+            .map_or("", |(_, shortened)| shortened.as_str())
     }
 }
 
@@ -360,7 +401,19 @@ impl App {
             worker_rx,
             commands,
             last_streaming_delta_at: None,
+            ollama_default_max_num_ctx: None,
         }
+    }
+
+    /// Snapshot the workspace-wide Ollama `num_ctx` cap from
+    /// `[ollama] default_max_num_ctx`. The TUI applies it to
+    /// every `to_model` conversion that builds a runtime
+    /// `Model` from freshly-discovered `ModelInfo`. `None`
+    /// preserves the prior uncapped behavior.
+    #[must_use]
+    pub fn with_ollama_default_max_num_ctx(mut self, cap: Option<u64>) -> Self {
+        self.ollama_default_max_num_ctx = cap;
+        self
     }
 
     /// Access the status bar state for setup and tests.
@@ -536,7 +589,7 @@ impl App {
             }
         };
         render_status_bar(
-            &self.status_bar,
+            &mut self.status_bar,
             &self.agent_state,
             self.output_pane.is_scrolled(),
             status_area,
@@ -560,9 +613,27 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn render_urgent_for_test(&mut self, frame: &mut Frame<'_>) {
+    /// Render in `UrgentInput` mode. Equivalent to what the
+    /// real event loop does for a keystroke paint, but exposed
+    /// so unit tests and the criterion bench can exercise the
+    /// same path without going through `run_tui`.
+    pub fn render_urgent(&mut self, frame: &mut Frame<'_>) {
         self.render_with_mode(frame, RenderMode::UrgentInput);
+    }
+
+    /// Construct an `App` for benchmarking with a pre-populated
+    /// `OutputPane`. The channel halves are dropped — callers
+    /// must not enter `run_tui`; the intended use is timing
+    /// `handle_terminal_event` + `render_urgent` against a
+    /// `TestBackend`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_bench(output_pane: OutputPane) -> Self {
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let mut app = Self::new(event_rx, action_tx, Vec::new(), Vec::new());
+        app.output_pane = output_pane;
+        app
     }
 
     /// Handle an incoming terminal event.
@@ -873,6 +944,13 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> RenderDirty {
+        // Keys that work the same regardless of agent state:
+        // PageUp/PageDown scroll, Ctrl+O opens the model
+        // picker. Try those first so the per-state handlers
+        // don't have to repeat the wiring.
+        if let Some(dirty) = self.try_shared_scroll_or_picker(key) {
+            return dirty;
+        }
         match self.agent_state {
             AgentUiState::Idle => self.handle_idle_key(key),
             AgentUiState::Streaming
@@ -881,36 +959,43 @@ impl App {
         }
     }
 
-    fn handle_idle_key(&mut self, key: KeyEvent) -> RenderDirty {
+    /// Handle keys whose behavior is identical across all agent
+    /// states. Returns `Some` if the key was consumed.
+    fn try_shared_scroll_or_picker(&mut self, key: KeyEvent) -> Option<RenderDirty> {
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                self.should_quit = true;
-                let _ = self.action_tx.send(UiAction::Quit);
-                RenderDirty::none()
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
-                self.should_quit = true;
-                let _ = self.action_tx.send(UiAction::Quit);
-                RenderDirty::none()
-            }
             (KeyModifiers::NONE, KeyCode::PageUp) => {
                 self.output_pane.scroll_page_up();
-                RenderDirty::full()
+                Some(RenderDirty::full())
             }
             (KeyModifiers::NONE, KeyCode::PageDown) => {
                 self.output_pane.scroll_page_down();
-                RenderDirty::full()
+                Some(RenderDirty::full())
             }
+            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
+                self.open_model_picker_for_current_provider(None);
+                Some(RenderDirty::full())
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_idle_key(&mut self, key: KeyEvent) -> RenderDirty {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
+                self.should_quit = true;
+                let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
+            }
+            // Home/End scroll only when the editor is empty.
+            // Otherwise they belong to the input pane (jump to
+            // start/end of the current line).
             (KeyModifiers::NONE, KeyCode::Home) if self.input_pane.content().is_empty() => {
                 self.output_pane.scroll_to_top();
                 RenderDirty::full()
             }
             (KeyModifiers::NONE, KeyCode::End) if self.input_pane.content().is_empty() => {
                 self.output_pane.scroll_to_bottom();
-                RenderDirty::full()
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-                self.open_model_picker_for_current_provider(None);
                 RenderDirty::full()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
@@ -945,24 +1030,15 @@ impl App {
                 let _ = self.action_tx.send(UiAction::Quit);
                 RenderDirty::none()
             }
-            (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.output_pane.scroll_page_up();
-                RenderDirty::full()
-            }
-            (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.output_pane.scroll_page_down();
-                RenderDirty::full()
-            }
+            // Active state: Home/End scroll unconditionally —
+            // the editor is locked while the agent is running,
+            // so input-line navigation is irrelevant.
             (KeyModifiers::NONE, KeyCode::Home) => {
                 self.output_pane.scroll_to_top();
                 RenderDirty::full()
             }
             (KeyModifiers::NONE, KeyCode::End) => {
                 self.output_pane.scroll_to_bottom();
-                RenderDirty::full()
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-                self.open_model_picker_for_current_provider(None);
                 RenderDirty::full()
             }
             _ => RenderDirty::none(),
@@ -1070,7 +1146,15 @@ impl App {
     /// If a new builtin is added to `builtin_commands()`, wire it
     /// here too and update the coverage test in `anie-cli/src/
     /// commands.rs` (`registry_covers_every_dispatched_slash_command`).
+    /// No-arg commands that simply forward a `UiAction` go in
+    /// `fixed_noarg_action` below; everything else (commands
+    /// with custom dispatch, side effects, or argument parsing)
+    /// stays in the main match.
     fn dispatch_validated_command(&mut self, info: &SlashCommandInfo, arg: Option<&str>) {
+        if let Some(action) = fixed_noarg_action(info.name) {
+            let _ = self.action_tx.send(action);
+            return;
+        }
         match info.name {
             "model" => match arg {
                 None => self.open_model_picker_for_current_provider(None),
@@ -1096,15 +1180,6 @@ impl App {
                     .action_tx
                     .send(UiAction::ContextLength(arg.map(str::to_string)));
             }
-            "compact" => {
-                let _ = self.action_tx.send(UiAction::Compact);
-            }
-            "fork" => {
-                let _ = self.action_tx.send(UiAction::ForkSession);
-            }
-            "diff" => {
-                let _ = self.action_tx.send(UiAction::ShowDiff);
-            }
             "clear" => {
                 self.output_pane.clear();
                 let _ = self.action_tx.send(UiAction::ClearOutput);
@@ -1122,9 +1197,6 @@ impl App {
                         .send(UiAction::SwitchSession(session_id.to_string()));
                 }
             },
-            "tools" => {
-                let _ = self.action_tx.send(UiAction::ShowTools);
-            }
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
             "copy" => self.copy_last_assistant_to_clipboard(),
@@ -1234,18 +1306,6 @@ impl App {
                         .add_system_message("Usage: /logout <provider>".to_string());
                 }
             },
-            "new" => {
-                let _ = self.action_tx.send(UiAction::NewSession);
-            }
-            "reload" => {
-                let _ = self.action_tx.send(UiAction::ReloadConfig {
-                    provider: None,
-                    model: None,
-                });
-            }
-            "help" => {
-                let _ = self.action_tx.send(UiAction::ShowHelp);
-            }
             "quit" => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
@@ -1423,9 +1483,11 @@ impl App {
                                 known.provider == model.provider && known.id == model.id
                             }) {
                                 let api = discovery_model_api(&provider_name, api, &base_url);
-                                self.known_models.push(
-                                    model.to_model(api, &discovery_model_base_url(api, &base_url)),
-                                );
+                                self.known_models.push(model.to_model(
+                                    api,
+                                    &discovery_model_base_url(api, &base_url),
+                                    self.ollama_default_max_num_ctx,
+                                ));
                             }
                         }
                         if let BottomPane::ModelPicker(session) = &mut self.bottom_pane {
@@ -1537,7 +1599,11 @@ impl App {
             .unwrap_or_else(|| {
                 let api =
                     discovery_model_api(&context.provider_name, context.api, &context.base_url);
-                model_info.to_model(api, &discovery_model_base_url(api, &context.base_url))
+                model_info.to_model(
+                    api,
+                    &discovery_model_base_url(api, &context.base_url),
+                    self.ollama_default_max_num_ctx,
+                )
             })
     }
 
@@ -2043,7 +2109,7 @@ fn display_path(path: &Path) -> String {
 }
 
 fn render_status_bar(
-    state: &StatusBarState,
+    state: &mut StatusBarState,
     agent_state: &AgentUiState,
     transcript_scrolled: bool,
     area: Rect,
@@ -2058,6 +2124,10 @@ fn render_status_bar(
     // right above the input box (stable position, doesn't
     // jitter into and out of the persistent info row).
     let _ = agent_state;
+    // Resolve the cached cwd before the format!, since the
+    // shortened_cwd accessor takes &mut self and the
+    // remaining state reads inside format! are immutable.
+    let short_cwd = state.shortened_cwd().to_string();
     let status = format!(
         " {}{}:{} │ thinking: {} │ {}/{} │ {}",
         if transcript_scrolled {
@@ -2070,7 +2140,7 @@ fn render_status_bar(
         state.thinking,
         format_tokens(used_tokens),
         format_tokens(state.context_window),
-        shorten_path(&state.cwd),
+        short_cwd,
     );
     Paragraph::new(Line::from(Span::styled(
         status,
@@ -2114,6 +2184,32 @@ fn render_spinner_row(
         Style::default().fg(Color::Yellow),
     )))
     .render(area, buf);
+}
+
+/// Map a slash-command name to the `UiAction` it forwards
+/// when the command takes no arguments and has no side effects
+/// other than dispatching that action. Returns `None` for any
+/// command that needs custom dispatch logic (`/model`,
+/// `/thinking`, `/clear`, `/quit`, etc.) — those stay in the
+/// main `dispatch_validated_command` match.
+///
+/// Adding a new no-arg builtin: extend the table here and the
+/// coverage test in `anie-cli/src/commands.rs`.
+fn fixed_noarg_action(name: &str) -> Option<UiAction> {
+    Some(match name {
+        "compact" => UiAction::Compact,
+        "fork" => UiAction::ForkSession,
+        "diff" => UiAction::ShowDiff,
+        "new" => UiAction::NewSession,
+        "tools" => UiAction::ShowTools,
+        "state" => UiAction::ShowState,
+        "help" => UiAction::ShowHelp,
+        "reload" => UiAction::ReloadConfig {
+            provider: None,
+            model: None,
+        },
+        _ => return None,
+    })
 }
 
 fn format_tokens(tokens: u64) -> String {

@@ -464,7 +464,16 @@ impl OnboardingScreen {
 
         let tx = self.worker_tx.clone();
         tokio::spawn(async move {
-            let servers = detect_local_servers().await;
+            // During onboarding the user is browsing what's
+            // available; the workspace-wide cap from
+            // [ollama] default_max_num_ctx (Cap PR 1) does not
+            // apply yet because the user hasn't necessarily
+            // finished writing their config. Once a model is
+            // selected and the regular catalog-build path runs
+            // (model_catalog::build_model_catalog), the cap
+            // applies through `to_model` and
+            // `probe_openai_compatible` like every other path.
+            let servers = detect_local_servers(None).await;
             let _ = tx.send(WorkerEvent::LocalServersDetected(servers));
         });
     }
@@ -1113,7 +1122,7 @@ impl OnboardingScreen {
                     .map(|model| model.base_url.clone())
                     .unwrap_or_else(|| normalize_openai_base_url(&server.base_url));
                 let api = discovery_model_api(&server.name, api, &base_url);
-                let mut model = model_info.to_model(api, &discovery_model_base_url(api, &base_url));
+                let mut model = model_info.to_model(api, &discovery_model_base_url(api, &base_url), None);
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
                     model,
@@ -1122,7 +1131,7 @@ impl OnboardingScreen {
                 }
             }
             ModelPickerContext::ApiPreset { preset, .. } => {
-                let mut model = model_info.to_model(preset.model.api, &preset.model.base_url);
+                let mut model = model_info.to_model(preset.model.api, &preset.model.base_url, None);
                 model.provider = preset.provider_name.to_string();
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
@@ -1137,7 +1146,7 @@ impl OnboardingScreen {
                 ..
             } => {
                 let api = discovery_model_api(provider_name, ApiKind::OpenAICompletions, base_url);
-                let mut model = model_info.to_model(api, &discovery_model_base_url(api, base_url));
+                let mut model = model_info.to_model(api, &discovery_model_base_url(api, base_url), None);
                 model.provider = provider_name.clone();
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {

@@ -70,30 +70,31 @@ fn find_link_ranges_in_line(line: &Line<'static>, theme: &MarkdownTheme) -> Vec<
         // text. They're emitted by link.rs::format_link_suffix
         // and rendered with MarkdownTheme::link_url — an
         // exact-style match is the cheapest identifier.
-        if span.style == theme.link_url {
-            if let Some(url) = extract_url_from_fallback(&span.content) {
-                // Skip the leading space + opening paren (2
-                // chars of the fallback " (url)") so the
-                // clickable region is just the URL text, not
-                // the punctuation.
-                let content_chars = span.content.chars().count() as u16;
-                // Compute the URL's inner position within the
-                // span: find the first '(' and the last ')'.
-                let url_start_in_span = span.content.find('(').unwrap_or(0) as u16 + 1;
-                let url_end_in_span = span
-                    .content
-                    .rfind(')')
-                    .map(|i| i as u16)
-                    .unwrap_or(content_chars);
-                let col_start = col.saturating_add(url_start_in_span);
-                let col_end = col.saturating_add(url_end_in_span);
-                if col_end > col_start {
-                    ranges.push(LinkRange {
-                        col_start,
-                        col_end,
-                        url,
-                    });
-                }
+        if span.style == theme.link_url
+            && let Some(url) = extract_url_from_fallback(&span.content)
+        {
+            // Skip the leading space + opening paren (2
+            // chars of the fallback " (url)") so the
+            // clickable region is just the URL text, not
+            // the punctuation. Reuse the span_chars count
+            // computed above instead of re-walking the
+            // content's chars.
+            let url_start_in_span = u16::try_from(span.content.find('(').unwrap_or(0))
+                .unwrap_or(u16::MAX)
+                .saturating_add(1);
+            let url_end_in_span = span
+                .content
+                .rfind(')')
+                .and_then(|i| u16::try_from(i).ok())
+                .unwrap_or(span_chars);
+            let col_start = col.saturating_add(url_start_in_span);
+            let col_end = col.saturating_add(url_end_in_span);
+            if col_end > col_start {
+                ranges.push(LinkRange {
+                    col_start,
+                    col_end,
+                    url,
+                });
             }
         }
         col = col.saturating_add(span_chars);

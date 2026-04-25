@@ -15,6 +15,7 @@ pub use model::{
     CostPerMillion, MaxTokensField, Model, ModelCompat, ModelInfo, ModelPricing,
     OpenAICompletionsCompat, OpenRouterRouting, ReasoningCapabilities, ReasoningControlMode,
     ReasoningOutputMode, ReasoningTags, ReplayCapabilities, ThinkingRequestMode,
+    clamp_ollama_context_window,
 };
 pub use options::{LlmContext, LlmMessage, ResolvedRequestOptions, StreamOptions};
 pub use provider::{Provider, ProviderEvent, ProviderStream, RequestOptionsResolver};

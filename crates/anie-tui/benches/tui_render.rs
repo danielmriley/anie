@@ -24,8 +24,9 @@
 
 use std::hint::black_box;
 
-use anie_tui::OutputPane;
+use anie_tui::{App, OutputPane};
 use criterion::{Criterion, criterion_group, criterion_main};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -133,10 +134,106 @@ fn bench_resize_during_stream(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------
+// Keystroke→paint benchmarks (PR 02 of docs/tui_perf_2026-04-25/).
+//
+// These scenarios drive the full `App` pipeline including
+// `InputPane::layout_lines`, `App::render_status_bar`, and the
+// urgent-input render mode. The existing scroll/stream/resize
+// benches above only exercise `OutputPane::render`, missing the
+// input + status-bar work the user actually feels.
+//
+// `TestBackend` doesn't model GPU sync wrap, so these times
+// reflect Rust-side cost only — terminal-side latency is out of
+// scope for a unit-bench harness.
+// ---------------------------------------------------------------
+
+fn build_app_with_transcript(turns: usize) -> (App, Terminal<TestBackend>) {
+    let pane = build_markdown_transcript(turns);
+    let app = App::for_bench(pane);
+    let terminal = new_terminal(VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    (app, terminal)
+}
+
+fn keypress(c: char) -> Event {
+    Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+}
+
+fn time_keystroke(app: &mut App, terminal: &mut Terminal<TestBackend>, ch: char) {
+    app.handle_terminal_event(keypress(ch))
+        .expect("handle_terminal_event");
+    terminal
+        .draw(|frame| app.render_urgent(frame))
+        .expect("draw urgent");
+}
+
+fn bench_keystroke_into_idle_app_600(c: &mut Criterion) {
+    let (mut app, mut terminal) = build_app_with_transcript(600);
+    // Warm: one full render to populate caches.
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("warm render");
+
+    c.bench_function("keystroke_into_idle_app_600", |b| {
+        b.iter(|| {
+            time_keystroke(black_box(&mut app), black_box(&mut terminal), 'a');
+        });
+    });
+}
+
+fn bench_keystroke_during_stream_600(c: &mut Criterion) {
+    let mut pane = build_markdown_transcript(600);
+    pane.add_streaming_assistant();
+    let mut app = App::for_bench(pane);
+    let mut terminal = new_terminal(VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("warm render");
+
+    c.bench_function("keystroke_during_stream_600", |b| {
+        b.iter(|| {
+            // Append a streaming chunk to simulate concurrent
+            // agent output, then time the keystroke paint.
+            // append_to_last_assistant is on OutputPane; we don't
+            // expose pane mutators on App, so this scenario
+            // measures the keystroke paint with a static-but-
+            // streaming-marked block. The block bypasses the
+            // line cache because is_streaming==true, so the
+            // re-render cost is paid every paint.
+            time_keystroke(black_box(&mut app), black_box(&mut terminal), 'a');
+        });
+    });
+}
+
+fn bench_keystroke_into_long_buffer(c: &mut Criterion) {
+    // Pre-fill the input buffer to 200 chars to stress
+    // InputPane::layout_lines (Finding F-1).
+    let (mut app, mut terminal) = build_app_with_transcript(20);
+    for ch in "abcdefghij".chars().cycle().take(200) {
+        app.handle_terminal_event(keypress(ch))
+            .expect("preload buffer");
+    }
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("warm render");
+
+    c.bench_function("keystroke_into_long_buffer", |b| {
+        b.iter(|| {
+            // Toggle a non-mutating navigation key would be
+            // ideal, but Char keystrokes go through layout_lines
+            // unconditionally, which is what we want to time.
+            time_keystroke(black_box(&mut app), black_box(&mut terminal), 'x');
+        });
+    });
+}
+
 criterion_group!(
     tui_render,
     bench_scroll_static_600,
     bench_stream_into_static_600,
     bench_resize_during_stream,
+    bench_keystroke_into_idle_app_600,
+    bench_keystroke_during_stream_600,
+    bench_keystroke_into_long_buffer,
 );
 criterion_main!(tui_render);

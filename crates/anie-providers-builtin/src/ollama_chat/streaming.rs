@@ -71,9 +71,17 @@ impl OllamaChatStreamState {
         let chunk: OllamaChatChunk = serde_json::from_str(line)
             .map_err(|error| ProviderError::InvalidStreamJson(error.to_string()))?;
         if let Some(error) = chunk.error {
+            // Inline NDJSON errors fire mid-stream — by definition
+            // the model already loaded successfully, so the
+            // load-resource pathway can't apply here. Pass
+            // `None` for `request_num_ctx` so any "memory"-shaped
+            // wording on this codepath stays a generic Http error
+            // rather than a misleading
+            // `/context-length` suggestion.
             return Err(classify_ollama_error_body(
                 reqwest::StatusCode::BAD_REQUEST,
                 &error,
+                None,
                 None,
             ));
         }
