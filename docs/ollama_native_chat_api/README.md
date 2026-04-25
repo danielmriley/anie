@@ -760,19 +760,22 @@ PR 3 machinery and PR 4A's shared tool schema helper.
 - `native_reasoning_unsupported_error_triggers_second_attempt_without_think`
 - `native_reasoning_unsupported_on_second_attempt_surfaces_original_error`
 
-### PR 5 — Discovery + probe tag Ollama as `OllamaChatApi`
+### PR 5A — Builtin discovery/probe tag Ollama as `OllamaChatApi`
 
-**Why fifth:** now that `OllamaChatApi` *works*, flip the
-discovery paths so new Ollama model records route through it
-by default.
+**Why fifth-A:** PR 5 as originally written touches more than
+five files, so split it before implementation. This first slice
+updates the built-in discovery/probe layer; caller-specific
+conversion and config warnings land separately.
 
 **Scope:**
 
-- `model_discovery::discover_ollama_tags` (currently
+- `model_discovery::discover_models` (currently
   [`model_discovery.rs`](../../crates/anie-providers-builtin/src/model_discovery.rs)):
-  set `ApiKind::OllamaChatApi` when building the discovered
-  `Model` via `to_model`. Remove hard-coded
-  `ApiKind::OpenAICompletions`.
+  add `ApiKind::OllamaChatApi` to the match and route it to
+  `discover_ollama_tags`. `discover_ollama_tags` itself returns
+  `Vec<ModelInfo>` and should stay API-kind-neutral; the
+  `ApiKind` is chosen by the callers that convert `ModelInfo`
+  into `Model`.
 - `local::probe_openai_compatible` at
   [`local.rs:probe_openai_compatible`](../../crates/anie-providers-builtin/src/local.rs):
   when `is_ollama_probe_target` (already exists from
@@ -780,6 +783,52 @@ by default.
   `ApiKind::OllamaChatApi`. Non-Ollama OpenAI-compat servers
   (`lmstudio`, `vllm`, `unknown`) continue to use
   `OpenAICompletions`.
+
+**Tests:**
+
+- `discover_models_supports_ollama_chat_api_request_kind`
+- `ollama_tag_discovery_still_returns_model_info_without_api_kind`
+- `probe_detects_openai_compatible_server`
+- `non_ollama_local_probes_still_use_openai_completions`
+
+### PR 5B — Route Ollama discovery callers through native API kind
+
+**Why fifth-B:** once the built-in discovery/probe layer supports
+`OllamaChatApi`, update each user-facing discovery caller to pass
+that API kind when converting Ollama `ModelInfo` rows into `Model`
+records.
+
+**Scope:**
+
+- Update each Ollama discovery caller so it passes
+  `ApiKind::OllamaChatApi` into `ModelInfo::to_model`:
+  `anie-cli/src/models_command.rs`,
+  `anie-tui/src/app.rs` model-picker discovery,
+  `anie-tui/src/overlays/onboarding.rs`, and
+  `anie-tui/src/overlays/providers.rs`. Do not key this only
+  on provider name; use the discovery request / endpoint shape
+  that already identified the target as Ollama.
+
+**Tests:**
+
+- `ollama_discovery_tags_models_as_ollama_chat_api_after_pr5`
+- `tui_model_picker_converts_ollama_discovery_to_ollama_chat_api`
+- `onboarding_converts_ollama_discovery_to_ollama_chat_api`
+- `provider_management_converts_ollama_discovery_to_ollama_chat_api`
+- `state_json_with_legacy_provider_model_resolves_to_new_api_kind_via_catalog`
+  (regression guard: a state.json written before this plan,
+  with `provider = "ollama"` and `model = "qwen3:32b"`, loads
+  fine and the resolved `Model` carries `OllamaChatApi` because
+  the catalog tagged it that way).
+
+### PR 5C — Warn on legacy user-authored Ollama OpenAI API config
+
+**Why fifth-C:** user-authored config remains authoritative, but
+legacy `api = "OpenAICompletions"` under Ollama should be visible
+now that new discovery produces native Ollama models.
+
+**Scope:**
+
 - Config-file warning in the `anie-config` load path: if a
   user-edited `[[providers.ollama.models]]` block declares
   `api = "OpenAICompletions"`, log (not print) a warning with
@@ -791,17 +840,7 @@ every load and naturally follows PR 5's tagging change.
 
 **Tests:**
 
-- `ollama_discovery_tags_models_as_ollama_chat_api_after_pr5`
-- `local_probe_tags_ollama_models_as_ollama_chat_api_after_pr5`
-- `non_ollama_local_probes_still_use_openai_completions`
-  (covers lmstudio and vllm in one test — both remain on the
-  OpenAI-compat path).
 - `config_toml_with_legacy_ollama_api_logs_warning_but_loads_unchanged`
-- `state_json_with_legacy_provider_model_resolves_to_new_api_kind_via_catalog`
-  (regression guard: a state.json written before this plan,
-  with `provider = "ollama"` and `model = "qwen3:32b"`, loads
-  fine and the resolved `Model` carries `OllamaChatApi` because
-  the catalog tagged it that way).
 
 ### PR 6 — Flip the `to_model` context-window guard for `OllamaChatApi`
 

@@ -207,6 +207,7 @@ pub async fn probe_openai_compatible(
     // model in a single /v1/models response.
     let trimmed_base_url = base_url.trim_end_matches('/').to_string();
     let v1_base_url = format!("{trimmed_base_url}/v1");
+    let is_ollama = is_ollama_probe_target(name, &trimmed_base_url);
     let probe_inputs = LocalProbeInputs::new(name, base_url);
     let mut models = body
         .get("data")?
@@ -218,8 +219,16 @@ pub async fn probe_openai_compatible(
                 id: id.to_string(),
                 name: id.to_string(),
                 provider: name.to_string(),
-                api: ApiKind::OpenAICompletions,
-                base_url: v1_base_url.clone(),
+                api: if is_ollama {
+                    ApiKind::OllamaChatApi
+                } else {
+                    ApiKind::OpenAICompletions
+                },
+                base_url: if is_ollama {
+                    trimmed_base_url.clone()
+                } else {
+                    v1_base_url.clone()
+                },
                 context_window: 32_768,
                 max_tokens: 8_192,
                 supports_reasoning: false,
@@ -245,7 +254,7 @@ pub async fn probe_openai_compatible(
     // bootstrap gets the authoritative signal too. Per-model
     // failure logs and keeps the heuristic for that model.
     // See `docs/ollama_capability_discovery/README.md` PR 5.
-    if is_ollama_probe_target(name, &trimmed_base_url) {
+    if is_ollama {
         let show_futures = models
             .iter()
             .map(|model| fetch_ollama_show_capabilities(client, &trimmed_base_url, &model.id));
@@ -349,7 +358,8 @@ mod tests {
         assert_eq!(detected.models.len(), 1);
         assert_eq!(detected.models[0].id, "qwen3:32b");
         assert_eq!(detected.models[0].provider, "ollama");
-        assert_eq!(detected.models[0].base_url, format!("http://{address}/v1"));
+        assert_eq!(detected.models[0].api, ApiKind::OllamaChatApi);
+        assert_eq!(detected.models[0].base_url, format!("http://{address}"));
         assert!(!detected.models[0].supports_reasoning);
         assert_eq!(
             detected.models[0].reasoning_capabilities,
@@ -360,6 +370,42 @@ mod tests {
                 request_mode: Some(ThinkingRequestMode::ReasoningEffort),
             })
         );
+
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn non_ollama_local_probes_still_use_openai_completions() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local server");
+        let address = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request_buffer = [0u8; 1024];
+            let _ = socket.read(&mut request_buffer).await;
+            let body = r#"{"data":[{"id":"local-model"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let detected = probe_openai_compatible(&client, "lmstudio", &format!("http://{address}"))
+            .await
+            .expect("detected local server");
+
+        assert_eq!(detected.models[0].api, ApiKind::OpenAICompletions);
+        assert_eq!(detected.models[0].base_url, format!("http://{address}/v1"));
 
         server.await.expect("server task");
     }

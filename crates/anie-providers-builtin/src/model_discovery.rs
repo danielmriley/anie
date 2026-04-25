@@ -49,10 +49,7 @@ pub async fn discover_models(
         ApiKind::GoogleGenerativeAI => Err(ProviderError::RequestBuild(
             "model discovery for Google Generative AI is not implemented yet".to_string(),
         )),
-        ApiKind::OllamaChatApi => Err(ProviderError::RequestBuild(
-            "model discovery for OllamaChatApi is not wired until the native Ollama discovery PR"
-                .to_string(),
-        )),
+        ApiKind::OllamaChatApi => discover_ollama_tags(request).await,
     }
 }
 
@@ -1121,6 +1118,58 @@ mod tests {
         assert_eq!(models[0].context_length, Some(1_000_000));
         assert_eq!(models[0].supports_images, Some(true));
         assert_eq!(models[0].supports_reasoning, Some(true));
+    }
+
+    #[tokio::test]
+    async fn discover_models_supports_ollama_chat_api_request_kind() {
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(
+                r#"{"models":[{"model":"qwen3:32b","details":{"family":"qwen3"}}]}"#,
+            ),
+            "/api/show" => MockResponse::ok_json(
+                r#"{"capabilities":["completion","thinking"],"model_info":{"general.architecture":"qwen3","qwen3.context_length":65536}}"#,
+            ),
+            other => panic!("unexpected path {other}"),
+        })
+        .await;
+
+        let models = discover_models(&request(
+            "ollama",
+            ApiKind::OllamaChatApi,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover ollama models");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3:32b");
+        assert_eq!(models[0].context_length, Some(65_536));
+        assert_eq!(models[0].supports_reasoning, Some(true));
+    }
+
+    #[tokio::test]
+    async fn ollama_tag_discovery_still_returns_model_info_without_api_kind() {
+        let server = spawn_mock_server(|path, _headers| match path.as_str() {
+            "/api/tags" => MockResponse::ok_json(r#"{"models":[{"name":"gemma3:4b"}]}"#),
+            "/api/show" => MockResponse::ok_json(r#"{"capabilities":["completion"]}"#),
+            other => panic!("unexpected path {other}"),
+        })
+        .await;
+
+        let models = discover_ollama_tags(&request(
+            "ollama",
+            ApiKind::OllamaChatApi,
+            &server.base_url,
+            None,
+        ))
+        .await
+        .expect("discover ollama tags");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemma3:4b");
+        assert_eq!(models[0].provider, "ollama");
+        assert_eq!(models[0].supports_reasoning, Some(false));
     }
 
     #[tokio::test]
