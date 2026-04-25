@@ -8,12 +8,13 @@ pub(super) fn build_request_body(
     context: &LlmContext,
     options: &StreamOptions,
 ) -> serde_json::Value {
+    let num_ctx = options.num_ctx_override.unwrap_or(model.context_window);
     let mut body = json!({
         "model": model.id,
         "messages": request_messages(context),
         "stream": true,
         "options": {
-            "num_ctx": model.context_window,
+            "num_ctx": num_ctx,
         },
     });
     if model.reasoning_capabilities.is_some() {
@@ -204,6 +205,31 @@ mod tests {
         );
 
         assert_eq!(body["options"]["num_ctx"], 16_384);
+    }
+
+    #[test]
+    fn ollama_chat_body_prefers_num_ctx_override_over_context_window() {
+        let body = build_request_body(
+            &sample_model(32_768),
+            &sample_context(),
+            &StreamOptions {
+                num_ctx_override: Some(16_384),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(body["options"]["num_ctx"], 16_384);
+    }
+
+    #[test]
+    fn ollama_chat_body_uses_context_window_when_override_is_none() {
+        let body = build_request_body(
+            &sample_model(32_768),
+            &sample_context(),
+            &StreamOptions::default(),
+        );
+
+        assert_eq!(body["options"]["num_ctx"], 32_768);
     }
 
     #[test]

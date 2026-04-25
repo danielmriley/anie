@@ -84,6 +84,7 @@ impl MessageSummarizer for CompactionStrategy {
             max_tokens: Some(resolved_model.max_tokens.min(4_096)),
             thinking: ThinkingLevel::Off,
             headers: request.headers,
+            num_ctx_override: None,
         };
 
         let stream = provider

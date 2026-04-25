@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use futures::{StreamExt, future::join_all};
@@ -190,7 +193,7 @@ use anie_protocol::{
 };
 use anie_provider::{
     LlmContext, Model, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
-    RequestOptionsResolver, ThinkingLevel,
+    RequestOptionsResolver, StreamOptions, ThinkingLevel,
 };
 
 use crate::ToolRegistry;
@@ -214,6 +217,7 @@ pub struct AgentLoopConfig {
     thinking: ThinkingLevel,
     tool_execution: ToolExecutionMode,
     request_options_resolver: Arc<dyn RequestOptionsResolver>,
+    ollama_num_ctx_override: Option<u64>,
     get_steering_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
     get_follow_up_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
     before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
@@ -236,10 +240,47 @@ impl AgentLoopConfig {
             thinking,
             tool_execution,
             request_options_resolver,
+            ollama_num_ctx_override: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
             before_tool_call_hook: None,
             after_tool_call_hook: None,
+        }
+    }
+
+    /// Snapshot an Ollama native `num_ctx` override for provider
+    /// requests. Non-Ollama providers ignore the resulting
+    /// `StreamOptions` field.
+    #[must_use]
+    pub fn with_ollama_num_ctx_override(mut self, override_value: Option<u64>) -> Self {
+        self.ollama_num_ctx_override = override_value;
+        self
+    }
+
+    fn stream_options(
+        &self,
+        api_key: Option<String>,
+        headers: HashMap<String, String>,
+    ) -> StreamOptions {
+        StreamOptions {
+            api_key,
+            temperature: None,
+            // Intentionally `None`: the upstream owns the
+            // `input + output <= context_window` invariant
+            // server-side and knows the real tokenizer.
+            // Bounding output at the agent layer is how pi avoids
+            // context-overflow 400s
+            // (`pi/packages/ai/src/providers/openai-completions.ts:394`
+            // only emits `max_tokens` when the caller explicitly
+            // sets it). Budget management is handled by compaction
+            // (`reserve_tokens`), which shrinks the *input* instead
+            // of capping the *output*. Compaction summarization still
+            // sets its own `max_tokens` explicitly — see
+            // `anie-cli/src/compaction.rs`.
+            max_tokens: None,
+            thinking: self.thinking,
+            headers,
+            num_ctx_override: self.ollama_num_ctx_override,
         }
     }
 
@@ -410,26 +451,7 @@ impl AgentLoop {
                 messages: provider.convert_messages(&sanitized_context),
                 tools: self.tool_registry.definitions(),
             };
-            let options = anie_provider::StreamOptions {
-                api_key: request.api_key,
-                temperature: None,
-                // Intentionally `None`: the upstream owns the
-                // `input + output <= context_window` invariant
-                // server-side and knows the real tokenizer.
-                // Bounding output at the agent layer is how
-                // pi avoids context-overflow 400s
-                // (`pi/packages/ai/src/providers/openai-completions.ts:394`
-                // only emits `max_tokens` when the caller
-                // explicitly sets it). Budget management is
-                // handled by compaction (`reserve_tokens`),
-                // which shrinks the *input* instead of capping
-                // the *output*. Compaction summarization still
-                // sets its own `max_tokens` explicitly — see
-                // `anie-cli/src/compaction.rs`.
-                max_tokens: None,
-                thinking: self.config.thinking,
-                headers: request.headers,
-            };
+            let options = self.config.stream_options(request.api_key, request.headers);
 
             let stream = match provider.stream(&model, llm_context, options) {
                 Ok(stream) => stream,
@@ -1334,11 +1356,80 @@ impl ToolCallBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_assistant_for_request, sanitize_context_for_request};
+    use std::{collections::HashMap, sync::Arc};
+
     use anie_protocol::{
         AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
     };
+    use anie_provider::{
+        CostPerMillion, Model, ModelCompat, ProviderError, RequestOptionsResolver,
+        ResolvedRequestOptions,
+    };
+    use async_trait::async_trait;
     use serde_json::json;
+
+    use super::{
+        AgentLoopConfig, ToolExecutionMode, sanitize_assistant_for_request,
+        sanitize_context_for_request,
+    };
+
+    struct StaticResolver;
+
+    #[async_trait]
+    impl RequestOptionsResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _context: &[Message],
+        ) -> Result<ResolvedRequestOptions, ProviderError> {
+            Ok(ResolvedRequestOptions::default())
+        }
+    }
+
+    fn sample_model() -> Model {
+        Model {
+            id: "mock-model".into(),
+            name: "Mock Model".into(),
+            provider: "mock".into(),
+            api: anie_provider::ApiKind::OpenAICompletions,
+            base_url: "http://localhost".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        }
+    }
+
+    fn sample_agent_loop_config() -> AgentLoopConfig {
+        AgentLoopConfig::new(
+            sample_model(),
+            "system".into(),
+            anie_provider::ThinkingLevel::Off,
+            ToolExecutionMode::Parallel,
+            Arc::new(StaticResolver),
+        )
+    }
+
+    #[test]
+    fn agent_loop_config_num_ctx_override_defaults_to_none() {
+        let options = sample_agent_loop_config().stream_options(None, HashMap::new());
+
+        assert_eq!(options.num_ctx_override, None);
+    }
+
+    #[test]
+    fn agent_loop_copies_num_ctx_override_into_stream_options() {
+        let config = sample_agent_loop_config().with_ollama_num_ctx_override(Some(16_384));
+
+        let options = config.stream_options(Some("key".into()), HashMap::new());
+
+        assert_eq!(options.api_key.as_deref(), Some("key"));
+        assert_eq!(options.num_ctx_override, Some(16_384));
+    }
 
     fn user_message(text: &str, timestamp: u64) -> Message {
         Message::User(UserMessage {

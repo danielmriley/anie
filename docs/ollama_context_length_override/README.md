@@ -178,10 +178,13 @@ Non-Ollama models show nothing extra.
 | File | PR | What |
 |------|----|------|
 | `crates/anie-cli/src/runtime_state.rs` | 1 | Add `ollama_num_ctx_overrides` field with forward-compat serde |
-| `crates/anie-provider/src/options.rs` | 2 | Add `StreamOptions::num_ctx_override: Option<u64>` |
-| `crates/anie-cli/src/runtime/config_state.rs` | 2 | Add `effective_num_ctx_override(&RuntimeState) -> Option<u64>` resolver |
-| `crates/anie-cli/src/controller.rs` | 2 | Populate `stream_options.num_ctx_override` before calling `Provider::stream` |
-| `crates/anie-providers-builtin/src/ollama_chat/convert.rs` | 2 | Prefer `options.num_ctx_override` over `model.context_window` |
+| `crates/anie-provider/src/options.rs` | 2A | Add `StreamOptions::num_ctx_override: Option<u64>` |
+| `crates/anie-agent/src/agent_loop.rs` | 2A | Add `AgentLoopConfig::ollama_num_ctx_override` and copy it into `StreamOptions` |
+| `crates/anie-cli/src/compaction.rs` | 2A | Keep summary requests compiling with `num_ctx_override: None`; effective override wiring lands in 2B |
+| `crates/anie-providers-builtin/src/ollama_chat/convert.rs` | 2A | Prefer `options.num_ctx_override` over `model.context_window` |
+| `crates/anie-cli/src/runtime/config_state.rs` | 2B | Add override getters/setters and effective context-window helpers |
+| `crates/anie-cli/src/controller.rs` | 2B | Snapshot override into `AgentLoopConfig`; use effective context window for compaction + status events |
+| `crates/anie-cli/src/compaction.rs` | 2B | Store/pass `num_ctx_override` in compaction summary requests |
 | `crates/anie-cli/src/commands.rs` | 3 | Register `/context-length` metadata |
 | `crates/anie-tui/src/commands.rs` | 3 | `ArgumentSpec` for `<N>|reset` |
 | `crates/anie-cli/src/controller.rs` | 3 | Handle `UiAction::SetContextLengthOverride`; validate + persist |
@@ -211,15 +214,12 @@ surface. No user-visible change yet.
 - `runtime_state_serializes_num_ctx_overrides_when_non_empty`
 - `runtime_state_omits_num_ctx_overrides_field_when_empty`
 
-### PR 2 — Resolver in the controller + `StreamOptions::num_ctx_override`
+### PR 2A — Provider/agent `num_ctx_override` plumbing
 
-**Why second:** no user-facing command yet, but all the plumbing
-is in place so PR 3 just needs to flip the stored value. The
-resolver lives in the controller (where the `ConfigState` +
-`RuntimeState` co-exist), and the provider receives a single
-`Option<u64>` via `StreamOptions`. This keeps the precedence
-logic in one unit-testable spot and keeps `OllamaChatProvider`
-stateless.
+**Why second-A:** the original PR 2 touched six files, so it is
+split to respect the five-file rule. This first slice adds the
+provider-facing option and snapshots it through `AgentLoopConfig`;
+there is still no user-facing command and no runtime-state lookup.
 
 **Scope:**
 
@@ -232,14 +232,62 @@ stateless.
 
       /// Override for Ollama's `options.num_ctx`. `None` means
       /// the provider falls back to `Model.context_window`.
-      /// Populated by the controller from the effective-value
-      /// resolver (see `docs/ollama_context_length_override`).
+      /// Populated by AgentLoop from AgentLoopConfig.
       /// Ignored by non-Ollama providers.
       pub num_ctx_override: Option<u64>,
   }
   ```
 
-  Additive default-able field; no forward-compat concern.
+  Additive default-able field; no session-schema concern.
+  Every existing `StreamOptions { ... }` literal must be
+  updated, including `anie-agent/src/agent_loop.rs`,
+  `anie-cli/src/compaction.rs`, provider unit tests, and
+  integration-test helpers.
+
+- Add `ollama_num_ctx_override: Option<u64>` to
+  [`AgentLoopConfig`](../../crates/anie-agent/src/agent_loop.rs)
+  with a builder-style setter, defaulting to `None` in
+  `AgentLoopConfig::new`. `AgentLoop::run` copies it into
+  `StreamOptions` at the actual construction site:
+
+  ```rust
+  let options = StreamOptions {
+      // …existing fields…
+      num_ctx_override: self.config.ollama_num_ctx_override,
+  };
+  ```
+
+- `ollama_chat/convert.rs` body builder prefers
+  `options.num_ctx_override` over `model.context_window` when
+  present:
+
+  ```rust
+  let num_ctx = options.num_ctx_override.unwrap_or(model.context_window);
+  body["options"] = json!({ "num_ctx": num_ctx });
+  ```
+
+- `compaction.rs` explicitly initializes the new field to `None`
+  until PR 2B wires in the effective override.
+
+- Non-Ollama providers ignore the field entirely.
+
+**Tests:**
+
+- `stream_options_num_ctx_override_default_is_none`
+- `agent_loop_config_num_ctx_override_defaults_to_none`
+- `agent_loop_copies_num_ctx_override_into_stream_options`
+- `ollama_chat_body_prefers_num_ctx_override_over_context_window`
+- `ollama_chat_body_uses_context_window_when_override_is_none`
+
+### PR 2B — Runtime config/controller/compaction override wiring
+
+**Why second-B:** once the provider-facing option exists, wire the
+runtime-state resolver through CLI state, controller snapshots,
+compaction thresholds, summary requests, and status updates. The
+provider remains stateless and receives a single `Option<u64>` via
+`StreamOptions`.
+
+**Scope:**
 
 - New helper in
   [`anie-cli/src/runtime/config_state.rs`](../../crates/anie-cli/src/runtime/config_state.rs)
@@ -247,15 +295,10 @@ stateless.
 
   ```rust
   impl ConfigState {
-      /// Compute the effective `num_ctx` for the current model.
-      /// Returns `None` when the current model isn't Ollama or
-      /// when the fallback chain resolves to the catalog's
-      /// `Model.context_window` (the provider will use that
-      /// directly).
-      pub(crate) fn effective_num_ctx_override(
-          &self,
-          runtime_state: &RuntimeState,
-      ) -> Option<u64> { … }
+      pub(crate) fn active_ollama_num_ctx_override(&self) -> Option<u64> { … }
+      pub(crate) fn effective_ollama_context_window(&self) -> u64 { … }
+      pub(crate) fn set_ollama_num_ctx_override(&mut self, value: u64) { … }
+      pub(crate) fn clear_ollama_num_ctx_override(&mut self) { … }
   }
   ```
 

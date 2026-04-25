@@ -37,6 +37,9 @@ pub struct StreamOptions {
     pub thinking: ThinkingLevel,
     /// Extra headers applied to the request.
     pub headers: HashMap<String, String>,
+    /// Override for Ollama's `options.num_ctx`. `None` means the
+    /// provider falls back to `Model.context_window`.
+    pub num_ctx_override: Option<u64>,
 }
 
 /// Request-specific auth and routing resolved just before a provider call.
@@ -48,4 +51,14 @@ pub struct ResolvedRequestOptions {
     pub headers: HashMap<String, String>,
     /// Optional base-URL override.
     pub base_url_override: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_options_num_ctx_override_default_is_none() {
+        assert_eq!(StreamOptions::default().num_ctx_override, None);
+    }
 }
