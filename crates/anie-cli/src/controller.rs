@@ -93,9 +93,14 @@ enum PendingRetry {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ContextLengthMutation {
-    Set,
+    /// Override applied. `above_cap_warning` carries an
+    /// optional message when the value exceeded the
+    /// workspace-wide `[ollama] default_max_num_ctx` cap; the
+    /// caller emits it as a separate system message so the
+    /// user sees both the success and the conflict.
+    Set { above_cap_warning: Option<String> },
     Reset,
 }
 
@@ -397,7 +402,7 @@ impl InteractiveController {
                     .await;
                 } else if let Some(argument) = argument {
                     match self.state.apply_context_length_argument(&argument) {
-                        Ok(ContextLengthMutation::Set) => {
+                        Ok(ContextLengthMutation::Set { above_cap_warning }) => {
                             anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                             self.send_system_message(&format!(
                                 "Context window set to {}. Ollama will reload the model on the next request (~5-30 s for this model).",
@@ -406,6 +411,13 @@ impl InteractiveController {
                                 ),
                             ))
                             .await;
+                            // Emit the above-cap warning as a
+                            // separate system message so it
+                            // doesn't get lost in the success
+                            // text. Cap PR 3.
+                            if let Some(warning) = above_cap_warning {
+                                self.send_system_message(&warning).await;
+                            }
                             if let Some(warning) = self
                                 .state
                                 .persist_runtime_state_warning("context_length_set")
@@ -772,16 +784,42 @@ impl ControllerState {
 
     fn context_length_status_message(&self) -> String {
         let effective = self.config.effective_ollama_context_window();
+        let baseline = self.config.current_model().context_window;
+        let cap = self.config.anie_config().ollama.default_max_num_ctx;
         match self.config.active_ollama_num_ctx_override() {
-            Some(_) => format!(
-                "Current context window: {} (runtime override; baseline {})",
-                format_context_length(effective),
-                format_context_length(self.config.current_model().context_window),
-            ),
-            None => format!(
-                "Current context window: {}",
-                format_context_length(effective)
-            ),
+            Some(value) => {
+                let mut message = format!(
+                    "Current context window: {} (runtime override; baseline {})",
+                    format_context_length(effective),
+                    format_context_length(baseline),
+                );
+                // If the user's runtime override exceeds the
+                // workspace-wide cap, surface that in the same
+                // message so they can see why the wire request
+                // might still hit a load failure even with their
+                // override active. Cap PR 3.
+                if let Some(cap_value) = cap
+                    && value > cap_value
+                {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        message,
+                        "; exceeds [ollama] default_max_num_ctx of {}",
+                        format_context_length(cap_value)
+                    );
+                }
+                message
+            }
+            None => match cap {
+                Some(_) => format!(
+                    "Current context window: {} (workspace cap from [ollama] default_max_num_ctx)",
+                    format_context_length(effective),
+                ),
+                None => format!(
+                    "Current context window: {}",
+                    format_context_length(effective)
+                ),
+            },
         }
     }
 
@@ -805,8 +843,26 @@ impl ControllerState {
             ));
         }
 
+        // Above-cap warning (Cap PR 3): the override still
+        // applies — user intent wins — but the conflict is
+        // surfaced so future load failures aren't a surprise.
+        let above_cap_warning = self
+            .config
+            .anie_config()
+            .ollama
+            .default_max_num_ctx
+            .filter(|cap| value > *cap)
+            .map(|cap| {
+                format!(
+                    "Note: this exceeds [ollama] default_max_num_ctx ({}). The override still applies, but the wire request may hit a load failure on this hardware.",
+                    format_context_length(cap),
+                )
+            });
+
         self.config.set_ollama_num_ctx_override(value);
-        Ok(ContextLengthMutation::Set)
+        Ok(ContextLengthMutation::Set {
+            above_cap_warning,
+        })
     }
 
     /// Build the compaction config + summarizer for the current

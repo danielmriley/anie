@@ -698,6 +698,61 @@ fn controller_for_context_length_test(
     (tempdir, controller, event_rx, ui_tx)
 }
 
+/// Variant of `controller_for_context_length_test` that sets a
+/// workspace `[ollama] default_max_num_ctx` cap on the
+/// underlying `AnieConfig`. Used by Cap PR 3 messaging tests.
+fn controller_for_context_length_test_with_cap(
+    runtime_state: RuntimeState,
+    cap: u64,
+) -> (
+    tempfile::TempDir,
+    InteractiveController,
+    mpsc::Receiver<AgentEvent>,
+    mpsc::UnboundedSender<UiAction>,
+) {
+    let tempdir = tempdir().expect("tempdir");
+    let cwd = tempdir.path().join("cwd");
+    let sessions_dir = tempdir.path().join("sessions");
+    let runtime_state_path = tempdir.path().join("state.json");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+    let mut config = AnieConfig::default();
+    config.ollama.default_max_num_ctx = Some(cap);
+
+    let tool_registry = build_tool_registry(&cwd, true);
+    let prompt_cache =
+        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+    let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
+    let default_model = ollama_model();
+
+    let mut config_state = ConfigState::new(
+        config.clone(),
+        runtime_state,
+        default_model.clone(),
+        ThinkingLevel::Medium,
+        None,
+    );
+    config_state.set_runtime_state_path_for_test(runtime_state_path);
+
+    let state = ControllerState {
+        config: config_state,
+        session: SessionHandle::from_manager(session, sessions_dir, cwd),
+        model_catalog: vec![default_model],
+        provider_registry: Arc::new(ProviderRegistry::new()),
+        tool_registry,
+        request_options_resolver: Arc::new(AuthResolver::new(None, config)),
+        prompt_cache,
+        retry_config: RetryConfig::default(),
+        command_registry: crate::commands::CommandRegistry::with_builtins(),
+    };
+
+    let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(32);
+    let controller = InteractiveController::new(state, ui_action_rx, event_tx, false);
+    (tempdir, controller, event_rx, ui_action_tx)
+}
+
 #[tokio::test]
 async fn context_length_sets_override_for_current_ollama_model() {
     let (_tempdir, mut controller, mut event_rx, _tx) =
@@ -866,6 +921,124 @@ async fn context_length_no_args_reports_current_effective_value_and_source() {
     assert_eq!(
         msg,
         "Current context window: 16 384 (runtime override; baseline 32 768)"
+    );
+}
+
+#[tokio::test]
+async fn context_length_no_args_message_includes_cap_when_capped() {
+    // Cap PR 3: when [ollama] default_max_num_ctx is set and
+    // no runtime override is active, the no-args /context-length
+    // message must disclose the cap so the user understands why
+    // the value isn't the model's architectural max.
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test_with_cap(RuntimeState::default(), 32_768);
+
+    controller
+        .handle_action(UiAction::ContextLength(None))
+        .await
+        .expect("query context length");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("workspace cap"),
+        "message must disclose the cap; got:\n{msg}"
+    );
+    assert!(
+        msg.contains("[ollama] default_max_num_ctx"),
+        "message must name the config field so users know how to change it; got:\n{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_no_args_message_omits_cap_when_no_cap_set() {
+    // Boundary: when no cap is configured, the message stays
+    // simple — don't add cap-related noise to the default
+    // experience.
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(None))
+        .await
+        .expect("query context length");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        !msg.contains("workspace cap"),
+        "no cap → no cap-related text; got:\n{msg}"
+    );
+    assert!(
+        !msg.contains("default_max_num_ctx"),
+        "no cap → no cap-field-name; got:\n{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_set_above_cap_emits_warning_but_applies_override() {
+    // Cap PR 3: a runtime override that exceeds the workspace
+    // cap still applies (user intent wins) but produces a
+    // warning so the conflict is visible. Otherwise users
+    // wouldn't know why their override might still hit a load
+    // failure on the wire.
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test_with_cap(RuntimeState::default(), 32_768);
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("65536".into())))
+        .await
+        .expect("set context length");
+
+    let success_msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        success_msg.contains("65 536"),
+        "first message confirms the override applied at the requested value; got:\n{success_msg}"
+    );
+    let warning = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        warning.contains("exceeds")
+            && warning.contains("default_max_num_ctx")
+            && warning.contains("32 768"),
+        "second message warns about the cap conflict; got:\n{warning}"
+    );
+
+    // The override still applies to the controller's effective
+    // value — the warning is informational, not blocking.
+    assert_eq!(
+        controller
+            .state
+            .config
+            .active_ollama_num_ctx_override(),
+        Some(65_536)
+    );
+}
+
+#[tokio::test]
+async fn context_length_no_args_with_override_above_cap_includes_exceeds_marker() {
+    // Cap PR 3 follow-on: after the user sets an above-cap
+    // override and then queries (no args), the status message
+    // must continue to flag the conflict. Otherwise the
+    // warning lives only in the set-time scrollback and
+    // disappears on next query.
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 65_536);
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test_with_cap(runtime_state, 32_768);
+
+    controller
+        .handle_action(UiAction::ContextLength(None))
+        .await
+        .expect("query context length");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("runtime override"),
+        "must indicate override is active; got:\n{msg}"
+    );
+    assert!(
+        msg.contains("exceeds"),
+        "must surface the cap conflict on every query, not just at set time; got:\n{msg}"
     );
 }
 
