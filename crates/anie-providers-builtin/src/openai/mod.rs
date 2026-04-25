@@ -31,6 +31,7 @@ mod tagged_reasoning;
 
 use convert::{
     assistant_message_to_openai_llm_message, join_text_content, llm_message_to_openai_message,
+    user_content_to_openai,
 };
 use reasoning_strategy::{
     NativeReasoningRequestStrategy, OpenAiCompatibleBackend, classify_openai_http_error,
@@ -465,7 +466,7 @@ impl Provider for OpenAIProvider {
             .filter_map(|message| match message {
                 Message::User(user_message) => Some(LlmMessage {
                     role: "user".into(),
-                    content: serde_json::Value::String(join_text_content(&user_message.content)),
+                    content: user_content_to_openai(&user_message.content),
                 }),
                 Message::Assistant(assistant_message) => {
                     assistant_message_to_openai_llm_message(assistant_message)
@@ -1299,7 +1300,8 @@ mod tests {
         };
 
         // ReasoningEffort → [TopLevelReasoningEffort, NoNativeFields]
-        let ollama = sample_heuristic_local_model("ollama", "http://localhost:11434/v1", "qwen3:32b");
+        let ollama =
+            sample_heuristic_local_model("ollama", "http://localhost:11434/v1", "qwen3:32b");
         assert_eq!(
             provider.native_reasoning_request_strategies(&ollama, &options),
             vec![

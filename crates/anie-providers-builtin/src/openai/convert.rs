@@ -141,6 +141,46 @@ pub(super) fn llm_message_to_openai_message(message: &LlmMessage) -> serde_json:
     }
 }
 
+/// Convert user content to OpenAI chat-completions content.
+///
+/// Text-only messages keep the legacy string shape for broad
+/// OpenAI-compatible backend support. When a user message includes an
+/// image, OpenAI requires ordered content parts; in that shape, anie's
+/// user-side thinking blocks pass through as text parts to preserve the
+/// previous `join_text_content` behavior. Redacted thinking remains
+/// provider-opaque and is not sent to OpenAI-compatible backends.
+pub(super) fn user_content_to_openai(content: &[ContentBlock]) -> serde_json::Value {
+    let has_image = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { .. }));
+    if !has_image {
+        return serde_json::Value::String(join_text_content(content));
+    }
+
+    let parts = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(json!({
+                "type": "text",
+                "text": text,
+            })),
+            ContentBlock::Thinking { thinking, .. } => Some(json!({
+                "type": "text",
+                "text": thinking,
+            })),
+            ContentBlock::Image { media_type, data } => Some(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{media_type};base64,{data}"),
+                },
+            })),
+            ContentBlock::RedactedThinking { .. } | ContentBlock::ToolCall(_) => None,
+        })
+        .collect();
+
+    serde_json::Value::Array(parts)
+}
+
 /// Flatten the text-bearing content of a message for wire formats that
 /// expect a single `content` string. Thinking blocks are joined inline;
 /// images are serialized as `[image:MIME;base64,…]` placeholders;
@@ -171,7 +211,10 @@ mod tests {
     use anie_protocol::{AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage};
     use anie_provider::Provider;
 
-    use super::{assistant_message_to_openai_llm_message, llm_message_to_openai_message};
+    use super::{
+        assistant_message_to_openai_llm_message, llm_message_to_openai_message,
+        user_content_to_openai,
+    };
     use crate::OpenAIProvider;
 
     #[test]
@@ -268,6 +311,55 @@ mod tests {
         })]);
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn text_only_user_content_keeps_legacy_string_shape_and_includes_thinking_text() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "question".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "scratchpad".into(),
+                signature: None,
+            },
+        ];
+
+        assert_eq!(
+            user_content_to_openai(&content),
+            json!("question\nscratchpad")
+        );
+    }
+
+    #[test]
+    fn image_user_content_uses_ordered_openai_content_parts() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "what is this?".into(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "inspect image".into(),
+                signature: None,
+            },
+        ];
+
+        assert_eq!(
+            user_content_to_openai(&content),
+            json!([
+                { "type": "text", "text": "what is this?" },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,iVBORw0KGgo="
+                    }
+                },
+                { "type": "text", "text": "inspect image" }
+            ])
+        );
     }
 
     #[test]
