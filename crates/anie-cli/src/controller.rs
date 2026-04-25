@@ -30,7 +30,7 @@ use crate::{
     compaction::CompactionStrategy,
     model_catalog::{resolve_requested_model, upsert_model},
     runtime::{ConfigState, SessionHandle, SystemPromptCache},
-    user_error::{HandleError, UserCommandError},
+    user_error::{HandleError, UserCommandError, render_user_facing_provider_error},
 };
 
 const DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day]");
@@ -188,6 +188,29 @@ impl InteractiveController {
                                         }
                                         RetryDecision::GiveUp { reason } => {
                                             info!(?reason, retry_attempt, error = %error, "not retrying provider error");
+                                            // Surface a user-facing message for variants
+                                            // that carry actionable recovery context
+                                            // (currently: ModelLoadResources →
+                                            // /context-length suggestion). Other
+                                            // variants stay log-only — their default
+                                            // Display is already adequate and the
+                                            // existing no-message-on-give-up behavior
+                                            // is preserved to avoid scope creep.
+                                            // See docs/ollama_load_failure_recovery
+                                            // README PR 3.
+                                            let model = self.state.config.current_model();
+                                            if let Some(message) = render_user_facing_provider_error(
+                                                error,
+                                                model.context_window,
+                                                &model.provider,
+                                                &model.id,
+                                            ) {
+                                                anie_agent::send_event(
+                                                    &self.event_tx,
+                                                    AgentEvent::SystemMessage { text: message },
+                                                )
+                                                .await;
+                                            }
                                             self.state.finish_run(&result).await?;
                                         }
                                     }
