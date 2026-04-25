@@ -28,6 +28,12 @@ use anie_protocol::{
 use anie_provider::{ApiKind, Model, ModelInfo};
 use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest};
 
+// Measured before Set A Plan 09 PR A: interactive mode uses
+// `mpsc::channel(256)`, so a saturated realistic streaming burst
+// can already drain 256 events in one frame. Keep the cap at that
+// observed burst size, counting the first awaited event.
+pub(crate) const MAX_AGENT_EVENTS_PER_FRAME: usize = 256;
+
 use crate::{
     InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
     OnboardingScreen, OutputPane, ProviderManagementAction, ProviderManagementScreen,
@@ -71,6 +77,21 @@ pub struct App {
     /// ms), idle-tick redraws are suppressed so the spinner
     /// freezes rather than eating CPU. Plan 06 PR-B.
     last_streaming_delta_at: Option<Instant>,
+}
+
+pub(crate) fn drain_agent_event_batch(
+    event_rx: &mut mpsc::Receiver<AgentEvent>,
+    first_event: AgentEvent,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::with_capacity(MAX_AGENT_EVENTS_PER_FRAME);
+    events.push(first_event);
+    while events.len() < MAX_AGENT_EVENTS_PER_FRAME {
+        let Ok(next) = event_rx.try_recv() else {
+            break;
+        };
+        events.push(next);
+    }
+    events
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1902,11 +1923,7 @@ pub async fn run_tui(
                 // call each, so the block cache invalidates once
                 // per contiguous delta-run rather than once per
                 // delta.
-                let mut events: Vec<AgentEvent> = Vec::with_capacity(8);
-                events.push(event);
-                while let Ok(next) = app.event_rx.try_recv() {
-                    events.push(next);
-                }
+                let events = drain_agent_event_batch(&mut app.event_rx, event);
                 app.handle_agent_event_batch(events)?;
                 dirty.full = true;
             }

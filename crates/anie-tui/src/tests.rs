@@ -10,6 +10,7 @@ use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat};
 
 use crate::{
     AgentUiState, App, OutputPane, RenderedBlock,
+    app::{MAX_AGENT_EVENTS_PER_FRAME, drain_agent_event_batch},
     commands::{ArgumentSpec, SlashCommandInfo},
 };
 
@@ -2447,4 +2448,68 @@ fn handle_agent_event_batch_flushes_on_kind_change() {
         .expect("assistant block");
     assert_eq!(text, "ac");
     assert_eq!(thinking, "b");
+}
+
+fn text_delta_event(text: impl Into<String>) -> AgentEvent {
+    AgentEvent::MessageDelta {
+        delta: StreamDelta::TextDelta(text.into()),
+    }
+}
+
+fn text_delta_payload(event: &AgentEvent) -> &str {
+    let AgentEvent::MessageDelta {
+        delta: StreamDelta::TextDelta(text),
+    } = event
+    else {
+        panic!("expected text delta event");
+    };
+    text
+}
+
+#[test]
+fn agent_event_drain_limit_matches_saturated_interactive_burst() {
+    let (tx, mut rx) = mpsc::channel(MAX_AGENT_EVENTS_PER_FRAME);
+    for index in 0..MAX_AGENT_EVENTS_PER_FRAME {
+        tx.try_send(text_delta_event(index.to_string()))
+            .expect("saturated realistic burst should fit channel capacity");
+    }
+
+    let first = rx.try_recv().expect("first event");
+    let batch = drain_agent_event_batch(&mut rx, first);
+
+    assert_eq!(batch.len(), MAX_AGENT_EVENTS_PER_FRAME);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn bounded_agent_event_drain_preserves_order_and_leaves_remainder() {
+    const EXTRA_EVENTS: usize = 8;
+    let (tx, mut rx) = mpsc::channel(MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS);
+    for index in 0..(MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS) {
+        tx.try_send(text_delta_event(index.to_string()))
+            .expect("test channel capacity");
+    }
+
+    let first = rx.try_recv().expect("first event");
+    let first_batch = drain_agent_event_batch(&mut rx, first);
+
+    assert_eq!(first_batch.len(), MAX_AGENT_EVENTS_PER_FRAME);
+    assert_eq!(text_delta_payload(&first_batch[0]), "0");
+    assert_eq!(
+        text_delta_payload(first_batch.last().expect("last first-batch event")),
+        (MAX_AGENT_EVENTS_PER_FRAME - 1).to_string()
+    );
+
+    let first_remaining = rx.try_recv().expect("remainder should stay queued");
+    let second_batch = drain_agent_event_batch(&mut rx, first_remaining);
+
+    assert_eq!(second_batch.len(), EXTRA_EVENTS);
+    assert_eq!(
+        text_delta_payload(&second_batch[0]),
+        MAX_AGENT_EVENTS_PER_FRAME.to_string()
+    );
+    assert_eq!(
+        text_delta_payload(second_batch.last().expect("last second-batch event")),
+        (MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS - 1).to_string()
+    );
 }
