@@ -23,7 +23,10 @@ use anie_config::{
     preferred_write_target,
 };
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
-use anie_providers_builtin::{ModelDiscoveryRequest, builtin_models, discover_models};
+use anie_providers_builtin::{
+    ModelDiscoveryRequest, builtin_models, discover_models, is_ollama_native_discovery_target,
+    ollama_native_base_url,
+};
 
 use crate::{ModelPickerAction, ModelPickerPane, Spinner};
 
@@ -1213,7 +1216,8 @@ fn model_for_entry(entry: &ProviderEntry) -> Model {
 
 fn model_info_to_provider_model(entry: &ProviderEntry, info: &ModelInfo) -> Model {
     let model = model_for_entry(entry);
-    let mut resolved = info.to_model(model.api, &model.base_url);
+    let api = discovery_model_api(&entry.name, model.api, &model.base_url);
+    let mut resolved = info.to_model(api, &discovery_model_base_url(api, &model.base_url));
     resolved.provider = entry.name.clone();
     anie_providers_builtin::apply_openrouter_capabilities(&mut resolved);
     resolved
@@ -1238,6 +1242,22 @@ fn default_provider_env(provider_name: &str) -> Option<&'static str> {
         "openai" => Some("OPENAI_API_KEY"),
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         _ => None,
+    }
+}
+
+fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
+    if is_ollama_native_discovery_target(provider_name, base_url) {
+        ApiKind::OllamaChatApi
+    } else {
+        api
+    }
+}
+
+fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
     }
 }
 
@@ -1484,6 +1504,30 @@ mod tests {
         screen.test_results.insert(0, TestResult::Pending);
         screen.replace_provider_entries(vec![entry("anthropic", false)]);
         assert!(screen.test_results.is_empty());
+    }
+
+    #[test]
+    fn provider_management_converts_ollama_discovery_to_ollama_chat_api() {
+        let mut entry = entry("ollama", true);
+        entry.base_url = Some("http://localhost:11434/v1".into());
+        let model = model_info_to_provider_model(
+            &entry,
+            &ModelInfo {
+                id: "qwen3:32b".into(),
+                name: "Qwen 3 32B".into(),
+                provider: "ollama".into(),
+                context_length: Some(32_768),
+                max_output_tokens: None,
+                supports_images: Some(false),
+                supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
+                provider_capabilities: None,
+            },
+        );
+
+        assert_eq!(model.api, ApiKind::OllamaChatApi);
+        assert_eq!(model.base_url, "http://localhost:11434");
     }
 
     #[test]

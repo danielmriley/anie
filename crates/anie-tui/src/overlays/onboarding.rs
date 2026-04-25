@@ -16,6 +16,7 @@ use anie_config::{ConfigMutator, global_config_path};
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
 use anie_providers_builtin::{
     LocalServer, ModelDiscoveryRequest, builtin_models, detect_local_servers, discover_models,
+    is_ollama_native_discovery_target, ollama_native_base_url,
 };
 
 use crate::{
@@ -1111,7 +1112,8 @@ impl OnboardingScreen {
                     .first()
                     .map(|model| model.base_url.clone())
                     .unwrap_or_else(|| normalize_openai_base_url(&server.base_url));
-                let mut model = model_info.to_model(api, &base_url);
+                let api = discovery_model_api(&server.name, api, &base_url);
+                let mut model = model_info.to_model(api, &discovery_model_base_url(api, &base_url));
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
                     model,
@@ -1134,7 +1136,8 @@ impl OnboardingScreen {
                 provider_name,
                 ..
             } => {
-                let mut model = model_info.to_model(ApiKind::OpenAICompletions, base_url);
+                let api = discovery_model_api(provider_name, ApiKind::OpenAICompletions, base_url);
+                let mut model = model_info.to_model(api, &discovery_model_base_url(api, base_url));
                 model.provider = provider_name.clone();
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
@@ -2103,6 +2106,22 @@ fn normalize_openai_base_url(base_url: &str) -> String {
     }
 }
 
+fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
+    if is_ollama_native_discovery_target(provider_name, base_url) {
+        ApiKind::OllamaChatApi
+    } else {
+        api
+    }
+}
+
+fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2313,6 +2332,33 @@ mod tests {
         });
 
         assert!(matches!(screen.state, OnboardingState::PickingModel { .. }));
+    }
+
+    #[test]
+    fn onboarding_converts_ollama_discovery_to_ollama_chat_api() {
+        let screen = OnboardingScreen::new_for_tests();
+        let context = ModelPickerContext::LocalServer {
+            selected: 0,
+            server: sample_local_server(),
+        };
+        let configured = screen.configured_provider_from_context(
+            &context,
+            &ModelInfo {
+                id: "qwen3:32b".into(),
+                name: "Qwen 3 32B".into(),
+                provider: "ollama".into(),
+                context_length: Some(32_768),
+                max_output_tokens: None,
+                supports_images: Some(false),
+                supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
+                provider_capabilities: None,
+            },
+        );
+
+        assert_eq!(configured.model.api, ApiKind::OllamaChatApi);
+        assert_eq!(configured.model.base_url, "http://localhost:11434");
     }
 
     #[test]

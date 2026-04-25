@@ -26,7 +26,10 @@ use anie_protocol::{
     AgentEvent, ContentBlock, Message, StreamDelta, ToolResult, ToolResultMessage,
 };
 use anie_provider::{ApiKind, Model, ModelInfo};
-use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest};
+use anie_providers_builtin::{
+    ModelDiscoveryCache, ModelDiscoveryRequest, is_ollama_native_discovery_target,
+    ollama_native_base_url,
+};
 
 // Measured before Set A Plan 09 PR A: interactive mode uses
 // `mpsc::channel(256)`, so a saturated realistic streaming burst
@@ -1412,7 +1415,10 @@ impl App {
                             if !self.known_models.iter().any(|known| {
                                 known.provider == model.provider && known.id == model.id
                             }) {
-                                self.known_models.push(model.to_model(api, &base_url));
+                                let api = discovery_model_api(&provider_name, api, &base_url);
+                                self.known_models.push(
+                                    model.to_model(api, &discovery_model_base_url(api, &base_url)),
+                                );
                             }
                         }
                         if let BottomPane::ModelPicker(session) = &mut self.bottom_pane {
@@ -1521,7 +1527,11 @@ impl App {
             .iter()
             .find(|model| model.provider == context.provider_name && model.id == model_info.id)
             .cloned()
-            .unwrap_or_else(|| model_info.to_model(context.api, &context.base_url))
+            .unwrap_or_else(|| {
+                let api =
+                    discovery_model_api(&context.provider_name, context.api, &context.base_url);
+                model_info.to_model(api, &discovery_model_base_url(api, &context.base_url))
+            })
     }
 
     fn spawn_model_discovery(&self, context: ModelPickerContext) {
@@ -1983,6 +1993,22 @@ fn default_provider_context(provider_name: &str) -> Option<ModelPickerContext> {
     }
 }
 
+fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
+    if is_ollama_native_discovery_target(provider_name, base_url) {
+        ApiKind::OllamaChatApi
+    } else {
+        api
+    }
+}
+
+fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
+    }
+}
+
 fn resolve_provider_api_key(provider_name: &str) -> Option<String> {
     let credential_store = CredentialStore::new();
     if let Some(key) = credential_store.get(provider_name) {
@@ -2251,4 +2277,24 @@ fn tool_result_elapsed_from_details(details: &serde_json::Value) -> Option<std::
         .get("elapsed_ms")
         .and_then(serde_json::Value::as_u64)
         .map(std::time::Duration::from_millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_model_picker_converts_ollama_discovery_to_ollama_chat_api() {
+        let api = discovery_model_api(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            "http://localhost:11434/v1",
+        );
+
+        assert_eq!(api, ApiKind::OllamaChatApi);
+        assert_eq!(
+            discovery_model_base_url(api, "http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+    }
 }

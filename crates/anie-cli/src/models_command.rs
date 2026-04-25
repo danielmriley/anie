@@ -5,7 +5,10 @@ use anyhow::Result;
 use anie_auth::{AuthCredential, CredentialStore, oauth_request_headers};
 use anie_config::{CliOverrides, load_config};
 use anie_provider::{ApiKind, ModelInfo};
-use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest, detect_local_servers};
+use anie_providers_builtin::{
+    ModelDiscoveryCache, ModelDiscoveryRequest, detect_local_servers,
+    is_ollama_native_discovery_target, ollama_native_base_url,
+};
 
 pub async fn run_models_command(provider_filter: Option<&str>, refresh: bool) -> Result<()> {
     let config = load_config(CliOverrides::default())?;
@@ -87,11 +90,13 @@ async fn configured_requests(
         else {
             continue;
         };
+        let api = discovery_api_for(provider_config.api, provider_name, &base_url);
+        let base_url = discovery_base_url_for(api, &base_url);
         requests.insert(
             provider_name.clone(),
             ModelDiscoveryRequest {
                 provider_name: provider_name.clone(),
-                api: provider_config.api.unwrap_or(default_api(provider_name)),
+                api,
                 base_url,
                 api_key: resolve_provider_api_key(
                     provider_name,
@@ -112,11 +117,13 @@ async fn configured_requests(
     if !requests.contains_key(&config.model.provider) {
         let provider_name = config.model.provider.clone();
         if let Some(base_url) = default_base_url(&provider_name) {
+            let api = discovery_api_for(None, &provider_name, &base_url);
+            let base_url = discovery_base_url_for(api, &base_url);
             requests.insert(
                 provider_name.clone(),
                 ModelDiscoveryRequest {
                     provider_name: provider_name.clone(),
-                    api: default_api(&provider_name),
+                    api,
                     base_url,
                     api_key: resolve_provider_api_key(&provider_name, None, credential_store),
                     headers: Default::default(),
@@ -148,11 +155,13 @@ async fn configured_requests(
         else {
             continue;
         };
+        let api = discovery_api_for(None, &provider_name, &base_url);
+        let base_url = discovery_base_url_for(api, &base_url);
         requests.insert(
             provider_name.clone(),
             ModelDiscoveryRequest {
                 provider_name: provider_name.clone(),
-                api: default_api(&provider_name),
+                api,
                 base_url,
                 api_key: Some(access_token),
                 headers: oauth_request_headers(&provider_name),
@@ -205,6 +214,24 @@ fn default_api(provider_name: &str) -> ApiKind {
     match provider_name {
         "anthropic" => ApiKind::AnthropicMessages,
         _ => ApiKind::OpenAICompletions,
+    }
+}
+
+fn discovery_api_for(configured: Option<ApiKind>, provider_name: &str, base_url: &str) -> ApiKind {
+    configured.unwrap_or_else(|| {
+        if is_ollama_native_discovery_target(provider_name, base_url) {
+            ApiKind::OllamaChatApi
+        } else {
+            default_api(provider_name)
+        }
+    })
+}
+
+fn discovery_base_url_for(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
     }
 }
 
@@ -357,6 +384,30 @@ mod tests {
         let requests = configured_requests(&config, &store).await;
         let req = requests.get("github-copilot").expect("req");
         assert_eq!(req.base_url, "https://custom.override");
+    }
+
+    #[test]
+    fn ollama_discovery_tags_models_as_ollama_chat_api_after_pr5() {
+        assert_eq!(
+            discovery_api_for(None, "ollama", "http://localhost:11434/v1"),
+            ApiKind::OllamaChatApi
+        );
+        assert_eq!(
+            discovery_base_url_for(ApiKind::OllamaChatApi, "http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn explicitly_configured_openai_api_remains_legacy_for_models_command() {
+        assert_eq!(
+            discovery_api_for(
+                Some(ApiKind::OpenAICompletions),
+                "ollama",
+                "http://localhost:11434/v1"
+            ),
+            ApiKind::OpenAICompletions
+        );
     }
 
     #[test]

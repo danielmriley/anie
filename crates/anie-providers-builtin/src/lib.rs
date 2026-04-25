@@ -29,6 +29,23 @@ pub use util::{classify_http_error, parse_retry_after};
 
 use anie_provider::{ApiKind, ProviderRegistry};
 
+/// True when model discovery should prefer Ollama's native
+/// `/api/tags` + `/api/show` and convert results to
+/// `ApiKind::OllamaChatApi`.
+#[must_use]
+pub fn is_ollama_native_discovery_target(provider_name: &str, base_url: &str) -> bool {
+    provider_name.eq_ignore_ascii_case("ollama")
+        || ollama_native_base_url(base_url).contains(":11434")
+}
+
+/// Convert an Ollama OpenAI-compatible base URL (`.../v1`) into
+/// the root URL expected by native `/api/chat` endpoints.
+#[must_use]
+pub fn ollama_native_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+}
+
 /// Register the currently implemented built-in providers.
 pub fn register_builtin_providers(registry: &mut ProviderRegistry) {
     registry.register(
@@ -37,4 +54,37 @@ pub fn register_builtin_providers(registry: &mut ProviderRegistry) {
     );
     registry.register(ApiKind::OpenAICompletions, Box::new(OpenAIProvider::new()));
     registry.register(ApiKind::OllamaChatApi, Box::new(OllamaChatProvider::new()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ollama_native_discovery_target_accepts_name_or_endpoint_shape() {
+        assert!(is_ollama_native_discovery_target(
+            "ollama",
+            "http://localhost:11434/v1"
+        ));
+        assert!(is_ollama_native_discovery_target(
+            "custom",
+            "http://127.0.0.1:11434"
+        ));
+        assert!(!is_ollama_native_discovery_target(
+            "lmstudio",
+            "http://localhost:1234/v1"
+        ));
+    }
+
+    #[test]
+    fn ollama_native_base_url_strips_openai_v1_suffix() {
+        assert_eq!(
+            ollama_native_base_url("http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_native_base_url("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+    }
 }
