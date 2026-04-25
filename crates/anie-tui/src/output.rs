@@ -1110,11 +1110,11 @@ fn assistant_block_lines(
         &mut result,
         if assistant.is_streaming {
             assistant.streaming_render.map_or_else(
-                || assistant_answer_lines(assistant.text, width, true, ctx),
+                || assistant_answer_lines(assistant.text, width, ctx),
                 |state| state.render_lines(width, ctx),
             )
         } else {
-            assistant_answer_lines(assistant.text, width, false, ctx)
+            assistant_answer_lines(assistant.text, width, ctx)
         },
     );
     // The "responding…" / "thinking…" status indicator used
@@ -1237,12 +1237,7 @@ fn assistant_thinking_lines(
 /// `animated_streaming_block_never_caches`), so per-frame
 /// markdown work is already the cost profile. No new cache
 /// pressure.
-fn assistant_answer_lines(
-    text: &str,
-    width: u16,
-    _is_streaming: bool,
-    ctx: &RenderContext,
-) -> Vec<Line<'static>> {
+fn assistant_answer_lines(text: &str, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -1953,8 +1948,8 @@ mod streaming_markdown_tests {
     fn streaming_and_finalized_render_are_cell_identical() {
         let ctx = RenderContext::default();
         let text = "# Heading\n\nBody paragraph.\n\n## Subheading\n\nTrailing line";
-        let streaming = assistant_answer_lines(text, 40, true, &ctx);
-        let finalized = assistant_answer_lines(text, 40, false, &ctx);
+        let streaming = assistant_answer_lines(text, 40, &ctx);
+        let finalized = assistant_answer_lines(text, 40, &ctx);
         assert_eq!(streaming.len(), finalized.len());
         for (idx, (a, b)) in streaming.iter().zip(finalized.iter()).enumerate() {
             let lhs: String = a.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1970,7 +1965,7 @@ mod streaming_markdown_tests {
     fn single_line_heading_renders_as_markdown_mid_stream() {
         let ctx = RenderContext::default();
         let text = "## Title still on the first line";
-        let streaming = assistant_answer_lines(text, 40, true, &ctx);
+        let streaming = assistant_answer_lines(text, 40, &ctx);
         let plain = wrap_text(text, 40, Style::default());
         // The markdown-rendered heading should NOT equal the
         // plain-wrapped version (plain keeps the `##` literal;
@@ -1993,8 +1988,7 @@ mod streaming_markdown_tests {
     #[test]
     fn empty_streaming_text_produces_no_lines() {
         let ctx = RenderContext::default();
-        assert!(assistant_answer_lines("", 40, true, &ctx).is_empty());
-        assert!(assistant_answer_lines("", 40, false, &ctx).is_empty());
+        assert!(assistant_answer_lines("", 40, &ctx).is_empty());
     }
 
     /// When markdown is disabled, streaming falls back to
@@ -2006,7 +2000,7 @@ mod streaming_markdown_tests {
             ..RenderContext::default()
         };
         let text = "# literal hash";
-        let streaming = assistant_answer_lines(text, 40, true, &ctx);
+        let streaming = assistant_answer_lines(text, 40, &ctx);
         let plain = wrap_text(text, 40, Style::default());
         assert_eq!(streaming.len(), plain.len());
         for (a, b) in streaming.iter().zip(plain.iter()) {
@@ -2024,7 +2018,7 @@ mod streaming_markdown_tests {
     fn unclosed_code_fence_renders_as_code_block_mid_stream() {
         let ctx = RenderContext::default();
         let text = "Here is some code:\n\n```rust\nfn main() {\n    println!";
-        let streaming = assistant_answer_lines(text, 60, true, &ctx);
+        let streaming = assistant_answer_lines(text, 60, &ctx);
         let rendered: String = streaming
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))

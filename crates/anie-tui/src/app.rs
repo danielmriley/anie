@@ -944,6 +944,13 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> RenderDirty {
+        // Keys that work the same regardless of agent state:
+        // PageUp/PageDown scroll, Ctrl+O opens the model
+        // picker. Try those first so the per-state handlers
+        // don't have to repeat the wiring.
+        if let Some(dirty) = self.try_shared_scroll_or_picker(key) {
+            return dirty;
+        }
         match self.agent_state {
             AgentUiState::Idle => self.handle_idle_key(key),
             AgentUiState::Streaming
@@ -952,36 +959,43 @@ impl App {
         }
     }
 
-    fn handle_idle_key(&mut self, key: KeyEvent) -> RenderDirty {
+    /// Handle keys whose behavior is identical across all agent
+    /// states. Returns `Some` if the key was consumed.
+    fn try_shared_scroll_or_picker(&mut self, key: KeyEvent) -> Option<RenderDirty> {
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                self.should_quit = true;
-                let _ = self.action_tx.send(UiAction::Quit);
-                RenderDirty::none()
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
-                self.should_quit = true;
-                let _ = self.action_tx.send(UiAction::Quit);
-                RenderDirty::none()
-            }
             (KeyModifiers::NONE, KeyCode::PageUp) => {
                 self.output_pane.scroll_page_up();
-                RenderDirty::full()
+                Some(RenderDirty::full())
             }
             (KeyModifiers::NONE, KeyCode::PageDown) => {
                 self.output_pane.scroll_page_down();
-                RenderDirty::full()
+                Some(RenderDirty::full())
             }
+            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
+                self.open_model_picker_for_current_provider(None);
+                Some(RenderDirty::full())
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_idle_key(&mut self, key: KeyEvent) -> RenderDirty {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
+                self.should_quit = true;
+                let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
+            }
+            // Home/End scroll only when the editor is empty.
+            // Otherwise they belong to the input pane (jump to
+            // start/end of the current line).
             (KeyModifiers::NONE, KeyCode::Home) if self.input_pane.content().is_empty() => {
                 self.output_pane.scroll_to_top();
                 RenderDirty::full()
             }
             (KeyModifiers::NONE, KeyCode::End) if self.input_pane.content().is_empty() => {
                 self.output_pane.scroll_to_bottom();
-                RenderDirty::full()
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-                self.open_model_picker_for_current_provider(None);
                 RenderDirty::full()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
@@ -1016,24 +1030,15 @@ impl App {
                 let _ = self.action_tx.send(UiAction::Quit);
                 RenderDirty::none()
             }
-            (KeyModifiers::NONE, KeyCode::PageUp) => {
-                self.output_pane.scroll_page_up();
-                RenderDirty::full()
-            }
-            (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.output_pane.scroll_page_down();
-                RenderDirty::full()
-            }
+            // Active state: Home/End scroll unconditionally —
+            // the editor is locked while the agent is running,
+            // so input-line navigation is irrelevant.
             (KeyModifiers::NONE, KeyCode::Home) => {
                 self.output_pane.scroll_to_top();
                 RenderDirty::full()
             }
             (KeyModifiers::NONE, KeyCode::End) => {
                 self.output_pane.scroll_to_bottom();
-                RenderDirty::full()
-            }
-            (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-                self.open_model_picker_for_current_provider(None);
                 RenderDirty::full()
             }
             _ => RenderDirty::none(),
@@ -1141,7 +1146,15 @@ impl App {
     /// If a new builtin is added to `builtin_commands()`, wire it
     /// here too and update the coverage test in `anie-cli/src/
     /// commands.rs` (`registry_covers_every_dispatched_slash_command`).
+    /// No-arg commands that simply forward a `UiAction` go in
+    /// `fixed_noarg_action` below; everything else (commands
+    /// with custom dispatch, side effects, or argument parsing)
+    /// stays in the main match.
     fn dispatch_validated_command(&mut self, info: &SlashCommandInfo, arg: Option<&str>) {
+        if let Some(action) = fixed_noarg_action(info.name) {
+            let _ = self.action_tx.send(action);
+            return;
+        }
         match info.name {
             "model" => match arg {
                 None => self.open_model_picker_for_current_provider(None),
@@ -1167,18 +1180,6 @@ impl App {
                     .action_tx
                     .send(UiAction::ContextLength(arg.map(str::to_string)));
             }
-            "state" => {
-                let _ = self.action_tx.send(UiAction::ShowState);
-            }
-            "compact" => {
-                let _ = self.action_tx.send(UiAction::Compact);
-            }
-            "fork" => {
-                let _ = self.action_tx.send(UiAction::ForkSession);
-            }
-            "diff" => {
-                let _ = self.action_tx.send(UiAction::ShowDiff);
-            }
             "clear" => {
                 self.output_pane.clear();
                 let _ = self.action_tx.send(UiAction::ClearOutput);
@@ -1196,9 +1197,6 @@ impl App {
                         .send(UiAction::SwitchSession(session_id.to_string()));
                 }
             },
-            "tools" => {
-                let _ = self.action_tx.send(UiAction::ShowTools);
-            }
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
             "copy" => self.copy_last_assistant_to_clipboard(),
@@ -1308,18 +1306,6 @@ impl App {
                         .add_system_message("Usage: /logout <provider>".to_string());
                 }
             },
-            "new" => {
-                let _ = self.action_tx.send(UiAction::NewSession);
-            }
-            "reload" => {
-                let _ = self.action_tx.send(UiAction::ReloadConfig {
-                    provider: None,
-                    model: None,
-                });
-            }
-            "help" => {
-                let _ = self.action_tx.send(UiAction::ShowHelp);
-            }
             "quit" => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
@@ -2198,6 +2184,32 @@ fn render_spinner_row(
         Style::default().fg(Color::Yellow),
     )))
     .render(area, buf);
+}
+
+/// Map a slash-command name to the `UiAction` it forwards
+/// when the command takes no arguments and has no side effects
+/// other than dispatching that action. Returns `None` for any
+/// command that needs custom dispatch logic (`/model`,
+/// `/thinking`, `/clear`, `/quit`, etc.) — those stay in the
+/// main `dispatch_validated_command` match.
+///
+/// Adding a new no-arg builtin: extend the table here and the
+/// coverage test in `anie-cli/src/commands.rs`.
+fn fixed_noarg_action(name: &str) -> Option<UiAction> {
+    Some(match name {
+        "compact" => UiAction::Compact,
+        "fork" => UiAction::ForkSession,
+        "diff" => UiAction::ShowDiff,
+        "new" => UiAction::NewSession,
+        "tools" => UiAction::ShowTools,
+        "state" => UiAction::ShowState,
+        "help" => UiAction::ShowHelp,
+        "reload" => UiAction::ReloadConfig {
+            provider: None,
+            model: None,
+        },
+        _ => return None,
+    })
 }
 
 fn format_tokens(tokens: u64) -> String {
