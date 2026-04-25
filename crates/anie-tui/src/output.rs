@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +84,12 @@ struct StreamingAssistantRender {
     tail_text: String,
     cached_committed_width: Option<u16>,
     cached_committed_markdown_enabled: bool,
+    /// Theme captured at the time the cache was filled. Theme
+    /// changes (e.g., a future light/dark switch) invalidate
+    /// the committed prefix even though width / markdown_enabled
+    /// agree. Without this the cache could serve stale-themed
+    /// lines until the next mutation.
+    cached_committed_theme: Option<MarkdownTheme>,
     cached_committed_lines: Vec<Line<'static>>,
 }
 
@@ -106,6 +113,7 @@ impl StreamingAssistantRender {
 
     fn invalidate_cache(&mut self) {
         self.cached_committed_width = None;
+        self.cached_committed_theme = None;
         self.cached_committed_lines.clear();
     }
 
@@ -123,6 +131,7 @@ impl StreamingAssistantRender {
         }
         if self.cached_committed_width == Some(width)
             && self.cached_committed_markdown_enabled == ctx.markdown_enabled
+            && self.cached_committed_theme == Some(ctx.theme)
         {
             return self.cached_committed_lines.clone();
         }
@@ -133,6 +142,7 @@ impl StreamingAssistantRender {
         };
         self.cached_committed_width = Some(width);
         self.cached_committed_markdown_enabled = ctx.markdown_enabled;
+        self.cached_committed_theme = Some(ctx.theme);
         self.cached_committed_lines = rendered.clone();
         rendered
     }
@@ -1465,26 +1475,33 @@ fn format_tool_header_spans(
     is_executing: bool,
     spinner_frame: &str,
 ) -> Vec<Span<'static>> {
-    let (bullet, bullet_style) = if is_executing {
+    // Static bullets borrow from string literals; only the
+    // executing path needs a fresh allocation (the spinner
+    // frame rotates each tick, no `&'static str` available).
+    let (bullet, bullet_style): (Cow<'static, str>, Style) = if is_executing {
         (
-            format!("{spinner_frame} "),
+            Cow::Owned(format!("{spinner_frame} ")),
             Style::default().fg(Color::Yellow),
         )
     } else if is_error {
-        ("• ".to_string(), Style::default().fg(Color::Red))
+        (Cow::Borrowed("• "), Style::default().fg(Color::Red))
     } else {
-        ("• ".to_string(), Style::default().fg(Color::Green))
+        (Cow::Borrowed("• "), Style::default().fg(Color::Green))
     };
-    let verb = tool_verb(tool_name);
+    // tool_verb returns &'static str; pass it as Cow::Borrowed
+    // through Span::styled so we don't allocate for the verb.
+    let verb: &'static str = tool_verb(tool_name);
     let mut spans = vec![
         Span::styled(bullet, bullet_style),
         Span::styled(
-            verb.to_string(),
+            Cow::Borrowed(verb),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
     if !args_display.is_empty() {
-        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::raw(Cow::Borrowed(" ")));
+        // args_display is a per-call &str, so the owned
+        // String here is unavoidable for the 'static span.
         spans.push(Span::styled(
             args_display.to_string(),
             Style::default().fg(Color::DarkGray),
@@ -2087,6 +2104,29 @@ mod wrap_tests {
     fn wrap_plain_text_line_exactly_width_is_one_line() {
         assert_eq!(wrap_plain_text("abcdef", 6), vec!["abcdef"]);
     }
+
+    /// PR 04 / F-9: bullet, verb, and the leading space between
+    /// verb and args use string literals (Cow::Borrowed). The
+    /// args span still allocates because `args_display` is a
+    /// per-call &str; spinner-frame allocates because it
+    /// rotates each tick. This test guards the static-vs-owned
+    /// classification so a future change can't silently
+    /// reintroduce the per-render allocations.
+    #[test]
+    fn tool_header_static_parts_are_borrowed() {
+        // Non-executing path: bullet "• " is borrowed.
+        let spans = format_tool_header_spans("bash", "ls /tmp", false, false, ".");
+        // [bullet, verb, " ", args]
+        assert!(matches!(spans[0].content, std::borrow::Cow::Borrowed(_)),
+            "bullet should be Cow::Borrowed");
+        assert!(matches!(spans[1].content, std::borrow::Cow::Borrowed(_)),
+            "verb should be Cow::Borrowed");
+        assert!(matches!(spans[2].content, std::borrow::Cow::Borrowed(_)),
+            "space separator should be Cow::Borrowed");
+        // args is per-call &str → unavoidable owned String.
+        assert!(matches!(spans[3].content, std::borrow::Cow::Owned(_)),
+            "args span owns its String (input is &str, not 'static)");
+    }
 }
 
 #[cfg(test)]
@@ -2262,6 +2302,33 @@ mod cache_tests {
         );
         let _ = pane.build_lines(80, ".");
         assert!(pane.is_cached(0));
+    }
+
+    /// Streaming-prefix render cache must be keyed by theme so
+    /// that a theme switch invalidates cached committed lines.
+    /// PR 04 of docs/tui_perf_2026-04-25/.
+    #[test]
+    fn streaming_prefix_cache_invalidates_on_theme_change() {
+        let ctx_dark = RenderContext::default();
+        let mut ctx_light = ctx_dark.clone();
+        // Mutate one style so theme equality fails. We're not
+        // shipping a real light theme here — just a different
+        // one, which is what the cache key needs to detect.
+        ctx_light.theme.h1 = ratatui::style::Style::default()
+            .fg(ratatui::style::Color::Yellow)
+            .add_modifier(ratatui::style::Modifier::BOLD);
+
+        let mut state = StreamingAssistantRender::default();
+        state.append_delta("# heading\n\nbody\n\n");
+        let with_dark = state.render_lines(40, &ctx_dark);
+        let with_light = state.render_lines(40, &ctx_light);
+        // Heading style in the rendered output must differ
+        // because the theme changed; if the cache served the
+        // dark prefix, both renders would be identical.
+        assert_ne!(
+            with_dark, with_light,
+            "theme change must invalidate the streaming prefix cache",
+        );
     }
 
     #[test]

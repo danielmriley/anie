@@ -87,30 +87,34 @@ The OutputPane numbers haven't moved materially. The user's
 complaint is real even though the bench numbers are stable,
 which is itself the finding behind PR 02.
 
-**Full progression: baseline → PR 01 → PR 03:**
+**Full progression: baseline → PR 01 → PR 03 → PR 04:**
 
-| Scenario | Baseline | After PR 01 | After PR 03 | Total Δ |
-|----------|---------:|------------:|------------:|--------:|
-| `scroll_static_600` (OutputPane only) | 316.68 µs | — | 243.63 µs | **-23.1%** |
-| `stream_into_static_600` (OutputPane only) | 2.0047 ms | — | 1.9235 ms | -4.0% |
-| `keystroke_into_idle_app_600` | 500.23 µs | 423.18 µs | 376.91 µs | **-24.7%** |
-| `keystroke_during_stream_600` | 496.44 µs | 420.31 µs | 375.08 µs | **-24.4%** |
-| `keystroke_into_long_buffer` | 504.14 µs | 423.80 µs | 377.42 µs | **-25.1%** |
+| Scenario | Baseline | After PR 01 | After PR 03 | After PR 04 | Total Δ |
+|----------|---------:|------------:|------------:|------------:|--------:|
+| `scroll_static_600` (OutputPane only) | 316.68 µs | — | 243.63 µs | 224.33 µs | **-29.2%** |
+| `stream_into_static_600` (OutputPane only) | 2.0047 ms | — | 1.9235 ms | 1.8853 ms | -6.0% |
+| `keystroke_into_idle_app_600` | 500.23 µs | 423.18 µs | 376.91 µs | 372.33 µs | **-25.6%** |
+| `keystroke_during_stream_600` | 496.44 µs | 420.31 µs | 375.08 µs | 371.13 µs | **-25.3%** |
+| `keystroke_into_long_buffer` | 504.14 µs | 423.80 µs | 377.42 µs | 374.68 µs | **-25.7%** |
+| `resize_during_stream` | 98.225 ms | — | 97.696 ms | 97.605 ms | -0.6% |
 
-PR 01 cut ~77 µs/keystroke (input-pane layout dedupe). PR 03
-cut another ~46 µs/keystroke on top, dominated by the visible-
-slice borrow win — F-4 turned out to be the single biggest
-per-frame cost. Cumulative: ~123 µs/keystroke removed, ~25%
-off baseline.
+Per-PR gains:
 
-The `scroll_static_600` improvement (23%) confirms the
-visible-slice clone was the per-frame floor. That bench
-exercises only `OutputPane::render` against a TestBackend, so
-its win is pure F-4 attribution.
+- **PR 01** (input-pane layout dedupe): ~77 µs off every keystroke.
+- **PR 03** (cache-hit path): ~46 µs off every keystroke; ~73 µs off
+  `scroll_static_600` (pure visible-slice attribution).
+- **PR 04** (streaming hot path): ~19 µs off `scroll_static_600`
+  (find_link_ranges dedupe), ~38 µs off `stream_into_static_600`
+  (bullet/box static-string borrow). Keystroke benches inside noise
+  since they don't exercise streaming or tool-header rendering.
 
-`resize_during_stream` was unchanged (within noise) — PR 03
-didn't touch the resize path. PR 03 was the wrong place to
-attack resize.
+Cumulative: **~127 µs/keystroke removed (~25%)**, with the per-frame
+floor (`scroll_static_600`) down 29%. Streaming-specific scenarios
+have an additional ~38 µs savings on top.
 
-PR 04 targets the streaming-specific link-scan + bullet/box
-header costs (F-8, F-9, F-15).
+`resize_during_stream` is essentially unchanged through all four PRs —
+PR 03's plan flagged this as expected and resize hardening would need
+its own PR (see archived `tui_input_responsiveness_fix_plan.md` PR 3).
+
+PR 05 is code-health (collapse dispatch match, drop dead parameter,
+merge scroll arms) — no perf target.

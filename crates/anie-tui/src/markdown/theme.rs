@@ -8,7 +8,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
 /// Styles applied to rendered markdown elements.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarkdownTheme {
     pub h1: Style,
     pub h2: Style,
