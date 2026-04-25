@@ -5,6 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
@@ -18,6 +19,8 @@ use anie_provider::{
 };
 
 pub use mutation::ConfigMutator;
+
+static ATOMIC_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Fully-resolved application configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -264,8 +267,8 @@ pub fn anie_dir() -> Option<PathBuf> {
 
 /// Atomically write `contents` to `path`.
 ///
-/// The write goes to a same-directory temp file (`.{name}.tmp.{pid}`),
-/// fsyncs, then renames over the destination. On POSIX the
+/// The write goes to a same-directory temp file
+/// (`.{name}.tmp.{pid}.{counter}`), fsyncs, then renames over the destination. On POSIX the
 /// rename is atomic for same-filesystem moves, so a crash during
 /// the write leaves the original `path` intact.
 ///
@@ -296,16 +299,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
     })?;
 
-    // PID in the temp name so concurrent anie processes writing
-    // the same target file don't collide on the temp. Logical
-    // concurrent write to the same file is still unsafe — this
-    // just avoids the temp-name clash.
-    let mut tmp = parent.to_path_buf();
-    tmp.push(format!(
-        ".{}.tmp.{}",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
+    let tmp = atomic_write_temp_path(parent, file_name);
 
     // Scope the file handle so the OS sees it fully closed before
     // the rename runs.
@@ -328,6 +322,20 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             Err(err)
         }
     }
+}
+
+fn atomic_write_temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    // PID separates concurrent anie processes; the in-process
+    // counter separates concurrent writes from the same process.
+    let nonce = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp = parent.to_path_buf();
+    tmp.push(format!(
+        ".{}.tmp.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+    tmp
 }
 
 /// Return the default global config path (`~/.anie/config.toml`).
@@ -656,6 +664,12 @@ struct PartialContextConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier, Mutex},
+        thread,
+    };
+
     use tempfile::tempdir;
 
     use super::*;
@@ -758,11 +772,11 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_temp_name_includes_pid_and_dot_prefix() {
+    fn atomic_write_temp_name_includes_pid_counter_and_dot_prefix() {
         // Document the temp-name convention. The temp file is a
         // sibling of the target (same parent), dot-prefixed, and
-        // tagged with the process pid so concurrent anie
-        // processes don't clash.
+        // tagged with the process pid plus a same-process counter
+        // so concurrent anie writes don't clash.
         let dir = tempdir().expect("tempdir");
         let target = dir.path().join("out.txt");
         atomic_write(&target, b"x").expect("write ok");
@@ -776,6 +790,47 @@ mod tests {
         assert!(
             !has_temp,
             "temp file must be cleaned after rename: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_temp_names_are_unique_for_same_process_concurrency() {
+        let dir = tempdir().expect("tempdir");
+        let parent = Arc::new(dir.path().to_path_buf());
+        let file_name = Arc::new(std::ffi::OsString::from("state.json"));
+        let barrier = Arc::new(Barrier::new(16));
+        let names = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles = (0..16)
+            .map(|_| {
+                let parent = Arc::clone(&parent);
+                let file_name = Arc::clone(&file_name);
+                let barrier = Arc::clone(&barrier);
+                let names = Arc::clone(&names);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let tmp = atomic_write_temp_path(&parent, &file_name);
+                    let file_name = tmp
+                        .file_name()
+                        .expect("temp file name")
+                        .to_string_lossy()
+                        .into_owned();
+                    names.lock().expect("names lock").insert(file_name);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("thread join");
+        }
+
+        let names = names.lock().expect("names lock");
+        assert_eq!(names.len(), 16, "temp names must be unique: {names:?}");
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with(".state.json.tmp.")),
+            "temp names must keep the documented prefix: {names:?}"
         );
     }
 
