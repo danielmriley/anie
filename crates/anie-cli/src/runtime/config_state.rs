@@ -32,6 +32,8 @@ pub(crate) struct ConfigState {
     current_model: Model,
     current_thinking: ThinkingLevel,
     cli_api_key: Option<String>,
+    #[cfg(test)]
+    runtime_state_path_override: Option<std::path::PathBuf>,
 }
 
 impl ConfigState {
@@ -48,6 +50,8 @@ impl ConfigState {
             current_model,
             current_thinking,
             cli_api_key,
+            #[cfg(test)]
+            runtime_state_path_override: None,
         }
     }
 
@@ -108,6 +112,10 @@ impl ConfigState {
         self.runtime_state.model = Some(self.current_model.id.clone());
         self.runtime_state.thinking = Some(self.current_thinking);
         self.runtime_state.last_session_id = Some(session_id.to_string());
+        #[cfg(test)]
+        if let Some(path) = &self.runtime_state_path_override {
+            return crate::runtime_state::save_runtime_state_to(path, &self.runtime_state);
+        }
         save_runtime_state(&self.runtime_state)
     }
 
@@ -189,6 +197,11 @@ impl ConfigState {
         self.runtime_state.thinking = Some(self.current_thinking);
         self.runtime_state.last_session_id = Some(session_id.to_string());
         crate::runtime_state::save_runtime_state_to(path, &self.runtime_state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_runtime_state_path_for_test(&mut self, path: std::path::PathBuf) {
+        self.runtime_state_path_override = Some(path);
     }
 }
 

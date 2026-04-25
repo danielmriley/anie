@@ -304,7 +304,7 @@ impl InteractiveController {
                     self.send_system_message("Cannot change models while a run is active.")
                         .await;
                 } else {
-                    self.state.set_model(&requested).await?;
+                    let persistence_warning = self.state.set_model(&requested).await?;
                     self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
@@ -313,6 +313,9 @@ impl InteractiveController {
                         self.state.config.current_model().id,
                     ))
                     .await;
+                    if let Some(warning) = persistence_warning {
+                        self.send_system_message(&warning).await;
+                    }
                 }
             }
             UiAction::SetResolvedModel(model) => {
@@ -320,9 +323,12 @@ impl InteractiveController {
                     self.send_system_message("Cannot change models while a run is active.")
                         .await;
                 } else {
-                    self.state.set_model_resolved(*model).await?;
+                    let persistence_warning = self.state.set_model_resolved(*model).await?;
                     self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    if let Some(warning) = persistence_warning {
+                        self.send_system_message(&warning).await;
+                    }
                 }
             }
             UiAction::SetThinking(level) => {
@@ -330,7 +336,7 @@ impl InteractiveController {
                     self.send_system_message("Cannot change thinking while a run is active.")
                         .await;
                 } else {
-                    self.state.set_thinking(&level).await?;
+                    let persistence_warning = self.state.set_thinking(&level).await?;
                     self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
@@ -338,6 +344,9 @@ impl InteractiveController {
                         format_thinking(self.state.config.current_thinking()),
                     ))
                     .await;
+                    if let Some(warning) = persistence_warning {
+                        self.send_system_message(&warning).await;
+                    }
                 }
             }
             UiAction::Compact => {
@@ -626,7 +635,16 @@ impl ControllerState {
         }
     }
 
-    async fn set_model(&mut self, requested: &str) -> Result<()> {
+    fn persist_runtime_state_warning(&mut self, context: &'static str) -> Option<String> {
+        self.persist_runtime_state().err().map(|error| {
+            warn!(%error, context, "failed to persist runtime state");
+            format!(
+                "Warning: setting is active for this session, but anie could not save it for the next launch; it may revert after restart: {error}"
+            )
+        })
+    }
+
+    async fn set_model(&mut self, requested: &str) -> Result<Option<String>> {
         let model = resolve_requested_model(
             requested,
             &self.config.current_model().provider,
@@ -636,26 +654,24 @@ impl ControllerState {
         self.set_model_resolved(model).await
     }
 
-    async fn set_model_resolved(&mut self, model: Model) -> Result<()> {
+    async fn set_model_resolved(&mut self, model: Model) -> Result<Option<String>> {
         upsert_model(&mut self.model_catalog, &model);
         self.config.set_model(model);
         self.session.inner_mut().append_model_change(
             &self.config.current_model().provider,
             &self.config.current_model().id,
         )?;
-        self.persist_runtime_state_logged("set_model_resolved");
-        Ok(())
+        Ok(self.persist_runtime_state_warning("set_model_resolved"))
     }
 
-    async fn set_thinking(&mut self, requested: &str) -> Result<()> {
+    async fn set_thinking(&mut self, requested: &str) -> Result<Option<String>> {
         let level = parse_thinking_level(requested)
             .map_err(|_| UserCommandError::InvalidThinkingLevel(requested.to_string()))?;
         self.config.set_thinking(level);
         self.session
             .inner_mut()
             .append_thinking_change(self.config.current_thinking())?;
-        self.persist_runtime_state_logged("set_thinking");
-        Ok(())
+        Ok(self.persist_runtime_state_warning("set_thinking"))
     }
 
     /// Build the compaction config + summarizer for the current

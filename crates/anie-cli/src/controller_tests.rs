@@ -144,6 +144,59 @@ fn agent_end_contains_text(events: &[AgentEvent], needle: &str) -> bool {
     })
 }
 
+fn controller_with_runtime_state_path(
+    runtime_state_path: std::path::PathBuf,
+) -> (InteractiveController, mpsc::Receiver<AgentEvent>) {
+    let tempdir = tempdir().expect("tempdir");
+    let cwd = tempdir.path().join("cwd");
+    let sessions_dir = tempdir.path().join("sessions");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+    let config = AnieConfig::default();
+    let tool_registry = build_tool_registry(&cwd, true);
+    let prompt_cache =
+        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+    let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
+    let mut config_state = ConfigState::new(
+        config.clone(),
+        RuntimeState::default(),
+        model("gpt-4o", "openai"),
+        ThinkingLevel::Medium,
+        None,
+    );
+    config_state.set_runtime_state_path_for_test(runtime_state_path);
+
+    let state = ControllerState {
+        config: config_state,
+        session: SessionHandle::from_manager(session, sessions_dir, cwd),
+        model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
+        provider_registry: Arc::new(ProviderRegistry::new()),
+        tool_registry,
+        request_options_resolver: Arc::new(AuthResolver::new(None, config)),
+        prompt_cache,
+        retry_config: RetryConfig::default(),
+        command_registry: crate::commands::CommandRegistry::with_builtins(),
+    };
+
+    let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(16);
+    (
+        InteractiveController::new(state, ui_action_rx, event_tx, false),
+        event_rx,
+    )
+}
+
+fn drain_system_messages(event_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<String> {
+    let mut messages = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event {
+            messages.push(text);
+        }
+    }
+    messages
+}
+
 #[test]
 fn no_tools_flag_builds_empty_registry() {
     let registry = build_tool_registry(Path::new("."), true);
@@ -521,6 +574,65 @@ async fn help_command_emits_system_message_with_registry_output() {
         event,
         AgentEvent::SystemMessage { text } if text == expected
     ));
+}
+
+#[tokio::test]
+async fn model_change_with_runtime_persistence_failure_warns_but_updates_state() {
+    let tempdir = tempdir().expect("tempdir");
+    let unwritable_state_path = tempdir.path().join("state-directory");
+    fs::create_dir_all(&unwritable_state_path).expect("create state directory");
+    let (mut controller, mut event_rx) = controller_with_runtime_state_path(unwritable_state_path);
+
+    controller
+        .handle_action(UiAction::SetModel("gpt-4.1".into()))
+        .await
+        .expect("set model");
+
+    assert_eq!(controller.state.config.current_model().id, "gpt-4.1");
+    let messages = drain_system_messages(&mut event_rx);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("setting is active for this session")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("may revert after restart")),
+        "{messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn thinking_change_with_runtime_persistence_failure_warns_but_updates_state() {
+    let tempdir = tempdir().expect("tempdir");
+    let unwritable_state_path = tempdir.path().join("state-directory");
+    fs::create_dir_all(&unwritable_state_path).expect("create state directory");
+    let (mut controller, mut event_rx) = controller_with_runtime_state_path(unwritable_state_path);
+
+    controller
+        .handle_action(UiAction::SetThinking("high".into()))
+        .await
+        .expect("set thinking");
+
+    assert_eq!(
+        controller.state.config.current_thinking(),
+        ThinkingLevel::High
+    );
+    let messages = drain_system_messages(&mut event_rx);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("setting is active for this session")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("may revert after restart")),
+        "{messages:?}"
+    );
 }
 
 // =============================================================================
