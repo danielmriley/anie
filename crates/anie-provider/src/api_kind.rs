@@ -11,4 +11,10 @@ pub enum ApiKind {
     OpenAIResponses,
     /// Google Generative AI streaming API.
     GoogleGenerativeAI,
+    /// Ollama's native `/api/chat` endpoint.
+    ///
+    /// anie-specific (not in pi): pi uses Ollama's
+    /// OpenAI-compatible endpoint, but that path cannot honor
+    /// `think: false` or `options.num_ctx`.
+    OllamaChatApi,
 }

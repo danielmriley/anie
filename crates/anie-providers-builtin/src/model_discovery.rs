@@ -49,6 +49,10 @@ pub async fn discover_models(
         ApiKind::GoogleGenerativeAI => Err(ProviderError::RequestBuild(
             "model discovery for Google Generative AI is not implemented yet".to_string(),
         )),
+        ApiKind::OllamaChatApi => Err(ProviderError::RequestBuild(
+            "model discovery for OllamaChatApi is not wired until the native Ollama discovery PR"
+                .to_string(),
+        )),
     }
 }
 
