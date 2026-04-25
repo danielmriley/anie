@@ -13,7 +13,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use anie_agent::{AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry};
 use anie_auth::AuthResolver;
@@ -616,8 +616,14 @@ pub(crate) struct ControllerState {
 }
 
 impl ControllerState {
-    pub(crate) fn persist_runtime_state(&mut self) {
-        self.config.persist_runtime_state(self.session.id());
+    pub(crate) fn persist_runtime_state(&mut self) -> Result<()> {
+        self.config.persist_runtime_state(self.session.id())
+    }
+
+    fn persist_runtime_state_logged(&mut self, context: &'static str) {
+        if let Err(error) = self.persist_runtime_state() {
+            warn!(%error, context, "failed to persist runtime state");
+        }
     }
 
     async fn set_model(&mut self, requested: &str) -> Result<()> {
@@ -637,7 +643,7 @@ impl ControllerState {
             &self.config.current_model().provider,
             &self.config.current_model().id,
         )?;
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("set_model_resolved");
         Ok(())
     }
 
@@ -648,7 +654,7 @@ impl ControllerState {
         self.session
             .inner_mut()
             .append_thinking_change(self.config.current_thinking())?;
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("set_thinking");
         Ok(())
     }
 
@@ -752,7 +758,7 @@ impl ControllerState {
 
     async fn new_session(&mut self) -> Result<()> {
         self.session.start_new()?;
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("new_session");
         Ok(())
     }
 
@@ -761,14 +767,14 @@ impl ControllerState {
             .switch_to(session_id)
             .map_err(|_| UserCommandError::UnknownSession(session_id.to_string()))?;
         self.apply_session_overrides();
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("switch_session");
         Ok(())
     }
 
     async fn fork_session(&mut self) -> Result<String> {
         let child_id = self.session.fork()?;
         self.apply_session_overrides();
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("fork_session");
         Ok(child_id)
     }
 
@@ -933,7 +939,7 @@ impl ControllerState {
         let cwd = self.session.cwd().to_path_buf();
         self.prompt_cache
             .replace(&cwd, &self.tool_registry, self.config.anie_config())?;
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("reload_config");
         Ok(())
     }
 

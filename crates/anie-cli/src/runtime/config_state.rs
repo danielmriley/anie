@@ -103,14 +103,12 @@ impl ConfigState {
         }
     }
 
-    pub(crate) fn persist_runtime_state(&mut self, session_id: &str) {
+    pub(crate) fn persist_runtime_state(&mut self, session_id: &str) -> Result<()> {
         self.runtime_state.provider = Some(self.current_model.provider.clone());
         self.runtime_state.model = Some(self.current_model.id.clone());
         self.runtime_state.thinking = Some(self.current_thinking);
         self.runtime_state.last_session_id = Some(session_id.to_string());
-        if let Err(error) = save_runtime_state(&self.runtime_state) {
-            tracing::warn!(%error, "failed to persist runtime state");
-        }
+        save_runtime_state(&self.runtime_state)
     }
 
     pub(crate) async fn reload_from_disk(
@@ -239,6 +237,27 @@ mod tests {
         assert_eq!(saved.model.as_deref(), Some("qwen3:32b"));
         assert_eq!(saved.thinking, Some(ThinkingLevel::High));
         assert_eq!(saved.last_session_id.as_deref(), Some("session-123"));
+    }
+
+    #[test]
+    fn persist_runtime_state_to_returns_write_errors() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model("qwen3:32b", "ollama"),
+            ThinkingLevel::High,
+            None,
+        );
+
+        let error = state
+            .persist_runtime_state_to(tempdir.path(), "session-123")
+            .expect_err("directory path cannot be written as runtime state file");
+
+        assert!(
+            error.to_string().contains("failed to write"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

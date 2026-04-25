@@ -11,6 +11,7 @@ use anie_tools::{
     BashTool, EditTool, FileMutationQueue, FindTool, GrepTool, LsTool, ReadTool, WriteTool,
 };
 use anie_tui::UiAction;
+use tracing::warn;
 
 use crate::{
     Cli,
@@ -96,7 +97,9 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         command_registry: crate::commands::CommandRegistry::with_builtins(),
     };
     state.apply_session_overrides();
-    state.persist_runtime_state();
+    if let Err(error) = state.persist_runtime_state() {
+        warn!(%error, "failed to persist runtime state during bootstrap");
+    }
     Ok(state)
 }
 
