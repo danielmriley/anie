@@ -526,7 +526,7 @@ fn auth_fingerprint(api_key: Option<&str>, headers: &HashMap<String, String>) ->
     api_key.unwrap_or_default().hash(&mut hasher);
 
     let mut items = headers.iter().collect::<Vec<_>>();
-    items.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    items.sort_by_key(|(key, _)| *key);
     for (key, value) in items {
         key.hash(&mut hasher);
         value.hash(&mut hasher);
