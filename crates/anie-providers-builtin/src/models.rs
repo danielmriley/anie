@@ -157,4 +157,21 @@ mod tests {
         assert_eq!(claude.reasoning_capabilities, native_separated_reasoning());
         assert_eq!(gpt_4o.reasoning_capabilities, None);
     }
+
+    #[test]
+    fn builtin_openai_compatible_image_models_are_audited() {
+        let models = builtin_models();
+        let image_capable_openai = models
+            .iter()
+            .filter(|model| model.api == ApiKind::OpenAICompletions && model.supports_images)
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        // Set A Plan 02 PR B audit: hosted OpenAI chat models that
+        // advertise image support are covered by the OpenAI converter's
+        // `image_url` content-part path. OpenRouter/local image support
+        // is discovered from live model metadata instead of this static
+        // catalog.
+        assert_eq!(image_capable_openai, vec!["gpt-4o", "o4-mini"]);
+    }
 }
