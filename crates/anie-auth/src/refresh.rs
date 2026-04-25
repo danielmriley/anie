@@ -178,7 +178,7 @@ impl<'a> OAuthRefresher<'a> {
             expires_at = %current.expires_at,
             "OAuth token near expiry; acquiring refresh lock"
         );
-        let lock_file = self.acquire_lock(provider_name)?;
+        let lock_file = self.acquire_lock_async(provider_name).await?;
 
         // Scope the lock so it releases even on early returns.
         let result = self.refresh_under_lock(provider_name).await;
@@ -262,14 +262,34 @@ impl<'a> OAuthRefresher<'a> {
         }
     }
 
-    fn acquire_lock(&self, provider_name: &str) -> Result<File, RefreshError> {
-        fs::create_dir_all(&self.lock_dir)
-            .with_context(|| format!("failed to create lock dir {}", self.lock_dir.display()))
+    async fn acquire_lock_async(&self, provider_name: &str) -> Result<File, RefreshError> {
+        let lock_dir = self.lock_dir.clone();
+        let lock_timeout = self.lock_timeout;
+        let provider_name = provider_name.to_string();
+        let provider_for_error = provider_name.clone();
+
+        tokio::task::spawn_blocking(move || {
+            Self::acquire_lock_blocking(lock_dir, lock_timeout, &provider_name)
+        })
+        .await
+        .map_err(|error| RefreshError::Persist {
+            provider: provider_for_error,
+            source: anyhow!("lock acquisition task failed: {error}"),
+        })?
+    }
+
+    fn acquire_lock_blocking(
+        lock_dir: PathBuf,
+        lock_timeout: Duration,
+        provider_name: &str,
+    ) -> Result<File, RefreshError> {
+        fs::create_dir_all(&lock_dir)
+            .with_context(|| format!("failed to create lock dir {}", lock_dir.display()))
             .map_err(|source| RefreshError::Persist {
                 provider: provider_name.to_string(),
                 source,
             })?;
-        let path = self.lock_dir.join(format!("{provider_name}.lock"));
+        let path = lock_dir.join(format!("{provider_name}.lock"));
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -282,7 +302,7 @@ impl<'a> OAuthRefresher<'a> {
                 source,
             })?;
 
-        let deadline = std::time::Instant::now() + self.lock_timeout;
+        let deadline = std::time::Instant::now() + lock_timeout;
         loop {
             match FileExt::try_lock_exclusive(&file) {
                 Ok(true) => return Ok(file),
@@ -290,7 +310,7 @@ impl<'a> OAuthRefresher<'a> {
                     if std::time::Instant::now() >= deadline {
                         return Err(RefreshError::LockTimeout {
                             provider: provider_name.to_string(),
-                            timeout: self.lock_timeout,
+                            timeout: lock_timeout,
                         });
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -526,6 +546,51 @@ mod tests {
             refresh_calls.load(Ordering::SeqCst),
             1,
             "lock must coalesce concurrent refreshes to a single call"
+        );
+    }
+
+    #[tokio::test]
+    async fn contended_provider_lock_surfaces_typed_timeout() {
+        let persistence =
+            InMemoryPersistence::with("anthropic", oauth("expired", &rfc3339_in(-60)));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            refresh_calls: refresh_calls.clone(),
+            next_token: "fresh-token".into(),
+            new_expires_at: rfc3339_in(3_600),
+        };
+        let tempdir = tempdir().expect("tempdir");
+        let lock_dir = tempdir.path().to_path_buf();
+        std::fs::create_dir_all(&lock_dir).expect("lock dir");
+        let lock_path = lock_dir.join("anthropic.lock");
+        let held_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+            .expect("open held lock");
+        FileExt::lock_exclusive(&held_lock).expect("hold provider lock");
+
+        let refresher = OAuthRefresher::new(&provider, &persistence, lock_dir)
+            .with_lock_timeout(Duration::from_millis(75));
+        let err = refresher.resolve_access_token().await.unwrap_err();
+
+        FileExt::unlock(&held_lock).expect("unlock held provider lock");
+        assert!(
+            matches!(
+                err,
+                RefreshError::LockTimeout {
+                    ref provider,
+                    timeout
+                } if provider == "anthropic" && timeout == Duration::from_millis(75)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            refresh_calls.load(Ordering::SeqCst),
+            0,
+            "refresh must not run when the provider lock cannot be acquired"
         );
     }
 
