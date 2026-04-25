@@ -19,7 +19,8 @@ use anie_provider::{
 };
 
 use crate::edit::{
-    MAX_EDIT_ARGUMENT_BYTES, MAX_EDIT_COUNT, MAX_EDIT_NEW_TEXT_BYTES, MAX_EDIT_OLD_TEXT_BYTES,
+    MAX_EDIT_ARGUMENT_BYTES, MAX_EDIT_COUNT, MAX_EDIT_INPUT_FILE_BYTES, MAX_EDIT_NEW_TEXT_BYTES,
+    MAX_EDIT_OLD_TEXT_BYTES, MAX_EDIT_OUTPUT_FILE_BYTES,
 };
 use crate::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
 
@@ -784,6 +785,81 @@ async fn edit_tool_rejects_combined_argument_budget_before_matching() {
         matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
             if message.contains("edit arguments") && message.contains(&MAX_EDIT_ARGUMENT_BYTES.to_string())),
         "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_input_file_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("large.txt");
+    tokio::fs::write(&path, vec![b'a'; MAX_EDIT_INPUT_FILE_BYTES + 1])
+        .await
+        .expect("seed oversized input");
+    let tool = EditTool::new(tempdir.path());
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "large.txt",
+                "edits": [{
+                    "oldText": "a",
+                    "newText": "b",
+                }],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized input file should fail");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("edit input files") && message.contains(&MAX_EDIT_INPUT_FILE_BYTES.to_string())),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_output_and_preserves_original_file() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("expand.txt");
+    let prefix = "A0\nA1\nA2\n";
+    let filler = "z".repeat(MAX_EDIT_INPUT_FILE_BYTES - prefix.len());
+    let original = format!("{prefix}{filler}");
+    tokio::fs::write(&path, &original).await.expect("seed file");
+    let tool = EditTool::new(tempdir.path());
+    let expansion_budget = MAX_EDIT_OUTPUT_FILE_BYTES - MAX_EDIT_INPUT_FILE_BYTES;
+    let replacement = "x".repeat((expansion_budget / 3) + 4);
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "expand.txt",
+                "edits": [
+                    { "oldText": "A0", "newText": replacement.clone() },
+                    { "oldText": "A1", "newText": replacement.clone() },
+                    { "oldText": "A2", "newText": replacement },
+                ],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized output should fail");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("edit outputs") && message.contains(&MAX_EDIT_OUTPUT_FILE_BYTES.to_string())),
+        "{error:?}"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&path)
+            .await
+            .expect("read original"),
+        original,
+        "failed output-size check must not modify the file"
     );
 }
 

@@ -17,6 +17,9 @@ pub(crate) const MAX_EDIT_COUNT: usize = 100;
 pub(crate) const MAX_EDIT_OLD_TEXT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_EDIT_NEW_TEXT_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_EDIT_ARGUMENT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_EDIT_INPUT_FILE_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const MAX_EDIT_OUTPUT_FILE_BYTES: usize =
+    MAX_EDIT_INPUT_FILE_BYTES + (MAX_EDIT_ARGUMENT_BYTES / 2);
 
 /// Apply one or more exact text replacements to a file.
 pub struct EditTool {
@@ -97,6 +100,12 @@ impl Tool for EditTool {
                 let bytes = tokio::fs::read(&abs_path).await.map_err(|error| {
                     ToolError::ExecutionFailed(format!("Failed to read {path}: {error}"))
                 })?;
+                if bytes.len() > MAX_EDIT_INPUT_FILE_BYTES {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "{path} is {} bytes; edit input files are limited to {MAX_EDIT_INPUT_FILE_BYTES} bytes. Split the file or use a smaller target.",
+                        bytes.len(),
+                    )));
+                }
                 let (has_bom, text) = decode_utf8_with_bom(&bytes).map_err(|error| {
                     ToolError::ExecutionFailed(format!(
                         "Failed to decode {path} as UTF-8 text: {error}"
@@ -107,6 +116,12 @@ impl Tool for EditTool {
                 let (new_normalized, diff) = apply_edits(&normalized, &edits, path)?;
                 let restored = restore_line_endings(&new_normalized, line_ending);
                 let output_bytes = encode_utf8_with_bom(&restored, has_bom);
+                if output_bytes.len() > MAX_EDIT_OUTPUT_FILE_BYTES {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "edited {path} would be {} bytes; edit outputs are limited to {MAX_EDIT_OUTPUT_FILE_BYTES} bytes. Split this into smaller edit calls.",
+                        output_bytes.len(),
+                    )));
+                }
 
                 tokio::fs::write(&abs_path, output_bytes)
                     .await
