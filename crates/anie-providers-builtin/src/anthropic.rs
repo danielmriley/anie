@@ -438,6 +438,7 @@ struct AnthropicStreamState {
     usage: Usage,
     blocks: BTreeMap<usize, AnthropicBlockState>,
     stop_reason: StopReason,
+    raw_stop_reason: Option<String>,
     finished: bool,
 }
 
@@ -448,6 +449,7 @@ impl AnthropicStreamState {
             usage: Usage::default(),
             blocks: BTreeMap::new(),
             stop_reason: StopReason::Stop,
+            raw_stop_reason: None,
             finished: false,
         }
     }
@@ -644,6 +646,7 @@ impl AnthropicStreamState {
                 update_usage(&mut self.usage, &payload["usage"]);
                 if let Some(stop_reason) = payload["delta"]["stop_reason"].as_str() {
                     self.stop_reason = map_stop_reason(stop_reason);
+                    self.raw_stop_reason = Some(stop_reason.to_string());
                 }
             }
             "message_stop" => {
@@ -967,6 +970,70 @@ mod tests {
             block,
             ContentBlock::ToolCall(ToolCall { id, arguments, .. }) if id == "call_1" && arguments == &json!({"path":"Cargo.toml"})
         )));
+    }
+
+    #[test]
+    fn raw_max_tokens_stop_reason_is_retained_with_existing_mapped_stop_reason() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text"}}"#,
+            )
+            .expect("text start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+            )
+            .expect("text delta");
+        state
+            .process_event(
+                "message_delta",
+                r#"{"delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8}}"#,
+            )
+            .expect("message delta");
+
+        assert_eq!(state.raw_stop_reason.as_deref(), Some("max_tokens"));
+
+        let done = state
+            .process_event("message_stop", "{}")
+            .expect("message stop");
+        let ProviderEvent::Done(message) = done.last().expect("done event") else {
+            panic!("expected done event");
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn normal_anthropic_stop_reason_still_maps_to_existing_stop_reason() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text"}}"#,
+            )
+            .expect("text start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"done"}}"#,
+            )
+            .expect("text delta");
+        state
+            .process_event("message_delta", r#"{"delta":{"stop_reason":"end_turn"}}"#)
+            .expect("message delta");
+
+        assert_eq!(state.raw_stop_reason.as_deref(), Some("end_turn"));
+
+        let done = state
+            .process_event("message_stop", "{}")
+            .expect("message stop");
+        let ProviderEvent::Done(message) = done.last().expect("done event") else {
+            panic!("expected done event");
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
     }
 
     #[test]
