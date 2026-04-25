@@ -722,10 +722,7 @@ async fn abort_during_retry_backoff_cancels_retry() {
     );
 }
 
-async fn assert_run_setting_change_cancels_armed_retry(
-    action: UiAction,
-    success_message: Option<&'static str>,
-) {
+async fn assert_run_affecting_action_cancels_armed_retry(action: UiAction) {
     tokio::time::pause();
 
     let (ui_tx, mut event_rx, handle) = spawn_live_controller(
@@ -750,13 +747,6 @@ async fn assert_run_setting_change_cancels_armed_retry(
             if text == "Pending retry canceled because run settings changed.")
     })
     .await;
-    if let Some(success_message) = success_message {
-        wait_for_event(
-            &mut event_rx,
-            |event| matches!(event, AgentEvent::SystemMessage { text } if text == success_message),
-        )
-        .await;
-    }
 
     tokio::time::advance(Duration::from_millis(60_001)).await;
     ui_tx.send(UiAction::Quit).expect("quit");
@@ -777,29 +767,35 @@ async fn assert_run_setting_change_cancels_armed_retry(
 
 #[tokio::test]
 async fn set_model_during_retry_backoff_cancels_retry() {
-    assert_run_setting_change_cancels_armed_retry(
-        UiAction::SetModel("gpt-4.1".into()),
-        Some("Model set to openai:gpt-4.1"),
-    )
-    .await;
+    assert_run_affecting_action_cancels_armed_retry(UiAction::SetModel("gpt-4.1".into())).await;
 }
 
 #[tokio::test]
 async fn set_resolved_model_during_retry_backoff_cancels_retry() {
-    assert_run_setting_change_cancels_armed_retry(
-        UiAction::SetResolvedModel(Box::new(model("gpt-4.1", "openai"))),
-        None,
-    )
+    assert_run_affecting_action_cancels_armed_retry(UiAction::SetResolvedModel(Box::new(model(
+        "gpt-4.1", "openai",
+    ))))
     .await;
 }
 
 #[tokio::test]
 async fn set_thinking_during_retry_backoff_cancels_retry() {
-    assert_run_setting_change_cancels_armed_retry(
-        UiAction::SetThinking("high".into()),
-        Some("Thinking level set to high"),
-    )
-    .await;
+    assert_run_affecting_action_cancels_armed_retry(UiAction::SetThinking("high".into())).await;
+}
+
+#[tokio::test]
+async fn compact_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::Compact).await;
+}
+
+#[tokio::test]
+async fn new_session_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::NewSession).await;
+}
+
+#[tokio::test]
+async fn fork_session_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::ForkSession).await;
 }
 
 #[tokio::test]

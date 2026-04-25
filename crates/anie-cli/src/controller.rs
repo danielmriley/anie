@@ -305,7 +305,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_model(&requested).await?;
-                    self.cancel_pending_retry_for_run_setting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Model set to {}:{}",
@@ -321,7 +321,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_model_resolved(*model).await?;
-                    self.cancel_pending_retry_for_run_setting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                 }
             }
@@ -331,7 +331,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_thinking(&level).await?;
-                    self.cancel_pending_retry_for_run_setting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Thinking level set to {}",
@@ -346,6 +346,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.force_compact(&self.event_tx).await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                 }
             }
             UiAction::ForkSession => {
@@ -354,6 +355,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let new_session_id = self.state.fork_session().await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     let transcript = self
                         .state
                         .session_context()
@@ -383,6 +385,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.new_session().await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     let _ = self
                         .event_tx
                         .send(AgentEvent::TranscriptReplace {
@@ -408,6 +411,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.switch_session(&session_id).await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     let transcript = self
                         .state
                         .session_context()
@@ -470,6 +474,7 @@ impl InteractiveController {
                     self.state
                         .reload_config(provider.as_deref(), model.as_deref())
                         .await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message("Configuration reloaded.").await;
                 }
@@ -479,7 +484,7 @@ impl InteractiveController {
         Ok(())
     }
 
-    async fn cancel_pending_retry_for_run_setting_change(&mut self) {
+    async fn cancel_pending_retry_for_run_affecting_change(&mut self) {
         if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
             self.pending_retry = PendingRetry::Idle;
             self.send_system_message("Pending retry canceled because run settings changed.")
