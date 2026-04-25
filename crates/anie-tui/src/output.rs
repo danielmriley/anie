@@ -62,21 +62,73 @@ pub struct ToolCallResult {
 /// public `RenderedBlock` shape stays the same and every existing
 /// construction / pattern-match site is untouched.
 #[derive(Debug, Clone)]
-struct LineCache {
+struct CachedAtWidth {
     width: u16,
     /// Per-line `Arc`s so cache reads hand out refcount bumps
     /// instead of deep-cloning each `Line` + `Span` + `Cow<str>`.
-    /// PR 06 of `docs/tui_perf_2026-04-25/`: previously this was
-    /// `Arc<Vec<Line>>` but the inner Vec still got deep-cloned
-    /// when extending into `flat_lines`. Per-line `Arc` lets
-    /// `flat_lines` itself store shared refs.
+    /// PR 06 of `docs/tui_perf_2026-04-25/`.
     lines: Vec<Arc<Line<'static>>>,
-    /// Link ranges per line, same length as `lines`. Empty
-    /// entries correspond to lines without clickable URLs.
-    /// Cached alongside the lines so cache-hit paths don't
-    /// re-scan. `Vec<LinkRange>` is small (usually empty), so
-    /// per-line `Arc` doesn't pay off the same way.
+    /// Link ranges per line, same length as `lines`.
     links: Vec<Vec<LinkRange>>,
+}
+
+/// Up to two widths cached per block. The primary entry holds
+/// the most recently filled width inline so the common single-
+/// width case pays no extra indirection vs. the previous
+/// single-entry shape. The secondary slot makes resize
+/// alternations between two stable widths cache-hit cheap
+/// (PR 07 of `docs/tui_perf_2026-04-25/`).
+///
+/// Why a hand-rolled two-slot shape instead of `Vec`: a `Vec`
+/// adds a heap indirection on every cache read. The cache-hit
+/// path is hot (600+ blocks per frame on a long transcript),
+/// so the cost showed up as a 5–7 % regression on the bench
+/// before this shape; keeping the primary inline preserves
+/// PR 06's gains.
+#[derive(Debug, Clone)]
+struct LineCache {
+    primary: CachedAtWidth,
+    secondary: Option<CachedAtWidth>,
+}
+
+impl LineCache {
+    fn new(entry: CachedAtWidth) -> Self {
+        Self {
+            primary: entry,
+            secondary: None,
+        }
+    }
+
+    #[inline]
+    fn entry_at_width(&self, width: u16) -> Option<&CachedAtWidth> {
+        if self.primary.width == width {
+            return Some(&self.primary);
+        }
+        self.secondary.as_ref().filter(|s| s.width == width)
+    }
+
+    /// Insert (or replace) an entry, keeping the most recent
+    /// fill in `primary`.
+    fn insert(&mut self, entry: CachedAtWidth) {
+        if self.primary.width == entry.width {
+            self.primary = entry;
+            return;
+        }
+        if let Some(sec) = self.secondary.as_mut()
+            && sec.width == entry.width
+        {
+            // The new entry is for what was the secondary
+            // width; promote it to primary so subsequent reads
+            // skip the secondary check.
+            std::mem::swap(&mut self.primary, sec);
+            self.primary = entry;
+            return;
+        }
+        // Rotate: previous primary becomes secondary, new entry
+        // becomes primary. Whatever was secondary before is
+        // dropped — that's the FIFO eviction.
+        self.secondary = Some(std::mem::replace(&mut self.primary, entry));
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -781,14 +833,16 @@ impl OutputPane {
 
             if hits_cache
                 && let Some(cached) = self.caches.get(index).and_then(Option::as_ref)
-                && cached.width == width
+                && let Some(entry) = cached.entry_at_width(width)
             {
                 // Per-line `Arc` cache: `iter().cloned()` here
                 // is `Arc::clone` for each entry — refcount
                 // bump, no `Line` / `Span` / `Cow<str>` deep
                 // copy. PR 06 of `docs/tui_perf_2026-04-25/`.
-                out.extend(cached.lines.iter().cloned());
-                link_map.extend(cached.links.iter().cloned());
+                // PR 07 makes the cache slot multi-width so
+                // resize alternations also hit.
+                out.extend(entry.lines.iter().cloned());
+                link_map.extend(entry.links.iter().cloned());
                 cache_hits += 1;
                 continue;
             }
@@ -839,11 +893,15 @@ impl OutputPane {
             let lines_arcs: Vec<Arc<Line<'static>>> =
                 computed.into_iter().map(Arc::new).collect();
             if hits_cache && let Some(slot) = self.caches.get_mut(index) {
-                *slot = Some(LineCache {
+                let entry = CachedAtWidth {
                     width,
                     lines: lines_arcs.clone(),
                     links: computed_links.clone(),
-                });
+                };
+                match slot {
+                    Some(cache) => cache.insert(entry),
+                    None => *slot = Some(LineCache::new(entry)),
+                }
                 cache_misses += 1;
             }
             out.extend(lines_arcs);
