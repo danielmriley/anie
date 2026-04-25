@@ -487,19 +487,7 @@ impl Provider for OpenAIProvider {
     }
 
     fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
-        tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    }
-                })
-            })
-            .collect()
+        crate::tool_schema::openai_function_schema(tools)
     }
 }
 

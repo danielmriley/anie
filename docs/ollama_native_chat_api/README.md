@@ -679,11 +679,11 @@ first discipline CLAUDE.md §3 requires for pi comparisons.
 - `classify_ollama_error_body_routes_401_to_auth_error`
 - `classify_ollama_error_body_routes_429_to_rate_limited_with_retry_after`
 
-### PR 4 — Thinking + tool calls + usage
+### PR 4A — Shared OpenAI tool schema extraction
 
-**Why fourth:** feature-complete the provider with the data
-channels PR 3 deferred. Small, focused additions on top of the
-PR 3 machinery.
+**Why fourth-A:** PR 4 as originally written touches six files, so
+the workflow requires a clean split before implementation. This first
+slice is the reusable refactor only; Ollama behavior stays unchanged.
 
 **Scope:**
 
@@ -697,6 +697,24 @@ PR 3 machinery.
     passthrough: `tool_schema::openai_function_schema(tools)`.
     Preserves the trait method so external callers are
     unchanged; the method body is just delegation now.
+  - Add `mod tool_schema;` in
+    [`anie-providers-builtin/src/lib.rs`](../../crates/anie-providers-builtin/src/lib.rs).
+
+**Tests:**
+
+- `openai_function_schema_extraction_matches_prior_output`
+  (regression: a pre-extraction snapshot of
+  `convert_tools(sample)` matches the post-extraction
+  `openai_function_schema(sample)` byte-for-byte).
+
+### PR 4B — Thinking + tool calls + native retry
+
+**Why fourth:** feature-complete the provider with the data
+channels PR 3 deferred. Small, focused additions on top of the
+PR 3 machinery and PR 4A's shared tool schema helper.
+
+**Scope:**
+
 - `ollama_chat/convert.rs`:
   - Add `think: bool` to the body derived from
     `StreamOptions::thinking` (non-Off → `true`, Off →
@@ -730,10 +748,6 @@ PR 3 machinery.
 
 **Tests:**
 
-- `openai_function_schema_extraction_matches_prior_output`
-  (regression: a pre-extraction snapshot of
-  `convert_tools(sample)` matches the post-extraction
-  `openai_function_schema(sample)` byte-for-byte).
 - `request_body_includes_think_true_for_low_medium_high`
 - `request_body_includes_think_false_for_off`
 - `request_body_omits_think_field_for_non_thinking_capable_model`

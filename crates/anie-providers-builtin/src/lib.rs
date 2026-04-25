@@ -10,6 +10,7 @@ mod ollama_chat;
 mod openai;
 mod openrouter;
 mod sse;
+mod tool_schema;
 mod util;
 
 pub use anthropic::AnthropicProvider;
