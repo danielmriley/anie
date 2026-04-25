@@ -42,6 +42,12 @@ fn default_test_commands() -> Vec<SlashCommandInfo> {
             },
             Some("[off|minimal|low|medium|high]"),
         ),
+        SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Query or override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
+        ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
         SlashCommandInfo::builtin("fork", "Fork session"),
         SlashCommandInfo::builtin("diff", "Show diff"),
@@ -1768,6 +1774,12 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
             Some("[off|minimal|low|medium|high]"),
         ),
         SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Query or override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
             "markdown",
             "Toggle markdown rendering",
             ArgumentSpec::Enumerated {
@@ -1857,6 +1869,49 @@ fn slash_thinking_valid_dispatches_set_thinking() {
 
     let action = action_rx.try_recv().expect("valid command must dispatch");
     assert!(matches!(action, crate::UiAction::SetThinking(level) if level == "high"));
+}
+
+#[test]
+fn context_length_slash_command_dispatches_ui_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/context-length 16384");
+
+    let action = action_rx.try_recv().expect("valid command must dispatch");
+    assert!(matches!(
+        action,
+        crate::UiAction::ContextLength(Some(value)) if value == "16384"
+    ));
+}
+
+#[test]
+fn context_length_slash_command_query_dispatches_none() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/context-length");
+
+    let action = action_rx.try_recv().expect("query command must dispatch");
+    assert!(matches!(action, crate::UiAction::ContextLength(None)));
+}
+
+#[test]
+fn context_length_slash_command_rejects_invalid_argument() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/context-length wide");
+
+    let msg = last_system_message(&app).expect("expected rejection");
+    assert!(msg.contains("wide") && msg.contains("reset"), "{msg}");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "invalid context-length argument must not dispatch"
+    );
 }
 
 #[test]

@@ -1091,6 +1091,11 @@ impl App {
                         .send(UiAction::SetThinking(level.to_string()));
                 }
             },
+            "context-length" => {
+                let _ = self
+                    .action_tx
+                    .send(UiAction::ContextLength(arg.map(str::to_string)));
+            }
             "compact" => {
                 let _ = self.action_tx.send(UiAction::Compact);
             }

@@ -240,6 +240,12 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
             },
             Some("[off|minimal|low|medium|high]"),
         ),
+        SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Query or override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
+        ),
         SlashCommandInfo::builtin("compact", "Manually compact the session context"),
         SlashCommandInfo::builtin("fork", "Create a child session branched from now"),
         SlashCommandInfo::builtin("diff", "Show file changes made in this session"),
@@ -349,6 +355,20 @@ mod tests {
     }
 
     #[test]
+    fn context_length_command_registered_with_expected_arg_spec() {
+        let registry = CommandRegistry::with_builtins();
+        let info = registry
+            .lookup("context-length")
+            .expect("context-length builtin");
+
+        assert!(matches!(
+            info.arguments,
+            ArgumentSpec::ContextLengthOverride
+        ));
+        assert_eq!(info.argument_hint, Some("[N|reset]"));
+    }
+
+    #[test]
     fn grouped_by_source_keeps_kinds_together() {
         let mut registry = CommandRegistry::with_builtins();
         registry
@@ -448,6 +468,7 @@ mod tests {
         let dispatched = [
             "model",
             "thinking",
+            "context-length",
             "compact",
             "fork",
             "diff",
@@ -484,6 +505,9 @@ mod tests {
                 "thinking",
                 |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == THINKING_LEVELS),
             ),
+            ("context-length", |spec| {
+                matches!(spec, ArgumentSpec::ContextLengthOverride)
+            }),
             ("model", |spec| {
                 matches!(spec, ArgumentSpec::FreeForm { required: false })
             }),

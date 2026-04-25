@@ -16,6 +16,8 @@ use super::{
 };
 use crate::commands::{ArgumentSpec, SlashCommandInfo};
 
+const CONTEXT_LENGTH_STATIC_VALUES: &[&str] = &["reset"];
+
 /// Runtime-supplied argument completions for a command whose
 /// values can't be baked into the static `ArgumentSpec`.
 ///
@@ -54,6 +56,10 @@ impl CachedCommand {
             ArgumentSpec::Subcommands { known } => {
                 known.iter().map(|v| v.to_ascii_lowercase()).collect()
             }
+            ArgumentSpec::ContextLengthOverride => CONTEXT_LENGTH_STATIC_VALUES
+                .iter()
+                .map(|v| v.to_ascii_lowercase())
+                .collect(),
             ArgumentSpec::FreeForm { .. } | ArgumentSpec::None => Vec::new(),
         };
         Self {
@@ -70,6 +76,7 @@ impl CachedCommand {
         match &self.info.arguments {
             ArgumentSpec::Enumerated { values, .. } => values,
             ArgumentSpec::Subcommands { known } => known,
+            ArgumentSpec::ContextLengthOverride => CONTEXT_LENGTH_STATIC_VALUES,
             ArgumentSpec::FreeForm { .. } | ArgumentSpec::None => &[],
         }
     }
@@ -231,6 +238,12 @@ mod tests {
                 ArgumentSpec::Subcommands { known: &["list"] },
                 Some("[list|<id>]"),
             ),
+            SlashCommandInfo::builtin_with_args(
+                "context-length",
+                "Override Ollama context length",
+                ArgumentSpec::ContextLengthOverride,
+                Some("[N|reset]"),
+            ),
             SlashCommandInfo::builtin("compact", "Manually compact"),
             SlashCommandInfo::builtin("help", "Show help"),
         ]
@@ -294,6 +307,15 @@ mod tests {
         let set = provider.suggestions(line, line.len()).expect("set");
         let values: Vec<_> = set.items.iter().map(|s| s.value.as_str()).collect();
         assert_eq!(values, vec!["list"]);
+    }
+
+    #[test]
+    fn context_length_argument_suggests_reset_only() {
+        let provider = CommandCompletionProvider::new(catalog());
+        let line = "/context-length r";
+        let set = provider.suggestions(line, line.len()).expect("set");
+        let values: Vec<_> = set.items.iter().map(|s| s.value.as_str()).collect();
+        assert_eq!(values, vec!["reset"]);
     }
 
     #[test]
