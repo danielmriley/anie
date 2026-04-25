@@ -420,6 +420,7 @@ pub fn load_config_with_paths(
     }
 
     apply_cli_overrides(&mut config, cli_overrides);
+    warn_legacy_ollama_openai_api(&config);
     Ok(config)
 }
 
@@ -465,6 +466,43 @@ pub fn configured_models(config: &AnieConfig) -> Vec<Model> {
         }
     }
     models
+}
+
+fn warn_legacy_ollama_openai_api(config: &AnieConfig) {
+    for provider_name in legacy_ollama_openai_api_providers(config) {
+        tracing::warn!(
+            provider = %provider_name,
+            "Ollama provider config uses legacy api = \"OpenAICompletions\"; newly discovered Ollama models use api = \"OllamaChatApi\" for native /api/chat support"
+        );
+    }
+}
+
+fn legacy_ollama_openai_api_providers(config: &AnieConfig) -> Vec<String> {
+    config
+        .providers
+        .iter()
+        .filter_map(|(provider_name, provider_config)| {
+            if provider_config.api != Some(ApiKind::OpenAICompletions) {
+                return None;
+            }
+            if provider_name.eq_ignore_ascii_case("ollama")
+                || provider_config
+                    .base_url
+                    .as_deref()
+                    .is_some_and(is_ollama_endpoint)
+            {
+                Some(provider_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_ollama_endpoint(base_url: &str) -> bool {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    root.contains(":11434")
 }
 
 fn custom_model_reasoning_capabilities(model: &CustomModelConfig) -> Option<ReasoningCapabilities> {
@@ -1005,6 +1043,38 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].provider, "local");
         assert_eq!(models[0].base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn config_toml_with_legacy_ollama_api_logs_warning_but_loads_unchanged() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [providers.ollama]
+            base_url = "http://localhost:11434/v1"
+            api = "OpenAICompletions"
+
+            [[providers.ollama.models]]
+            id = "qwen3:32b"
+            name = "Qwen 3 32B"
+            context_window = 32768
+            max_tokens = 8192
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert_eq!(
+            legacy_ollama_openai_api_providers(&config),
+            vec!["ollama".to_string()]
+        );
+        let provider = config.providers.get("ollama").expect("ollama provider");
+        assert_eq!(provider.api, Some(ApiKind::OpenAICompletions));
+        assert_eq!(provider.models[0].id, "qwen3:32b");
     }
 
     #[test]
