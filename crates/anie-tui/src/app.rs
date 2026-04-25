@@ -80,6 +80,17 @@ pub struct App {
     /// ms), idle-tick redraws are suppressed so the spinner
     /// freezes rather than eating CPU. Plan 06 PR-B.
     last_streaming_delta_at: Option<Instant>,
+    /// Workspace-wide cap on Ollama `num_ctx` from
+    /// `[ollama] default_max_num_ctx`. Applied to every
+    /// `ModelInfo::to_model` call the TUI makes when
+    /// converting a freshly-discovered `ModelInfo` into a
+    /// runtime `Model` (model picker, post-discovery
+    /// catalog updates). `None` (the default) preserves
+    /// uncapped behavior. Set via
+    /// `with_ollama_default_max_num_ctx` from
+    /// `interactive_mode.rs` based on the loaded
+    /// `AnieConfig`. See `docs/ollama_default_num_ctx_cap`.
+    ollama_default_max_num_ctx: Option<u64>,
 }
 
 pub(crate) fn drain_agent_event_batch(
@@ -360,7 +371,19 @@ impl App {
             worker_rx,
             commands,
             last_streaming_delta_at: None,
+            ollama_default_max_num_ctx: None,
         }
+    }
+
+    /// Snapshot the workspace-wide Ollama `num_ctx` cap from
+    /// `[ollama] default_max_num_ctx`. The TUI applies it to
+    /// every `to_model` conversion that builds a runtime
+    /// `Model` from freshly-discovered `ModelInfo`. `None`
+    /// preserves the prior uncapped behavior.
+    #[must_use]
+    pub fn with_ollama_default_max_num_ctx(mut self, cap: Option<u64>) -> Self {
+        self.ollama_default_max_num_ctx = cap;
+        self
     }
 
     /// Access the status bar state for setup and tests.
@@ -1423,9 +1446,11 @@ impl App {
                                 known.provider == model.provider && known.id == model.id
                             }) {
                                 let api = discovery_model_api(&provider_name, api, &base_url);
-                                self.known_models.push(
-                                    model.to_model(api, &discovery_model_base_url(api, &base_url)),
-                                );
+                                self.known_models.push(model.to_model(
+                                    api,
+                                    &discovery_model_base_url(api, &base_url),
+                                    self.ollama_default_max_num_ctx,
+                                ));
                             }
                         }
                         if let BottomPane::ModelPicker(session) = &mut self.bottom_pane {
@@ -1537,7 +1562,11 @@ impl App {
             .unwrap_or_else(|| {
                 let api =
                     discovery_model_api(&context.provider_name, context.api, &context.base_url);
-                model_info.to_model(api, &discovery_model_base_url(api, &context.base_url))
+                model_info.to_model(
+                    api,
+                    &discovery_model_base_url(api, &context.base_url),
+                    self.ollama_default_max_num_ctx,
+                )
             })
     }
 

@@ -157,7 +157,9 @@ pub fn default_local_reasoning_capabilities(
 /// (TLS roots unavailable, etc.) — discovery is a best-effort
 /// feature and should never prevent startup. A warning is logged so
 /// the failure is visible.
-pub async fn detect_local_servers() -> Vec<LocalServer> {
+pub async fn detect_local_servers(
+    ollama_default_max_num_ctx: Option<u64>,
+) -> Vec<LocalServer> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
@@ -173,23 +175,43 @@ pub async fn detect_local_servers() -> Vec<LocalServer> {
     };
 
     let mut servers = Vec::new();
-    if let Some(server) = probe_openai_compatible(&client, "ollama", "http://localhost:11434").await
+    if let Some(server) = probe_openai_compatible(
+        &client,
+        "ollama",
+        "http://localhost:11434",
+        ollama_default_max_num_ctx,
+    )
+    .await
     {
         servers.push(server);
     }
-    if let Some(server) =
-        probe_openai_compatible(&client, "lmstudio", "http://localhost:1234").await
+    if let Some(server) = probe_openai_compatible(
+        &client,
+        "lmstudio",
+        "http://localhost:1234",
+        ollama_default_max_num_ctx,
+    )
+    .await
     {
         servers.push(server);
     }
     servers
 }
 
-/// Probe a single OpenAI-compatible base URL for `/v1/models` support.
+/// Probe a single OpenAI-compatible base URL for `/v1/models`
+/// support.
+///
+/// `ollama_default_max_num_ctx` mirrors the parameter on
+/// `ModelInfo::to_model`: when the probed server is Ollama and
+/// the cap is `Some(N)`, the discovered context length is
+/// clamped to `N` before assignment to `Model.context_window`.
+/// `None` (the default) preserves the discovered value.
+/// Non-Ollama probes ignore the cap.
 pub async fn probe_openai_compatible(
     client: &reqwest::Client,
     name: &str,
     base_url: &str,
+    ollama_default_max_num_ctx: Option<u64>,
 ) -> Option<LocalServer> {
     let response = client
         .get(format!("{}/v1/models", base_url.trim_end_matches('/')))
@@ -310,7 +332,18 @@ pub async fn probe_openai_compatible(
                     // bootstrap / `detect_local_servers` path used
                     // at startup and onboarding.
                     if let Some(ctx) = show.context_length {
-                        model.context_window = ctx;
+                        // Apply the workspace-wide cap from
+                        // [ollama] default_max_num_ctx (Cap PR 1
+                        // / Cap PR 2). `None` cap preserves the
+                        // discovered value; `Some(N)` clamps to
+                        // `min(discovered, N)`. Symmetric with
+                        // `to_model`'s clamp on the
+                        // model_discovery path. See
+                        // `docs/ollama_default_num_ctx_cap/README.md`.
+                        model.context_window = anie_provider::clamp_ollama_context_window(
+                            ctx,
+                            ollama_default_max_num_ctx,
+                        );
                     }
                 }
                 Ok(None) => {
@@ -375,7 +408,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"))
+        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
             .await
             .expect("detected local server");
 
@@ -426,7 +459,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "lmstudio", &format!("http://{address}"))
+        let detected = probe_openai_compatible(&client, "lmstudio", &format!("http://{address}"), None)
             .await
             .expect("detected local server");
 
@@ -617,7 +650,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"))
+        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
             .await
             .expect("detected local server");
 
@@ -709,7 +742,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"))
+        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
             .await
             .expect("detected local server");
 
@@ -771,7 +804,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"))
+        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
             .await
             .expect("detected local server");
 
@@ -784,13 +817,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_probe_clamps_show_context_length_when_cap_is_set() {
+        // /api/show reports 40960 but the workspace cap is
+        // 32768 — the resulting Model.context_window must
+        // reflect the cap, not the raw show value. Mirror of
+        // `to_model_clamps_ollama_context_window_when_cap_is_set`
+        // for the bootstrap-detection path.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local server");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request_buffer = vec![0u8; 8192];
+                let Ok(_read) = socket.read(&mut request_buffer).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request_buffer);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/v1/models" => r#"{"data":[{"id":"qwen3:8b"}]}"#.to_string(),
+                    "/api/show" => r#"{
+                        "capabilities": ["completion", "thinking"],
+                        "model_info": {
+                            "general.architecture": "qwen3",
+                            "qwen3.context_length": 40960
+                        }
+                    }"#
+                    .to_string(),
+                    _ => String::new(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let detected = probe_openai_compatible(
+            &client,
+            "ollama",
+            &format!("http://{address}"),
+            Some(32_768),
+        )
+        .await
+        .expect("detected local server");
+
+        let qwen = detected
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3:8b")
+            .expect("qwen present");
+        assert_eq!(
+            qwen.context_window, 32_768,
+            "discovered=40960, cap=32768 → context_window=32768; got {}",
+            qwen.context_window
+        );
+    }
+
+    #[tokio::test]
+    async fn local_probe_preserves_discovered_when_cap_exceeds_discovered() {
+        // Symmetric: cap above discovered must not increase
+        // the value. Mirror of
+        // `to_model_preserves_discovered_when_cap_exceeds_discovered`.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local server");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request_buffer = vec![0u8; 8192];
+                let Ok(_read) = socket.read(&mut request_buffer).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request_buffer);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/v1/models" => r#"{"data":[{"id":"qwen3:8b"}]}"#.to_string(),
+                    "/api/show" => r#"{
+                        "capabilities": ["completion", "thinking"],
+                        "model_info": {
+                            "general.architecture": "qwen3",
+                            "qwen3.context_length": 40960
+                        }
+                    }"#
+                    .to_string(),
+                    _ => String::new(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let detected = probe_openai_compatible(
+            &client,
+            "ollama",
+            &format!("http://{address}"),
+            Some(1_048_576),
+        )
+        .await
+        .expect("detected local server");
+        let qwen = detected
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3:8b")
+            .expect("qwen present");
+        assert_eq!(qwen.context_window, 40_960);
+    }
+
+    #[tokio::test]
     async fn probe_times_out_quickly_when_server_is_missing() {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(150))
             .build()
             .expect("client");
         let started = std::time::Instant::now();
-        let detected = probe_openai_compatible(&client, "missing", "http://127.0.0.1:9").await;
+        let detected = probe_openai_compatible(&client, "missing", "http://127.0.0.1:9", None).await;
         assert!(detected.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }

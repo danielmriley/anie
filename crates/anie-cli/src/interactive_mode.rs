@@ -35,6 +35,7 @@ pub(crate) async fn run_interactive_mode(cli: Cli) -> Result<()> {
     let popup_enabled = state.config.anie_config().ui.slash_command_popup_enabled;
     let markdown_enabled = state.config.anie_config().ui.markdown_enabled;
     let tool_output_mode = state.config.anie_config().ui.tool_output_mode;
+    let ollama_default_max_num_ctx = state.config.anie_config().ollama.default_max_num_ctx;
     let capabilities = TerminalCapabilities::detect();
     let controller =
         crate::controller::InteractiveController::new(state, ui_action_rx, agent_event_tx, false);
@@ -49,7 +50,8 @@ pub(crate) async fn run_interactive_mode(cli: Cli) -> Result<()> {
     .with_autocomplete_enabled(popup_enabled)
     .with_markdown_enabled(markdown_enabled)
     .with_tool_output_mode(tool_output_mode)
-    .with_terminal_capabilities(capabilities);
+    .with_terminal_capabilities(capabilities)
+    .with_ollama_default_max_num_ctx(ollama_default_max_num_ctx);
     apply_status_event(app.status_bar_mut(), &initial_status);
     app.load_transcript(&transcript);
 

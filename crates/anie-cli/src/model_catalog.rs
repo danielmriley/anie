@@ -42,7 +42,7 @@ pub(crate) struct InitialSelection {
 /// with the authoritative list.
 pub(crate) async fn build_model_catalog(config: &AnieConfig) -> (Vec<Model>, bool) {
     let credential_store = CredentialStore::new();
-    let local_servers = detect_local_servers().await;
+    let local_servers = detect_local_servers(config.ollama.default_max_num_ctx).await;
     let local_models = local_servers
         .iter()
         .flat_map(|server| server.models.clone())
