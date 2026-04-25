@@ -18,6 +18,9 @@ use anie_provider::{
     mock::{MockProvider, MockStreamScript},
 };
 
+use crate::edit::{
+    MAX_EDIT_ARGUMENT_BYTES, MAX_EDIT_COUNT, MAX_EDIT_NEW_TEXT_BYTES, MAX_EDIT_OLD_TEXT_BYTES,
+};
 use crate::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
 
 struct StaticResolver;
@@ -658,6 +661,129 @@ async fn edit_tool_detects_overlapping_replacements() {
 
     assert!(
         matches!(error, anie_agent::ToolError::ExecutionFailed(message) if message.contains("overlaps edit"))
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_too_many_edits_before_reading_file() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+    let edits = (0..=MAX_EDIT_COUNT)
+        .map(|index| {
+            serde_json::json!({
+                "oldText": format!("old-{index}"),
+                "newText": "new",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": edits,
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("too many edits should fail before reading");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("at most 100") && message.contains("Split this")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_old_text_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": [{
+                    "oldText": "x".repeat(MAX_EDIT_OLD_TEXT_BYTES + 1),
+                    "newText": "replacement",
+                }],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized oldText should fail before matching");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("oldText") && message.contains(&MAX_EDIT_OLD_TEXT_BYTES.to_string())),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_new_text_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": [{
+                    "oldText": "target",
+                    "newText": "x".repeat(MAX_EDIT_NEW_TEXT_BYTES + 1),
+                }],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized newText should fail before matching");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("newText") && message.contains(&MAX_EDIT_NEW_TEXT_BYTES.to_string())),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_combined_argument_budget_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+    let chunk = "x".repeat(MAX_EDIT_ARGUMENT_BYTES / 4);
+    let edits = (0..5)
+        .map(|index| {
+            serde_json::json!({
+                "oldText": format!("target-{index}"),
+                "newText": chunk,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": edits,
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("combined edit budget should fail before matching");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("edit arguments") && message.contains(&MAX_EDIT_ARGUMENT_BYTES.to_string())),
+        "{error:?}"
     );
 }
 

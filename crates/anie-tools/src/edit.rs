@@ -13,6 +13,11 @@ use crate::{
     shared::{required_string_arg, resolve_path, text_result},
 };
 
+pub(crate) const MAX_EDIT_COUNT: usize = 100;
+pub(crate) const MAX_EDIT_OLD_TEXT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_EDIT_NEW_TEXT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_EDIT_ARGUMENT_BYTES: usize = 1024 * 1024;
+
 /// Apply one or more exact text replacements to a file.
 pub struct EditTool {
     cwd: Arc<PathBuf>,
@@ -52,12 +57,13 @@ impl Tool for EditTool {
                     "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
                     "edits": {
                         "type": "array",
+                        "maxItems": MAX_EDIT_COUNT,
                         "description": "One or more targeted replacements. Each edit is matched against the original file, not after earlier edits are applied.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "oldText": { "type": "string", "description": "Exact text for one targeted replacement" },
-                                "newText": { "type": "string", "description": "Replacement text for this targeted edit" }
+                                "oldText": { "type": "string", "maxLength": MAX_EDIT_OLD_TEXT_BYTES, "description": "Exact text for one targeted replacement" },
+                                "newText": { "type": "string", "maxLength": MAX_EDIT_NEW_TEXT_BYTES, "description": "Replacement text for this targeted edit" }
                             },
                             "required": ["oldText", "newText"],
                             "additionalProperties": false
@@ -157,7 +163,14 @@ fn parse_edits(args: &serde_json::Value) -> Result<Vec<Edit>, ToolError> {
             "'edits' must contain at least one replacement".into(),
         ));
     }
+    if edits.len() > MAX_EDIT_COUNT {
+        return Err(ToolError::ExecutionFailed(format!(
+            "'edits' contains {} replacements; at most {MAX_EDIT_COUNT} are allowed per edit call. Split this into smaller edit calls.",
+            edits.len(),
+        )));
+    }
 
+    let mut total_edit_bytes = 0usize;
     edits
         .iter()
         .enumerate()
@@ -174,12 +187,37 @@ fn parse_edits(args: &serde_json::Value) -> Result<Vec<Edit>, ToolError> {
                 .ok_or_else(|| {
                     ToolError::ExecutionFailed(format!("edit #{index} is missing 'newText'"))
                 })?;
+            enforce_edit_text_limit(index, "oldText", old_text, MAX_EDIT_OLD_TEXT_BYTES)?;
+            enforce_edit_text_limit(index, "newText", new_text, MAX_EDIT_NEW_TEXT_BYTES)?;
+            total_edit_bytes = total_edit_bytes
+                .saturating_add(old_text.len())
+                .saturating_add(new_text.len());
+            if total_edit_bytes > MAX_EDIT_ARGUMENT_BYTES {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "edit arguments are {total_edit_bytes} bytes; at most {MAX_EDIT_ARGUMENT_BYTES} bytes are allowed per edit call. Split this into smaller edit calls.",
+                )));
+            }
             Ok(Edit {
                 old_text: normalize_to_lf(old_text),
                 new_text: normalize_to_lf(new_text),
             })
         })
         .collect()
+}
+
+fn enforce_edit_text_limit(
+    index: usize,
+    field: &str,
+    value: &str,
+    limit: usize,
+) -> Result<(), ToolError> {
+    if value.len() > limit {
+        return Err(ToolError::ExecutionFailed(format!(
+            "edit #{index} {field} is {} bytes; at most {limit} bytes are allowed. Split this into smaller edit calls.",
+            value.len(),
+        )));
+    }
+    Ok(())
 }
 
 fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<(String, String), ToolError> {
