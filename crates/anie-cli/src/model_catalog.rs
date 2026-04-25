@@ -734,6 +734,7 @@ mod tests {
             model: Some("gpt-4o".into()),
             thinking: None,
             last_session_id: None,
+            ..RuntimeState::default()
         };
         let session_context = SessionContext::empty();
         let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
@@ -765,6 +766,7 @@ mod tests {
             model: Some("qwen3:32b".into()),
             thinking: None,
             last_session_id: None,
+            ..RuntimeState::default()
         };
         let session_context = SessionContext::empty();
         let models = vec![model("gpt-4o", "openai"), model("qwen3:32b", "ollama")];
