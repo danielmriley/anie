@@ -69,6 +69,58 @@ impl OllamaChatProvider {
         }
     }
 
+    /// Outer retry layer for Ollama model-load failures. Wraps
+    /// `send_request_with_reasoning_retry` (which handles the
+    /// drop-`think` recovery): on the first attempt's
+    /// `ProviderError::ModelLoadResources`, builds a fresh
+    /// request body with `num_ctx_override =
+    /// Some(suggested_num_ctx)` and tries once more. The second
+    /// attempt's outcome propagates verbatim — including a
+    /// repeated `ModelLoadResources` (so the user-facing
+    /// message in PR 3 reflects the smaller value the inner
+    /// retry tried, not the original request's value).
+    ///
+    /// One retry, not exponential. Each attempt costs an
+    /// Ollama model reload (~5-30 s); a second halving on a
+    /// system that's already too constrained at half-size is
+    /// extremely unlikely to fit at quarter-size and would
+    /// just double the wasted reload time.
+    ///
+    /// See `docs/ollama_load_failure_recovery/README.md` PR 2.
+    async fn send_request_with_load_resource_retry(
+        client: reqwest::Client,
+        url: String,
+        model: &Model,
+        context: &LlmContext,
+        options: &StreamOptions,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let initial_body = build_request_body(model, context, options);
+        match Self::send_request_with_reasoning_retry(
+            client.clone(),
+            url.clone(),
+            initial_body,
+            options,
+        )
+        .await
+        {
+            Err(ProviderError::ModelLoadResources {
+                suggested_num_ctx, ..
+            }) => {
+                let mut retry_options = options.clone();
+                retry_options.num_ctx_override = Some(suggested_num_ctx);
+                let retry_body = build_request_body(model, context, &retry_options);
+                Self::send_request_with_reasoning_retry(
+                    client,
+                    url,
+                    retry_body,
+                    &retry_options,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
     async fn send_request(
         client: reqwest::Client,
         url: String,
@@ -132,11 +184,18 @@ impl Provider for OllamaChatProvider {
     ) -> Result<ProviderStream, ProviderError> {
         let provider = self.clone();
         let state_model = model.clone();
+        let request_model = model.clone();
         let url = format!("{}/api/chat", model.base_url.trim_end_matches('/'));
-        let body = build_request_body(model, &context, &options);
 
         let stream = try_stream! {
-            let response = Self::send_request_with_reasoning_retry(provider.client.clone(), url, body, &options).await?;
+            let response = Self::send_request_with_load_resource_retry(
+                provider.client.clone(),
+                url,
+                &request_model,
+                &context,
+                &options,
+            )
+            .await?;
             yield ProviderEvent::Start;
 
             let mut lines = NdjsonLines::new(response.bytes_stream());
@@ -668,6 +727,209 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains(r#""think":true"#));
         assert!(!requests[1].contains(r#""think""#));
+    }
+
+    /// Drive `send_request_with_load_resource_retry` against a
+    /// 2-attempt mock. First attempt always returns the
+    /// captured Ollama load-failure body (HTTP 500); the second
+    /// attempt returns whatever `second_response` specifies.
+    /// Captures the request body bytes from both attempts so
+    /// tests can assert that `num_ctx` halved between them.
+    async fn capture_load_resource_retry_requests(
+        second_response: &'static str,
+        initial_num_ctx: u64,
+    ) -> (Result<reqwest::Response, ProviderError>, Vec<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut buffer = vec![0_u8; 8192];
+                let read = socket.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests.push(request.clone());
+                if index == 0 {
+                    let body = r#"{"error":"model requires more system memory (56.0 GiB) than is available (50.3 GiB)"}"#;
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .expect("write first response");
+                } else {
+                    socket
+                        .write_all(second_response.as_bytes())
+                        .await
+                        .expect("write second response");
+                }
+            }
+            requests
+        });
+
+        let mut model = ollama_model();
+        model.context_window = initial_num_ctx;
+        // Avoid the `think` field appearing in the request body
+        // so this test is purely about num_ctx retry semantics
+        // (the existing reasoning-retry harness already covers
+        // think dropping). `reasoning_capabilities = None` means
+        // build_request_body skips the `think` field.
+        model.reasoning_capabilities = None;
+        let context = empty_context();
+        let result = OllamaChatProvider::send_request_with_load_resource_retry(
+            reqwest::Client::new(),
+            format!("http://{addr}/api/chat"),
+            &model,
+            &context,
+            &StreamOptions::default(),
+        )
+        .await;
+        let requests = server.await.expect("server task");
+        (result, requests)
+    }
+
+    fn extract_num_ctx_from_request(raw_request: &str) -> u64 {
+        let body_start = raw_request
+            .find("\r\n\r\n")
+            .map(|idx| idx + 4)
+            .expect("HTTP body separator");
+        let body: serde_json::Value =
+            serde_json::from_str(&raw_request[body_start..]).expect("JSON body");
+        body["options"]["num_ctx"]
+            .as_u64()
+            .expect("options.num_ctx field")
+    }
+
+    #[tokio::test]
+    async fn ollama_load_failure_recovered_by_halved_retry_streams_normally() {
+        // First attempt at num_ctx=131_072 returns load failure;
+        // second attempt at num_ctx=65_536 (half) succeeds. The
+        // wrapper must propagate the success to the caller and
+        // make exactly two requests.
+        let (result, requests) = capture_load_resource_retry_requests(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            131_072,
+        )
+        .await;
+
+        result.expect("retry should recover via halved num_ctx");
+        assert_eq!(requests.len(), 2, "exactly one retry, no exponential decay");
+        assert_eq!(
+            extract_num_ctx_from_request(&requests[0]),
+            131_072,
+            "first attempt uses the initial num_ctx"
+        );
+        assert_eq!(
+            extract_num_ctx_from_request(&requests[1]),
+            65_536,
+            "second attempt uses half"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_load_failure_triggers_one_halved_retry_then_surfaces() {
+        // Both attempts return load failure; the wrapper must
+        // propagate the SECOND attempt's error so the user-facing
+        // message in PR 3 reflects the smaller suggested value
+        // (here: 65_536 / 2 = 32_768).
+        let (result, requests) = capture_load_resource_retry_requests(
+            "HTTP/1.1 500 Internal Server Error\r\nconnection: close\r\n\r\n{\"error\":\"model requires more system memory after halving too\"}",
+            131_072,
+        )
+        .await;
+
+        assert_eq!(requests.len(), 2, "no third attempt — one halved retry only");
+        let error = result.expect_err("second failure must surface as Err");
+        match error {
+            ProviderError::ModelLoadResources {
+                suggested_num_ctx, ..
+            } => {
+                assert_eq!(
+                    suggested_num_ctx, 32_768,
+                    "must reflect the halved attempt's suggestion (65_536/2), not the original"
+                );
+            }
+            other => panic!(
+                "second-attempt failure should propagate as ModelLoadResources, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_load_failure_retry_floors_suggested_num_ctx_at_minimum() {
+        // Pathological setup: requested num_ctx is already so
+        // small that the first failure suggests halving below
+        // the 2_048 floor. The retry should still happen
+        // (with num_ctx=2_048, the floor) rather than refuse
+        // outright.
+        let (result, requests) = capture_load_resource_retry_requests(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            3_000,
+        )
+        .await;
+
+        result.expect("retry should still proceed at the floor");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            extract_num_ctx_from_request(&requests[1]),
+            2_048,
+            "halved from 3_000 floors at MIN_SUGGESTED_NUM_CTX"
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_non_load_failure_does_not_trigger_halved_retry() {
+        // Negative test: a non-load-failure (e.g. 401) on the
+        // first attempt must NOT trigger a halved-num_ctx
+        // retry. Only `ModelLoadResources` does.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let server = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                count += 1;
+                let mut buffer = vec![0_u8; 8192];
+                let _ = socket.read(&mut buffer).await;
+                socket
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnope")
+                    .await
+                    .ok();
+            }
+            count
+        });
+
+        let mut model = ollama_model();
+        model.context_window = 131_072;
+        model.reasoning_capabilities = None;
+        let context = empty_context();
+        let result = OllamaChatProvider::send_request_with_load_resource_retry(
+            reqwest::Client::new(),
+            format!("http://{addr}/api/chat"),
+            &model,
+            &context,
+            &StreamOptions::default(),
+        )
+        .await;
+
+        let error = result.expect_err("auth error must surface");
+        assert!(
+            matches!(error, ProviderError::Auth(_)),
+            "auth error must NOT route through num_ctx retry; got {error:?}"
+        );
+        // We can't reliably count exactly-one accept on the mock
+        // because the server task was aborted on test exit, but
+        // the absence of a halved retry is verified by the typed
+        // error (Auth, not ModelLoadResources).
+        drop(server);
     }
 
     #[tokio::test]
