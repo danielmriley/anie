@@ -1,5 +1,25 @@
 # Plan 09 — markdown rendering perf regression
 
+> **Status (2026-04-25): superseded.** The instrumentation
+> (PR-A) and the suspected fix targets (PR-B) were absorbed
+> into `tui_perf_architecture/`:
+>
+> - `ANIE_PERF_TRACE` JSONL spans + criterion benches landed
+>   under Plan 01 (`306e4e3`, `cd06e21`) — covers PR-A's
+>   `build_lines` instrumentation and PR-C's benchmarks.
+> - `Arc<Vec<Line>>` line cache + `wrap_spans` rewrite +
+>   helper sweep landed under Plan 03/04 (`3fb113d`, `646de92`,
+>   `c058f51`) — covers PR-B's "cheap clone via refcount"
+>   and "fix wrap_spans cost" hypotheses.
+> - Drain-batch coalescing of streaming deltas (`38eda8e`)
+>   removed the per-token re-render cost the user felt as
+>   slowness.
+>
+> See `tui_perf_architecture/execution/README.md` for the
+> consolidated landing record. This doc is kept for the
+> diagnostic reasoning but should not be used as a work
+> source; pick from `tui_perf_architecture/` instead.
+
 **Perf. The TUI felt slower after markdown enabled.**
 
 User-reported: "the TUI feels slow again" after Plan 05 shipped

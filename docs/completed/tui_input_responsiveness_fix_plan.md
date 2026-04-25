@@ -1,5 +1,17 @@
 # TUI input responsiveness fix plan
 
+> **Status (2026-04-25):** PR 1 + PR 2 landed in `c509001`
+> ("tui: improve input responsiveness"), with follow-up
+> `b125f98` skipping the DECSET 2026 sync wrap on keystroke
+> paints to remove the residual VSync-aligned latency on GPU
+> terminals, and `9a57148` adding progressive markdown rendering
+> during streaming. PR 3 (resize hardening) is **gated** — it
+> was conditional on PR 1 + PR 2 leaving visible lag and has
+> not been opened. A fresh `resize_during_stream` bench against
+> the current tree is the right gate-check before opening it.
+> See `tui_perf_architecture/execution/README.md` for the
+> latest perf numbers.
+
 ## Rationale
 
 The reported bug is not "the input widget is slow." The bug is that

@@ -1,5 +1,23 @@
 # Plan 10 — clickable hyperlinks in the TUI
 
+> **Status (2026-04-25):** landed in `f051758`
+> ("plan10: click-to-open hyperlinks (pivot from OSC 8)")
+> via the click-to-open path described in the
+> "Approach pivot" section below — not the OSC 8
+> wrapping-backend route. Implementation: markdown
+> rendering records `(line, col_start, col_end, url)`
+> via `find_link_ranges` (`anie-tui/src/markdown/mod.rs`);
+> `OutputPane::url_at_terminal_position` translates
+> screen coordinates (with scroll offset + pane top) to
+> a hit; `App::handle_left_click` calls
+> `opener::open_browser` (`anie-tui/src/app.rs:1009`).
+> Fallback `(url)` text still renders for non-OSC-8
+> consumers and for terminals without mouse capture.
+>
+> The OSC 8 / wrapping-backend material in the
+> "Design" section below was the pre-pivot survey and
+> is kept for the reasoning but not implemented.
+
 **Feature. Makes URLs in agent output clickable.**
 
 Plan 05 PR D deferred OSC 8 escape emission because ratatui's
