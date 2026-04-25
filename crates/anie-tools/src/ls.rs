@@ -1,11 +1,13 @@
 //! Directory-listing tool.
 //!
 //! One entry per line, with `/` suffix on directories and `*`
-//! suffix on executables. Respects the cwd guard like `read` does.
+//! suffix on executables. Relative paths resolve from the session cwd;
+//! absolute paths are allowed intentionally because tools are not
+//! sandboxed.
 //! Default limit of 500 entries matches pi
 //! (`packages/coding-agent/src/core/tools/ls.ts`).
 
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -24,7 +26,8 @@ pub struct LsTool {
 }
 
 impl LsTool {
-    /// Create an ls tool rooted at the provided working directory.
+    /// Create an ls tool with the provided working directory as the
+    /// default path and base for relative paths.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
         Self {
@@ -45,13 +48,13 @@ impl Tool for LsTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "ls".into(),
-            description: "List the contents of a directory. Directories end with `/`, executables end with `*`. Hidden files are omitted unless `show_hidden: true`. Limit defaults to 500 entries.".into(),
+            description: "List the contents of a directory. Relative paths resolve from the session cwd; absolute paths are allowed. Directories end with `/`, executables end with `*`. Hidden files are omitted unless `show_hidden: true`. Limit defaults to 500 entries.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Directory to list. Defaults to the session cwd."
+                        "description": "Directory to list. Defaults to the session cwd. Relative paths resolve from cwd; absolute paths are allowed."
                     },
                     "show_hidden": {
                         "type": "boolean",
@@ -157,6 +160,8 @@ impl Tool for LsTool {
 
 #[cfg(unix)]
 fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
     metadata.permissions().mode() & 0o111 != 0
 }
 

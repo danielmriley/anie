@@ -28,13 +28,15 @@ pub struct EditTool {
 }
 
 impl EditTool {
-    /// Create an edit tool with its own file-mutation queue.
+    /// Create an edit tool with its own file-mutation queue. Relative
+    /// paths resolve from `cwd`; absolute paths are allowed.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
         Self::with_queue(cwd, Arc::new(FileMutationQueue::new()))
     }
 
     /// Create an edit tool using a shared file-mutation queue.
+    /// Relative paths resolve from `cwd`; absolute paths are allowed.
     #[must_use]
     pub fn with_queue<P: Into<PathBuf>>(cwd: P, mutation_queue: Arc<FileMutationQueue>) -> Self {
         Self {
@@ -53,11 +55,11 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "edit".into(),
-            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits.".into(),
+            description: "Edit a single file using exact text replacement. Relative paths resolve from the session cwd; absolute paths are allowed. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
+                    "path": { "type": "string", "description": "Path to the file to edit. Relative paths resolve from the session cwd; absolute paths are allowed." },
                     "edits": {
                         "type": "array",
                         "maxItems": MAX_EDIT_COUNT,

@@ -12,6 +12,11 @@ Entry point for the anie-rs docs tree.
 - **[refactor_plans/](refactor_plans/)** — large not-yet-started
   refactors. Currently just the pi-shaped extension system (plan 10)
   plus the pi-mono comparison it's grounded in.
+- **[code_review_2026-04-24/](code_review_2026-04-24/)** —
+  implementation-ready hardening plans from the GPT-5.5 review,
+  cross-checked against pi and Codex. Covers async auth, OpenAI image
+  support, retry consistency, persistence visibility, resource caps,
+  TUI event draining, and repo hygiene.
 - **[add_providers/](add_providers/)** — plans for adding new LLM
   providers (OpenRouter, Gemini, xAI/Groq/Cerebras/Mistral, Azure,
   Bedrock, OpenAI Responses). Complements the `adding-providers`
@@ -21,8 +26,10 @@ Entry point for the anie-rs docs tree.
 ### If you want to understand how anie works today
 
 - **[arch/anie-rs_architecture.md](arch/anie-rs_architecture.md)** —
-  crate graph, event flow, session persistence, tool execution.
-  Accurate as of the current tree.
+  canonical architecture source of truth: crate ownership, runtime
+  flow, provider/tool contracts, persistence formats, hot paths,
+  known risks, and refactor guidance. Update this alongside
+  architecture-significant code changes.
 - **[arch/credential_resolution.md](arch/credential_resolution.md)** —
   how auth keys flow (CLI → keyring → JSON → env).
 - **[arch/onboarding_flow.md](arch/onboarding_flow.md)** — first-run

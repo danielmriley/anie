@@ -19,13 +19,15 @@ pub struct WriteTool {
 }
 
 impl WriteTool {
-    /// Create a write tool with its own file-mutation queue.
+    /// Create a write tool with its own file-mutation queue. Relative
+    /// paths resolve from `cwd`; absolute paths are allowed.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
         Self::with_queue(cwd, Arc::new(FileMutationQueue::new()))
     }
 
     /// Create a write tool using a shared file-mutation queue.
+    /// Relative paths resolve from `cwd`; absolute paths are allowed.
     #[must_use]
     pub fn with_queue<P: Into<PathBuf>>(cwd: P, mutation_queue: Arc<FileMutationQueue>) -> Self {
         Self {
@@ -44,11 +46,11 @@ impl Tool for WriteTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "write".into(),
-            description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".into(),
+            description: "Write content to a file. Relative paths resolve from the session cwd; absolute paths are allowed. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to write" },
+                    "path": { "type": "string", "description": "Path to the file to write. Relative paths resolve from the session cwd; absolute paths are allowed." },
                     "content": { "type": "string", "description": "Content to write to the file" }
                 },
                 "required": ["path", "content"],

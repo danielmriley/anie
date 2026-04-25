@@ -35,7 +35,13 @@ Mostly first-time / fresh-hardware setups with large models:
 
 - Mac mini / 16 GB Mac with a 32B+ model and `num_ctx =
   262 144` from `/api/show` → KV cache demand exceeds
-  available RAM at load time.
+  available RAM at load time. (On Apple Silicon, "VRAM" is
+  unified memory; the cap is hardware-agnostic — the user
+  picks based on their actual ceiling, not based on a
+  separate GPU/CPU split. A 16 GB unified-memory Mac and a
+  16 GB-VRAM PC have different practical ceilings even at the
+  same nominal number, so this plan does not try to auto-
+  detect; it gives the user a knob.)
 - A homelab box with 24 GB VRAM trying to run several
   parallel anie sessions against the same Ollama — each
   session's KV demand is independent from anie's perspective
@@ -45,6 +51,14 @@ For users with abundant memory the default behavior is
 correct and this plan adds nothing. The cap is unset by
 default; users who want it set it once in
 `~/.anie/config.toml`.
+
+### Why pi has no equivalent
+
+pi-mono uses Ollama's OpenAI-compatible endpoint exclusively
+and never sends `options.num_ctx` (`grep -r num_ctx
+pi/packages` returns zero matches). The whole `[ollama]`
+config block proposed here is **anie-specific** and must be
+flagged inline at the type definition per CLAUDE.md §3.
 
 ## Design
 

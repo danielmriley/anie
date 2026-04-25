@@ -1749,10 +1749,7 @@ mod tests {
         );
         // `model_id.contains("reason")` and `starts_with('o')`
         // still apply — they're independent of the family rule.
-        assert_eq!(
-            infer_reasoning("openai", "o4-mini", None, None),
-            Some(true),
-        );
+        assert_eq!(infer_reasoning("openai", "o4-mini", None, None), Some(true),);
         // Anthropic provider short-circuit still applies.
         assert_eq!(
             infer_reasoning("anthropic", "claude-sonnet-4-6", None, None),
@@ -1876,9 +1873,9 @@ mod tests {
         // exit criteria. 500 on /api/show must not propagate as
         // an outer Err.
         let server = spawn_mock_server(|path, _headers| match path.as_str() {
-            "/api/tags" => MockResponse::ok_json(
-                r#"{"models":[{"name":"qwen3:32b","model":"qwen3:32b"}]}"#,
-            ),
+            "/api/tags" => {
+                MockResponse::ok_json(r#"{"models":[{"name":"qwen3:32b","model":"qwen3:32b"}]}"#)
+            }
             "/api/show" => MockResponse::status(500, "server error"),
             _ => MockResponse::status(404, "not found"),
         })
@@ -1905,12 +1902,12 @@ mod tests {
         // provider_capabilities so the catalog can represent it
         // without a schema bump.
         let server = spawn_mock_server(|path, _headers| match path.as_str() {
-            "/api/tags" => MockResponse::ok_json(
-                r#"{"models":[{"name":"future:7b","model":"future:7b"}]}"#,
-            ),
-            "/api/show" => MockResponse::ok_json(
-                r#"{"capabilities":["completion","future-capability-xyz"]}"#,
-            ),
+            "/api/tags" => {
+                MockResponse::ok_json(r#"{"models":[{"name":"future:7b","model":"future:7b"}]}"#)
+            }
+            "/api/show" => {
+                MockResponse::ok_json(r#"{"capabilities":["completion","future-capability-xyz"]}"#)
+            }
             _ => MockResponse::status(404, "not found"),
         })
         .await;
@@ -1961,9 +1958,9 @@ mod tests {
         // discovery layer must not panic and context_length
         // falls back to whatever /api/tags provided (None here).
         let server = spawn_mock_server(|path, _headers| match path.as_str() {
-            "/api/tags" => MockResponse::ok_json(
-                r#"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b"}]}"#,
-            ),
+            "/api/tags" => {
+                MockResponse::ok_json(r#"{"models":[{"name":"qwen3.5:9b","model":"qwen3.5:9b"}]}"#)
+            }
             "/api/show" => MockResponse::ok_json(r#"{"capabilities":["completion"]}"#),
             _ => MockResponse::status(404, "not found"),
         })

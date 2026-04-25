@@ -22,7 +22,8 @@ pub struct ReadTool {
 }
 
 impl ReadTool {
-    /// Create a read tool rooted at the provided working directory.
+    /// Create a read tool with the provided working directory as the
+    /// base for relative paths. Absolute paths are allowed.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
         Self {
@@ -40,11 +41,11 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "read".into(),
-            description: "Read file contents. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). When you need the full file, continue with offset until complete.".into(),
+            description: "Read file contents. Relative paths resolve from the session cwd; absolute paths are allowed. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). When you need the full file, continue with offset until complete.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
+                    "path": { "type": "string", "description": "Path to the file to read. Relative paths resolve from the session cwd; absolute paths are allowed." },
                     "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
                     "limit": { "type": "integer", "description": "Maximum number of lines to read" }
                 },

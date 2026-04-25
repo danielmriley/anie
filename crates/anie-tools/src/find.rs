@@ -33,7 +33,8 @@ pub struct FindTool {
 }
 
 impl FindTool {
-    /// Create a find tool rooted at the provided working directory.
+    /// Create a find tool with the provided working directory as the
+    /// default search root and base for relative paths.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
         Self {
@@ -54,7 +55,7 @@ impl Tool for FindTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "find".into(),
-            description: "Find files matching a glob pattern (e.g. 'src/**/*.rs'). Respects .gitignore by default. Returns one path per line, up to 1000 results or 50 KB of output.".into(),
+            description: "Find files matching a glob pattern (e.g. 'src/**/*.rs'). Relative paths resolve from the session cwd; absolute paths are allowed. Respects .gitignore by default. Returns one path per line, up to 1000 results or 50 KB of output.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -64,7 +65,7 @@ impl Tool for FindTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Search root directory. Defaults to the session cwd."
+                        "description": "Search root directory. Defaults to the session cwd. Relative paths resolve from cwd; absolute paths are allowed."
                     },
                     "limit": {
                         "type": "integer",

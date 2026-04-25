@@ -41,6 +41,9 @@ pub struct AnieConfig {
     /// Interactive TUI preferences.
     #[serde(default)]
     pub ui: UiConfig,
+    /// Built-in tool configuration.
+    #[serde(default)]
+    pub tools: ToolsConfig,
     /// True if a loaded config file (`~/.anie/config.toml` or
     /// a project-local `.anie/config.toml`) explicitly set the
     /// `[model]` section. Lets callers distinguish "the user
@@ -50,6 +53,51 @@ pub struct AnieConfig {
     /// declared default. Not persisted — derived at load time.
     #[serde(skip)]
     pub model_explicitly_set: bool,
+}
+
+/// Built-in tool configuration. These settings are guardrails and
+/// presentation preferences; they are not a sandbox boundary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ToolsConfig {
+    /// Bash tool settings.
+    #[serde(default)]
+    pub bash: BashToolConfig,
+}
+
+/// Bash tool settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BashToolConfig {
+    /// Pre-spawn deny policy for bash commands.
+    #[serde(default)]
+    pub policy: BashPolicyConfig,
+}
+
+/// Pre-spawn deny policy for bash commands.
+///
+/// This policy reduces accidental execution of commands a user never
+/// wants anie to run. It is not a sandbox: shell indirection and other
+/// tools can still bypass textual checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BashPolicyConfig {
+    /// Whether the policy is evaluated before spawning the shell.
+    pub enabled: bool,
+    /// Exact command names to block, matched against command basenames
+    /// after simple shell-segment splitting.
+    #[serde(default)]
+    pub deny_commands: Vec<String>,
+    /// Regex patterns matched against the raw command string.
+    #[serde(default)]
+    pub deny_patterns: Vec<String>,
+}
+
+impl Default for BashPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            deny_commands: Vec::new(),
+            deny_patterns: Vec::new(),
+        }
+    }
 }
 
 /// Interactive-TUI-only preferences. None of these affect the
@@ -578,7 +626,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 /// Return the default config template written on first run.
 #[must_use]
 pub fn default_config_template() -> &'static str {
-    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
+    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
 }
 
 fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
@@ -649,6 +697,21 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.context.max_total_bytes = max_total_bytes;
         }
     }
+
+    if let Some(tools) = partial.tools
+        && let Some(bash) = tools.bash
+        && let Some(policy) = bash.policy
+    {
+        if let Some(enabled) = policy.enabled {
+            config.tools.bash.policy.enabled = enabled;
+        }
+        if let Some(deny_commands) = policy.deny_commands {
+            config.tools.bash.policy.deny_commands = deny_commands;
+        }
+        if let Some(deny_patterns) = policy.deny_patterns {
+            config.tools.bash.policy.deny_patterns = deny_patterns;
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -673,6 +736,8 @@ struct PartialAnieConfig {
     compaction: Option<PartialCompactionConfig>,
     #[serde(default)]
     context: Option<PartialContextConfig>,
+    #[serde(default)]
+    tools: Option<PartialToolsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -702,6 +767,23 @@ struct PartialContextConfig {
     filenames: Option<Vec<String>>,
     max_file_bytes: Option<u64>,
     max_total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialToolsConfig {
+    bash: Option<PartialBashToolConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialBashToolConfig {
+    policy: Option<PartialBashPolicyConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialBashPolicyConfig {
+    enabled: Option<bool>,
+    deny_commands: Option<Vec<String>>,
+    deny_patterns: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -882,6 +964,71 @@ mod tests {
             load_config_with_paths(None, None, CliOverrides::default()).expect("load defaults");
         assert_eq!(config.model.provider, "openai");
         assert_eq!(config.context.max_total_bytes, 65_536);
+        assert!(config.tools.bash.policy.enabled);
+        assert!(config.tools.bash.policy.deny_commands.is_empty());
+        assert!(config.tools.bash.policy.deny_patterns.is_empty());
+    }
+
+    #[test]
+    fn bash_policy_loads_from_config() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.bash.policy]
+            enabled = true
+            deny_commands = ["rm", "dd"]
+            deny_patterns = ["git\\s+push\\s+--force"]
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert!(config.tools.bash.policy.enabled);
+        assert_eq!(config.tools.bash.policy.deny_commands, vec!["rm", "dd"]);
+        assert_eq!(
+            config.tools.bash.policy.deny_patterns,
+            vec!["git\\s+push\\s+--force"]
+        );
+    }
+
+    #[test]
+    fn bash_policy_layer_merging_replaces_lists() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.toml");
+        let project_path = tempdir.path().join("project.toml");
+        fs::write(
+            &global_path,
+            r#"
+            [tools.bash.policy]
+            deny_commands = ["rm", "dd"]
+            deny_patterns = ["curl"]
+            "#,
+        )
+        .expect("write global config");
+        fs::write(
+            &project_path,
+            r#"
+            [tools.bash.policy]
+            enabled = false
+            deny_commands = ["git"]
+            "#,
+        )
+        .expect("write project config");
+
+        let config = load_config_with_paths(
+            Some(&global_path),
+            Some(&project_path),
+            CliOverrides::default(),
+        )
+        .expect("load config");
+
+        assert!(!config.tools.bash.policy.enabled);
+        assert_eq!(config.tools.bash.policy.deny_commands, vec!["git"]);
+        assert_eq!(config.tools.bash.policy.deny_patterns, vec!["curl"]);
     }
 
     #[test]

@@ -59,6 +59,29 @@ So the affected population is "users running larger models on
 constrained hardware." The slash command is the fix; this plan
 makes the fix discoverable.
 
+### Why pi has no equivalent
+
+Worth stating because the project's pi-adoption discipline
+demands it (CLAUDE.md §3). pi-mono uses Ollama's
+OpenAI-compatible endpoint exclusively and never sends
+`options.num_ctx` on the wire (pi has no native `/api/chat`
+codepath — see
+[`docs/ollama_native_chat_api/README.md`](../ollama_native_chat_api/README.md)
+"What pi-mono and codex do"). pi therefore cannot trigger the
+load-failure failure mode this plan addresses. Grepping pi's
+source for `num_ctx` returns zero matches.
+
+The whole `ProviderError::ModelLoadResources` plane is
+**anie-specific** and must be flagged inline at the variant
+definition in PR 1, per CLAUDE.md §3.
+
+pi does have a thoughtful **prompt-overflow** detector at
+[`packages/ai/src/utils/overflow.ts`](../../../pi/packages/ai/src/utils/overflow.ts),
+but that addresses a different failure mode (a successfully-
+loaded model receiving an oversized prompt). See "Distinct
+from anie's existing overflow detector" below and the
+"Deferred" section.
+
 ### What a load failure looks like on the wire
 
 **Empirical verification required before PR 1 lands.** The
@@ -134,6 +157,42 @@ the outer (controller) layer, since the inner-strategy retry
 in `OllamaChatProvider::stream` handles the recoverable case.
 The outer give-up is what surfaces the actionable message to
 the user — the provider has already tried halving once.
+
+### Distinct from anie's existing overflow detector
+
+anie already has a prompt-overflow detector at
+[`crates/anie-providers-builtin/src/util.rs:20-32`](../../crates/anie-providers-builtin/src/util.rs)
+inside `classify_http_error`'s 400-status arm:
+
+```rust
+400 => {
+    let body_lower = body.to_ascii_lowercase();
+    if body_lower.contains("context") || body_lower.contains("token") {
+        anie_provider::ProviderError::ContextOverflow(body.to_string())
+    } else { … }
+}
+```
+
+That's narrower than pi's regex set and only fires on 400. Two
+critical points for this plan's PR 1:
+
+- **Different failure mode.** `ContextOverflow` is "loaded
+  model received a prompt larger than its `num_ctx`."
+  `ModelLoadResources` is "model could not be loaded at all
+  because the requested `num_ctx` is too big for memory."
+  The recovery action differs (compact vs halve `num_ctx`),
+  so the variants must stay distinct.
+- **Different status codes.** Ollama returns load failures
+  primarily on 500 (verify in PR 1 empirical session). The
+  existing detector won't catch them because the existing
+  detector is gated on 400. PR 1's classifier sits in
+  `classify_ollama_error_body` (Ollama-specific), not
+  `classify_http_error` (cross-provider), so there's no
+  ordering ambiguity — but the implementer must NOT
+  re-route load-failure bodies into `ContextOverflow` for
+  consistency. Add an explicit negative test
+  (`load_failure_body_is_not_classified_as_context_overflow`)
+  to lock this in.
 
 ### Body-pattern recognition
 
@@ -443,6 +502,53 @@ Per-PR tests above. Cross-cutting:
   Distinct concern: this plan is reactive (handle the failure
   cleanly); the cap plan is preventive (avoid the failure on
   known-constrained hardware).
+- **Broaden anie's prompt-overflow detector to match pi's
+  coverage.** pi's
+  [`packages/ai/src/utils/overflow.ts`](../../../pi/packages/ai/src/utils/overflow.ts)
+  recognizes overflow patterns from ~12 providers, including
+  Ollama-specific `prompt too long; exceeded (?:max )?context
+  length`, plus a silent-overflow check (`usage.input >
+  contextWindow` after a successful response). anie's current
+  detector at
+  [`util.rs:20-32`](../../crates/anie-providers-builtin/src/util.rs)
+  fires only on HTTP 400 with `body.contains("context") ||
+  body.contains("token")` — narrower in three ways:
+  - Misses Ollama's runtime-overflow body when returned on
+    statuses other than 400.
+  - Misses provider-specific patterns pi has documented (xAI
+    "maximum prompt length", Mistral "too large for model
+    with X maximum context length", LM Studio "greater than
+    the context length", etc.).
+  - No silent-overflow detection. This is the real lever for
+    Ollama-specific concerns going forward: if Ollama
+    silently truncates a prompt to fit its actual loaded
+    `num_ctx` (different from what we sent because of VRAM
+    pressure), anie cannot detect it today. pi catches this
+    via `usage.input > contextWindow`; anie's `Usage` struct
+    already has `input_tokens`, so the check is mechanical.
+
+  This is its own plan, not a slice of this one. Citation:
+  pi's `overflow.ts` is the right shape to mirror (regex set
+  with NEGATIVE patterns to exclude rate-limit lookalikes).
+  pi-cmp note for the future implementer: anie's CLAUDE.md
+  §3 flags pi's regex-on-error-strings as a general anti-
+  pattern, but for body-pattern detection that classifies
+  into typed variants, regex-on-strings IS the established
+  anie pattern (see
+  [`looks_like_native_reasoning_compat_body`](../../crates/anie-providers-builtin/src/openai/reasoning_strategy.rs)).
+  The §3 concern is using regexes as the END of the error
+  taxonomy; using them as a recognition step for typed
+  variants is fine.
+
+- **Silent-truncation detection on the Ollama path.** Ollama
+  sometimes silently clamps `num_ctx` if the requested value
+  doesn't fit at all (recent Ollama versions added this
+  behavior). After a successful response, compare
+  `request_num_ctx` against `usage.prompt_eval_count + N`
+  (where N is a small fudge for token-count mismatches). If
+  the gap suggests truncation, log a one-time hint pointing
+  at `/context-length`. This is a subset of the broader pi-
+  style overflow detector above. Defer.
 
 ## Reference
 

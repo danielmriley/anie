@@ -39,6 +39,10 @@ pub(crate) const MAX_READ_BYTES: usize = 50 * 1024;
 pub(crate) const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const IO_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Resolve a tool path using `cwd` only as the base for relative
+/// paths. Absolute paths and parent traversal are intentionally
+/// preserved: anie tools currently have the same filesystem access as
+/// the process user, not a cwd sandbox.
 pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     let requested = Path::new(path);
     if requested.is_absolute() {
@@ -129,4 +133,37 @@ pub(crate) fn trim_to_char_boundary(value: &str, max_bytes: usize) -> &str {
         boundary -= 1;
     }
     &value[..boundary]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_path_uses_cwd_for_relative_paths() {
+        let cwd = PathBuf::from("workspace").join("project");
+
+        assert_eq!(resolve_path(&cwd, "src/main.rs"), cwd.join("src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_path_preserves_absolute_paths() {
+        let cwd = PathBuf::from("workspace").join("project");
+        let requested = std::env::current_dir().expect("current dir is available");
+
+        assert_eq!(
+            resolve_path(&cwd, requested.to_str().expect("current dir is utf-8")),
+            requested
+        );
+    }
+
+    #[test]
+    fn resolve_path_preserves_parent_traversal() {
+        let cwd = PathBuf::from("workspace").join("project");
+
+        assert_eq!(
+            resolve_path(&cwd, "../outside.txt"),
+            cwd.join("../outside.txt")
+        );
+    }
 }

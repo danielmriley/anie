@@ -11,7 +11,7 @@ mod read;
 mod shared;
 mod write;
 
-pub use bash::BashTool;
+pub use bash::{BashPolicy, BashTool};
 pub use edit::EditTool;
 pub use file_mutation_queue::FileMutationQueue;
 pub use find::FindTool;

@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{AgentLoop, AgentLoopConfig, Tool, ToolExecutionMode, ToolRegistry};
+use anie_agent::{AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionMode, ToolRegistry};
 use anie_protocol::{
     AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
 };
@@ -22,7 +22,7 @@ use crate::edit::{
     MAX_EDIT_ARGUMENT_BYTES, MAX_EDIT_COUNT, MAX_EDIT_INPUT_FILE_BYTES, MAX_EDIT_NEW_TEXT_BYTES,
     MAX_EDIT_OLD_TEXT_BYTES, MAX_EDIT_OUTPUT_FILE_BYTES,
 };
-use crate::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
+use crate::{BashPolicy, BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
 
 struct StaticResolver;
 
@@ -375,6 +375,114 @@ async fn bash_tool_runs_simple_command() {
         .expect("command succeeds");
 
     assert!(text_content(&result).contains("hello"));
+}
+
+#[tokio::test]
+async fn bash_policy_blocks_denied_command_before_spawn() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: true,
+            deny_commands: vec!["touch".into()],
+            deny_patterns: Vec::new(),
+        },
+    );
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "touch blocked.txt" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("policy should block");
+
+    assert!(
+        matches!(error, ToolError::ExecutionFailed(message) if message.contains("command 'touch' is denied"))
+    );
+    assert!(!tempdir.path().join("blocked.txt").exists());
+}
+
+#[tokio::test]
+async fn bash_policy_blocks_denied_command_basename() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: true,
+            deny_commands: vec!["touch".into()],
+            deny_patterns: Vec::new(),
+        },
+    );
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "/usr/bin/touch blocked.txt" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("policy should block");
+
+    assert!(
+        matches!(error, ToolError::ExecutionFailed(message) if message.contains("command 'touch' is denied"))
+    );
+    assert!(!tempdir.path().join("blocked.txt").exists());
+}
+
+#[tokio::test]
+async fn bash_policy_blocks_denied_regex_pattern() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: true,
+            deny_commands: Vec::new(),
+            deny_patterns: vec![r"git\s+push\s+--force".into()],
+        },
+    );
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "git push --force origin main" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("policy should block");
+
+    assert!(
+        matches!(error, ToolError::ExecutionFailed(message) if message.contains("matched deny pattern"))
+    );
+}
+
+#[tokio::test]
+async fn bash_policy_disabled_does_not_block() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: false,
+            deny_commands: vec!["echo".into()],
+            deny_patterns: vec!["echo".into()],
+        },
+    );
+
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "echo allowed" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("disabled policy should not block");
+
+    assert!(text_content(&result).contains("allowed"));
 }
 
 #[cfg(unix)]

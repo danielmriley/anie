@@ -44,7 +44,8 @@ pub struct GrepTool {
 }
 
 impl GrepTool {
-    /// Create a grep tool rooted at the provided working directory.
+    /// Create a grep tool with the provided working directory as the
+    /// default search root and base for relative paths.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
         Self {
@@ -65,7 +66,7 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "grep".into(),
-            description: "Search file contents for a regex pattern. Respects .gitignore by default. Returns `path:line:match` triples, up to 100 matches or 50 KB of output (whichever hits first). Use `ignoreCase` for case-insensitive matching, `literal` to treat the pattern as a fixed string instead of a regex, and `context` to include N lines before/after each match.".into(),
+            description: "Search file contents for a regex pattern. Relative paths resolve from the session cwd; absolute paths are allowed. Respects .gitignore by default. Returns `path:line:match` triples, up to 100 matches or 50 KB of output (whichever hits first). Use `ignoreCase` for case-insensitive matching, `literal` to treat the pattern as a fixed string instead of a regex, and `context` to include N lines before/after each match.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -75,7 +76,7 @@ impl Tool for GrepTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "File or directory to search. Defaults to the session cwd."
+                        "description": "File or directory to search. Defaults to the session cwd. Relative paths resolve from cwd; absolute paths are allowed."
                     },
                     "glob": {
                         "type": "string",
