@@ -66,6 +66,11 @@ pub enum CallbackError {
 /// Plain + self-closing so it works without JS or CSS.
 const SUCCESS_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>anie — login complete</title></head><body style=\"font-family:system-ui,sans-serif;padding:2rem;\"><h1>anie</h1><p>Login complete. You can close this window and return to your terminal.</p></body></html>";
 
+/// Localhost callback clients should send a tiny GET immediately after
+/// connecting. Keep this shorter than the overall OAuth timeout so an
+/// idle local connection cannot consume the entire login window.
+const ACCEPTED_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// HTML rendered when the provider reports an error on
 /// redirect. Keeps the page minimal and instructs the user
 /// what to do.
@@ -132,11 +137,9 @@ pub async fn await_callback_on_path(
             Err(_) => return Err(CallbackError::Timeout(timeout)),
         };
 
-        // Read a reasonable chunk — HTTP request line + headers
-        // for a simple GET easily fits in 8 KiB.
-        let mut buffer = vec![0u8; 8 * 1024];
-        let n = stream.read(&mut buffer).await?;
-        buffer.truncate(n);
+        let Some(buffer) = read_request_chunk(&mut stream, deadline, timeout).await? else {
+            continue;
+        };
         let request = String::from_utf8_lossy(&buffer);
 
         let Some(target) = parse_request_target(&request) else {
@@ -249,6 +252,34 @@ pub async fn await_callback_on_path(
                 });
             }
         }
+    }
+}
+
+async fn read_request_chunk(
+    stream: &mut tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+    overall_timeout: Duration,
+) -> Result<Option<Vec<u8>>, CallbackError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(CallbackError::Timeout(overall_timeout));
+    }
+
+    // Read a reasonable chunk — HTTP request line + headers for a
+    // simple GET easily fits in 8 KiB.
+    let mut buffer = vec![0u8; 8 * 1024];
+    match tokio::time::timeout(
+        remaining.min(ACCEPTED_READ_TIMEOUT),
+        stream.read(&mut buffer),
+    )
+    .await
+    {
+        Ok(Ok(n)) => {
+            buffer.truncate(n);
+            Ok(Some(buffer))
+        }
+        Ok(Err(err)) => Err(CallbackError::Io(err)),
+        Err(_) => Ok(None),
     }
 }
 
@@ -368,6 +399,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CallbackError::Timeout(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn await_callback_ignores_idle_connection_and_accepts_later_valid_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let server = tokio::spawn(await_callback(port, Duration::from_secs(5)));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let idle = tokio::task::spawn_blocking(move || {
+            BlockingTcpStream::connect(("127.0.0.1", port)).expect("idle connect")
+        })
+        .await
+        .expect("idle task");
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = BlockingTcpStream::connect(("127.0.0.1", port)).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            stream
+                .write_all(b"GET /callback?code=late-code&state=late-state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .expect("write valid callback");
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+        })
+        .await
+        .expect("send valid callback");
+        drop(idle);
+
+        let callback = server.await.expect("join").expect("callback");
+        assert_eq!(callback.code, "late-code");
+        assert_eq!(callback.state, "late-state");
     }
 
     #[tokio::test]
