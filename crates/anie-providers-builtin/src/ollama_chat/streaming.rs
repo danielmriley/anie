@@ -7,16 +7,18 @@
 //! | Field | Landing spot |
 //! |-------|--------------|
 //! | `message.content` | `ContentBlock::Text` |
+//! | `message.thinking` | `ContentBlock::Thinking` with no signature |
+//! | `message.tool_calls[].function.name` | `ContentBlock::ToolCall.name` |
+//! | `message.tool_calls[].function.arguments` | `ContentBlock::ToolCall.arguments` |
 //! | `done_reason` | `OllamaChatStreamState::done_reason` for terminal classification |
 //! | `prompt_eval_count` | `Usage::input_tokens` |
 //! | `eval_count` | `Usage::output_tokens` |
 //!
-//! Fields deferred to later PRs in this plan:
+//! Synthesized by anie:
 //!
-//! | Field | Why safe for this PR |
-//! |-------|----------------------|
-//! | `message.thinking` | PR 4 adds `ThinkingDelta`; PR 3 is text-only. |
-//! | `message.tool_calls` | PR 4 adds tool-call lifecycle support. |
+//! | Field | Why synthesized |
+//! |-------|-----------------|
+//! | `ToolCall.id` | Ollama does not emit a stable tool-call id. |
 //!
 //! Intentionally dropped on replay:
 //!
@@ -31,14 +33,17 @@
 
 use serde::Deserialize;
 
-use anie_protocol::{AssistantMessage, ContentBlock, StopReason, Usage, now_millis};
+use anie_protocol::{AssistantMessage, ContentBlock, StopReason, ToolCall, Usage, now_millis};
 use anie_provider::{Model, ProviderError, ProviderEvent};
 
 use super::classify_ollama_error_body;
 
 pub(super) struct OllamaChatStreamState {
     model: Model,
+    thinking: String,
     text: String,
+    tool_calls: Vec<ToolCall>,
+    tool_call_counter: u64,
     usage: Usage,
     done_reason: Option<String>,
     finished: bool,
@@ -48,7 +53,10 @@ impl OllamaChatStreamState {
     pub(super) fn new(model: &Model) -> Self {
         Self {
             model: model.clone(),
+            thinking: String::new(),
             text: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_counter: 0,
             usage: Usage::default(),
             done_reason: None,
             finished: false,
@@ -72,16 +80,22 @@ impl OllamaChatStreamState {
 
         let mut events = Vec::new();
         if let Some(message) = chunk.message {
-            if message.tool_calls.is_some() {
-                return Err(ProviderError::UnsupportedStreamFeature(
-                    "Ollama tool_calls are implemented in the native tool-call PR".into(),
-                ));
+            if let Some(thinking) = message.thinking
+                && !thinking.is_empty()
+            {
+                self.thinking.push_str(&thinking);
+                events.push(ProviderEvent::ThinkingDelta(thinking));
             }
             if let Some(content) = message.content
                 && !content.is_empty()
             {
                 self.text.push_str(&content);
                 events.push(ProviderEvent::TextDelta(content));
+            }
+            if let Some(tool_calls) = message.tool_calls {
+                for tool_call in tool_calls {
+                    events.extend(self.push_tool_call(tool_call)?);
+                }
             }
         }
 
@@ -116,18 +130,72 @@ impl OllamaChatStreamState {
     }
 
     fn has_meaningful_content(&self) -> bool {
-        !self.text.is_empty()
+        !self.text.is_empty() || !self.tool_calls.is_empty()
+    }
+
+    fn push_tool_call(
+        &mut self,
+        tool_call: OllamaToolCall,
+    ) -> Result<Vec<ProviderEvent>, ProviderError> {
+        self.tool_call_counter += 1;
+        let id = format!("ollama_tool_call_{}", self.tool_call_counter);
+        let arguments = tool_call
+            .function
+            .arguments
+            .unwrap_or(serde_json::Value::Null);
+        let arguments_delta = serde_json::to_string(&arguments).map_err(|error| {
+            ProviderError::ToolCallMalformed(format!(
+                "failed to serialize Ollama tool-call arguments: {error}"
+            ))
+        })?;
+        let call = ToolCall {
+            id: id.clone(),
+            name: tool_call.function.name,
+            arguments,
+        };
+        let start = ToolCall {
+            id: id.clone(),
+            name: call.name.clone(),
+            arguments: serde_json::Value::Null,
+        };
+        self.tool_calls.push(call);
+        Ok(vec![
+            ProviderEvent::ToolCallStart(start),
+            ProviderEvent::ToolCallDelta {
+                id: id.clone(),
+                arguments_delta,
+            },
+            ProviderEvent::ToolCallEnd { id },
+        ])
     }
 
     #[allow(clippy::wrong_self_convention)]
     fn into_message(&mut self) -> AssistantMessage {
         self.finished = true;
-        AssistantMessage {
-            content: vec![ContentBlock::Text {
+        let mut content = Vec::new();
+        if !self.thinking.is_empty() {
+            content.push(ContentBlock::Thinking {
+                thinking: std::mem::take(&mut self.thinking),
+                signature: None,
+            });
+        }
+        if !self.text.is_empty() {
+            content.push(ContentBlock::Text {
                 text: std::mem::take(&mut self.text),
-            }],
+            });
+        }
+        for tool_call in std::mem::take(&mut self.tool_calls) {
+            content.push(ContentBlock::ToolCall(tool_call));
+        }
+        let used_tool = content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall(_)));
+        AssistantMessage {
+            content,
             usage: std::mem::take(&mut self.usage),
             stop_reason: match self.done_reason.as_deref() {
+                Some("tool_calls") => StopReason::ToolUse,
+                _ if used_tool => StopReason::ToolUse,
                 Some("stop") | Some("length") | None => StopReason::Stop,
                 _ => StopReason::Stop,
             },
@@ -161,7 +229,21 @@ struct OllamaChatMessage {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
-    tool_calls: Option<Vec<serde_json::Value>>,
+    thinking: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct OllamaToolCall {
+    function: OllamaToolFunction,
+}
+
+#[derive(Deserialize)]
+struct OllamaToolFunction {
+    name: String,
+    #[serde(default)]
+    arguments: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -259,5 +341,78 @@ mod tests {
             .expect_err("empty response");
 
         assert_eq!(error, ProviderError::EmptyAssistantResponse);
+    }
+
+    #[test]
+    fn streaming_state_emits_thinking_deltas_when_think_is_true() {
+        let mut state = OllamaChatStreamState::new(&sample_model());
+
+        let events = state
+            .process_line(r#"{"message":{"role":"assistant","thinking":"plan"},"done":false}"#)
+            .expect("thinking line");
+
+        assert_eq!(events, vec![ProviderEvent::ThinkingDelta("plan".into())]);
+    }
+
+    #[test]
+    fn streaming_state_emits_tool_call_lifecycle_for_arguments_object() {
+        let mut state = OllamaChatStreamState::new(&sample_model());
+
+        let events = state
+            .process_line(
+                r#"{"message":{"role":"assistant","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"Cargo.toml"}}}]},"done":false}"#,
+            )
+            .expect("tool call line");
+
+        assert!(matches!(
+            events.first(),
+            Some(ProviderEvent::ToolCallStart(ToolCall { name, .. })) if name == "read_file"
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(ProviderEvent::ToolCallDelta { arguments_delta, .. })
+                if arguments_delta == r#"{"path":"Cargo.toml"}"#
+        ));
+        assert!(matches!(
+            events.get(2),
+            Some(ProviderEvent::ToolCallEnd { .. })
+        ));
+    }
+
+    #[test]
+    fn streaming_state_populates_usage_from_done_line() {
+        let mut state = OllamaChatStreamState::new(&sample_model());
+        state
+            .process_line(r#"{"message":{"role":"assistant","content":"ok"},"done":false}"#)
+            .expect("text line");
+
+        let events = state
+            .process_line(
+                r#"{"done":true,"done_reason":"stop","prompt_eval_count":13,"eval_count":21}"#,
+            )
+            .expect("done line");
+
+        let Some(ProviderEvent::Done(message)) = events.last() else {
+            panic!("expected done");
+        };
+        assert_eq!(message.usage.input_tokens, 13);
+        assert_eq!(message.usage.output_tokens, 21);
+        assert_eq!(message.usage.total_tokens, Some(34));
+    }
+
+    #[test]
+    fn tool_call_id_is_synthesized_when_ollama_omits_it() {
+        let mut state = OllamaChatStreamState::new(&sample_model());
+
+        let events = state
+            .process_line(
+                r#"{"message":{"role":"assistant","tool_calls":[{"function":{"name":"read_file","arguments":{}}}]},"done":false}"#,
+            )
+            .expect("tool call line");
+
+        let Some(ProviderEvent::ToolCallStart(tool_call)) = events.first() else {
+            panic!("expected tool call start");
+        };
+        assert_eq!(tool_call.id, "ollama_tool_call_1");
     }
 }

@@ -46,9 +46,27 @@ impl OllamaChatProvider {
         &self,
         model: &Model,
         context: &LlmContext,
-        _options: &StreamOptions,
+        options: &StreamOptions,
     ) -> serde_json::Value {
-        build_request_body(model, context)
+        build_request_body(model, context, options)
+    }
+
+    async fn send_request_with_reasoning_retry(
+        client: reqwest::Client,
+        url: String,
+        body: serde_json::Value,
+        options: &StreamOptions,
+    ) -> Result<reqwest::Response, ProviderError> {
+        match Self::send_request(client.clone(), url.clone(), body.clone(), options).await {
+            Ok(response) => Ok(response),
+            Err(error @ ProviderError::NativeReasoningUnsupported(_)) => {
+                let retry_body = body_without_think(body);
+                Self::send_request(client, url, retry_body, options)
+                    .await
+                    .map_err(|_| error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn send_request(
@@ -98,10 +116,10 @@ impl Provider for OllamaChatProvider {
         let provider = self.clone();
         let state_model = model.clone();
         let url = format!("{}/api/chat", model.base_url.trim_end_matches('/'));
-        let body = build_request_body(model, &context);
+        let body = build_request_body(model, &context, &options);
 
         let stream = try_stream! {
-            let response = Self::send_request(provider.client.clone(), url, body, &options).await?;
+            let response = Self::send_request_with_reasoning_retry(provider.client.clone(), url, body, &options).await?;
             yield ProviderEvent::Start;
 
             let mut lines = NdjsonLines::new(response.bytes_stream());
@@ -126,9 +144,16 @@ impl Provider for OllamaChatProvider {
         convert::convert_messages(messages)
     }
 
-    fn convert_tools(&self, _tools: &[ToolDef]) -> Vec<serde_json::Value> {
-        Vec::new()
+    fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
+        crate::tool_schema::openai_function_schema(tools)
     }
+}
+
+fn body_without_think(mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("think");
+    }
+    body
 }
 
 pub(crate) fn classify_ollama_error_body(
@@ -313,5 +338,85 @@ mod tests {
         .await;
 
         assert!(request.contains("x-test-header: present"));
+    }
+
+    async fn capture_reasoning_retry_requests(
+        second_response: &'static str,
+    ) -> (Result<reqwest::Response, ProviderError>, Vec<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server addr");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut buffer = vec![0_u8; 8192];
+                let read = socket.read(&mut buffer).await.expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests.push(request.clone());
+                if index == 0 {
+                    let body = r#"{"error":"first think option is not supported"}"#;
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .expect("write first response");
+                } else {
+                    socket
+                        .write_all(second_response.as_bytes())
+                        .await
+                        .expect("write second response");
+                }
+            }
+            requests
+        });
+
+        let result = OllamaChatProvider::send_request_with_reasoning_retry(
+            reqwest::Client::new(),
+            format!("http://{addr}/api/chat"),
+            json!({
+                "model": "qwen3:32b",
+                "think": true,
+            }),
+            &StreamOptions::default(),
+        )
+        .await;
+        let requests = server.await.expect("server task");
+        (result, requests)
+    }
+
+    #[tokio::test]
+    async fn native_reasoning_unsupported_error_triggers_second_attempt_without_think() {
+        let (result, requests) = capture_reasoning_retry_requests(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+
+        result.expect("retry succeeds");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(r#""think":true"#));
+        assert!(!requests[1].contains(r#""think""#));
+    }
+
+    #[tokio::test]
+    async fn native_reasoning_unsupported_on_second_attempt_surfaces_original_error() {
+        let (result, requests) = capture_reasoning_retry_requests(
+            "HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n{\"error\":\"second think option is not supported\"}",
+        )
+        .await;
+
+        assert_eq!(requests.len(), 2);
+        let error = result.expect_err("second failure should surface original error");
+        assert!(matches!(
+            error,
+            ProviderError::NativeReasoningUnsupported(message) if message.contains("first think")
+        ));
     }
 }
