@@ -29,6 +29,18 @@ struct AutocompleteState {
     popup: Option<AutocompletePopup>,
 }
 
+/// Cached output of `layout_lines_uncached`, keyed by the
+/// triple that affects what the layout renders: width, cursor
+/// position, and content. The triple covers every observable
+/// mutation; we don't have to instrument individual mutators.
+struct CachedLayout {
+    width: u16,
+    cursor: usize,
+    content: String,
+    lines: Vec<String>,
+    cursor_visual: (u16, u16),
+}
+
 /// Multi-line input editor with simple history support.
 pub struct InputPane {
     content: String,
@@ -37,6 +49,14 @@ pub struct InputPane {
     history_index: Option<usize>,
     saved_content: Option<String>,
     autocomplete: Option<AutocompleteState>,
+    cached_layout: Option<CachedLayout>,
+    /// Test-only counter incremented every time
+    /// `layout_lines_uncached` actually runs (i.e., a cache
+    /// miss). Used by the dedupe regression tests to assert
+    /// that repeated reads at the same key are served from
+    /// cache.
+    #[cfg(test)]
+    layout_misses: std::cell::Cell<u64>,
 }
 
 impl InputPane {
@@ -50,6 +70,9 @@ impl InputPane {
             history_index: None,
             saved_content: None,
             autocomplete: None,
+            cached_layout: None,
+            #[cfg(test)]
+            layout_misses: std::cell::Cell::new(0),
         }
     }
 
@@ -264,10 +287,10 @@ impl InputPane {
 
     /// Compute the preferred input height for the given width.
     #[must_use]
-    pub fn preferred_height(&self, width: u16) -> u16 {
+    pub fn preferred_height(&mut self, width: u16) -> u16 {
         let width = width.max(1);
-        let (lines, _) = self.layout_lines(width);
-        let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let cached = self.layout(width);
+        let line_count = u16::try_from(cached.lines.len()).unwrap_or(u16::MAX);
         line_count.clamp(3, 8)
     }
 
@@ -277,19 +300,21 @@ impl InputPane {
     /// the input region reads as a discrete box separate from
     /// the transcript and the status strip — matching pi's and
     /// Claude Code's input styling.
-    pub fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Position {
+    pub fn render(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Position {
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_style(Style::default().fg(Color::DarkGray));
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let (lines, cursor) = self.layout_lines(inner.width.max(1));
-        let rendered_lines = lines
-            .into_iter()
+        let cached = self.layout(inner.width.max(1));
+        let rendered_lines = cached
+            .lines
+            .iter()
             .take(inner.height as usize)
-            .map(|line| Line::styled(line, Style::default().fg(Color::White)))
+            .map(|line| Line::styled(line.clone(), Style::default().fg(Color::White)))
             .collect::<Vec<_>>();
+        let cursor = cached.cursor_visual;
         Paragraph::new(rendered_lines).render(inner, buf);
 
         Position::new(
@@ -300,6 +325,40 @@ impl InputPane {
                 .y
                 .saturating_add(cursor.1.min(inner.height.saturating_sub(1))),
         )
+    }
+
+    /// Return the cached layout for `width`, recomputing only
+    /// when the cache is missing or any of (width, cursor,
+    /// content) changed since the last hit. Both `preferred_height`
+    /// and `render` go through here, so the doubled work that
+    /// used to happen per keystroke paint is eliminated.
+    fn layout(&mut self, width: u16) -> &CachedLayout {
+        let stale = self.cached_layout.as_ref().is_none_or(|c| {
+            c.width != width || c.cursor != self.cursor || c.content != self.content
+        });
+        if stale {
+            let (lines, cursor_visual) = self.layout_lines_uncached(width);
+            #[cfg(test)]
+            self.layout_misses.set(self.layout_misses.get() + 1);
+            self.cached_layout = Some(CachedLayout {
+                width,
+                cursor: self.cursor,
+                content: self.content.clone(),
+                lines,
+                cursor_visual,
+            });
+        }
+        // After the populate above, cached_layout is always
+        // `Some`; `get_or_insert_with` lets the borrow checker
+        // see that without a panic-on-None unwrap.
+        self.cached_layout
+            .get_or_insert_with(|| CachedLayout {
+                width,
+                cursor: self.cursor,
+                content: self.content.clone(),
+                lines: Vec::new(),
+                cursor_visual: (0, 0),
+            })
     }
 
     fn submit(&mut self) -> InputAction {
@@ -497,7 +556,7 @@ impl InputPane {
         }
     }
 
-    fn layout_lines(&self, width: u16) -> (Vec<String>, (u16, u16)) {
+    fn layout_lines_uncached(&self, width: u16) -> (Vec<String>, (u16, u16)) {
         let width = width.max(1) as usize;
         let prefix = "> ";
         let mut lines = vec![String::new()];
@@ -753,6 +812,91 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "tick must not fire an extra refresh"
+        );
+    }
+
+    // ------------------------------------------------------
+    // PR 01: layout cache regression tests.
+    //
+    // The old shape called `layout_lines` once for
+    // `preferred_height` and again from `render`. The cache
+    // collapses both into a single computation per
+    // (width, cursor, content) tuple.
+    // ------------------------------------------------------
+
+    fn miss_count(pane: &InputPane) -> u64 {
+        pane.layout_misses.get()
+    }
+
+    #[test]
+    fn layout_cache_serves_repeat_reads_at_same_key() {
+        let mut pane = InputPane::new();
+        type_char(&mut pane, 'a');
+        type_char(&mut pane, 'b');
+        let _ = pane.preferred_height(80);
+        let initial = miss_count(&pane);
+        // A second preferred_height call at the same width must
+        // not recompute.
+        let _ = pane.preferred_height(80);
+        assert_eq!(miss_count(&pane), initial);
+    }
+
+    #[test]
+    fn layout_cache_invalidates_on_insert() {
+        let mut pane = InputPane::new();
+        type_char(&mut pane, 'a');
+        let _ = pane.preferred_height(80);
+        let before = miss_count(&pane);
+        type_char(&mut pane, 'b');
+        let _ = pane.preferred_height(80);
+        assert_eq!(miss_count(&pane), before + 1);
+    }
+
+    #[test]
+    fn layout_cache_invalidates_on_cursor_move() {
+        let mut pane = InputPane::new();
+        type_char(&mut pane, 'a');
+        type_char(&mut pane, 'b');
+        let _ = pane.preferred_height(80);
+        let before = miss_count(&pane);
+        // Move cursor left — layout output's cursor position
+        // changes, so cache must miss.
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let _ = pane.preferred_height(80);
+        assert_eq!(miss_count(&pane), before + 1);
+    }
+
+    #[test]
+    fn layout_cache_invalidates_on_width_change() {
+        let mut pane = InputPane::new();
+        type_char(&mut pane, 'a');
+        let _ = pane.preferred_height(80);
+        let before = miss_count(&pane);
+        let _ = pane.preferred_height(120);
+        assert_eq!(miss_count(&pane), before + 1);
+    }
+
+    #[test]
+    fn render_after_preferred_height_does_not_recompute() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut pane = InputPane::new();
+        for ch in "hello world".chars() {
+            type_char(&mut pane, ch);
+        }
+        let _ = pane.preferred_height(80);
+        let after_pref = miss_count(&pane);
+        let area = Rect::new(0, 0, 80, 5);
+        let mut buf = Buffer::empty(area);
+        let _ = pane.render(area, &mut buf);
+        // render uses inner.width = area.width = 80 (no border
+        // truncation on a Borders::TOP|BOTTOM block in this
+        // direction), so the cache key matches.
+        assert_eq!(
+            miss_count(&pane),
+            after_pref,
+            "render must not recompute the layout already cached by preferred_height",
         );
     }
 }

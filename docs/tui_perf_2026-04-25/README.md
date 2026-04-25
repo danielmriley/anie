@@ -87,23 +87,22 @@ The OutputPane numbers haven't moved materially. The user's
 complaint is real even though the bench numbers are stable,
 which is itself the finding behind PR 02.
 
-**App + InputPane (new in PR 02):**
+**App + InputPane (PR 02 baseline → PR 01 result):**
 
-| Scenario | Mean |
-|----------|-----:|
-| `keystroke_into_idle_app_600` | 500.23 µs |
-| `keystroke_during_stream_600` | 496.44 µs |
-| `keystroke_into_long_buffer` | 504.14 µs |
+| Scenario | PR 02 | After PR 01 | Δ |
+|----------|------:|------------:|--:|
+| `keystroke_into_idle_app_600` | 500.23 µs | 423.18 µs | -12.5% |
+| `keystroke_during_stream_600` | 496.44 µs | 420.31 µs | -12.3% |
+| `keystroke_into_long_buffer` | 504.14 µs | 423.80 µs | -13.0% |
 
-These first three numbers are the gate values for PR 01, 03, 04.
-A keystroke in the App pipeline costs ~184 µs more than a bare
-`OutputPane::render` on the same transcript — that delta is the
-input-pane + status-bar + render-mode overhead that PRs 01 and
-03 target.
+PR 01 cut ~77 µs/keystroke consistently across all three
+scenarios — exactly what the model predicts when one of two
+`layout_lines` walks is eliminated. The 30% target the plan
+sketched was speculative ("doubled → singled is 50%
+theoretical"); the actual layout step is one of several costs
+in the keystroke paint, so its elimination shows up as a
+consistent ~75 µs floor reduction rather than a long-buffer-
+specific scaling win.
 
-The long-buffer scenario (F-1's target) is barely worse than
-idle — only ~4 µs delta — which says the absolute cost of
-the doubled `layout_lines` walk is small relative to the per-
-frame floor (visible-slice clone, status-bar formatting, etc.).
-PR 01 will help input scaling but the dominant residual will
-come from PR 03's per-frame floor work.
+PR 03 targets the remaining per-frame floor (visible-slice
+clone, status-bar formatting, animated-block walk).
