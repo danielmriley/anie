@@ -286,6 +286,32 @@ pub async fn probe_openai_compatible(
                     } else {
                         None
                     };
+                    // Mirror native_chat PR 6's flip: propagate the
+                    // architectural context length from `/api/show`
+                    // into `Model.context_window`. The literal
+                    // 32_768 above is a placeholder for non-Ollama
+                    // local probes (lmstudio, vllm, custom) that
+                    // can't honor `num_ctx` on the wire and which
+                    // skip this whole block. For Ollama-on-the-
+                    // native-`/api/chat` path the discovered value
+                    // is the truth.
+                    //
+                    // Without this, the local-server-detection path
+                    // produces `Model.context_window = 32_768` and
+                    // the agent loop snapshots that into
+                    // `StreamOptions::num_ctx_override`'s fallback,
+                    // causing Ollama to load with `num_ctx = 32_768`
+                    // even on models whose `/api/show` reports a
+                    // larger architectural max (e.g. 40_960 for
+                    // qwen3:8b, 262_144 for qwen3.5). `to_model`
+                    // already does this for the
+                    // `model_discovery::discover_ollama_tags` path;
+                    // this loop is the equivalent fix for the
+                    // bootstrap / `detect_local_servers` path used
+                    // at startup and onboarding.
+                    if let Some(ctx) = show.context_length {
+                        model.context_window = ctx;
+                    }
                 }
                 Ok(None) => {
                     // Keep heuristic defaults from the filter_map
@@ -620,6 +646,141 @@ mod tests {
         // Non-thinking model → cleared so the silent-drop
         // invariant kicks in.
         assert_eq!(gemma.reasoning_capabilities, None);
+    }
+
+    #[tokio::test]
+    async fn local_probe_propagates_show_context_length_to_model_context_window() {
+        // Regression: the local-server-detection probe was
+        // building `Model { context_window: 32_768, .. }` literal
+        // and never reading `show.context_length`. Live observation:
+        // qwen3:8b's `/api/show` reports `qwen3.context_length =
+        // 40960`, anie's catalog displayed 40 960 (via the
+        // `to_model` path in `discover_ollama_tags`), but the
+        // bootstrap path produced 32 768 and Ollama loaded the
+        // model with `num_ctx = 32_768` despite the user seeing
+        // 40 960 in the TUI.
+        //
+        // After the fix, the probe path mirrors `to_model`: when
+        // `/api/show` carries an architectural context length, it
+        // becomes `Model.context_window` directly, the agent loop
+        // snapshots that into `num_ctx`, and the wire request
+        // reflects the discovered value.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local server");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request_buffer = vec![0u8; 8192];
+                let Ok(_read) = socket.read(&mut request_buffer).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request_buffer);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/v1/models" => r#"{"data":[{"id":"qwen3:8b"}]}"#.to_string(),
+                    "/api/show" => r#"{
+                        "capabilities": ["completion", "thinking"],
+                        "model_info": {
+                            "general.architecture": "qwen3",
+                            "qwen3.context_length": 40960
+                        }
+                    }"#
+                    .to_string(),
+                    _ => String::new(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"))
+            .await
+            .expect("detected local server");
+
+        let qwen = detected
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3:8b")
+            .expect("qwen present");
+        assert_eq!(
+            qwen.context_window, 40_960,
+            "Ollama probe must propagate /api/show's architectural \
+             context length so the wire request honors num_ctx; got {}",
+            qwen.context_window
+        );
+        // Sanity guard: the existing capability propagation must
+        // still work alongside the new context_length wiring.
+        assert!(qwen.supports_reasoning);
+    }
+
+    #[tokio::test]
+    async fn local_probe_keeps_32k_fallback_when_show_omits_context_length() {
+        // Symmetric to the test above: when `/api/show` returns no
+        // `model_info`, the probe must keep the 32_768 fallback so
+        // we don't accidentally promote `Some(0)` or panic.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local server");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request_buffer = vec![0u8; 8192];
+                let Ok(_read) = socket.read(&mut request_buffer).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request_buffer);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = match path.as_str() {
+                    "/v1/models" => r#"{"data":[{"id":"qwen3:8b"}]}"#.to_string(),
+                    "/api/show" => r#"{"capabilities":["completion","thinking"]}"#.to_string(),
+                    _ => String::new(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"))
+            .await
+            .expect("detected local server");
+
+        let qwen = detected
+            .models
+            .iter()
+            .find(|m| m.id == "qwen3:8b")
+            .expect("qwen present");
+        assert_eq!(qwen.context_window, 32_768);
     }
 
     #[tokio::test]
