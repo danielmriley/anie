@@ -64,18 +64,19 @@ pub struct ToolCallResult {
 #[derive(Debug, Clone)]
 struct LineCache {
     width: u16,
-    /// `Arc` so cache reads hand out a cheap reference-count
-    /// bump instead of deep-cloning every `Line` + `Span`.
-    /// Writes also avoid an extra clone — the computed vec
-    /// moves into the Arc and the render path borrows via
-    /// `.iter()`.
-    lines: Arc<Vec<Line<'static>>>,
+    /// Per-line `Arc`s so cache reads hand out refcount bumps
+    /// instead of deep-cloning each `Line` + `Span` + `Cow<str>`.
+    /// PR 06 of `docs/tui_perf_2026-04-25/`: previously this was
+    /// `Arc<Vec<Line>>` but the inner Vec still got deep-cloned
+    /// when extending into `flat_lines`. Per-line `Arc` lets
+    /// `flat_lines` itself store shared refs.
+    lines: Vec<Arc<Line<'static>>>,
     /// Link ranges per line, same length as `lines`. Empty
-    /// `Vec<LinkRange>` entries correspond to lines without
-    /// clickable URLs. Cached alongside the lines so cache-
-    /// hit paths don't re-scan. Also `Arc`-shared for the
-    /// same reason as `lines`.
-    links: Arc<Vec<Vec<LinkRange>>>,
+    /// entries correspond to lines without clickable URLs.
+    /// Cached alongside the lines so cache-hit paths don't
+    /// re-scan. `Vec<LinkRange>` is small (usually empty), so
+    /// per-line `Arc` doesn't pay off the same way.
+    links: Vec<Vec<LinkRange>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,7 +210,12 @@ pub struct OutputPane {
     /// cache-hit render path from O(total_lines) per-Line
     /// clones to O(visible_lines) per frame. See Plan 04 PR-C.
     /// Invalidation tracked via `flat_cache_valid`.
-    flat_lines: Vec<Line<'static>>,
+    /// Flat per-line view for the visible-region render. Each
+    /// line is stored behind an `Arc` so populating this vec
+    /// from cache hits is a refcount bump per line, not a deep
+    /// `Line + Span + Cow<str>` clone. `Buffer::set_line`
+    /// accepts `&Line`, so we deref the `Arc` at render time.
+    flat_lines: Vec<Arc<Line<'static>>>,
     /// Width that `flat_lines` was built at. `None` before the
     /// first render. When the current render width differs,
     /// we rebuild regardless of `flat_cache_valid` because
@@ -633,7 +639,7 @@ impl OutputPane {
         let end = start
             .saturating_add(viewport_height)
             .min(self.flat_lines.len());
-        let visible: &[Line<'static>] = if start < end {
+        let visible: &[Arc<Line<'static>>] = if start < end {
             &self.flat_lines[start..end]
         } else {
             &[]
@@ -649,7 +655,8 @@ impl OutputPane {
         // pipeline (we don't use any of those features — lines
         // are pre-wrapped during build_flat_lines) and avoids
         // the per-frame deep clone that `Paragraph::new(Vec<Line>)`
-        // forces. Cache-hit floor cost falls accordingly.
+        // forced before. The `as_ref()` dereferences the Arc to
+        // produce the `&Line<'_>` Buffer::set_line wants.
         for (row_offset, line) in visible.iter().enumerate() {
             let Ok(offset_u16) = u16::try_from(row_offset) else {
                 break;
@@ -658,7 +665,7 @@ impl OutputPane {
             if y >= area.y.saturating_add(area.height) {
                 break;
             }
-            buf.set_line(area.x, y, line, area.width);
+            buf.set_line(area.x, y, line.as_ref(), area.width);
         }
         drop(paragraph_span);
     }
@@ -690,7 +697,13 @@ impl OutputPane {
     #[cfg(test)]
     fn build_lines(&mut self, width: u16, spinner_frame: &str) -> Vec<Line<'static>> {
         self.rebuild_flat_cache(width, spinner_frame);
-        self.flat_lines.clone()
+        // flat_lines holds Arc<Line> after PR 06 — deep-clone
+        // here is a test convenience; production paths borrow
+        // via `set_line(line.as_ref(), ...)` instead.
+        self.flat_lines
+            .iter()
+            .map(|arc| (**arc).clone())
+            .collect()
     }
 
     /// Fast-path the flat cache when nothing has changed.
@@ -753,7 +766,7 @@ impl OutputPane {
         for index in 0..self.blocks.len() {
             let block = &self.blocks[index];
             if !out.is_empty() {
-                out.push(Line::default());
+                out.push(Arc::new(Line::default()));
                 link_map.push(Vec::new());
             }
 
@@ -770,12 +783,10 @@ impl OutputPane {
                 && let Some(cached) = self.caches.get(index).and_then(Option::as_ref)
                 && cached.width == width
             {
-                // Arc-backed cache: `iter().cloned()` still
-                // clones each `Line`, but that's the only way
-                // to push into `out`. The cache itself is not
-                // cloned — we're just borrowing through the
-                // `Arc` deref. The previous shape paid this
-                // cost AND cloned the outer Vec.
+                // Per-line `Arc` cache: `iter().cloned()` here
+                // is `Arc::clone` for each entry — refcount
+                // bump, no `Line` / `Span` / `Cow<str>` deep
+                // copy. PR 06 of `docs/tui_perf_2026-04-25/`.
                 out.extend(cached.lines.iter().cloned());
                 link_map.extend(cached.links.iter().cloned());
                 cache_hits += 1;
@@ -822,24 +833,24 @@ impl OutputPane {
                 }
                 links
             };
-            // Move the computed vecs into `Arc` once; the cache
-            // entry and the output stream now share the same
-            // backing allocation via refcount bumps. Plan 04 PR-B.
-            let lines_arc = Arc::new(computed);
-            let links_arc = Arc::new(computed_links);
+            // Wrap each line in its own `Arc` so the cache slot
+            // and the flat output share the same allocation. The
+            // cache hit path then refcount-bumps; no deep clone.
+            let lines_arcs: Vec<Arc<Line<'static>>> =
+                computed.into_iter().map(Arc::new).collect();
             if hits_cache && let Some(slot) = self.caches.get_mut(index) {
                 *slot = Some(LineCache {
                     width,
-                    lines: Arc::clone(&lines_arc),
-                    links: Arc::clone(&links_arc),
+                    lines: lines_arcs.clone(),
+                    links: computed_links.clone(),
                 });
                 cache_misses += 1;
             }
-            out.extend(lines_arc.iter().cloned());
-            link_map.extend(links_arc.iter().cloned());
+            out.extend(lines_arcs);
+            link_map.extend(computed_links);
         }
         if out.is_empty() {
-            out.push(Line::default());
+            out.push(Arc::new(Line::default()));
             link_map.push(Vec::new());
         }
         debug_assert_eq!(
