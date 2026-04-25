@@ -1813,6 +1813,7 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
             Some("<provider>"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
+        SlashCommandInfo::builtin("state", "Show persistent values"),
         SlashCommandInfo::builtin("help", "Show help"),
     ]
 }
@@ -1884,6 +1885,18 @@ fn context_length_slash_command_dispatches_ui_action() {
         action,
         crate::UiAction::ContextLength(Some(value)) if value == "16384"
     ));
+}
+
+#[test]
+fn slash_state_dispatches_show_state_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/state");
+
+    let action = action_rx.try_recv().expect("/state must dispatch");
+    assert!(matches!(action, crate::UiAction::ShowState));
 }
 
 #[test]

@@ -227,6 +227,10 @@ pub enum UiAction {
     SetThinking(String),
     /// Query, set, or reset the Ollama native context-length override.
     ContextLength(Option<String>),
+    /// Show a read-only summary of persistent values affecting the
+    /// current model (effective context window, layered overrides,
+    /// session id, persistent file paths).
+    ShowState,
     /// Clear the output pane.
     ClearOutput,
     /// Request a manual context compaction.
@@ -1118,6 +1122,9 @@ impl App {
                 let _ = self
                     .action_tx
                     .send(UiAction::ContextLength(arg.map(str::to_string)));
+            }
+            "state" => {
+                let _ = self.action_tx.send(UiAction::ShowState);
             }
             "compact" => {
                 let _ = self.action_tx.send(UiAction::Compact);

@@ -246,6 +246,10 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
             ArgumentSpec::ContextLengthOverride,
             Some("[N|reset]"),
         ),
+        SlashCommandInfo::builtin(
+            "state",
+            "Show current model, context-window layers, and persistent file paths",
+        ),
         SlashCommandInfo::builtin("compact", "Manually compact the session context"),
         SlashCommandInfo::builtin("fork", "Create a child session branched from now"),
         SlashCommandInfo::builtin("diff", "Show file changes made in this session"),
@@ -469,6 +473,7 @@ mod tests {
             "model",
             "thinking",
             "context-length",
+            "state",
             "compact",
             "fork",
             "diff",

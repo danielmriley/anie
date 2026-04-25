@@ -1748,3 +1748,190 @@ async fn unbounded_channel_preserves_fifo_order_under_burst() {
         .expect("controller join")
         .expect("controller run");
 }
+
+// ---------------------------------------------------------------
+// /state command tests.
+// ---------------------------------------------------------------
+
+#[test]
+fn state_summary_for_ollama_with_runtime_override_shows_all_three_layers() {
+    let mut model = ollama_model();
+    model.context_window = 32_768;
+
+    let summary = format_state_summary(
+        &model,
+        ThinkingLevel::Medium,
+        Some(16_384),
+        Some(32_768),
+        16_384,
+        "session-abc",
+        Some(std::path::PathBuf::from("/tmp/anie/config.toml")),
+        Some(std::path::PathBuf::from("/tmp/anie/state.json")),
+    );
+
+    assert!(summary.contains("ollama:qwen3:32b"), "{summary}");
+    assert!(
+        summary.contains("Effective:        16 384 tokens (runtime override active)"),
+        "{summary}",
+    );
+    assert!(
+        summary.contains("Runtime override: 16 384 (state.json)"),
+        "{summary}",
+    );
+    assert!(
+        summary.contains("Workspace cap:    32 768 (config.toml [ollama] default_max_num_ctx)"),
+        "{summary}",
+    );
+    assert!(
+        summary.contains("Model baseline:   32 768 (Model.context_window)"),
+        "{summary}",
+    );
+}
+
+#[test]
+fn state_summary_for_ollama_without_override_marks_override_none() {
+    let summary = format_state_summary(
+        &ollama_model(),
+        ThinkingLevel::Off,
+        None,
+        Some(32_768),
+        32_768,
+        "session-1",
+        None,
+        None,
+    );
+
+    assert!(
+        summary.contains("Effective:        32 768 tokens\n"),
+        "header should not claim override active: {summary}",
+    );
+    assert!(summary.contains("Runtime override: (none)"), "{summary}");
+    assert!(summary.contains("Workspace cap:    32 768"), "{summary}");
+}
+
+#[test]
+fn state_summary_for_ollama_without_cap_marks_cap_none() {
+    let mut model = ollama_model();
+    model.context_window = 131_072;
+
+    let summary = format_state_summary(
+        &model,
+        ThinkingLevel::High,
+        None,
+        None,
+        131_072,
+        "session-1",
+        None,
+        None,
+    );
+
+    assert!(summary.contains("Runtime override: (none)"), "{summary}");
+    assert!(summary.contains("Workspace cap:    (none)"), "{summary}");
+    assert!(summary.contains("Model baseline:   131 072"), "{summary}");
+}
+
+#[test]
+fn state_summary_for_non_ollama_model_omits_layered_breakdown() {
+    let summary = format_state_summary(
+        &model("gpt-5", "openai"),
+        ThinkingLevel::Medium,
+        None,
+        None,
+        200_000,
+        "session-x",
+        None,
+        None,
+    );
+
+    assert!(summary.contains("openai:gpt-5"), "{summary}");
+    assert!(summary.contains("OpenAICompletions"), "{summary}");
+    assert!(summary.contains("Effective: 200 000 tokens"), "{summary}");
+    assert!(
+        summary.contains("only apply to Ollama /api/chat models"),
+        "{summary}",
+    );
+    assert!(
+        !summary.contains("Runtime override:"),
+        "non-Ollama model should not emit override row: {summary}",
+    );
+    assert!(
+        !summary.contains("Workspace cap:"),
+        "non-Ollama model should not emit cap row: {summary}",
+    );
+}
+
+#[test]
+fn state_summary_includes_thinking_and_session_id() {
+    let summary = format_state_summary(
+        &ollama_model(),
+        ThinkingLevel::High,
+        None,
+        None,
+        32_768,
+        "abc-123-def",
+        None,
+        None,
+    );
+
+    assert!(summary.contains("Thinking: high"), "{summary}");
+    assert!(summary.contains("Active: abc-123-def"), "{summary}");
+}
+
+#[test]
+fn state_summary_lists_persistent_file_paths_when_available() {
+    let summary = format_state_summary(
+        &ollama_model(),
+        ThinkingLevel::Off,
+        None,
+        None,
+        32_768,
+        "s",
+        Some(std::path::PathBuf::from("/home/u/.anie/config.toml")),
+        Some(std::path::PathBuf::from("/home/u/.anie/state.json")),
+    );
+
+    assert!(
+        summary.contains("Config: /home/u/.anie/config.toml (hand-edited)"),
+        "{summary}",
+    );
+    assert!(
+        summary.contains("State:  /home/u/.anie/state.json (written by anie)"),
+        "{summary}",
+    );
+}
+
+#[test]
+fn state_summary_omits_path_lines_when_path_helpers_return_none() {
+    // Guards the no-HOME case where anie_dir() returns None.
+    let summary = format_state_summary(
+        &ollama_model(),
+        ThinkingLevel::Off,
+        None,
+        None,
+        32_768,
+        "s",
+        None,
+        None,
+    );
+
+    assert!(summary.contains("Files"), "{summary}");
+    assert!(!summary.contains("Config:"), "{summary}");
+    assert!(!summary.contains("State: "), "{summary}");
+}
+
+#[tokio::test]
+async fn show_state_action_emits_summary_as_system_message() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test_with_cap(RuntimeState::default(), 32_768);
+
+    controller
+        .handle_action(UiAction::ShowState)
+        .await
+        .expect("show state");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.starts_with("Current model"), "{msg}");
+    assert!(msg.contains("ollama:qwen3:32b"), "{msg}");
+    assert!(msg.contains("Workspace cap:    32 768"), "{msg}");
+    assert!(msg.contains("Files"), "{msg}");
+}

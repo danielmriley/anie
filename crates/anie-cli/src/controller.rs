@@ -445,6 +445,10 @@ impl InteractiveController {
                     }
                 }
             }
+            UiAction::ShowState => {
+                let summary = self.state.state_summary_message();
+                self.send_system_message(&summary).await;
+            }
             UiAction::Compact => {
                 if self.current_run.is_some() {
                     self.send_system_message("Cannot compact while a run is active.")
@@ -779,6 +783,19 @@ impl ControllerState {
         format!(
             "`/context-length` only applies to Ollama native /api/chat models -- selected model '{}:{}' uses {:?}.",
             model.provider, model.id, model.api,
+        )
+    }
+
+    fn state_summary_message(&self) -> String {
+        format_state_summary(
+            self.config.current_model(),
+            self.config.current_thinking(),
+            self.config.active_ollama_num_ctx_override(),
+            self.config.anie_config().ollama.default_max_num_ctx,
+            self.config.effective_ollama_context_window(),
+            self.session.id(),
+            anie_config::global_config_path(),
+            anie_config::anie_state_json_path(),
         )
     }
 
@@ -1270,6 +1287,96 @@ fn format_context_length(value: u64) -> String {
             out.push(' ');
         }
         out.push(ch);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_state_summary(
+    model: &Model,
+    thinking: ThinkingLevel,
+    runtime_override: Option<u64>,
+    workspace_cap: Option<u64>,
+    effective: u64,
+    session_id: &str,
+    config_path: Option<PathBuf>,
+    state_path: Option<PathBuf>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    let _ = writeln!(out, "Current model");
+    let _ = writeln!(
+        out,
+        "  {}:{} · {:?}",
+        model.provider, model.id, model.api,
+    );
+    let _ = writeln!(out, "  Thinking: {}", format_thinking(thinking));
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "Context window");
+    if model.api == ApiKind::OllamaChatApi {
+        let suffix = if runtime_override.is_some() {
+            " (runtime override active)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "  Effective:        {} tokens{suffix}",
+            format_context_length(effective),
+        );
+        let _ = writeln!(
+            out,
+            "  Runtime override: {}",
+            match runtime_override {
+                Some(value) => format!("{} (state.json)", format_context_length(value)),
+                None => "(none)".to_string(),
+            },
+        );
+        let _ = writeln!(
+            out,
+            "  Workspace cap:    {}",
+            match workspace_cap {
+                Some(value) => format!(
+                    "{} (config.toml [ollama] default_max_num_ctx)",
+                    format_context_length(value),
+                ),
+                None => "(none)".to_string(),
+            },
+        );
+        let _ = writeln!(
+            out,
+            "  Model baseline:   {} (Model.context_window)",
+            format_context_length(model.context_window),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  Effective: {} tokens",
+            format_context_length(effective),
+        );
+        let _ = writeln!(
+            out,
+            "  (Layered overrides only apply to Ollama /api/chat models)",
+        );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "Session");
+    let _ = writeln!(out, "  Active: {session_id}");
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "Files");
+    if let Some(path) = config_path {
+        let _ = writeln!(out, "  Config: {} (hand-edited)", path.display());
+    }
+    if let Some(path) = state_path {
+        let _ = writeln!(out, "  State:  {} (written by anie)", path.display());
+    }
+
+    while out.ends_with('\n') {
+        out.pop();
     }
     out
 }
