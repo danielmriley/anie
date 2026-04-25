@@ -87,34 +87,37 @@ The OutputPane numbers haven't moved materially. The user's
 complaint is real even though the bench numbers are stable,
 which is itself the finding behind PR 02.
 
-**Full progression: baseline → PR 01 → PR 03 → PR 04:**
+**Full progression: baseline → all PRs (01–07):**
 
-| Scenario | Baseline | After PR 01 | After PR 03 | After PR 04 | Total Δ |
-|----------|---------:|------------:|------------:|------------:|--------:|
-| `scroll_static_600` (OutputPane only) | 316.68 µs | — | 243.63 µs | 224.33 µs | **-29.2%** |
-| `stream_into_static_600` (OutputPane only) | 2.0047 ms | — | 1.9235 ms | 1.8853 ms | -6.0% |
-| `keystroke_into_idle_app_600` | 500.23 µs | 423.18 µs | 376.91 µs | 372.33 µs | **-25.6%** |
-| `keystroke_during_stream_600` | 496.44 µs | 420.31 µs | 375.08 µs | 371.13 µs | **-25.3%** |
-| `keystroke_into_long_buffer` | 504.14 µs | 423.80 µs | 377.42 µs | 374.68 µs | **-25.7%** |
-| `resize_during_stream` | 98.225 ms | — | 97.696 ms | 97.605 ms | -0.6% |
+| Scenario | Baseline | After PR 06 | After PR 07 | Total Δ |
+|----------|---------:|------------:|------------:|--------:|
+| `scroll_static_600` (OutputPane only) | 316.68 µs | 228.06 µs | 245.36 µs | **-22.5%** |
+| `stream_into_static_600` (OutputPane only) | 2.0047 ms | 763.42 µs | 774.48 µs | **-61.4%** |
+| `keystroke_into_idle_app_600` | 500.23 µs | ~365 µs | ~380 µs | **-24%** |
+| `keystroke_during_stream_600` | 496.44 µs | ~365 µs | ~380 µs | **-24%** |
+| `keystroke_into_long_buffer` | 504.14 µs | ~366 µs | ~380 µs | **-25%** |
+| `resize_during_stream` | 98.225 ms | 98.138 ms | **534.86 µs** | **-99.5%** |
 
-Per-PR gains:
+**Per-PR contribution:**
 
-- **PR 01** (input-pane layout dedupe): ~77 µs off every keystroke.
-- **PR 03** (cache-hit path): ~46 µs off every keystroke; ~73 µs off
-  `scroll_static_600` (pure visible-slice attribution).
-- **PR 04** (streaming hot path): ~19 µs off `scroll_static_600`
-  (find_link_ranges dedupe), ~38 µs off `stream_into_static_600`
-  (bullet/box static-string borrow). Keystroke benches inside noise
-  since they don't exercise streaming or tool-header rendering.
+- **PR 01** (input layout dedupe): -77 µs/keystroke (one of two
+  doubled `layout_lines` walks eliminated).
+- **PR 03** (cache-hit path cleanup): -73 µs scroll, -46 µs/keystroke
+  — visible-slice borrow (the largest single win on the cache-hit
+  path), animated-block count cache, status-bar `shorten_path` cache.
+- **PR 04** (streaming hot path): -19 µs scroll (find_link_ranges
+  dedupe), -38 µs streaming (bullet/box static-string borrow).
+- **PR 05** (simplifications): code-health, no perf target.
+- **PR 06** (per-line `Arc<Line>` sharing): **-1.1 ms streaming**
+  (~60% of `stream_into_static_600`) — cache hits became refcount
+  bumps instead of deep clones of each `Line` + `Span` + `Cow<str>`.
+- **PR 07** (multi-width `LineCache`): **-97.5 ms resize**
+  (~99.5% of `resize_during_stream`) — resize alternations between
+  two widths now hit cache. Trades ~17 µs/+7.6% on `scroll_static_600`
+  (Option pattern overhead vs. the previous direct field compare),
+  but absolute scroll stays well under one frame at 60 fps.
 
-Cumulative: **~127 µs/keystroke removed (~25%)**, with the per-frame
-floor (`scroll_static_600`) down 29%. Streaming-specific scenarios
-have an additional ~38 µs savings on top.
-
-`resize_during_stream` is essentially unchanged through all four PRs —
-PR 03's plan flagged this as expected and resize hardening would need
-its own PR (see archived `tui_input_responsiveness_fix_plan.md` PR 3).
-
-PR 05 is code-health (collapse dispatch match, drop dead parameter,
-merge scroll arms) — no perf target.
+Cumulative: **~120 µs/keystroke removed (-24%)**, **62% off
+streaming render**, **99.5% off resize**. The user's
+input-and-output sluggishness should feel materially better,
+especially during streaming output and on terminal resize.
