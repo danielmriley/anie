@@ -660,6 +660,9 @@ impl AnthropicStreamState {
                 // failure surfaces once and the user can adjust
                 // prompt or model.
                 if !self.has_visible_content() {
+                    if self.raw_stop_reason.as_deref() == Some("max_tokens") {
+                        return Err(ProviderError::ResponseTruncated);
+                    }
                     return Err(ProviderError::EmptyAssistantResponse);
                 }
                 events.push(ProviderEvent::Done(self.into_message()));
@@ -1125,6 +1128,37 @@ mod tests {
         assert!(
             matches!(error, ProviderError::EmptyAssistantResponse),
             "expected EmptyAssistantResponse, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn message_stop_after_max_tokens_without_visible_content_returns_response_truncated() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"thinking"}}"#,
+            )
+            .expect("thinking start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"reasoning only"}}"#,
+            )
+            .expect("thinking delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+        state
+            .process_event("message_delta", r#"{"delta":{"stop_reason":"max_tokens"}}"#)
+            .expect("message delta");
+
+        let error = state
+            .process_event("message_stop", "{}")
+            .expect_err("message_stop must classify max_tokens truncation");
+        assert!(
+            matches!(error, ProviderError::ResponseTruncated),
+            "expected ResponseTruncated, got {error:?}"
         );
     }
 

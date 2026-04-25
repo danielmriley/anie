@@ -61,10 +61,12 @@ pub enum ProviderError {
     )]
     EmptyAssistantResponse,
 
-    /// The provider signalled `finish_reason: "length"` before the
-    /// model produced any visible text or tool call — i.e. the
-    /// response was truncated *during reasoning* because the total
-    /// output token budget was exhausted. Distinct from
+    /// The provider signalled output-budget exhaustion
+    /// (`finish_reason: "length"`, Anthropic `stop_reason:
+    /// "max_tokens"`, or equivalent) before the model produced any
+    /// visible text or tool call — i.e. the response was truncated
+    /// *during reasoning* because the total output token budget was
+    /// exhausted. Distinct from
     /// `EmptyAssistantResponse` because the fix is different: the
     /// model didn't run out of ideas, it ran out of room. Common
     /// on OpenRouter when hosted reasoning models emit several
