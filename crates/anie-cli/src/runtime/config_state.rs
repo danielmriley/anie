@@ -94,6 +94,18 @@ impl ConfigState {
             .unwrap_or(self.current_model.context_window)
     }
 
+    pub(crate) fn set_ollama_num_ctx_override(&mut self, value: u64) {
+        self.runtime_state
+            .ollama_num_ctx_overrides
+            .insert(ollama_num_ctx_key(&self.current_model), value);
+    }
+
+    pub(crate) fn clear_ollama_num_ctx_override(&mut self) {
+        self.runtime_state
+            .ollama_num_ctx_overrides
+            .remove(&ollama_num_ctx_key(&self.current_model));
+    }
+
     pub(crate) fn apply_session_overrides(
         &mut self,
         session_context: &SessionContext,

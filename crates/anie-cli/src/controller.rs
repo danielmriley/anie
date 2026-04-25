@@ -20,7 +20,7 @@ use anie_auth::AuthResolver;
 use anie_config::{AnieConfig, collect_context_files};
 use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
 use anie_provider::{
-    Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
+    ApiKind, Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
 };
 use anie_session::{CompactionConfig, SessionContext, SessionInfo};
 use anie_tui::UiAction;
@@ -34,6 +34,8 @@ use crate::{
 };
 
 const DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day]");
+const MIN_OLLAMA_CONTEXT_LENGTH: u64 = 2_048;
+const MAX_OLLAMA_CONTEXT_LENGTH: u64 = 1_048_576;
 
 use crate::retry_policy::{RetryConfig, RetryDecision, RetryPolicy};
 
@@ -89,6 +91,12 @@ enum PendingRetry {
         attempt: u32,
         already_compacted: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextLengthMutation {
+    Set,
+    Reset,
 }
 
 impl InteractiveController {
@@ -346,6 +354,59 @@ impl InteractiveController {
                     .await;
                     if let Some(warning) = persistence_warning {
                         self.send_system_message(&warning).await;
+                    }
+                }
+            }
+            UiAction::ContextLength(argument) => {
+                if !self.state.current_model_uses_ollama_chat_api() {
+                    self.send_system_message(&self.state.context_length_non_ollama_message())
+                        .await;
+                } else if argument.is_none() {
+                    self.send_system_message(&self.state.context_length_status_message())
+                        .await;
+                } else if self.current_run.is_some() {
+                    self.send_system_message("Cannot change context length while a run is active.")
+                        .await;
+                } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+                    self.send_system_message(
+                        "Cannot change context length while a retry is pending. Abort the retry first.",
+                    )
+                    .await;
+                } else if let Some(argument) = argument {
+                    match self.state.apply_context_length_argument(&argument) {
+                        Ok(ContextLengthMutation::Set) => {
+                            anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                            self.send_system_message(&format!(
+                                "Context window set to {}. Ollama will reload the model on the next request (~5-30 s for this model).",
+                                format_context_length(
+                                    self.state.config.effective_ollama_context_window()
+                                ),
+                            ))
+                            .await;
+                            if let Some(warning) = self
+                                .state
+                                .persist_runtime_state_warning("context_length_set")
+                            {
+                                self.send_system_message(&warning).await;
+                            }
+                        }
+                        Ok(ContextLengthMutation::Reset) => {
+                            anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                            self.send_system_message(&format!(
+                                "Context window reset to {}.",
+                                format_context_length(
+                                    self.state.config.effective_ollama_context_window()
+                                ),
+                            ))
+                            .await;
+                            if let Some(warning) = self
+                                .state
+                                .persist_runtime_state_warning("context_length_reset")
+                            {
+                                self.send_system_message(&warning).await;
+                            }
+                        }
+                        Err(message) => self.send_system_message(&message).await,
                     }
                 }
             }
@@ -672,6 +733,57 @@ impl ControllerState {
             .inner_mut()
             .append_thinking_change(self.config.current_thinking())?;
         Ok(self.persist_runtime_state_warning("set_thinking"))
+    }
+
+    fn current_model_uses_ollama_chat_api(&self) -> bool {
+        self.config.current_model().api == ApiKind::OllamaChatApi
+    }
+
+    fn context_length_non_ollama_message(&self) -> String {
+        let model = self.config.current_model();
+        format!(
+            "`/context-length` only applies to Ollama native /api/chat models -- selected model '{}:{}' uses {:?}.",
+            model.provider, model.id, model.api,
+        )
+    }
+
+    fn context_length_status_message(&self) -> String {
+        let effective = self.config.effective_ollama_context_window();
+        match self.config.active_ollama_num_ctx_override() {
+            Some(_) => format!(
+                "Current context window: {} (runtime override; baseline {})",
+                format_context_length(effective),
+                format_context_length(self.config.current_model().context_window),
+            ),
+            None => format!(
+                "Current context window: {}",
+                format_context_length(effective)
+            ),
+        }
+    }
+
+    fn apply_context_length_argument(
+        &mut self,
+        argument: &str,
+    ) -> Result<ContextLengthMutation, String> {
+        if argument.eq_ignore_ascii_case("reset") {
+            self.config.clear_ollama_num_ctx_override();
+            return Ok(ContextLengthMutation::Reset);
+        }
+
+        let value = argument.parse::<u64>().map_err(|_| {
+            format!(
+                "Invalid context length '{argument}'. Expected an integer from {MIN_OLLAMA_CONTEXT_LENGTH} to {MAX_OLLAMA_CONTEXT_LENGTH}, or reset.",
+            )
+        })?;
+        if !(MIN_OLLAMA_CONTEXT_LENGTH..=MAX_OLLAMA_CONTEXT_LENGTH).contains(&value) {
+            return Err(format!(
+                "Invalid context length {value}. Expected a value from {MIN_OLLAMA_CONTEXT_LENGTH} to {MAX_OLLAMA_CONTEXT_LENGTH}.",
+            ));
+        }
+
+        self.config.set_ollama_num_ctx_override(value);
+        Ok(ContextLengthMutation::Set)
     }
 
     /// Build the compaction config + summarizer for the current
@@ -1069,6 +1181,18 @@ fn format_thinking(level: ThinkingLevel) -> String {
         ThinkingLevel::High => "high",
     }
     .to_string()
+}
+
+fn format_context_length(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String {

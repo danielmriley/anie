@@ -214,6 +214,8 @@ pub enum UiAction {
     SetResolvedModel(Box<Model>),
     /// Set the active thinking level.
     SetThinking(String),
+    /// Query, set, or reset the Ollama native context-length override.
+    ContextLength(Option<String>),
     /// Clear the output pane.
     ClearOutput,
     /// Request a manual context compaction.

@@ -372,24 +372,20 @@ provider remains stateless and receives a single `Option<u64>` via
 - `compaction_summary_request_passes_num_ctx_override`
 - `build_agent_snapshots_num_ctx_override_into_agent_loop_config`
 
-### PR 3 — `/context-length` command
+### PR 3A — `/context-length` controller action
 
-**Why third:** the user-facing surface. Builds on PR 1 (store)
-and PR 2 (consume).
+**Why third-A:** the original PR 3 crosses six files, so it is
+split to respect the five-file rule. This backend slice adds
+the `UiAction`, controller validation/mutation, persistence, and
+request-consistency tests without registering the slash command
+yet.
 
 **Scope:**
 
-- Register `/context-length` in
-  [`anie-cli/src/commands.rs` `builtin_commands()`
-  function](../../crates/anie-cli/src/commands.rs) — pattern
-  identical to the existing `/thinking` registration.
-- Argument spec in
-  [`anie-tui/src/commands.rs::ArgumentSpec`](../../crates/anie-tui/src/commands.rs):
-  `ArgumentSpec::ContextLengthOverride`, accepting no arg,
-  `<positive-integer>`, or the literal `reset`.
-- Controller handler: new
-  `UiAction::ContextLength(Option<String>)` and a
-  `handle_action` arm in
+- Add `UiAction::ContextLength(Option<String>)`.
+- Add `ConfigState` mutators that set/reset the current model's
+  `{provider}:{model_id}` runtime override.
+- Add a controller handler for `UiAction::ContextLength` in
   [`controller.rs:handle_action`](../../crates/anie-cli/src/controller.rs)
   (near the existing `UiAction::SetModel` /
   `UiAction::SetThinking` arms).
@@ -418,7 +414,6 @@ and PR 2 (consume).
 
 **Tests:**
 
-- `context_length_command_registered_with_expected_arg_spec`
 - `context_length_sets_override_for_current_ollama_model`
 - `context_length_reset_clears_override`
 - `context_length_on_non_ollama_model_emits_friendly_error`
@@ -430,9 +425,35 @@ and PR 2 (consume).
 - `context_length_set_emits_status_update_with_effective_context_window`
 - `context_length_override_persists_across_session_restart`
 - `context_length_override_applies_to_next_request_without_reload`
-  (integration test via mock Ollama server: send two requests
-  with an override in between, assert the second request body
-  has the new `num_ctx`).
+  (recording-provider test: apply an override, build the next
+  agent request without reloading config, and assert the
+  request options carry the new `num_ctx`).
+
+### PR 3B — `/context-length` slash-command registration
+
+**Why third-B:** once the controller action is safe and tested,
+wire the user-facing slash command and TUI-side argument
+validation.
+
+**Scope:**
+
+- Register `/context-length` in
+  [`anie-cli/src/commands.rs` `builtin_commands()`
+  function](../../crates/anie-cli/src/commands.rs) — pattern
+  identical to the existing `/thinking` registration.
+- Argument spec in
+  [`anie-tui/src/commands.rs::ArgumentSpec`](../../crates/anie-tui/src/commands.rs):
+  `ArgumentSpec::ContextLengthOverride`, accepting no arg,
+  `<positive-integer>`, or the literal `reset`.
+- Dispatch validated `/context-length [N|reset]` to
+  `UiAction::ContextLength`.
+
+**Tests:**
+
+- `context_length_command_registered_with_expected_arg_spec`
+- `context_length_arg_spec_accepts_query_set_and_reset`
+- `context_length_arg_spec_rejects_out_of_range_and_unparseable_values`
+- `context_length_slash_command_dispatches_ui_action`
 
 ## Test plan
 

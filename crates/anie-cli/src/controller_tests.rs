@@ -6,7 +6,7 @@ use std::{
 
 use super::*;
 use crate::bootstrap::build_tool_registry;
-use crate::runtime_state::RuntimeState;
+use crate::runtime_state::{RuntimeState, load_runtime_state_from};
 use anie_protocol::{StopReason, ToolDef};
 use anie_provider::{
     ApiKind, CostPerMillion, LlmContext, LlmMessage, ModelCompat, Provider, ProviderError,
@@ -422,6 +422,19 @@ fn build_dispatch_controller_with_runtime_state(
     mpsc::Receiver<AgentEvent>,
     mpsc::UnboundedSender<UiAction>,
 ) {
+    build_dispatch_controller_with_runtime_state_path(catalog, event_capacity, runtime_state, None)
+}
+
+fn build_dispatch_controller_with_runtime_state_path(
+    catalog: Vec<Model>,
+    event_capacity: usize,
+    runtime_state: RuntimeState,
+    runtime_state_path: Option<std::path::PathBuf>,
+) -> (
+    InteractiveController,
+    mpsc::Receiver<AgentEvent>,
+    mpsc::UnboundedSender<UiAction>,
+) {
     let tempdir = tempdir().expect("tempdir");
     let cwd = tempdir.path().join("cwd");
     let sessions_dir = tempdir.path().join("sessions");
@@ -438,14 +451,19 @@ fn build_dispatch_controller_with_runtime_state(
         .cloned()
         .unwrap_or_else(|| model("gpt-4o", "openai"));
 
+    let mut config_state = ConfigState::new(
+        config.clone(),
+        runtime_state,
+        default_model.clone(),
+        ThinkingLevel::Medium,
+        None,
+    );
+    if let Some(path) = runtime_state_path {
+        config_state.set_runtime_state_path_for_test(path);
+    }
+
     let state = ControllerState {
-        config: ConfigState::new(
-            config.clone(),
-            runtime_state,
-            default_model.clone(),
-            ThinkingLevel::Medium,
-            None,
-        ),
+        config: config_state,
         session: SessionHandle::from_manager(session, sessions_dir, cwd),
         model_catalog: if catalog.is_empty() {
             vec![default_model]
@@ -642,6 +660,295 @@ async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
     let agent = build_agent(&state);
     let (event_tx, _event_rx) = mpsc::channel(16);
 
+    let result = agent
+        .run(
+            vec![user_message("hello")],
+            Vec::new(),
+            event_tx,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.terminal_error.is_none());
+    let options = recorded_options.lock().expect("recorded options");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].num_ctx_override, Some(16_384));
+}
+
+fn ollama_model() -> Model {
+    model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi)
+}
+
+fn controller_for_context_length_test(
+    runtime_state: RuntimeState,
+) -> (
+    tempfile::TempDir,
+    InteractiveController,
+    mpsc::Receiver<AgentEvent>,
+    mpsc::UnboundedSender<UiAction>,
+) {
+    let tempdir = tempdir().expect("tempdir");
+    let runtime_state_path = tempdir.path().join("state.json");
+    let (controller, event_rx, ui_tx) = build_dispatch_controller_with_runtime_state_path(
+        vec![ollama_model()],
+        32,
+        runtime_state,
+        Some(runtime_state_path),
+    );
+    (tempdir, controller, event_rx, ui_tx)
+}
+
+#[tokio::test]
+async fn context_length_sets_override_for_current_ollama_model() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        Some(16_384)
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("Context window set to 16 384"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_reset_clears_override() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(runtime_state);
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("reset".into())))
+        .await
+        .expect("reset context length");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    assert_eq!(
+        controller.state.config.effective_ollama_context_window(),
+        32_768
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("Context window reset to 32 768"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_on_non_ollama_model_emits_friendly_error() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("reject non-Ollama model");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("only applies to Ollama native /api/chat models")
+            && msg.contains("openai:gpt-4o"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_rejects_out_of_range_value() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("1024".into())))
+        .await
+        .expect("reject out of range");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("Invalid context length 1024") && msg.contains("2048"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_rejects_unparseable_argument() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("wide".into())))
+        .await
+        .expect("reject unparseable");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("Invalid context length 'wide'") && msg.contains("reset"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_set_rejected_while_run_active() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+    controller.current_run = Some(CurrentRun {
+        handle: tokio::spawn(async { anie_agent::AgentRunResult::default() }),
+        cancel: CancellationToken::new(),
+        already_compacted: false,
+        retry_attempt: 0,
+    });
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("reject while active");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("run is active"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_set_rejected_while_retry_pending() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: Instant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+    };
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("reject while retry pending");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("retry is pending"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_no_args_reports_current_effective_value_and_source() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(runtime_state);
+
+    controller
+        .handle_action(UiAction::ContextLength(None))
+        .await
+        .expect("query context length");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert_eq!(
+        msg,
+        "Current context window: 16 384 (runtime override; baseline 32 768)"
+    );
+}
+
+#[tokio::test]
+async fn context_length_set_emits_status_update_with_effective_context_window() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+
+    let event = event_rx.recv().await.expect("status update");
+    assert!(matches!(
+        event,
+        AgentEvent::StatusUpdate {
+            context_window: 16_384,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn context_length_override_persists_across_session_restart() {
+    let tempdir = tempdir().expect("tempdir");
+    let runtime_state_path = tempdir.path().join("state.json");
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller_with_runtime_state_path(
+        vec![ollama_model()],
+        16,
+        RuntimeState::default(),
+        Some(runtime_state_path.clone()),
+    );
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+
+    let loaded = load_runtime_state_from(&runtime_state_path).expect("load state");
+    assert_eq!(
+        loaded
+            .ollama_num_ctx_overrides
+            .get("ollama:qwen3:32b")
+            .copied(),
+        Some(16_384)
+    );
+    let restarted = ConfigState::new(
+        AnieConfig::default(),
+        loaded,
+        ollama_model(),
+        ThinkingLevel::Medium,
+        None,
+    );
+    assert_eq!(restarted.active_ollama_num_ctx_override(), Some(16_384));
+}
+
+#[tokio::test]
+async fn context_length_override_applies_to_next_request_without_reload() {
+    let tempdir = tempdir().expect("tempdir");
+    let recorded_options = Arc::new(Mutex::new(Vec::new()));
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        ApiKind::OllamaChatApi,
+        Box::new(RecordingProvider {
+            options: Arc::clone(&recorded_options),
+        }),
+    );
+    let mut state =
+        build_state_with_registry(ollama_model(), RuntimeState::default(), provider_registry);
+    state
+        .config
+        .set_runtime_state_path_for_test(tempdir.path().join("state.json"));
+    let (event_tx, _event_rx) = mpsc::channel(16);
+    let (_ui_tx, ui_rx) = mpsc::unbounded_channel();
+    let mut controller = InteractiveController::new(state, ui_rx, event_tx, false);
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+    let agent = build_agent(&controller.state);
+    let (event_tx, _event_rx) = mpsc::channel(16);
     let result = agent
         .run(
             vec![user_message("hello")],
