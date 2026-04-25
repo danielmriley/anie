@@ -53,13 +53,15 @@ sessions is the right surface.
   (2 048 ≤ N ≤ 1 048 576). Applied on the next request.
 - `/context-length reset` — clear the override for the current
   model. Falls back to `Model.context_window`.
-- Non-Ollama (hosted) models reject the command with a
-  friendly message: "`/context-length` only applies to Ollama
-  models — selected model '{id}' is served by provider
-  '{name}'."
+- Models whose `Model.api` is not `ApiKind::OllamaChatApi`
+  reject the command with a friendly message:
+  "`/context-length` only applies to Ollama native /api/chat
+  models — selected model '{provider}:{id}' uses {api}."
 - Persisted per-model across sessions.
-- TUI status-bar visibility (optional but nice):
-  `context_window: 16 384 (override)` in the `/model` view.
+- The existing status-bar context denominator uses the
+  effective value, so progress / compaction pressure matches
+  the next request. A source marker like `(override)` is
+  deferred UI polish.
 
 ## Design
 
@@ -83,9 +85,10 @@ pub struct RuntimeState {
 ```
 
 Stored in state.json (not config.toml) because this is a
-runtime preference, not a config declaration. Config values
-still win if the user wants to hard-pin a value —
-`config.toml` remains authoritative.
+runtime preference, not a config declaration. The runtime
+override intentionally shadows config/discovery while active;
+`/context-length reset` returns to the baseline
+`Model.context_window`.
 
 ### Effective-value resolution
 
@@ -107,16 +110,32 @@ Two tiers, short-circuit in order:
    already whichever of config-pinned / discovered / 32 k
    applies, per Plan 1's catalog-load path).
 
-Resolved in the controller just before it calls
-`Provider::stream`: the controller owns both `ConfigState` and
-`RuntimeState`, so it's the one place that can read the
-override map. The resolved value flows into
-`OllamaChatProvider` via a new
-`StreamOptions::num_ctx_override: Option<u64>` field. The
-provider stays stateless — no map lookups, no controller
-pointers — it just reads one `Option<u64>` and writes it to
-the body if set, otherwise uses `Model.context_window`.
-Unit-testable in one place (the resolver).
+Resolved in `ConfigState`, then snapshotted into each
+agent-loop / compaction strategy before a request starts:
+
+1. `ConfigState` owns private `RuntimeState`, so it exposes
+   resolver methods that read `ollama_num_ctx_overrides`
+   without leaking the map.
+2. `build_agent(state)` in `controller.rs` snapshots
+   `ConfigState::active_ollama_num_ctx_override()` into a new
+   `AgentLoopConfig` field.
+3. `AgentLoop::run` copies that field into
+   `StreamOptions::num_ctx_override` when it assembles the
+   provider request at
+   [`anie-agent/src/agent_loop.rs:413-432`](../../crates/anie-agent/src/agent_loop.rs).
+4. `CompactionStrategy` gets the same snapshot so summary
+   requests also honor the user's `num_ctx`.
+5. `OllamaChatProvider` stays stateless — no map lookups, no
+   controller pointers — it just reads one `Option<u64>` and
+   writes it to the body if set, otherwise uses
+   `Model.context_window`.
+
+The effective context window also drives compaction thresholds:
+`ControllerState::compaction_strategy` must use
+`ConfigState::effective_ollama_context_window()` rather than
+raw `current_model().context_window`, otherwise a lower
+override could let the transcript grow beyond the `num_ctx`
+that will be sent to Ollama.
 
 **Persistence model for a user who wants a permanent change:**
 edit `~/.anie/config.toml` and set
@@ -137,18 +156,24 @@ alongside `UiAction::SetModel` / `UiAction::SetThinking`. New
 `UiAction` variant:
 
 ```rust
-UiAction::SetContextLengthOverride(Option<u64>),
-// None  → reset
-// Some  → set to value (already validated by the argument parser)
+UiAction::ContextLength(Option<String>),
+// None          → query
+// Some("reset") → reset
+// Some("<N>")   → set after controller-side validation
 ```
 
 ### Argument parsing
 
-Slash-command argument spec (`ArgumentSpec::FreeForm` with a
-validator) living in
-[`anie-tui::ArgumentSpec`](../../crates/anie-tui/src/commands.rs):
+The current `ArgumentSpec::FreeForm` only validates presence;
+it cannot validate `<N>|reset`. Add a dedicated static variant
+in [`anie-tui::ArgumentSpec`](../../crates/anie-tui/src/commands.rs):
+
+```rust
+ArgumentSpec::ContextLengthOverride
+```
 
 - Accept `<integer>` or the literal string `reset`.
+- Accept no argument for the query form.
 - Reject integers < 2 048 or > 1 048 576 with a message.
 - Reject non-integer / non-`reset` strings with a message
   pointing at the correct usage.
@@ -158,20 +183,17 @@ Echoed in the autocomplete-popup hint column as
 
 ### Status-bar / `/model` visibility
 
-Optional but recommended. The status bar already carries
-`provider_name` / `model_name`
-([`anie-tui/src/app.rs`](../../crates/anie-tui/src/app.rs)
-`StatusBarState`); extend with a computed `context_window`
-string for Ollama models:
+Required: the existing status bar's `{used}/{context_window}`
+denominator must use the **effective** context window. This
+falls out of `ControllerState::status_event` once it uses
+`ConfigState::effective_ollama_context_window()`.
 
-- No override → `ctx 32 768` (value alone; source is
-  "baseline" whether that's config, discovery, or fallback —
-  the distinction requires inspecting the raw `AnieConfig`
-  and `ModelInfo.context_length` from the status-bar path,
-  which isn't worth the plumbing for a cosmetic hint).
-- Runtime override set → `ctx 16 384 (override)`.
-
-Non-Ollama models show nothing extra.
+Deferred: a cosmetic source marker such as `ctx 16 384
+(override)`. That requires extending
+`AgentEvent::StatusUpdate`, `interactive_mode::apply_status_event`,
+`StatusBarState`, and `render_status_bar`; it is not required
+for correctness because `/context-length` query reports the
+source explicitly.
 
 ## Files to touch
 
@@ -186,10 +208,9 @@ Non-Ollama models show nothing extra.
 | `crates/anie-cli/src/controller.rs` | 2B | Snapshot override into `AgentLoopConfig`; use effective context window for compaction + status events |
 | `crates/anie-cli/src/compaction.rs` | 2B | Store/pass `num_ctx_override` in compaction summary requests |
 | `crates/anie-cli/src/commands.rs` | 3 | Register `/context-length` metadata |
-| `crates/anie-tui/src/commands.rs` | 3 | `ArgumentSpec` for `<N>|reset` |
-| `crates/anie-cli/src/controller.rs` | 3 | Handle `UiAction::SetContextLengthOverride`; validate + persist |
-| `crates/anie-tui/src/app.rs` (StatusBarState) | 4 | Show effective context window + source |
-| `crates/anie-cli/src/controller.rs` | 4 | Populate the status-bar field on model switch + override change |
+| `crates/anie-tui/src/commands.rs` | 3 | Add `ArgumentSpec::ContextLengthOverride` |
+| `crates/anie-tui/src/app.rs` | 3 | Dispatch `/context-length` as `UiAction::ContextLength(Option<String>)` |
+| `crates/anie-cli/src/controller.rs` | 3 | Handle query/set/reset; validate, persist, and emit status |
 
 ## Phased PRs
 
@@ -297,8 +318,6 @@ provider remains stateless and receives a single `Option<u64>` via
   impl ConfigState {
       pub(crate) fn active_ollama_num_ctx_override(&self) -> Option<u64> { … }
       pub(crate) fn effective_ollama_context_window(&self) -> u64 { … }
-      pub(crate) fn set_ollama_num_ctx_override(&mut self, value: u64) { … }
-      pub(crate) fn clear_ollama_num_ctx_override(&mut self) { … }
   }
   ```
 
@@ -307,48 +326,51 @@ provider remains stateless and receives a single `Option<u64>` via
   ```rust
   let key = format!("{}:{}", self.current_model().provider,
                     self.current_model().id);
-  runtime_state.ollama_num_ctx_overrides.get(&key).copied()
+  self.runtime_state.ollama_num_ctx_overrides.get(&key).copied()
   ```
+
+  The helper returns `None` unless
+  `self.current_model().api == ApiKind::OllamaChatApi`. Custom
+  provider names backed by Ollama still work; provider-name-only
+  checks are deliberately avoided.
 
   Config-pinned and discovered values live in
   `Model.context_window` (baked in at catalog load); the
   provider reads those when the override is `None`. No
   four-tier ladder, no second lookup into `AnieConfig`.
 
-- Controller populates the field just before
-  `Provider::stream` at
-  [`controller.rs:build_agent`](../../crates/anie-cli/src/controller.rs)
-  (or wherever `StreamOptions` is assembled today; one single
-  site):
+- `build_agent(state)` in
+  [`controller.rs`](../../crates/anie-cli/src/controller.rs)
+  snapshots `state.config.active_ollama_num_ctx_override()`
+  into `AgentLoopConfig`. Then
+  [`AgentLoop::run`](../../crates/anie-agent/src/agent_loop.rs)
+  receives it through the PR 2A `AgentLoopConfig` field.
 
-  ```rust
-  stream_options.num_ctx_override =
-      self.config_state.effective_num_ctx_override(&self.runtime_state);
-  ```
+- `ControllerState::compaction_strategy` uses
+  `state.config.effective_ollama_context_window()` for the
+  `CompactionConfig.context_window` threshold. It also passes
+  the active override into `CompactionStrategy::new`, and
+  `CompactionStrategy::summarize` copies it into its
+  `StreamOptions`. This keeps auto-compaction, overflow
+  recovery, and summary requests consistent with the next
+  Ollama `num_ctx`.
 
-- `ollama_chat/convert.rs` body builder prefers
-  `options.num_ctx_override` over `model.context_window` when
-  present:
-
-  ```rust
-  let num_ctx = options.num_ctx_override.unwrap_or(model.context_window);
-  body["options"] = json!({ "num_ctx": num_ctx });
-  ```
-
-- Non-Ollama providers ignore the field entirely.
+- `ControllerState::status_event` emits
+  `context_window: state.config.effective_ollama_context_window()`
+  so the status bar denominator reflects the active override.
 
 **Tests:**
 
-- `effective_num_ctx_override_returns_none_when_no_runtime_entry`
-- `effective_num_ctx_override_returns_some_when_runtime_entry_present`
-- `effective_num_ctx_override_keyed_by_provider_and_model_tuple`
+- `active_ollama_num_ctx_override_returns_none_when_no_runtime_entry`
+- `active_ollama_num_ctx_override_returns_some_when_runtime_entry_present`
+- `active_ollama_num_ctx_override_keyed_by_provider_and_model_tuple`
   (qwen3:32b on `ollama1` and qwen3:32b on `ollama2` track
   separately).
-- `effective_num_ctx_override_ignores_non_ollama_current_model`
-- `stream_options_num_ctx_override_default_is_none`
-- `ollama_chat_body_prefers_num_ctx_override_over_context_window`
-- `ollama_chat_body_uses_context_window_when_override_is_none`
-- `openai_provider_ignores_num_ctx_override_field`
+- `active_ollama_num_ctx_override_ignores_non_ollama_chat_api_model`
+- `effective_ollama_context_window_uses_override_when_present`
+- `compaction_strategy_uses_effective_ollama_context_window`
+- `compaction_summary_request_passes_num_ctx_override`
+- `build_agent_snapshots_num_ctx_override_into_agent_loop_config`
 
 ### PR 3 — `/context-length` command
 
@@ -363,20 +385,29 @@ and PR 2 (consume).
   identical to the existing `/thinking` registration.
 - Argument spec in
   [`anie-tui/src/commands.rs::ArgumentSpec`](../../crates/anie-tui/src/commands.rs):
-  a custom variant or a `FreeForm` with validation that
-  accepts `<positive-integer>` or the literal `reset`.
+  `ArgumentSpec::ContextLengthOverride`, accepting no arg,
+  `<positive-integer>`, or the literal `reset`.
 - Controller handler: new
-  `UiAction::SetContextLengthOverride(Option<u64>)` and a
+  `UiAction::ContextLength(Option<String>)` and a
   `handle_action` arm in
   [`controller.rs:handle_action`](../../crates/anie-cli/src/controller.rs)
   (near the existing `UiAction::SetModel` /
   `UiAction::SetThinking` arms).
-- Validation — reject non-Ollama models with a friendly
-  system message. Reject out-of-range values with a system
-  message pointing at the accepted range. Accept `reset` and
-  remove the key from the map.
+- Validation — reject models whose `api` is not
+  `ApiKind::OllamaChatApi` with a friendly system message.
+  Reject out-of-range values with a system message pointing at
+  the accepted range. Accept `reset` and remove the key from
+  the map.
+- Runtime safety — reject set/reset while a run is active or a
+  retry backoff is armed. The next retry should not silently
+  change `num_ctx` relative to the failed attempt. The query
+  form may still run while idle/active because it does not
+  mutate state.
 - Persist immediately via the existing
   `ConfigState::persist_runtime_state` path.
+- After set/reset, emit `AgentEvent::StatusUpdate` so the
+  status bar denominator reflects the new effective context
+  window before the next request.
 - `/context-length` with no args emits a system message:
   `"Current context window: 16 384 (runtime override; baseline 262 144)"`
   when an override is active, or
@@ -393,33 +424,15 @@ and PR 2 (consume).
 - `context_length_on_non_ollama_model_emits_friendly_error`
 - `context_length_rejects_out_of_range_value`
 - `context_length_rejects_unparseable_argument`
+- `context_length_set_rejected_while_run_active`
+- `context_length_set_rejected_while_retry_pending`
 - `context_length_no_args_reports_current_effective_value_and_source`
+- `context_length_set_emits_status_update_with_effective_context_window`
 - `context_length_override_persists_across_session_restart`
 - `context_length_override_applies_to_next_request_without_reload`
   (integration test via mock Ollama server: send two requests
   with an override in between, assert the second request body
   has the new `num_ctx`).
-
-### PR 4 — Status-bar visibility
-
-**Why last:** pure UI polish; doesn't block the feature.
-
-**Scope:**
-
-- Extend `StatusBarState` in
-  [`anie-tui/src/app.rs`](../../crates/anie-tui/src/app.rs)
-  with a `context_window_hint: Option<String>` field.
-- Populate on model switch + on override change in the
-  controller.
-- Render next to provider/model in the status bar. For
-  non-Ollama models, `context_window_hint` is `None` and
-  nothing is shown.
-
-**Tests:**
-
-- `status_bar_shows_context_window_value_for_ollama_without_override`
-- `status_bar_shows_override_marker_when_runtime_override_active`
-- `status_bar_omits_context_window_hint_for_non_ollama_models`
 
 ## Test plan
 
@@ -433,7 +446,7 @@ Per-PR tests above. Cross-cutting manual smoke:
 | Manual | `/context-length 0` or `/context-length huge` — expect a rejection, no state change, no reload. | smoke |
 | Manual | `/context-length` on a hosted (non-Ollama) model — expect the friendly error; state unchanged. | smoke |
 | Manual | Restart anie; previously-set override still applies to the next request (persistence). | smoke |
-| Manual | Status bar shows `ctx <value> (source)`; switch models; value updates. | smoke |
+| Manual | Status bar denominator changes to the effective value after set/reset; switch models; value updates. | smoke |
 | Auto | `cargo test --workspace` green. | CI |
 | Auto | `cargo clippy --workspace --all-targets -- -D warnings` clean. | CI |
 
@@ -468,6 +481,14 @@ Per-PR tests above. Cross-cutting manual smoke:
   `/context-length` output distinguishes "override" from
   "baseline" explicitly so the user can tell at a glance.
   `/context-length reset` always returns to the baseline.
+- **Compaction mismatch.** If compaction keeps using
+  `Model.context_window` while the provider sends a smaller
+  override, anie could retain more input than Ollama accepts.
+  PR 2 explicitly routes the effective context window into
+  `CompactionConfig` and compaction summary `StreamOptions`.
+- **Retry consistency.** Changing `num_ctx` during a pending
+  retry would make the retry request differ from the failed
+  request. PR 3 rejects set/reset while a retry is armed.
 - **Tool autocomplete list grows.** Minor — one more entry.
   Well within the existing UI budget.
 
@@ -475,12 +496,11 @@ Per-PR tests above. Cross-cutting manual smoke:
 
 - [ ] PR 1 merged: `RuntimeState.ollama_num_ctx_overrides`
       field exists with forward-compat serde.
-- [ ] PR 2 merged: resolver correctly composes
-      override + discovered + fallback in that precedence.
+- [ ] PR 2 merged: effective `num_ctx` reaches
+      `AgentLoop`, `CompactionStrategy`, `OllamaChatProvider`,
+      compaction thresholds, and status updates.
 - [ ] PR 3 merged: `/context-length` command works end-to-end
       with all four shapes (set, reset, query, error).
-- [ ] PR 4 merged: status bar shows the effective value and
-      source.
 - [ ] Every cross-cutting smoke test above passes against a
       real Ollama instance.
 - [ ] `cargo test --workspace` green.
@@ -506,6 +526,12 @@ Per-PR tests above. Cross-cutting manual smoke:
 - **GC of orphan overrides.** No active cleanup when a model
   disappears from the catalog. Punted as a
   rounding-error-sized concern.
+- **Status-bar source marker.** The status bar's denominator
+  uses the effective context window in PR 2. A cosmetic marker
+  like `ctx 16 384 (override)` can wait; it requires adding a
+  source field to `AgentEvent::StatusUpdate`,
+  `interactive_mode::apply_status_event`, `StatusBarState`, and
+  `render_status_bar`.
 
 ## Reference
 
@@ -521,7 +547,14 @@ Per-PR tests above. Cross-cutting manual smoke:
 - `UiAction` dispatch pattern:
   `crates/anie-cli/src/controller.rs:handle_action` (near the
   `SetModel` / `SetThinking` arms).
-- `StatusBarState`:
+- Agent-loop request construction:
+  `crates/anie-agent/src/agent_loop.rs` (search for
+  `StreamOptions`).
+- Compaction request construction:
+  `crates/anie-cli/src/compaction.rs`.
+- Status events:
+  `crates/anie-protocol/src/events.rs::AgentEvent::StatusUpdate`,
+  `crates/anie-cli/src/controller.rs::status_event`, and
   `crates/anie-tui/src/app.rs` (search for `status_bar`).
 - `RuntimeState` persistence:
   `crates/anie-cli/src/runtime_state.rs`.

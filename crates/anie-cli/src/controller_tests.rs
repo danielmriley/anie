@@ -1,22 +1,32 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::{Mutex, MutexGuard},
+};
 
 use super::*;
 use crate::bootstrap::build_tool_registry;
 use crate::runtime_state::RuntimeState;
-use anie_protocol::StopReason;
+use anie_protocol::{StopReason, ToolDef};
 use anie_provider::{
-    ApiKind, CostPerMillion, ModelCompat, ProviderError,
+    ApiKind, CostPerMillion, LlmContext, LlmMessage, ModelCompat, Provider, ProviderError,
+    ProviderEvent, ProviderStream, StreamOptions,
     mock::{MockProvider, MockStreamScript},
 };
 use anie_session::SessionManager;
+use futures::stream;
 use tempfile::tempdir;
 
 fn model(id: &str, provider: &str) -> Model {
+    model_with_api(id, provider, ApiKind::OpenAICompletions)
+}
+
+fn model_with_api(id: &str, provider: &str, api: ApiKind) -> Model {
     Model {
         id: id.into(),
         name: id.into(),
         provider: provider.into(),
-        api: ApiKind::OpenAICompletions,
+        api,
         base_url: "http://localhost:11434/v1".into(),
         context_window: 32_768,
         max_tokens: 8_192,
@@ -26,6 +36,44 @@ fn model(id: &str, provider: &str) -> Model {
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
         compat: ModelCompat::None,
+    }
+}
+
+struct RecordingProvider {
+    options: Arc<Mutex<Vec<StreamOptions>>>,
+}
+
+impl RecordingProvider {
+    fn lock_options(&self) -> MutexGuard<'_, Vec<StreamOptions>> {
+        self.options.lock().expect("recorded options")
+    }
+}
+
+impl Provider for RecordingProvider {
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: LlmContext,
+        options: StreamOptions,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.lock_options().push(options);
+        Ok(Box::pin(stream::iter(vec![Ok(ProviderEvent::Done(
+            assistant_message("done"),
+        ))])))
+    }
+
+    fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage> {
+        messages
+            .iter()
+            .map(|message| LlmMessage {
+                role: "user".into(),
+                content: serde_json::to_value(message).expect("message json"),
+            })
+            .collect()
+    }
+
+    fn convert_tools(&self, _tools: &[ToolDef]) -> Vec<serde_json::Value> {
+        Vec::new()
     }
 }
 
@@ -362,6 +410,18 @@ fn build_dispatch_controller(
     mpsc::Receiver<AgentEvent>,
     mpsc::UnboundedSender<UiAction>,
 ) {
+    build_dispatch_controller_with_runtime_state(catalog, event_capacity, RuntimeState::default())
+}
+
+fn build_dispatch_controller_with_runtime_state(
+    catalog: Vec<Model>,
+    event_capacity: usize,
+    runtime_state: RuntimeState,
+) -> (
+    InteractiveController,
+    mpsc::Receiver<AgentEvent>,
+    mpsc::UnboundedSender<UiAction>,
+) {
     let tempdir = tempdir().expect("tempdir");
     let cwd = tempdir.path().join("cwd");
     let sessions_dir = tempdir.path().join("sessions");
@@ -381,7 +441,7 @@ fn build_dispatch_controller(
     let state = ControllerState {
         config: ConfigState::new(
             config.clone(),
-            RuntimeState::default(),
+            runtime_state,
             default_model.clone(),
             ThinkingLevel::Medium,
             None,
@@ -405,6 +465,42 @@ fn build_dispatch_controller(
     let controller = InteractiveController::new(state, ui_action_rx, event_tx, false);
 
     (controller, event_rx, ui_action_tx)
+}
+
+fn build_state_with_registry(
+    model: Model,
+    runtime_state: RuntimeState,
+    provider_registry: ProviderRegistry,
+) -> ControllerState {
+    let tempdir = tempdir().expect("tempdir");
+    let cwd = tempdir.path().join("cwd");
+    let sessions_dir = tempdir.path().join("sessions");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+    let config = AnieConfig::default();
+    let tool_registry = build_tool_registry(&cwd, true);
+    let prompt_cache =
+        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+    let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
+
+    ControllerState {
+        config: ConfigState::new(
+            config.clone(),
+            runtime_state,
+            model.clone(),
+            ThinkingLevel::Medium,
+            None,
+        ),
+        session: SessionHandle::from_manager(session, sessions_dir, cwd),
+        model_catalog: vec![model],
+        provider_registry: Arc::new(provider_registry),
+        tool_registry,
+        request_options_resolver: Arc::new(AuthResolver::new(None, config)),
+        prompt_cache,
+        retry_config: RetryConfig::default(),
+        command_registry: crate::commands::CommandRegistry::with_builtins(),
+    }
 }
 
 fn system_message_text(event: &AgentEvent) -> Option<&str> {
@@ -485,6 +581,80 @@ async fn valid_thinking_level_emits_success_message_and_updates_state() {
         controller.state.config.current_thinking(),
         ThinkingLevel::High
     );
+}
+
+#[test]
+fn compaction_strategy_uses_effective_ollama_context_window() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let ollama_model = model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi);
+    let (controller, _event_rx, _tx) =
+        build_dispatch_controller_with_runtime_state(vec![ollama_model], 16, runtime_state);
+
+    let (config, _strategy) = controller.state.compaction_strategy(2_000);
+
+    assert_eq!(config.context_window, 16_384);
+    assert_eq!(config.keep_recent_tokens, 2_000);
+}
+
+#[test]
+fn status_event_uses_effective_ollama_context_window() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let ollama_model = model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi);
+    let (controller, _event_rx, _tx) =
+        build_dispatch_controller_with_runtime_state(vec![ollama_model], 16, runtime_state);
+
+    let event = controller.state.status_event();
+
+    assert!(matches!(
+        event,
+        AgentEvent::StatusUpdate {
+            context_window: 16_384,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
+    let recorded_options = Arc::new(Mutex::new(Vec::new()));
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        ApiKind::OllamaChatApi,
+        Box::new(RecordingProvider {
+            options: Arc::clone(&recorded_options),
+        }),
+    );
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let state = build_state_with_registry(
+        model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+        runtime_state,
+        provider_registry,
+    );
+    let agent = build_agent(&state);
+    let (event_tx, _event_rx) = mpsc::channel(16);
+
+    let result = agent
+        .run(
+            vec![user_message("hello")],
+            Vec::new(),
+            event_tx,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.terminal_error.is_none());
+    let options = recorded_options.lock().expect("recorded options");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].num_ctx_override, Some(16_384));
 }
 
 #[tokio::test]

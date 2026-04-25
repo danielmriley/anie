@@ -681,7 +681,7 @@ impl ControllerState {
         keep_recent_tokens: u64,
     ) -> (CompactionConfig, CompactionStrategy) {
         let config = CompactionConfig {
-            context_window: self.config.current_model().context_window,
+            context_window: self.config.effective_ollama_context_window(),
             reserve_tokens: self.config.anie_config().compaction.reserve_tokens,
             keep_recent_tokens,
         };
@@ -689,6 +689,7 @@ impl ControllerState {
             self.config.current_model().clone(),
             Arc::clone(&self.provider_registry),
             Arc::clone(&self.request_options_resolver),
+            self.config.active_ollama_num_ctx_override(),
         );
         (config, strategy)
     }
@@ -916,7 +917,7 @@ impl ControllerState {
             model_name: self.config.current_model().id.clone(),
             thinking: format_thinking(self.config.current_thinking()),
             estimated_context_tokens: self.estimated_context_tokens(),
-            context_window: self.config.current_model().context_window,
+            context_window: self.config.effective_ollama_context_window(),
             cwd: self.session.cwd().display().to_string(),
             session_id: self.session.id().to_string(),
         }
@@ -977,7 +978,8 @@ fn build_agent(state: &ControllerState) -> AgentLoop {
             state.config.current_thinking(),
             ToolExecutionMode::Parallel,
             Arc::clone(&state.request_options_resolver),
-        ),
+        )
+        .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override()),
     )
 }
 

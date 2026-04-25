@@ -8,7 +8,7 @@
 use anyhow::{Result, anyhow};
 
 use anie_config::{AnieConfig, CliOverrides, load_config};
-use anie_provider::{Model, ThinkingLevel};
+use anie_provider::{ApiKind, Model, ThinkingLevel};
 use anie_session::SessionContext;
 
 use crate::{
@@ -77,6 +77,21 @@ impl ConfigState {
 
     pub(crate) fn set_thinking(&mut self, thinking: ThinkingLevel) {
         self.current_thinking = thinking;
+    }
+
+    pub(crate) fn active_ollama_num_ctx_override(&self) -> Option<u64> {
+        if self.current_model.api != ApiKind::OllamaChatApi {
+            return None;
+        }
+        self.runtime_state
+            .ollama_num_ctx_overrides
+            .get(&ollama_num_ctx_key(&self.current_model))
+            .copied()
+    }
+
+    pub(crate) fn effective_ollama_context_window(&self) -> u64 {
+        self.active_ollama_num_ctx_override()
+            .unwrap_or(self.current_model.context_window)
     }
 
     pub(crate) fn apply_session_overrides(
@@ -205,18 +220,26 @@ impl ConfigState {
     }
 }
 
+fn ollama_num_ctx_key(model: &Model) -> String {
+    format!("{}:{}", model.provider, model.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime_state::load_runtime_state_from;
-    use anie_provider::{ApiKind, CostPerMillion, ModelCompat};
+    use anie_provider::{CostPerMillion, ModelCompat};
 
     fn model(id: &str, provider: &str) -> Model {
+        model_with_api(id, provider, ApiKind::OpenAICompletions)
+    }
+
+    fn model_with_api(id: &str, provider: &str, api: ApiKind) -> Model {
         Model {
             id: id.into(),
             name: id.into(),
             provider: provider.into(),
-            api: ApiKind::OpenAICompletions,
+            api,
             base_url: "http://localhost:11434/v1".into(),
             context_window: 32_768,
             max_tokens: 8_192,
@@ -347,5 +370,110 @@ mod tests {
         assert_eq!(outcome.current_thinking, ThinkingLevel::Medium);
         assert_eq!(state.current_model().provider, "ollama");
         assert_eq!(state.current_thinking(), ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_returns_none_when_no_runtime_entry() {
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), None);
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_returns_some_when_runtime_entry_present() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama:qwen3:32b".into(), 16_384);
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(16_384));
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_keyed_by_provider_and_model_tuple() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama1:qwen3:32b".into(), 16_384);
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama2:qwen3:32b".into(), 65_536);
+        let mut state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model_with_api("qwen3:32b", "ollama1", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(16_384));
+
+        state.set_model(model_with_api(
+            "qwen3:32b",
+            "ollama2",
+            ApiKind::OllamaChatApi,
+        ));
+
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(65_536));
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_ignores_non_ollama_chat_api_model() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama:qwen3:32b".into(), 16_384);
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model("qwen3:32b", "ollama"),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), None);
+    }
+
+    #[test]
+    fn effective_ollama_context_window_uses_override_when_present() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama:qwen3:32b".into(), 16_384);
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.effective_ollama_context_window(), 16_384);
+    }
+
+    #[test]
+    fn effective_ollama_context_window_uses_model_context_when_no_override() {
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.effective_ollama_context_window(), 32_768);
     }
 }
