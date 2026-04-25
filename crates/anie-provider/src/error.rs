@@ -131,6 +131,34 @@ pub enum ProviderError {
     /// which has a specific fallback path.
     #[error("Feature not supported by provider: {0}")]
     FeatureUnsupported(String),
+
+    /// The provider rejected the request because the requested
+    /// resources (typically Ollama's `num_ctx`) exceed available
+    /// memory at model-load time. Carries a halved-and-floored
+    /// suggestion the caller can retry with, plus the original
+    /// provider body verbatim for surfacing to the user.
+    ///
+    /// The retry semantics live in the provider impl
+    /// (`OllamaChatProvider::stream` does one same-request retry
+    /// with `num_ctx_override = Some(suggested_num_ctx)` before
+    /// the error reaches the controller). The retry policy
+    /// classifies this as terminal so the controller doesn't
+    /// double-retry.
+    ///
+    /// anie-specific (not in pi): pi has no native `/api/chat`
+    /// codepath and never sends `num_ctx`, so this failure mode
+    /// does not exist in pi's error taxonomy. See
+    /// `docs/ollama_load_failure_recovery/README.md`.
+    #[error(
+        "model load failed: {body} — try a smaller context window (e.g. /context-length {suggested_num_ctx})"
+    )]
+    ModelLoadResources {
+        /// Original provider body, unmodified.
+        body: String,
+        /// Suggested smaller `num_ctx` (half of the requested
+        /// value, floored at 2048).
+        suggested_num_ctx: u64,
+    },
 }
 
 impl ProviderError {

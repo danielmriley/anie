@@ -118,7 +118,19 @@ impl<'a> RetryPolicy<'a> {
             // `EmptyAssistantResponse` — the same prompt at the
             // same `max_tokens` produces the same truncation — but
             // the error message surfaces a more accurate fix.
-            | ProviderError::ResponseTruncated => RetryDecision::GiveUp {
+            | ProviderError::ResponseTruncated
+            // `ModelLoadResources` means Ollama refused to load the
+            // model with the requested `num_ctx` because it doesn't
+            // fit in available memory. The provider impl
+            // (`OllamaChatProvider::stream` after PR 2 of the
+            // load-failure plan) does one same-request retry with
+            // a halved `num_ctx` before this variant reaches the
+            // controller — by the time we see it here, halving has
+            // already been tried. Outer retry would just attempt
+            // the same too-large allocation again, so terminate
+            // and let the user act on the actionable
+            // `/context-length` suggestion the variant carries.
+            | ProviderError::ModelLoadResources { .. } => RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             },
             ProviderError::RateLimited { .. } => {
@@ -538,6 +550,30 @@ mod tests {
         assert_eq!(
             policy.decide(
                 &ProviderError::NativeReasoningUnsupported("unsupported".into()),
+                0,
+                false,
+            ),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::Terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn retry_policy_decide_classifies_model_load_resources_as_terminal() {
+        // The provider impl (post-PR 2) does one halved-num_ctx
+        // retry before the variant ever reaches the controller.
+        // By the time `decide` sees it, halving has already been
+        // tried and failed. Outer retry would just repeat the
+        // same too-large allocation, so terminate and let the
+        // user act on the variant's `/context-length` suggestion.
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::ModelLoadResources {
+                    body: "model requires more system memory".into(),
+                    suggested_num_ctx: 16_384,
+                },
                 0,
                 false,
             ),
