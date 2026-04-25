@@ -36,3 +36,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 Plus a manual smoke: long agent run (e.g. the Nemotron session
 that surfaced the original bug), keystrokes during streaming,
 scroll through history. No input lag.
+
+## Follow-up: bounded agent-event drain
+
+`docs/code_review_2026-04-24/09_tui_event_drain_bounds.md`
+added an explicit cap to the agent-event drain path. The cap is
+256 events per frame, including the first awaited event, because
+interactive mode uses `mpsc::channel(256)` and a saturated
+channel burst drained 256 events in one frame before the bound.
+
+Benchmark smoke after the cap:
+
+```text
+cargo bench -p anie-tui --bench tui_render -- --warm-up-time 1 --measurement-time 3
+scroll_static_600:       [312.31 us 312.47 us 312.62 us]
+stream_into_static_600:  [2.0288 ms 2.0341 ms 2.0413 ms]
+resize_during_stream:    [96.466 ms 96.609 ms 96.776 ms]
+```
+
+No tuning change was needed: the cap matches the realistic
+saturated burst size while preventing producer refills from
+extending a single frame's drain indefinitely.
