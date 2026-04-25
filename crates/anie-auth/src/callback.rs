@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, warn};
 
@@ -70,6 +70,18 @@ const SUCCESS_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><
 /// connecting. Keep this shorter than the overall OAuth timeout so an
 /// idle local connection cannot consume the entire login window.
 const ACCEPTED_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Response writes are tiny, so a stalled local peer should not
+/// consume the overall OAuth callback window.
+const ACCEPTED_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct HttpResponse<'a> {
+    status_code: u16,
+    reason: &'a str,
+    content_type: &'a str,
+    body: &'a str,
+    context: &'a str,
+}
 
 /// HTML rendered when the provider reports an error on
 /// redirect. Keeps the page minimal and instructs the user
@@ -145,15 +157,19 @@ pub async fn await_callback_on_path(
         let Some(target) = parse_request_target(&request) else {
             // Malformed request — respond 400 and keep waiting
             // for the real callback.
-            write_http_response(
+            write_http_response_best_effort(
                 &mut stream,
-                400,
-                "Bad Request",
-                "text/plain; charset=utf-8",
-                "bad request",
+                deadline,
+                timeout,
+                HttpResponse {
+                    status_code: 400,
+                    reason: "Bad Request",
+                    content_type: "text/plain; charset=utf-8",
+                    body: "bad request",
+                    context: "malformed callback request",
+                },
             )
-            .await
-            .ok();
+            .await;
             continue;
         };
 
@@ -161,27 +177,35 @@ pub async fn await_callback_on_path(
         // `/favicon.ico` — browsers fire these) get 404 and we
         // keep listening.
         let Some((path, query)) = split_target(&target) else {
-            write_http_response(
+            write_http_response_best_effort(
                 &mut stream,
-                404,
-                "Not Found",
-                "text/plain; charset=utf-8",
-                "not found",
+                deadline,
+                timeout,
+                HttpResponse {
+                    status_code: 404,
+                    reason: "Not Found",
+                    content_type: "text/plain; charset=utf-8",
+                    body: "not found",
+                    context: "callback request without path",
+                },
             )
-            .await
-            .ok();
+            .await;
             continue;
         };
         if path != expected_path {
-            write_http_response(
+            write_http_response_best_effort(
                 &mut stream,
-                404,
-                "Not Found",
-                "text/plain; charset=utf-8",
-                "not found",
+                deadline,
+                timeout,
+                HttpResponse {
+                    status_code: 404,
+                    reason: "Not Found",
+                    content_type: "text/plain; charset=utf-8",
+                    body: "not found",
+                    context: "callback request for unexpected path",
+                },
             )
-            .await
-            .ok();
+            .await;
             continue;
         }
 
@@ -189,15 +213,19 @@ pub async fn await_callback_on_path(
 
         if let Some((_, err_value)) = params.iter().find(|(k, _)| k == "error") {
             let html = error_html(err_value);
-            write_http_response(
+            write_http_response_best_effort(
                 &mut stream,
-                400,
-                "Bad Request",
-                "text/html; charset=utf-8",
-                &html,
+                deadline,
+                timeout,
+                HttpResponse {
+                    status_code: 400,
+                    reason: "Bad Request",
+                    content_type: "text/html; charset=utf-8",
+                    body: &html,
+                    context: "provider error callback",
+                },
             )
-            .await
-            .ok();
+            .await;
             return Err(CallbackError::ProviderError(err_value.clone()));
         }
 
@@ -212,41 +240,55 @@ pub async fn await_callback_on_path(
 
         match (code, state) {
             (Some(code), Some(state)) => {
-                write_http_response(
+                write_http_response_best_effort(
                     &mut stream,
-                    200,
-                    "OK",
-                    "text/html; charset=utf-8",
-                    SUCCESS_HTML,
+                    deadline,
+                    timeout,
+                    HttpResponse {
+                        status_code: 200,
+                        reason: "OK",
+                        content_type: "text/html; charset=utf-8",
+                        body: SUCCESS_HTML,
+                        context: "successful callback",
+                    },
                 )
-                .await
-                .ok();
+                .await;
                 return Ok(Callback { code, state });
             }
             (None, _) => {
-                write_http_response(
+                let html = error_html("missing code parameter");
+                write_http_response_best_effort(
                     &mut stream,
-                    400,
-                    "Bad Request",
-                    "text/html; charset=utf-8",
-                    &error_html("missing code parameter"),
+                    deadline,
+                    timeout,
+                    HttpResponse {
+                        status_code: 400,
+                        reason: "Bad Request",
+                        content_type: "text/html; charset=utf-8",
+                        body: &html,
+                        context: "callback missing code",
+                    },
                 )
-                .await
-                .ok();
+                .await;
                 return Err(CallbackError::MissingParam {
                     missing: "code".into(),
                 });
             }
             (_, None) => {
-                write_http_response(
+                let html = error_html("missing state parameter");
+                write_http_response_best_effort(
                     &mut stream,
-                    400,
-                    "Bad Request",
-                    "text/html; charset=utf-8",
-                    &error_html("missing state parameter"),
+                    deadline,
+                    timeout,
+                    HttpResponse {
+                        status_code: 400,
+                        reason: "Bad Request",
+                        content_type: "text/html; charset=utf-8",
+                        body: &html,
+                        context: "callback missing state",
+                    },
                 )
-                .await
-                .ok();
+                .await;
                 return Err(CallbackError::MissingParam {
                     missing: "state".into(),
                 });
@@ -301,24 +343,72 @@ fn split_target(target: &str) -> Option<(&str, &str)> {
     }
 }
 
-async fn write_http_response(
-    stream: &mut tokio::net::TcpStream,
-    status_code: u16,
-    reason: &str,
-    content_type: &str,
-    body: &str,
-) -> Result<()> {
+async fn write_http_response_best_effort<W>(
+    stream: &mut W,
+    deadline: tokio::time::Instant,
+    overall_timeout: Duration,
+    response: HttpResponse<'_>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let context = response.context;
+    if let Err(err) = write_http_response(stream, deadline, overall_timeout, response).await {
+        warn!(%err, context, "failed to write callback response");
+    }
+}
+
+async fn write_http_response<W>(
+    stream: &mut W,
+    deadline: tokio::time::Instant,
+    overall_timeout: Duration,
+    response: HttpResponse<'_>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(anyhow!(
+            "callback response deadline elapsed after {overall_timeout:?}"
+        ));
+    }
+
     let response = format!(
         "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        len = body.len(),
+        status_code = response.status_code,
+        reason = response.reason,
+        content_type = response.content_type,
+        len = response.body.len(),
+        body = response.body,
     );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|err| anyhow!("failed to write response: {err}"))?;
-    stream.shutdown().await.ok();
-    if let Err(err) = stream.flush().await {
-        warn!(%err, "failed to flush callback response");
+
+    match tokio::time::timeout(
+        remaining.min(ACCEPTED_WRITE_TIMEOUT),
+        stream.write_all(response.as_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(anyhow!("failed to write response: {err}")),
+        Err(_) => return Err(anyhow!("timed out writing callback response")),
+    }
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !remaining.is_zero() {
+        match tokio::time::timeout(remaining.min(ACCEPTED_WRITE_TIMEOUT), stream.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(%err, "failed to shutdown callback response"),
+            Err(_) => return Err(anyhow!("timed out shutting down callback response")),
+        }
+    }
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !remaining.is_zero() {
+        match tokio::time::timeout(remaining.min(ACCEPTED_WRITE_TIMEOUT), stream.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(%err, "failed to flush callback response"),
+            Err(_) => return Err(anyhow!("timed out flushing callback response")),
+        }
     }
     Ok(())
 }
@@ -327,7 +417,29 @@ async fn write_http_response(
 mod tests {
     use super::*;
     use std::net::TcpStream as BlockingTcpStream;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
+
+    struct StalledWriter;
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn await_callback_captures_code_and_state_from_query_string() {
@@ -436,6 +548,79 @@ mod tests {
         let callback = server.await.expect("join").expect("callback");
         assert_eq!(callback.code, "late-code");
         assert_eq!(callback.state, "late-state");
+    }
+
+    #[tokio::test]
+    async fn malformed_request_gets_best_effort_400_before_later_valid_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let server = tokio::spawn(await_callback(port, Duration::from_secs(5)));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut malformed =
+                BlockingTcpStream::connect(("127.0.0.1", port)).expect("connect malformed");
+            malformed
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            malformed
+                .write_all(b"not-http\r\n\r\n")
+                .expect("write malformed request");
+            let mut buf = [0u8; 512];
+            let n = malformed.read(&mut buf).expect("read malformed response");
+            let response = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            drop(malformed);
+
+            let mut valid =
+                BlockingTcpStream::connect(("127.0.0.1", port)).expect("connect valid");
+            valid
+                .write_all(
+                    b"GET /callback?code=after-malformed&state=ok HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .expect("write valid callback");
+            let _ = valid.read(&mut buf);
+        })
+        .await
+        .expect("send requests");
+
+        let callback = server.await.expect("join").expect("callback");
+        assert_eq!(callback.code, "after-malformed");
+        assert_eq!(callback.state, "ok");
+    }
+
+    #[tokio::test]
+    async fn write_http_response_times_out_on_stalled_writer() {
+        let mut writer = StalledWriter;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+        let err = write_http_response(
+            &mut writer,
+            deadline,
+            Duration::from_millis(50),
+            HttpResponse {
+                status_code: 400,
+                reason: "Bad Request",
+                content_type: "text/plain; charset=utf-8",
+                body: "bad request",
+                context: "test response",
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("timed out writing callback response"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
