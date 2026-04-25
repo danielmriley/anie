@@ -23,10 +23,27 @@ pub(crate) use anie_tui::{ArgumentSpec, SlashCommandInfo, SlashCommandSource};
 ///
 /// Shared by the builtin catalog and the autocomplete argument
 /// source (plan 12).
-pub(crate) const THINKING_LEVELS: &[&str] = &["off", "low", "medium", "high"];
+pub(crate) const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
 
 /// Known subcommands for `/session`.
 pub(crate) const SESSION_SUBCOMMANDS: &[&str] = &["list"];
+
+/// Accepted values for `/markdown`.
+pub(crate) const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
+
+/// Accepted values for `/tool-output`. Plan 09 PR-C.
+pub(crate) const TOOL_OUTPUT_MODES: &[&str] = &["verbose", "compact"];
+
+/// Providers that expose OAuth login (and are valid arguments
+/// to `/login` / `/logout`). Mirrors the registry in
+/// `anie-cli::login_command::build_oauth_provider`.
+pub(crate) const OAUTH_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai-codex",
+    "github-copilot",
+    "google-antigravity",
+    "google-gemini-cli",
+];
 
 /// All slash commands known to this anie process.
 ///
@@ -221,7 +238,13 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
                 values: THINKING_LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Query or override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact the session context"),
         SlashCommandInfo::builtin("fork", "Create a child session branched from now"),
@@ -241,6 +264,39 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
         SlashCommandInfo::builtin("clear", "Clear the output pane"),
         SlashCommandInfo::builtin("reload", "Hot-reload config and context files"),
         SlashCommandInfo::builtin("copy", "Copy the last assistant message to the clipboard"),
+        SlashCommandInfo::builtin_with_args(
+            "markdown",
+            "Toggle markdown rendering for finalized messages",
+            ArgumentSpec::Enumerated {
+                values: MARKDOWN_SWITCHES,
+                required: false,
+            },
+            Some("[on|off]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "tool-output",
+            "Set tool-output display mode (verbose or compact)",
+            ArgumentSpec::Enumerated {
+                values: TOOL_OUTPUT_MODES,
+                required: false,
+            },
+            Some("[verbose|compact]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "login",
+            "Show instructions for OAuth login against a provider",
+            ArgumentSpec::Enumerated {
+                values: OAUTH_PROVIDERS,
+                required: true,
+            },
+            Some("<provider>"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "logout",
+            "Remove a stored OAuth or API-key credential",
+            ArgumentSpec::FreeForm { required: true },
+            Some("<provider>"),
+        ),
         SlashCommandInfo::builtin("help", "Show this list"),
         SlashCommandInfo::builtin("quit", "Quit anie"),
     ]
@@ -296,6 +352,20 @@ mod tests {
             .expect("register extension");
         let info = registry.lookup("mycmd").expect("lookup extension");
         assert!(matches!(info.source, SlashCommandSource::Extension { .. }));
+    }
+
+    #[test]
+    fn context_length_command_registered_with_expected_arg_spec() {
+        let registry = CommandRegistry::with_builtins();
+        let info = registry
+            .lookup("context-length")
+            .expect("context-length builtin");
+
+        assert!(matches!(
+            info.arguments,
+            ArgumentSpec::ContextLengthOverride
+        ));
+        assert_eq!(info.argument_hint, Some("[N|reset]"));
     }
 
     #[test]
@@ -380,7 +450,7 @@ mod tests {
         let registry = CommandRegistry::with_builtins();
         let help = registry.format_help();
         assert!(
-            help.contains("/thinking") && help.contains("[off|low|medium|high]"),
+            help.contains("/thinking") && help.contains("[off|minimal|low|medium|high]"),
             "expected thinking row with hint column, got:\n{help}"
         );
         assert!(
@@ -398,6 +468,7 @@ mod tests {
         let dispatched = [
             "model",
             "thinking",
+            "context-length",
             "compact",
             "fork",
             "diff",
@@ -409,6 +480,10 @@ mod tests {
             "clear",
             "reload",
             "copy",
+            "markdown",
+            "tool-output",
+            "login",
+            "logout",
             "help",
             "quit",
         ];
@@ -426,14 +501,34 @@ mod tests {
         type SpecCheck = fn(&ArgumentSpec) -> bool;
         let registry = CommandRegistry::with_builtins();
         let expected: &[(&str, SpecCheck)] = &[
-            ("thinking", |spec| {
-                matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == THINKING_LEVELS)
+            (
+                "thinking",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == THINKING_LEVELS),
+            ),
+            ("context-length", |spec| {
+                matches!(spec, ArgumentSpec::ContextLengthOverride)
             }),
             ("model", |spec| {
                 matches!(spec, ArgumentSpec::FreeForm { required: false })
             }),
-            ("session", |spec| {
-                matches!(spec, ArgumentSpec::Subcommands { known } if *known == SESSION_SUBCOMMANDS)
+            (
+                "session",
+                |spec| matches!(spec, ArgumentSpec::Subcommands { known } if *known == SESSION_SUBCOMMANDS),
+            ),
+            (
+                "markdown",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == MARKDOWN_SWITCHES),
+            ),
+            (
+                "tool-output",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: false } if *values == TOOL_OUTPUT_MODES),
+            ),
+            (
+                "login",
+                |spec| matches!(spec, ArgumentSpec::Enumerated { values, required: true } if *values == OAUTH_PROVIDERS),
+            ),
+            ("logout", |spec| {
+                matches!(spec, ArgumentSpec::FreeForm { required: true })
             }),
             ("compact", |spec| matches!(spec, ArgumentSpec::None)),
             ("help", |spec| matches!(spec, ArgumentSpec::None)),

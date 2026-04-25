@@ -28,6 +28,7 @@ pub(crate) struct CompactionStrategy {
     model: Model,
     registry: Arc<ProviderRegistry>,
     resolver: Arc<dyn RequestOptionsResolver>,
+    num_ctx_override: Option<u64>,
 }
 
 impl CompactionStrategy {
@@ -35,11 +36,13 @@ impl CompactionStrategy {
         model: Model,
         registry: Arc<ProviderRegistry>,
         resolver: Arc<dyn RequestOptionsResolver>,
+        num_ctx_override: Option<u64>,
     ) -> Self {
         Self {
             model,
             registry,
             resolver,
+            num_ctx_override,
         }
     }
 }
@@ -84,6 +87,7 @@ impl MessageSummarizer for CompactionStrategy {
             max_tokens: Some(resolved_model.max_tokens.min(4_096)),
             thinking: ThinkingLevel::Off,
             headers: request.headers,
+            num_ctx_override: self.num_ctx_override,
         };
 
         let stream = provider
@@ -119,16 +123,39 @@ impl MessageSummarizer for CompactionStrategy {
 }
 
 fn join_assistant_text(message: &AssistantMessage) -> String {
-    let text = message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
-            ContentBlock::Thinking { thinking, .. } => Some(thinking.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Plan 08 PR-A: the previous shape cloned every visible
+    // text / thinking fragment into a `Vec<String>` and then
+    // `.join`'d. Replaced with a single-allocation sized-up
+    // direct-buffer build that borrows the fragments instead
+    // of cloning them.
+    let mut total = 0usize;
+    let mut first = true;
+    for block in &message.content {
+        let fragment = match block {
+            ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
+            _ => continue,
+        };
+        if !first {
+            total += 1;
+        }
+        total += fragment.len();
+        first = false;
+    }
+    let mut text = String::with_capacity(total);
+    let mut first = true;
+    for block in &message.content {
+        let fragment = match block {
+            ContentBlock::Text { text } => text.as_str(),
+            ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
+            _ => continue,
+        };
+        if !first {
+            text.push('\n');
+        }
+        text.push_str(fragment);
+        first = false;
+    }
     if text.is_empty() {
         message
             .error_message
@@ -136,5 +163,130 @@ fn join_assistant_text(message: &AssistantMessage) -> String {
             .unwrap_or_else(|| String::from("[empty summary response]"))
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use anie_protocol::{StopReason, ToolDef, Usage};
+    use anie_provider::{
+        ApiKind, CostPerMillion, LlmMessage, Provider, ProviderStream, ResolvedRequestOptions,
+    };
+    use async_trait::async_trait;
+    use futures::stream;
+
+    use super::*;
+
+    struct StaticResolver;
+
+    #[async_trait]
+    impl RequestOptionsResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _context: &[Message],
+        ) -> Result<ResolvedRequestOptions, anie_provider::ProviderError> {
+            Ok(ResolvedRequestOptions::default())
+        }
+    }
+
+    struct RecordingProvider {
+        options: Arc<Mutex<Vec<StreamOptions>>>,
+    }
+
+    impl Provider for RecordingProvider {
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: LlmContext,
+            options: StreamOptions,
+        ) -> Result<ProviderStream, anie_provider::ProviderError> {
+            self.options.lock().expect("record options").push(options);
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "summary".into(),
+                }],
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                provider: "ollama".into(),
+                model: "qwen3:32b".into(),
+                timestamp: 1,
+                reasoning_details: None,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(ProviderEvent::Done(
+                message,
+            ))])))
+        }
+
+        fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage> {
+            messages
+                .iter()
+                .map(|message| LlmMessage {
+                    role: "user".into(),
+                    content: serde_json::to_value(message).expect("message json"),
+                })
+                .collect()
+        }
+
+        fn convert_tools(&self, _tools: &[ToolDef]) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+    }
+
+    fn ollama_model() -> Model {
+        Model {
+            id: "qwen3:32b".into(),
+            name: "qwen3:32b".into(),
+            provider: "ollama".into(),
+            api: ApiKind::OllamaChatApi,
+            base_url: "http://localhost:11434".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: anie_provider::ModelCompat::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_request_passes_num_ctx_override() {
+        let recorded_options = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            ApiKind::OllamaChatApi,
+            Box::new(RecordingProvider {
+                options: Arc::clone(&recorded_options),
+            }),
+        );
+        let strategy = CompactionStrategy::new(
+            ollama_model(),
+            Arc::new(registry),
+            Arc::new(StaticResolver),
+            Some(16_384),
+        );
+
+        let summary = strategy
+            .summarize(
+                &[Message::User(UserMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "source".into(),
+                    }],
+                    timestamp: 1,
+                })],
+                None,
+            )
+            .await
+            .expect("summary");
+
+        assert_eq!(summary, "summary");
+        let options = recorded_options.lock().expect("recorded options");
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].num_ctx_override, Some(16_384));
     }
 }

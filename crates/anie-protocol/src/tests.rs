@@ -59,6 +59,7 @@ fn assistant_message_roundtrip() {
         provider: "mock".into(),
         model: "test-model".into(),
         timestamp: 2,
+        reasoning_details: None,
     }));
 }
 
@@ -272,6 +273,7 @@ fn assistant_message_error_message_is_optional() {
         provider: "mock".into(),
         model: "m".into(),
         timestamp: 99,
+        reasoning_details: None,
     })
     .expect("serialize assistant");
     assert!(value.get("error_message").is_none());

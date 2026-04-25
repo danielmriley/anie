@@ -8,17 +8,21 @@ use tempfile::tempdir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{AgentLoop, AgentLoopConfig, Tool, ToolExecutionMode, ToolRegistry};
+use anie_agent::{AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionMode, ToolRegistry};
 use anie_protocol::{
     AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
 };
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ProviderError, ProviderRegistry, RequestOptionsResolver,
-    ResolvedRequestOptions, ThinkingLevel,
+    ApiKind, CostPerMillion, Model, ModelCompat, ProviderError, ProviderRegistry,
+    RequestOptionsResolver, ResolvedRequestOptions, ThinkingLevel,
     mock::{MockProvider, MockStreamScript},
 };
 
-use crate::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
+use crate::edit::{
+    MAX_EDIT_ARGUMENT_BYTES, MAX_EDIT_COUNT, MAX_EDIT_INPUT_FILE_BYTES, MAX_EDIT_NEW_TEXT_BYTES,
+    MAX_EDIT_OLD_TEXT_BYTES, MAX_EDIT_OUTPUT_FILE_BYTES,
+};
+use crate::{BashPolicy, BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
 
 struct StaticResolver;
 
@@ -47,6 +51,7 @@ fn sample_model() -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 
@@ -76,6 +81,7 @@ fn assistant_with_tool_call(
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 
@@ -90,6 +96,7 @@ fn final_assistant(text: &str) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 2,
+        reasoning_details: None,
     }
 }
 
@@ -368,6 +375,114 @@ async fn bash_tool_runs_simple_command() {
         .expect("command succeeds");
 
     assert!(text_content(&result).contains("hello"));
+}
+
+#[tokio::test]
+async fn bash_policy_blocks_denied_command_before_spawn() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: true,
+            deny_commands: vec!["touch".into()],
+            deny_patterns: Vec::new(),
+        },
+    );
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "touch blocked.txt" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("policy should block");
+
+    assert!(
+        matches!(error, ToolError::ExecutionFailed(message) if message.contains("command 'touch' is denied"))
+    );
+    assert!(!tempdir.path().join("blocked.txt").exists());
+}
+
+#[tokio::test]
+async fn bash_policy_blocks_denied_command_basename() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: true,
+            deny_commands: vec!["touch".into()],
+            deny_patterns: Vec::new(),
+        },
+    );
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "/usr/bin/touch blocked.txt" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("policy should block");
+
+    assert!(
+        matches!(error, ToolError::ExecutionFailed(message) if message.contains("command 'touch' is denied"))
+    );
+    assert!(!tempdir.path().join("blocked.txt").exists());
+}
+
+#[tokio::test]
+async fn bash_policy_blocks_denied_regex_pattern() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: true,
+            deny_commands: Vec::new(),
+            deny_patterns: vec![r"git\s+push\s+--force".into()],
+        },
+    );
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "git push --force origin main" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("policy should block");
+
+    assert!(
+        matches!(error, ToolError::ExecutionFailed(message) if message.contains("matched deny pattern"))
+    );
+}
+
+#[tokio::test]
+async fn bash_policy_disabled_does_not_block() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::with_policy(
+        tempdir.path(),
+        BashPolicy {
+            enabled: false,
+            deny_commands: vec!["echo".into()],
+            deny_patterns: vec!["echo".into()],
+        },
+    );
+
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "echo allowed" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("disabled policy should not block");
+
+    assert!(text_content(&result).contains("allowed"));
 }
 
 #[cfg(unix)]
@@ -655,6 +770,204 @@ async fn edit_tool_detects_overlapping_replacements() {
 
     assert!(
         matches!(error, anie_agent::ToolError::ExecutionFailed(message) if message.contains("overlaps edit"))
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_too_many_edits_before_reading_file() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+    let edits = (0..=MAX_EDIT_COUNT)
+        .map(|index| {
+            serde_json::json!({
+                "oldText": format!("old-{index}"),
+                "newText": "new",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": edits,
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("too many edits should fail before reading");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("at most 100") && message.contains("Split this")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_old_text_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": [{
+                    "oldText": "x".repeat(MAX_EDIT_OLD_TEXT_BYTES + 1),
+                    "newText": "replacement",
+                }],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized oldText should fail before matching");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("oldText") && message.contains(&MAX_EDIT_OLD_TEXT_BYTES.to_string())),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_new_text_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": [{
+                    "oldText": "target",
+                    "newText": "x".repeat(MAX_EDIT_NEW_TEXT_BYTES + 1),
+                }],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized newText should fail before matching");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("newText") && message.contains(&MAX_EDIT_NEW_TEXT_BYTES.to_string())),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_combined_argument_budget_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = EditTool::new(tempdir.path());
+    let chunk = "x".repeat(MAX_EDIT_ARGUMENT_BYTES / 4);
+    let edits = (0..5)
+        .map(|index| {
+            serde_json::json!({
+                "oldText": format!("target-{index}"),
+                "newText": chunk,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "missing.txt",
+                "edits": edits,
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("combined edit budget should fail before matching");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("edit arguments") && message.contains(&MAX_EDIT_ARGUMENT_BYTES.to_string())),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_input_file_before_matching() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("large.txt");
+    tokio::fs::write(&path, vec![b'a'; MAX_EDIT_INPUT_FILE_BYTES + 1])
+        .await
+        .expect("seed oversized input");
+    let tool = EditTool::new(tempdir.path());
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "large.txt",
+                "edits": [{
+                    "oldText": "a",
+                    "newText": "b",
+                }],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized input file should fail");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("edit input files") && message.contains(&MAX_EDIT_INPUT_FILE_BYTES.to_string())),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_rejects_oversized_output_and_preserves_original_file() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("expand.txt");
+    let prefix = "A0\nA1\nA2\n";
+    let filler = "z".repeat(MAX_EDIT_INPUT_FILE_BYTES - prefix.len());
+    let original = format!("{prefix}{filler}");
+    tokio::fs::write(&path, &original).await.expect("seed file");
+    let tool = EditTool::new(tempdir.path());
+    let expansion_budget = MAX_EDIT_OUTPUT_FILE_BYTES - MAX_EDIT_INPUT_FILE_BYTES;
+    let replacement = "x".repeat((expansion_budget / 3) + 4);
+
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "expand.txt",
+                "edits": [
+                    { "oldText": "A0", "newText": replacement.clone() },
+                    { "oldText": "A1", "newText": replacement.clone() },
+                    { "oldText": "A2", "newText": replacement },
+                ],
+            }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized output should fail");
+
+    assert!(
+        matches!(error, anie_agent::ToolError::ExecutionFailed(ref message)
+            if message.contains("edit outputs") && message.contains(&MAX_EDIT_OUTPUT_FILE_BYTES.to_string())),
+        "{error:?}"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&path)
+            .await
+            .expect("read original"),
+        original,
+        "failed output-size check must not modify the file"
     );
 }
 

@@ -17,13 +17,16 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use anie_auth::CredentialStore;
+use anie_auth::{AuthCredential, CredentialStore};
 use anie_config::{
     CliOverrides, ConfigMutator, find_project_config, global_config_path, load_config_with_paths,
     preferred_write_target,
 };
-use anie_provider::{ApiKind, CostPerMillion, Model, ModelInfo};
-use anie_providers_builtin::{ModelDiscoveryRequest, builtin_models, discover_models};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
+use anie_providers_builtin::{
+    ModelDiscoveryRequest, builtin_models, discover_models, is_ollama_native_discovery_target,
+    ollama_native_base_url,
+};
 
 use crate::{ModelPickerAction, ModelPickerPane, Spinner};
 
@@ -44,6 +47,10 @@ pub struct ProviderEntry {
 pub enum ProviderType {
     Local,
     ApiKey,
+    /// OAuth-backed provider — login / logout via the OAuth flow
+    /// rather than pasting an API key. Stored credentials carry
+    /// refresh tokens and per-user endpoints.
+    OAuth,
     Custom,
 }
 
@@ -231,7 +238,9 @@ impl ProviderManagementScreen {
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
-        let spinner_frame = self.spinner.tick().to_string();
+        // Borrow the &'static str from Spinner::tick rather
+        // than allocating a fresh String per frame. Plan 04 PR-F.
+        let spinner_frame: &'static str = self.spinner.tick();
         match &self.mode {
             ProviderManagementMode::Table => self.render_table(frame, inner),
             ProviderManagementMode::ActionMenu { selected } => {
@@ -260,7 +269,7 @@ impl ProviderManagementScreen {
                 footer_line("[Esc] Back"),
             ),
             ProviderManagementMode::PickingModel { picker, .. } => {
-                self.render_model_picker(frame, inner, picker, &spinner_frame)
+                self.render_model_picker(frame, inner, picker, spinner_frame)
             }
             ProviderManagementMode::Status { message, is_error } => self.render_status_panel(
                 frame,
@@ -546,7 +555,7 @@ impl ProviderManagementScreen {
                     ProviderManagementMode::PickingModel { entry, .. } => entry.clone(),
                     _ => return ProviderManagementAction::Continue,
                 };
-                return self.apply_selected_model(entry, model_info);
+                return self.apply_selected_model(entry, *model_info);
             }
         }
         ProviderManagementAction::Continue
@@ -555,7 +564,11 @@ impl ProviderManagementScreen {
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(area);
 
         let header = Row::new(vec![
@@ -592,6 +605,7 @@ impl ProviderManagementScreen {
                     Cell::from(match entry.provider_type {
                         ProviderType::Local => "Local",
                         ProviderType::ApiKey => "API",
+                        ProviderType::OAuth => "OAuth",
                         ProviderType::Custom => "Custom",
                     }),
                     Cell::from(entry.default_model.clone()),
@@ -616,11 +630,18 @@ impl ProviderManagementScreen {
         .column_spacing(1)
         .render(chunks[0], frame.buffer_mut());
 
+        Paragraph::new(Line::from(Span::styled(
+            "To add a new provider, run /onboard.",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .wrap(Wrap { trim: false })
+        .render(chunks[1], frame.buffer_mut());
+
         Paragraph::new(footer_line(
             "[↑↓] Navigate   [Enter] Actions   [t] Test   [e] Edit Key   [s] Set Default   [d] Delete   [q] Close",
         ))
         .wrap(Wrap { trim: false })
-        .render(chunks[1], frame.buffer_mut());
+        .render(chunks[2], frame.buffer_mut());
     }
 
     fn render_action_menu(&self, frame: &mut Frame<'_>, area: Rect, selected: usize) {
@@ -1049,6 +1070,11 @@ fn load_provider_entries(
         .map(|name| {
             let provider_config = config.providers.get(&name);
             let builtin_default = builtin_catalog.iter().find(|model| model.provider == name);
+            let stored_credential = credential_store.get_credential(&name);
+            let oauth_defaults = stored_credential.as_ref().and_then(|cred| match cred {
+                AuthCredential::OAuth { .. } => oauth_provider_display_defaults(&name),
+                _ => None,
+            });
             let default_model = if has_any_config && config.model.provider == name {
                 config.model.id.clone()
             } else {
@@ -1056,14 +1082,26 @@ fn load_provider_entries(
                     .and_then(|provider| provider.models.first())
                     .map(|model| model.id.clone())
                     .or_else(|| builtin_default.map(|model| model.id.clone()))
+                    .or_else(|| oauth_defaults.map(|(id, _)| id.to_string()))
                     .unwrap_or_else(|| "unknown".to_string())
             };
+            // OAuth credentials carry a per-user `api_base_url`
+            // (Copilot's proxy-ep rewrite). Prefer the stored
+            // value so the /providers card shows the user's
+            // actual endpoint rather than the generic default.
+            let oauth_base_url = stored_credential.as_ref().and_then(|cred| match cred {
+                AuthCredential::OAuth { api_base_url, .. } => api_base_url.clone(),
+                _ => None,
+            });
             let base_url = provider_config
                 .and_then(|provider| provider.base_url.clone())
-                .or_else(|| builtin_default.map(|model| model.base_url.clone()));
-            let provider_type = classify_provider_type(&name, base_url.as_deref());
+                .or(oauth_base_url)
+                .or_else(|| builtin_default.map(|model| model.base_url.clone()))
+                .or_else(|| oauth_defaults.map(|(_, url)| url.to_string()));
+            let provider_type =
+                classify_provider_type(&name, base_url.as_deref(), stored_credential.as_ref());
             ProviderEntry {
-                has_credential: credential_store.get(&name).is_some(),
+                has_credential: stored_credential.is_some(),
                 is_default: has_any_config && config.model.provider == name,
                 name,
                 provider_type,
@@ -1077,8 +1115,18 @@ fn load_provider_entries(
     Ok(entries)
 }
 
-fn classify_provider_type(provider: &str, base_url: Option<&str>) -> ProviderType {
+fn classify_provider_type(
+    provider: &str,
+    base_url: Option<&str>,
+    credential: Option<&AuthCredential>,
+) -> ProviderType {
     let provider = provider.to_ascii_lowercase();
+    // OAuth credential trumps name-based guessing: a provider
+    // that's in our OAuth registry AND has a stored OAuth
+    // credential should render as `OAuth`, not `Custom`.
+    if matches!(credential, Some(AuthCredential::OAuth { .. })) {
+        return ProviderType::OAuth;
+    }
     let is_local = matches!(provider.as_str(), "ollama" | "lmstudio" | "vllm")
         || base_url.is_some_and(is_local_base_url);
     if is_local {
@@ -1087,6 +1135,28 @@ fn classify_provider_type(provider: &str, base_url: Option<&str>) -> ProviderTyp
         ProviderType::ApiKey
     } else {
         ProviderType::Custom
+    }
+}
+
+/// Default model + base URL to show in `/providers` listings
+/// for OAuth-backed providers. Matches
+/// `oauth_placeholder_model` in `anie-cli::model_catalog` so the
+/// TUI's picker and the overlay agree on a "first model" for
+/// each provider before live discovery runs.
+fn oauth_provider_display_defaults(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider {
+        "github-copilot" => Some((
+            "claude-sonnet-4.6",
+            "https://api.individual.githubcopilot.com",
+        )),
+        "openai-codex" => Some(("gpt-5", "https://api.openai.com/v1")),
+        "google-gemini-cli" => Some(("gemini-2.5-pro", "https://cloudcode-pa.googleapis.com")),
+        "google-antigravity" => Some((
+            "gemini-3-pro-preview",
+            "https://cloudcode-pa.googleapis.com",
+        )),
+        "anthropic" => Some(("claude-sonnet-4-6", "https://api.anthropic.com")),
+        _ => None,
     }
 }
 
@@ -1140,13 +1210,16 @@ fn model_for_entry(entry: &ProviderEntry) -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 
 fn model_info_to_provider_model(entry: &ProviderEntry, info: &ModelInfo) -> Model {
     let model = model_for_entry(entry);
-    let mut resolved = info.to_model(model.api, &model.base_url);
+    let api = discovery_model_api(&entry.name, model.api, &model.base_url);
+    let mut resolved = info.to_model(api, &discovery_model_base_url(api, &model.base_url));
     resolved.provider = entry.name.clone();
+    anie_providers_builtin::apply_openrouter_capabilities(&mut resolved);
     resolved
 }
 
@@ -1172,6 +1245,22 @@ fn default_provider_env(provider_name: &str) -> Option<&'static str> {
     }
 }
 
+fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
+    if is_ollama_native_discovery_target(provider_name, base_url) {
+        ApiKind::OllamaChatApi
+    } else {
+        api
+    }
+}
+
+fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
+    }
+}
+
 async fn discover_models_for_entry(
     entry: &ProviderEntry,
     credential_store: &CredentialStore,
@@ -1186,7 +1275,12 @@ async fn discover_models_for_entry(
             entry.api_key_env.as_deref(),
             credential_store,
         ),
-        headers: HashMap::new(),
+        // Copilot's `/models` endpoint rejects calls without
+        // the editor-identifying headers pi pins. Sharing the
+        // helper keeps this path in lock-step with the CLI
+        // `anie models` flow and the TUI model-picker
+        // discovery.
+        headers: anie_auth::oauth_request_headers(&entry.name),
     };
     discover_models(&request)
         .await
@@ -1413,6 +1507,30 @@ mod tests {
     }
 
     #[test]
+    fn provider_management_converts_ollama_discovery_to_ollama_chat_api() {
+        let mut entry = entry("ollama", true);
+        entry.base_url = Some("http://localhost:11434/v1".into());
+        let model = model_info_to_provider_model(
+            &entry,
+            &ModelInfo {
+                id: "qwen3:32b".into(),
+                name: "Qwen 3 32B".into(),
+                provider: "ollama".into(),
+                context_length: Some(32_768),
+                max_output_tokens: None,
+                supports_images: Some(false),
+                supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
+                provider_capabilities: None,
+            },
+        );
+
+        assert_eq!(model.api, ApiKind::OllamaChatApi);
+        assert_eq!(model.base_url, "http://localhost:11434");
+    }
+
+    #[test]
     fn delete_provider_removes_row() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let write_target = tempdir.path().join("config.toml");
@@ -1517,8 +1635,12 @@ mod tests {
                 name: "GPT-4o".into(),
                 provider: "openai".into(),
                 context_length: Some(128_000),
+                max_output_tokens: None,
                 supports_images: Some(true),
                 supports_reasoning: Some(false),
+                pricing: None,
+                supported_parameters: None,
+                provider_capabilities: None,
             }]),
         });
         assert!(matches!(

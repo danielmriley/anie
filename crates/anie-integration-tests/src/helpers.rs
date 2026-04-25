@@ -11,8 +11,8 @@ use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
 };
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ProviderError, ProviderRegistry, RequestOptionsResolver,
-    ResolvedRequestOptions, ThinkingLevel, mock::MockProvider,
+    ApiKind, CostPerMillion, Model, ModelCompat, ProviderError, ProviderRegistry,
+    RequestOptionsResolver, ResolvedRequestOptions, ThinkingLevel, mock::MockProvider,
 };
 use anie_session::{SessionContext, SessionManager};
 use anie_tools::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
@@ -32,6 +32,7 @@ pub fn sample_model() -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 
@@ -157,6 +158,7 @@ pub fn final_assistant(text: &str) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 
@@ -170,6 +172,7 @@ pub fn final_assistant_at(text: &str, timestamp: u64) -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp,
+        reasoning_details: None,
     }
 }
 
@@ -184,6 +187,7 @@ pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> AssistantMessage 
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 

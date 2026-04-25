@@ -108,5 +108,4 @@ mod tests {
         let err = UserCommandError::UnknownModel("gpt-99".into());
         assert_eq!(err.to_string(), "unknown model 'gpt-99'");
     }
-
 }

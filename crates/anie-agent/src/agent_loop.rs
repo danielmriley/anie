@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use futures::{StreamExt, future::join_all};
@@ -190,7 +193,7 @@ use anie_protocol::{
 };
 use anie_provider::{
     LlmContext, Model, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
-    RequestOptionsResolver, ThinkingLevel,
+    RequestOptionsResolver, StreamOptions, ThinkingLevel,
 };
 
 use crate::ToolRegistry;
@@ -214,6 +217,7 @@ pub struct AgentLoopConfig {
     thinking: ThinkingLevel,
     tool_execution: ToolExecutionMode,
     request_options_resolver: Arc<dyn RequestOptionsResolver>,
+    ollama_num_ctx_override: Option<u64>,
     get_steering_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
     get_follow_up_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
     before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
@@ -236,10 +240,47 @@ impl AgentLoopConfig {
             thinking,
             tool_execution,
             request_options_resolver,
+            ollama_num_ctx_override: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
             before_tool_call_hook: None,
             after_tool_call_hook: None,
+        }
+    }
+
+    /// Snapshot an Ollama native `num_ctx` override for provider
+    /// requests. Non-Ollama providers ignore the resulting
+    /// `StreamOptions` field.
+    #[must_use]
+    pub fn with_ollama_num_ctx_override(mut self, override_value: Option<u64>) -> Self {
+        self.ollama_num_ctx_override = override_value;
+        self
+    }
+
+    fn stream_options(
+        &self,
+        api_key: Option<String>,
+        headers: HashMap<String, String>,
+    ) -> StreamOptions {
+        StreamOptions {
+            api_key,
+            temperature: None,
+            // Intentionally `None`: the upstream owns the
+            // `input + output <= context_window` invariant
+            // server-side and knows the real tokenizer.
+            // Bounding output at the agent layer is how pi avoids
+            // context-overflow 400s
+            // (`pi/packages/ai/src/providers/openai-completions.ts:394`
+            // only emits `max_tokens` when the caller explicitly
+            // sets it). Budget management is handled by compaction
+            // (`reserve_tokens`), which shrinks the *input* instead
+            // of capping the *output*. Compaction summarization still
+            // sets its own `max_tokens` explicitly — see
+            // `anie-cli/src/compaction.rs`.
+            max_tokens: None,
+            thinking: self.thinking,
+            headers,
+            num_ctx_override: self.ollama_num_ctx_override,
         }
     }
 
@@ -410,13 +451,7 @@ impl AgentLoop {
                 messages: provider.convert_messages(&sanitized_context),
                 tools: self.tool_registry.definitions(),
             };
-            let options = anie_provider::StreamOptions {
-                api_key: request.api_key,
-                temperature: None,
-                max_tokens: Some(model.max_tokens),
-                thinking: self.config.thinking,
-                headers: request.headers,
-            };
+            let options = self.config.stream_options(request.api_key, request.headers);
 
             let stream = match provider.stream(&model, llm_context, options) {
                 Ok(stream) => stream,
@@ -792,9 +827,19 @@ impl AgentLoop {
             return tool_result_message(&tool_call, result, true);
         };
 
-        let definition = tool.definition();
-        if let Err(message) = validate_tool_arguments(&definition.parameters, &tool_call.arguments)
-        {
+        // Fetch the precompiled validator from the registry.
+        // Missing validator would mean we skipped registration
+        // (can't happen here — `tool_registry.get` above
+        // returned Some(tool) so the validator also exists),
+        // but handle it defensively with the legacy error
+        // message so behavior is identical to the pre-cache
+        // code path.
+        let validator_state = self.tool_registry.validator(&tool_call.name);
+        let validation_result = match validator_state {
+            Some(state) => validate_tool_arguments(state, &tool_call.arguments),
+            None => Err("Tool schema compilation failed: validator missing from registry".into()),
+        };
+        if let Err(message) = validation_result {
             let result = error_tool_result(message);
             send_event(
                 event_tx,
@@ -896,6 +941,7 @@ impl AgentLoop {
             provider: self.config.model.provider.clone(),
             model: self.config.model.id.clone(),
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 }
@@ -911,12 +957,25 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
-fn sanitize_context_for_request(
-    messages: &[Message],
+/// Plan 02 PR-A: return `Cow::Borrowed` on the common no-
+/// sanitization path so the entire context Vec isn't cloned
+/// every turn. The needs-sanitization scan inspects each
+/// assistant message and short-circuits as soon as one
+/// would have been filtered or rewritten; if none would,
+/// the caller borrows the original slice.
+fn sanitize_context_for_request<'a>(
+    messages: &'a [Message],
     includes_thinking_in_replay: bool,
     requires_thinking_signature: bool,
-) -> Vec<Message> {
-    messages
+) -> std::borrow::Cow<'a, [Message]> {
+    if !context_needs_sanitization(
+        messages,
+        includes_thinking_in_replay,
+        requires_thinking_signature,
+    ) {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    let sanitized: Vec<Message> = messages
         .iter()
         .filter_map(|message| match message {
             Message::Assistant(assistant) => sanitize_assistant_for_request(
@@ -927,7 +986,59 @@ fn sanitize_context_for_request(
             .map(Message::Assistant),
             _ => Some(message.clone()),
         })
-        .collect()
+        .collect();
+    std::borrow::Cow::Owned(sanitized)
+}
+
+/// `true` when any assistant message in `messages` would be
+/// filtered or rewritten by `sanitize_assistant_for_request`.
+/// Mirrors the sanitizer's own predicates — when they drift,
+/// update both.
+fn context_needs_sanitization(
+    messages: &[Message],
+    includes_thinking_in_replay: bool,
+    requires_thinking_signature: bool,
+) -> bool {
+    messages.iter().any(|message| {
+        let Message::Assistant(assistant) = message else {
+            return false;
+        };
+        if matches!(
+            assistant.stop_reason,
+            StopReason::Error | StopReason::Aborted
+        ) {
+            return true;
+        }
+        let mut non_thinking_visible = false;
+        let mut any_drop = false;
+        for block in &assistant.content {
+            match block {
+                ContentBlock::Text { text } if text.trim().is_empty() => any_drop = true,
+                ContentBlock::Text { .. } => non_thinking_visible = true,
+                ContentBlock::Thinking { thinking, .. } if thinking.trim().is_empty() => {
+                    any_drop = true
+                }
+                ContentBlock::Thinking { .. } if !includes_thinking_in_replay => any_drop = true,
+                ContentBlock::Thinking {
+                    signature: None, ..
+                } if requires_thinking_signature => any_drop = true,
+                ContentBlock::Thinking { .. } => {}
+                ContentBlock::RedactedThinking { .. } if !includes_thinking_in_replay => {
+                    any_drop = true
+                }
+                ContentBlock::RedactedThinking { .. } => {}
+                _ => non_thinking_visible = true,
+            }
+        }
+        if any_drop {
+            return true;
+        }
+        // Sanitizer also filters out messages with no non-
+        // thinking visible blocks. If the original already
+        // has none, the sanitizer would filter it — sanitize
+        // path needed.
+        !non_thinking_visible
+    })
 }
 
 fn sanitize_assistant_for_request(
@@ -984,11 +1095,16 @@ fn sanitize_assistant_for_request(
 }
 
 fn validate_tool_arguments(
-    schema: &serde_json::Value,
+    validator_state: &crate::tool::ValidatorState,
     args: &serde_json::Value,
 ) -> Result<(), String> {
-    let validator = jsonschema::validator_for(schema)
-        .map_err(|error| format!("Tool schema compilation failed: {error}"))?;
+    let validator = match validator_state {
+        crate::tool::ValidatorState::Ready(v) => v,
+        // Preserve the legacy error wording verbatim so any
+        // downstream log-match or integration test that keyed
+        // on "Tool schema compilation failed:" still works.
+        crate::tool::ValidatorState::Invalid(message) => return Err(message.clone()),
+    };
     let errors: Vec<String> = validator
         .iter_errors(args)
         .map(|error| error.to_string())
@@ -1096,6 +1212,7 @@ impl AssistantMessageBuilder {
             provider: self.provider.clone(),
             model: self.model.clone(),
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 
@@ -1163,6 +1280,7 @@ impl AssistantMessageBuilder {
             provider: self.provider,
             model: self.model,
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 
@@ -1238,11 +1356,80 @@ impl ToolCallBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_assistant_for_request, sanitize_context_for_request};
+    use std::{collections::HashMap, sync::Arc};
+
     use anie_protocol::{
         AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
     };
+    use anie_provider::{
+        CostPerMillion, Model, ModelCompat, ProviderError, RequestOptionsResolver,
+        ResolvedRequestOptions,
+    };
+    use async_trait::async_trait;
     use serde_json::json;
+
+    use super::{
+        AgentLoopConfig, ToolExecutionMode, sanitize_assistant_for_request,
+        sanitize_context_for_request,
+    };
+
+    struct StaticResolver;
+
+    #[async_trait]
+    impl RequestOptionsResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _context: &[Message],
+        ) -> Result<ResolvedRequestOptions, ProviderError> {
+            Ok(ResolvedRequestOptions::default())
+        }
+    }
+
+    fn sample_model() -> Model {
+        Model {
+            id: "mock-model".into(),
+            name: "Mock Model".into(),
+            provider: "mock".into(),
+            api: anie_provider::ApiKind::OpenAICompletions,
+            base_url: "http://localhost".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        }
+    }
+
+    fn sample_agent_loop_config() -> AgentLoopConfig {
+        AgentLoopConfig::new(
+            sample_model(),
+            "system".into(),
+            anie_provider::ThinkingLevel::Off,
+            ToolExecutionMode::Parallel,
+            Arc::new(StaticResolver),
+        )
+    }
+
+    #[test]
+    fn agent_loop_config_num_ctx_override_defaults_to_none() {
+        let options = sample_agent_loop_config().stream_options(None, HashMap::new());
+
+        assert_eq!(options.num_ctx_override, None);
+    }
+
+    #[test]
+    fn agent_loop_copies_num_ctx_override_into_stream_options() {
+        let config = sample_agent_loop_config().with_ollama_num_ctx_override(Some(16_384));
+
+        let options = config.stream_options(Some("key".into()), HashMap::new());
+
+        assert_eq!(options.api_key.as_deref(), Some("key"));
+        assert_eq!(options.num_ctx_override, Some(16_384));
+    }
 
     fn user_message(text: &str, timestamp: u64) -> Message {
         Message::User(UserMessage {
@@ -1264,7 +1451,65 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp,
+            reasoning_details: None,
         }
+    }
+
+    /// Plan 02 PR-A fast path: a context with no empty/
+    /// failed/filter-eligible assistants returns
+    /// `Cow::Borrowed`.
+    #[test]
+    fn sanitize_context_fast_path_returns_borrowed_when_no_rewrite_needed() {
+        use std::borrow::Cow;
+
+        let context = vec![
+            user_message("first", 1),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text {
+                    text: "visible".into(),
+                }],
+                StopReason::Stop,
+                2,
+            )),
+            user_message("second", 3),
+        ];
+
+        let sanitized = sanitize_context_for_request(&context, false, false);
+        assert!(
+            matches!(sanitized, Cow::Borrowed(_)),
+            "expected borrowed Cow on fast path"
+        );
+    }
+
+    /// Plan 02 PR-A: the owned path still runs when any
+    /// assistant message triggers a filter or rewrite.
+    #[test]
+    fn sanitize_context_owned_path_runs_when_rewrite_needed() {
+        use std::borrow::Cow;
+
+        // Empty-text assistant forces a drop — sanitizer must
+        // rewrite, so the Cow is Owned.
+        let context = vec![
+            user_message("first", 1),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text { text: "  ".into() }],
+                StopReason::Stop,
+                2,
+            )),
+            Message::Assistant(assistant_message(
+                vec![ContentBlock::Text {
+                    text: "keep".into(),
+                }],
+                StopReason::Stop,
+                3,
+            )),
+        ];
+
+        let sanitized = sanitize_context_for_request(&context, false, false);
+        assert!(
+            matches!(sanitized, Cow::Owned(_)),
+            "expected owned Cow when rewrite needed"
+        );
     }
 
     #[test]

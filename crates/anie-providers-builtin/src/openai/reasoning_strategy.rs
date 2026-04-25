@@ -19,6 +19,7 @@ use crate::local::default_local_reasoning_capabilities;
 pub(super) fn reasoning_effort(thinking: ThinkingLevel) -> Option<&'static str> {
     match thinking {
         ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => Some("minimal"),
         ThinkingLevel::Low => Some("low"),
         ThinkingLevel::Medium => Some("medium"),
         ThinkingLevel::High => Some("high"),
@@ -56,6 +57,9 @@ pub(super) fn local_reasoning_prompt_steering(thinking: ThinkingLevel) -> &'stat
         ThinkingLevel::Off => {
             "For this response, answer directly and avoid a visible reasoning block unless it is necessary."
         }
+        ThinkingLevel::Minimal => {
+            "For this response, do the minimum reasoning necessary — favor a direct answer unless the question genuinely requires analysis."
+        }
         ThinkingLevel::Low => {
             "For this response, do a brief internal plan and keep reasoning concise before answering."
         }
@@ -78,9 +82,21 @@ pub(super) enum NativeReasoningRequestStrategy {
     /// Used by hosted OpenAI, Ollama, vLLM, and most OpenAI-compat
     /// servers.
     TopLevelReasoningEffort,
-    /// Send nested `reasoning: { effort: "..." }`.
-    /// LM Studio's proprietary shape.
-    LmStudioNestedReasoning,
+    /// Send nested `reasoning: { effort: "..." }`. Used by LM
+    /// Studio locally and by hosted OpenRouter (OpenRouter
+    /// normalizes reasoning across upstream providers via this
+    /// nested object). Unlike `TopLevelReasoningEffort`, this
+    /// path emits `{ effort: "none" }` for `ThinkingLevel::Off`
+    /// so the upstream receives an explicit disable signal.
+    NestedReasoning,
+    /// Send `enable_thinking: bool` as a disable-signaling flag.
+    /// `nested = false` emits it at the top level (pi's `zai` /
+    /// `qwen` formats); `nested = true` emits it inside
+    /// `chat_template_kwargs` (pi's `qwen-chat-template`
+    /// format). The boolean is derived from `ThinkingLevel`:
+    /// `Off` → `false`, any other level → `true`. Intended for
+    /// vLLM / SGLang Qwen3+ deployments and Z.ai GLM models.
+    EnableThinkingFlag { nested: bool },
 }
 
 /// Identifies which OpenAI-compatible backend shape `model` targets.
@@ -117,6 +133,9 @@ pub(super) fn effective_max_tokens(model: &Model, options: &StreamOptions) -> Op
         .is_some();
     let base_headroom = match options.thinking {
         ThinkingLevel::Off => 0,
+        // Minimal sits between Off and Low — the reasoning
+        // output is expected to be very brief.
+        ThinkingLevel::Minimal => max_tokens / 20,
         ThinkingLevel::Low => max_tokens / 10,
         ThinkingLevel::Medium => max_tokens / 5,
         ThinkingLevel::High => max_tokens / 4,
@@ -124,6 +143,7 @@ pub(super) fn effective_max_tokens(model: &Model, options: &StreamOptions) -> Op
     let visible_reasoning_headroom = if visible_reasoning_output_likely {
         match options.thinking {
             ThinkingLevel::Off => 0,
+            ThinkingLevel::Minimal => 64,
             ThinkingLevel::Low => 128,
             ThinkingLevel::Medium => 256,
             ThinkingLevel::High => 512,
@@ -193,7 +213,18 @@ fn looks_like_native_reasoning_compat_body(body: &str) -> bool {
         || body.contains("\"reasoning\"")
         || body.contains("'reasoning'")
         || body.contains("reasoning")
-        || body.contains(" field required") && body.contains("reasoning");
+        || body.contains(" field required") && body.contains("reasoning")
+        // Ollama's native `/api/chat` errors surface through the
+        // OpenAI-compat endpoint using the word `think` / `thinking`
+        // rather than `reasoning`, e.g.
+        //   `think value "low" is not supported for this model`
+        //   `"gemma3:1b" does not support thinking`
+        // Recognize both so `send_stream_request` retries with
+        // `NoNativeFields`. See docs/ollama_capability_discovery
+        // PR 2.
+        || body.contains("thinking")
+        || body.contains("think value")
+        || body.contains("think field");
     let indicates_compatibility_failure = body.contains("unknown")
         || body.contains("unsupported")
         || body.contains("unexpected")
@@ -202,29 +233,46 @@ fn looks_like_native_reasoning_compat_body(body: &str) -> bool {
         || body.contains("not permitted")
         || body.contains("additional properties")
         || body.contains("invalid")
-        || body.contains("bad request");
+        || body.contains("bad request")
+        // Ollama phrasings — "is not supported for this model",
+        // "does not support thinking".
+        || body.contains("not supported")
+        || body.contains("does not support");
 
     mentions_reasoning_field && indicates_compatibility_failure
 }
 
 /// Extract a thinking/reasoning delta from a streamed chat-completion
 /// `delta` object. Returns the first non-empty value found in any of
-/// `reasoning`, `reasoning_content`, or `thinking`.
+/// `reasoning`, `reasoning_content`, `reasoning_text`, or `thinking`.
+///
+/// The three `reasoning*` names are all seen in the wild: OpenAI and
+/// most OpenAI-compat servers use `reasoning` or `reasoning_content`;
+/// OpenRouter forwards `reasoning_text` from some upstreams
+/// (DeepSeek's native API among them) without normalizing the field
+/// name.
 pub(super) fn native_reasoning_delta(delta: &serde_json::Value) -> Option<String> {
-    ["reasoning", "reasoning_content", "thinking"]
-        .iter()
-        .find_map(|field| {
-            delta
-                .get(*field)
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
+    [
+        "reasoning",
+        "reasoning_content",
+        "reasoning_text",
+        "thinking",
+    ]
+    .iter()
+    .find_map(|field| {
+        delta
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use anie_provider::{CostPerMillion, ReasoningControlMode, ThinkingRequestMode};
+    use anie_provider::{
+        CostPerMillion, ModelCompat, ReasoningControlMode, ReasoningOutputMode, ThinkingRequestMode,
+    };
 
     use super::*;
     use crate::OpenAIProvider;
@@ -243,6 +291,7 @@ mod tests {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -260,7 +309,42 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
+    }
+
+    #[test]
+    fn native_reasoning_delta_captures_every_known_field_name() {
+        use serde_json::json;
+        for field in [
+            "reasoning",
+            "reasoning_content",
+            "reasoning_text",
+            "thinking",
+        ] {
+            let delta = json!({ field: "thinking hard" });
+            assert_eq!(
+                native_reasoning_delta(&delta),
+                Some("thinking hard".to_string()),
+                "field {field:?} should be recognized"
+            );
+        }
+    }
+
+    #[test]
+    fn native_reasoning_delta_returns_none_when_no_recognized_field_present() {
+        let delta = serde_json::json!({ "content": "plain text", "role": "assistant" });
+        assert_eq!(native_reasoning_delta(&delta), None);
+    }
+
+    #[test]
+    fn reasoning_effort_maps_minimal_level_to_minimal_string() {
+        // Plan 01 PR B: GPT-5 family accepts `reasoning_effort:
+        // "minimal"`. Providers without `supportsReasoningEffort`
+        // ignore it silently; the mapping just has to be in
+        // place so those that do support it get the right wire
+        // value.
+        assert_eq!(reasoning_effort(ThinkingLevel::Minimal), Some("minimal"));
     }
 
     #[test]
@@ -323,6 +407,55 @@ mod tests {
     }
 
     #[test]
+    fn classify_openai_http_error_recognizes_ollama_leveled_think_rejection() {
+        // Ollama reports non-thinking-capable models rejecting a
+        // leveled `think` value with this exact body. Must upgrade
+        // to NativeReasoningUnsupported so the caller retries with
+        // `NoNativeFields`.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"think value \"low\" is not supported for this model","type":"api_error"}}"#,
+            None,
+        );
+        assert!(
+            matches!(err, ProviderError::NativeReasoningUnsupported(_)),
+            "expected NativeReasoningUnsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_openai_http_error_recognizes_ollama_no_thinking_capability() {
+        // Alternate Ollama wording for models lacking the
+        // `thinking` capability entirely.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"\"gemma3:1b\" does not support thinking","type":"api_error"}}"#,
+            None,
+        );
+        assert!(
+            matches!(err, ProviderError::NativeReasoningUnsupported(_)),
+            "expected NativeReasoningUnsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_openai_http_error_does_not_misclassify_unrelated_400s() {
+        // Negative: a 400 body about a genuinely-unrelated field
+        // must stay a plain Http error so the caller surfaces the
+        // underlying mistake instead of retrying into a
+        // reasoning-compat fallback.
+        let err = classify_openai_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"missing required field \"messages\"","type":"api_error"}}"#,
+            None,
+        );
+        assert!(
+            matches!(err, ProviderError::Http { .. }),
+            "expected Http {{ .. }}, got {err:?}"
+        );
+    }
+
+    #[test]
     fn backend_defaults_resolve_conservatively_for_local_models() {
         let provider = OpenAIProvider::new();
         let options = StreamOptions {
@@ -348,7 +481,7 @@ mod tests {
         assert_eq!(
             provider.native_reasoning_request_strategies(&lmstudio, &options),
             vec![
-                NativeReasoningRequestStrategy::LmStudioNestedReasoning,
+                NativeReasoningRequestStrategy::NestedReasoning,
                 NativeReasoningRequestStrategy::NoNativeFields,
             ]
         );
@@ -371,6 +504,69 @@ mod tests {
         assert_eq!(
             provider.native_reasoning_request_strategies(&unknown, &options),
             vec![NativeReasoningRequestStrategy::NoNativeFields]
+        );
+    }
+
+    #[test]
+    fn effective_reasoning_capabilities_prefers_declared_over_heuristic() {
+        // After PR 5 a Model discovered against Ollama's
+        // /api/show carries a declared `reasoning_capabilities`.
+        // `effective_reasoning_capabilities` must honor the
+        // declared value verbatim — even when the model id is
+        // one the substring heuristic would still mis-classify
+        // (say, a hypothetical `qwen3-new:9b` that /api/show
+        // flagged as *non*-thinking).
+        let model = Model {
+            id: "qwen3-new:9b".into(),
+            name: "Qwen 3 New 9B".into(),
+            provider: "ollama".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "http://localhost:11434/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: true,
+            // Declared = Native / ReasoningEffort (authoritative
+            // from /api/show). The heuristic would also say
+            // "reasoning" here (qwen3- prefix), but if we ever
+            // flipped the declared value to None or a different
+            // profile, *that* must win.
+            reasoning_capabilities: Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+            }),
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        };
+
+        let effective = effective_reasoning_capabilities(&model);
+        assert_eq!(effective, model.reasoning_capabilities);
+
+        // Sanity check: flipping the declared profile to None
+        // disables reasoning even for a qwen3-prefixed id — the
+        // declared-over-heuristic precedence lets `/api/show`
+        // positively override the family heuristic.
+        let mut non_thinking = model;
+        non_thinking.reasoning_capabilities = None;
+        let effective = effective_reasoning_capabilities(&non_thinking);
+        // Falls back to the heuristic on a qwen3- id. The
+        // heuristic still says "Native + ReasoningEffort" (it
+        // doesn't know /api/show said no), so the authoritative
+        // precedence is only meaningful when /api/show's result
+        // is wired into reasoning_capabilities — exactly what
+        // PR 5's to_model change does. Assert the fallback
+        // matches the heuristic so this test documents the
+        // order-of-precedence rule.
+        assert_eq!(
+            effective,
+            default_local_reasoning_capabilities(
+                &non_thinking.provider,
+                &non_thinking.base_url,
+                &non_thinking.id
+            )
         );
     }
 

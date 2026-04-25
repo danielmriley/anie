@@ -27,3 +27,10 @@ coverage/
 dist/
 *.profraw
 *.profdata
+
+# Local review/input artifacts. Keep these anchored so committed docs under
+# docs/ remain visible.
+/code-review_*.md
+/code_review_*.md
+/review_input.rs
+/.claude/*.lock

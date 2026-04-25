@@ -25,7 +25,7 @@ pub enum ProviderError {
 
     /// Rate-limited response. `retry_after_ms` carries the server's
     /// `Retry-After` hint when present.
-    #[error("Rate limited (retry after {retry_after_ms:?}ms)")]
+    #[error("{}", format_rate_limited(*.retry_after_ms))]
     RateLimited { retry_after_ms: Option<u64> },
 
     /// Context-window overflow. Triggers the compaction-retry path
@@ -60,6 +60,22 @@ pub enum ProviderError {
         "model returned no visible content (only reasoning); rephrase, lower the thinking level, or switch models"
     )]
     EmptyAssistantResponse,
+
+    /// The provider signalled output-budget exhaustion
+    /// (`finish_reason: "length"`, Anthropic `stop_reason:
+    /// "max_tokens"`, or equivalent) before the model produced any
+    /// visible text or tool call — i.e. the response was truncated
+    /// *during reasoning* because the total output token budget was
+    /// exhausted. Distinct from
+    /// `EmptyAssistantResponse` because the fix is different: the
+    /// model didn't run out of ideas, it ran out of room. Common
+    /// on OpenRouter when hosted reasoning models emit several
+    /// thousand tokens of reasoning before answering and the
+    /// configured `max_tokens` is too small.
+    #[error(
+        "response truncated before a visible answer was produced (max_tokens reached during reasoning); lower the thinking level, raise the model's max_tokens, or switch to a non-reasoning model"
+    )]
+    ResponseTruncated,
 
     /// An SSE frame could not be parsed as JSON. Usually a transient
     /// upstream issue; retryable.
@@ -125,6 +141,14 @@ impl ProviderError {
             Self::RateLimited { retry_after_ms } => *retry_after_ms,
             _ => None,
         }
+    }
+}
+
+fn format_rate_limited(retry_after_ms: Option<u64>) -> String {
+    match retry_after_ms {
+        Some(ms) if ms >= 1_000 => format!("Rate limited (retry after {}s)", ms / 1_000),
+        Some(ms) => format!("Rate limited (retry after {ms}ms)"),
+        None => "Rate limited (no retry hint from provider)".to_string(),
     }
 }
 

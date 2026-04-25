@@ -5,9 +5,9 @@ use anie_protocol::{
 };
 
 use crate::{
-    ApiKind, CostPerMillion, LlmContext, Model, Provider, ProviderError, ProviderEvent,
-    ProviderRegistry, ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode,
-    ReasoningTags, StreamOptions, ThinkingRequestMode,
+    ApiKind, CostPerMillion, LlmContext, Model, ModelCompat, Provider, ProviderError,
+    ProviderEvent, ProviderRegistry, ReasoningCapabilities, ReasoningControlMode,
+    ReasoningOutputMode, ReasoningTags, StreamOptions, ThinkingRequestMode,
     mock::{MockProvider, MockStreamScript},
 };
 
@@ -25,6 +25,7 @@ fn sample_model() -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }
 }
 
@@ -40,6 +41,16 @@ fn sample_context() -> LlmContext {
     }
 }
 
+fn api_kind_wire_name(api: ApiKind) -> &'static str {
+    match api {
+        ApiKind::AnthropicMessages => "AnthropicMessages",
+        ApiKind::OpenAICompletions => "OpenAICompletions",
+        ApiKind::OpenAIResponses => "OpenAIResponses",
+        ApiKind::GoogleGenerativeAI => "GoogleGenerativeAI",
+        ApiKind::OllamaChatApi => "OllamaChatApi",
+    }
+}
+
 fn final_message() -> AssistantMessage {
     AssistantMessage {
         content: vec![ContentBlock::Text {
@@ -51,7 +62,33 @@ fn final_message() -> AssistantMessage {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
+}
+
+#[test]
+fn ollama_chat_api_variant_round_trips_serde_name() {
+    let json = serde_json::to_string(&ApiKind::OllamaChatApi).expect("serialize api kind");
+    assert_eq!(json, "\"OllamaChatApi\"");
+
+    let roundtrip: ApiKind = serde_json::from_str(&json).expect("deserialize api kind");
+    assert_eq!(roundtrip, ApiKind::OllamaChatApi);
+
+    let mut model = sample_model();
+    model.provider = "ollama".into();
+    model.api = ApiKind::OllamaChatApi;
+    model.base_url = "http://localhost:11434".into();
+
+    let toml = toml::to_string(&model).expect("serialize model to toml");
+    assert!(toml.contains("api = \"OllamaChatApi\""));
+
+    let roundtrip: Model = toml::from_str(&toml).expect("deserialize model from toml");
+    assert_eq!(roundtrip, model);
+}
+
+#[test]
+fn api_kind_exhaustive_match_still_compiles() {
+    assert_eq!(api_kind_wire_name(ApiKind::OllamaChatApi), "OllamaChatApi");
 }
 
 #[test]

@@ -13,9 +13,10 @@ use tokio::sync::mpsc;
 
 use anie_auth::CredentialStore;
 use anie_config::{ConfigMutator, global_config_path};
-use anie_provider::{ApiKind, CostPerMillion, Model, ModelInfo};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
 use anie_providers_builtin::{
     LocalServer, ModelDiscoveryRequest, builtin_models, detect_local_servers, discover_models,
+    is_ollama_native_discovery_target, ollama_native_base_url,
 };
 
 use crate::{
@@ -75,6 +76,15 @@ enum OnboardingState {
     NoLocalServers,
     ProviderPresetList {
         selected: usize,
+    },
+    /// Terminal state for OAuth-backed presets. Shows the user
+    /// the exact `anie login <provider>` command + a brief
+    /// explanation of why we can't run the flow in-process.
+    /// Enter / Esc returns to the preset list.
+    OAuthLoginInstructions {
+        provider_name: &'static str,
+        display_name: &'static str,
+        preset_index: usize,
     },
     ApiKeyInput {
         preset_index: usize,
@@ -158,6 +168,12 @@ struct ProviderPreset {
     provider_name: &'static str,
     kind: ConfiguredProviderKind,
     model: Model,
+    /// OAuth-backed provider — selecting it in the preset list
+    /// routes to the `OAuthLoginInstructions` state instead of
+    /// the API key input. Login itself happens via the CLI
+    /// (`anie login <provider>`) because the callback server
+    /// can't run inside the alternate-screen TUI.
+    oauth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +262,9 @@ impl OnboardingScreen {
             OnboardingState::LocalServerSelect { .. } => self.handle_local_select_key(key),
             OnboardingState::NoLocalServers => self.handle_no_local_servers_key(key),
             OnboardingState::ProviderPresetList { .. } => self.handle_provider_preset_key(key),
+            OnboardingState::OAuthLoginInstructions { .. } => {
+                self.handle_oauth_instructions_key(key)
+            }
             OnboardingState::ApiKeyInput { .. } => self.handle_api_key_input_key(key),
             OnboardingState::CustomEndpoint { .. } => self.handle_custom_endpoint_key(key),
             OnboardingState::Busy { .. } => self.handle_busy_key(key),
@@ -307,7 +326,9 @@ impl OnboardingScreen {
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
-        let spinner_frame = self.spinner.tick().to_string();
+        // Borrow the &'static str from Spinner::tick rather
+        // than allocating a fresh String per frame. Plan 04 PR-F.
+        let spinner_frame: &'static str = self.spinner.tick();
         match &self.state {
             OnboardingState::MainMenu { selected } => {
                 self.render_main_menu(frame, inner, *selected)
@@ -325,7 +346,7 @@ impl OnboardingScreen {
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::LocalServerSelect { selected } => {
-                self.render_local_server_select(frame, inner, *selected, &spinner_frame)
+                self.render_local_server_select(frame, inner, *selected, spinner_frame)
             }
             OnboardingState::NoLocalServers => self.render_busy_panel(
                 frame,
@@ -337,6 +358,11 @@ impl OnboardingScreen {
             OnboardingState::ProviderPresetList { selected } => {
                 self.render_provider_presets(frame, inner, *selected)
             }
+            OnboardingState::OAuthLoginInstructions {
+                provider_name,
+                display_name,
+                ..
+            } => self.render_oauth_instructions(frame, inner, provider_name, display_name),
             OnboardingState::ApiKeyInput {
                 preset_index,
                 input,
@@ -359,7 +385,7 @@ impl OnboardingScreen {
                 footer_line("[Esc] Back"),
             ),
             OnboardingState::PickingModel { picker, .. } => {
-                self.render_model_picker(frame, inner, picker, &spinner_frame)
+                self.render_model_picker(frame, inner, picker, spinner_frame)
             }
             OnboardingState::Success { message } => self.render_status_panel(
                 frame,
@@ -680,9 +706,45 @@ impl OnboardingScreen {
                 *selected = (*selected + 1).min(presets.len().saturating_sub(1));
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                self.state = OnboardingState::ApiKeyInput {
-                    preset_index: *selected,
-                    input: TextField::masked(),
+                let preset = presets.get(*selected).cloned();
+                if let Some(preset) = preset {
+                    if preset.oauth {
+                        // Pivot to the OAuth instructions screen
+                        // instead of the API key prompt.
+                        self.state = OnboardingState::OAuthLoginInstructions {
+                            provider_name: preset.provider_name,
+                            display_name: preset.display_name,
+                            preset_index: *selected,
+                        };
+                    } else {
+                        self.state = OnboardingState::ApiKeyInput {
+                            preset_index: *selected,
+                            input: TextField::masked(),
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+        OnboardingAction::Continue
+    }
+
+    fn handle_oauth_instructions_key(&mut self, key: KeyEvent) -> OnboardingAction {
+        let preset_index = match &self.state {
+            OnboardingState::OAuthLoginInstructions { preset_index, .. } => *preset_index,
+            _ => return OnboardingAction::Continue,
+        };
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Esc)
+            | (KeyModifiers::NONE, KeyCode::Backspace)
+            | (KeyModifiers::NONE, KeyCode::Enter) => {
+                // Enter on the instructions screen means "I've
+                // read this, take me back so I can pick
+                // something else." Actually running `anie
+                // login` is on the user; we're just a
+                // signpost.
+                self.state = OnboardingState::ProviderPresetList {
+                    selected: preset_index,
                 };
             }
             _ => {}
@@ -1050,24 +1112,34 @@ impl OnboardingScreen {
                     .first()
                     .map(|model| model.base_url.clone())
                     .unwrap_or_else(|| normalize_openai_base_url(&server.base_url));
+                let api = discovery_model_api(&server.name, api, &base_url);
+                let mut model = model_info.to_model(api, &discovery_model_base_url(api, &base_url));
+                anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
-                    model: model_info.to_model(api, &base_url),
+                    model,
                     kind: ConfiguredProviderKind::ConfigBacked,
                     is_default: true,
                 }
             }
-            ModelPickerContext::ApiPreset { preset, .. } => ConfiguredProvider {
-                model: model_info.to_model(preset.model.api, &preset.model.base_url),
-                kind: preset.kind,
-                is_default: true,
-            },
+            ModelPickerContext::ApiPreset { preset, .. } => {
+                let mut model = model_info.to_model(preset.model.api, &preset.model.base_url);
+                model.provider = preset.provider_name.to_string();
+                anie_providers_builtin::apply_openrouter_capabilities(&mut model);
+                ConfiguredProvider {
+                    model,
+                    kind: preset.kind,
+                    is_default: true,
+                }
+            }
             ModelPickerContext::CustomEndpoint {
                 base_url,
                 provider_name,
                 ..
             } => {
-                let mut model = model_info.to_model(ApiKind::OpenAICompletions, base_url);
+                let api = discovery_model_api(provider_name, ApiKind::OpenAICompletions, base_url);
+                let mut model = model_info.to_model(api, &discovery_model_base_url(api, base_url));
                 model.provider = provider_name.clone();
+                anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
                     model,
                     kind: ConfiguredProviderKind::ConfigBacked,
@@ -1119,6 +1191,7 @@ impl OnboardingScreen {
                             supports_images: false,
                             cost_per_million: CostPerMillion::zero(),
                             replay_capabilities: None,
+                            compat: ModelCompat::None,
                         },
                         kind: ConfiguredProviderKind::ConfigBacked,
                         is_default: true,
@@ -1461,6 +1534,36 @@ impl OnboardingScreen {
         self.render_status_panel(frame, area, title, body, Color::Cyan, footer);
     }
 
+    /// Render the OAuth login-instructions screen. Static —
+    /// dominant element is the exact `anie login <provider>`
+    /// command so the user can copy it and run externally.
+    fn render_oauth_instructions(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        provider_name: &str,
+        display_name: &str,
+    ) {
+        let body = format!(
+            "{display_name} uses OAuth login, which needs a browser \
+             callback server that conflicts with the TUI's alternate\
+             -screen state.\n\n\
+             Run this in a regular shell to finish setup:\n\n\
+             \x20   anie login {provider_name}\n\n\
+             A browser will open; complete the flow there. Once the \
+             credential is saved, relaunch anie and {display_name} \
+             models will appear in the picker automatically.",
+        );
+        self.render_status_panel(
+            frame,
+            area,
+            "OAuth Login Required",
+            &body,
+            Color::Yellow,
+            footer_line("[Enter/Esc] Back"),
+        );
+    }
+
     fn render_status_panel(
         &self,
         frame: &mut Frame<'_>,
@@ -1723,7 +1826,7 @@ fn discovery_request_for_context(
             api: preset.model.api,
             base_url: preset.model.base_url.clone(),
             api_key: Some(api_key.clone()),
-            headers: std::collections::HashMap::new(),
+            headers: anie_auth::oauth_request_headers(preset.provider_name),
         }),
         ModelPickerContext::CustomEndpoint {
             api_key,
@@ -1739,7 +1842,7 @@ fn discovery_request_for_context(
             } else {
                 Some(api_key.clone())
             },
-            headers: std::collections::HashMap::new(),
+            headers: anie_auth::oauth_request_headers(provider_name),
         }),
     }
 }
@@ -1833,6 +1936,7 @@ fn provider_presets() -> Vec<ProviderPreset> {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         });
     let anthropic = builtin_models()
         .into_iter()
@@ -1850,6 +1954,7 @@ fn provider_presets() -> Vec<ProviderPreset> {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         });
 
     vec![
@@ -1858,13 +1963,21 @@ fn provider_presets() -> Vec<ProviderPreset> {
             provider_name: "anthropic",
             kind: ConfiguredProviderKind::BuiltinHosted,
             model: anthropic,
+            oauth: false,
         },
         ProviderPreset {
             display_name: "OpenAI (GPT-4o, o-series)",
             provider_name: "openai",
             kind: ConfiguredProviderKind::BuiltinHosted,
             model: openai,
+            oauth: false,
         },
+        custom_openai_preset(
+            "OpenRouter (discovery, 500+ models)",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            "openai/gpt-4o",
+        ),
         custom_openai_preset("xAI / Grok", "xai", "https://api.x.ai/v1", "grok-2-1212"),
         custom_openai_preset(
             "Groq",
@@ -1890,7 +2003,60 @@ fn provider_presets() -> Vec<ProviderPreset> {
             "https://api.mistral.ai/v1",
             "mistral-large-latest",
         ),
+        // OAuth-backed providers. Selecting these routes to the
+        // `OAuthLoginInstructions` screen with the exact `anie
+        // login <provider>` command to run. We can't run the
+        // flow in-process because the browser callback server
+        // would clash with the TUI's alternate-screen state.
+        oauth_preset("GitHub Copilot (OAuth)", "github-copilot"),
+        oauth_preset("OpenAI Codex (ChatGPT OAuth)", "openai-codex"),
+        oauth_preset("Google Gemini CLI (OAuth)", "google-gemini-cli"),
+        oauth_preset("Google Antigravity (OAuth)", "google-antigravity"),
+        // Intentionally NO Anthropic OAuth here: the flow
+        // works, but Anthropic actively enforces ToS against
+        // third-party agent use and steering new users towards
+        // it from an onboarding UX would be irresponsible.
+        // Power users who know the risk can still run
+        // `anie login anthropic` directly.
     ]
+}
+
+fn oauth_preset(display_name: &'static str, provider_name: &'static str) -> ProviderPreset {
+    // Placeholder Model for the preset's display; real model
+    // metadata arrives later via OAuth-backed discovery after
+    // the user logs in.
+    let model = Model {
+        id: oauth_default_model_id(provider_name).to_string(),
+        name: oauth_default_model_id(provider_name).to_string(),
+        provider: provider_name.to_string(),
+        api: ApiKind::OpenAICompletions,
+        base_url: "oauth://pending".to_string(),
+        context_window: 200_000,
+        max_tokens: 16_384,
+        supports_reasoning: true,
+        reasoning_capabilities: None,
+        supports_images: false,
+        cost_per_million: CostPerMillion::zero(),
+        replay_capabilities: None,
+        compat: ModelCompat::None,
+    };
+    ProviderPreset {
+        display_name,
+        provider_name,
+        kind: ConfiguredProviderKind::BuiltinHosted,
+        model,
+        oauth: true,
+    }
+}
+
+fn oauth_default_model_id(provider_name: &str) -> &'static str {
+    match provider_name {
+        "github-copilot" => "claude-sonnet-4.6",
+        "openai-codex" => "gpt-5",
+        "google-gemini-cli" => "gemini-2.5-pro",
+        "google-antigravity" => "gemini-3-pro-preview",
+        _ => "default",
+    }
 }
 
 fn default_openai_preset() -> ProviderPreset {
@@ -1925,7 +2091,9 @@ fn custom_openai_preset(
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         },
+        oauth: false,
     }
 }
 
@@ -1935,6 +2103,22 @@ fn normalize_openai_base_url(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/v1")
+    }
+}
+
+fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
+    if is_ollama_native_discovery_target(provider_name, base_url) {
+        ApiKind::OllamaChatApi
+    } else {
+        api
+    }
+}
+
+fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
     }
 }
 
@@ -1967,8 +2151,104 @@ mod tests {
                 supports_images: false,
                 cost_per_million: CostPerMillion::zero(),
                 replay_capabilities: None,
+                compat: ModelCompat::None,
             }],
         }
+    }
+
+    #[test]
+    fn oauth_presets_are_listed_alongside_api_key_presets() {
+        let presets = provider_presets();
+        for expected in [
+            "github-copilot",
+            "openai-codex",
+            "google-gemini-cli",
+            "google-antigravity",
+        ] {
+            let preset = presets
+                .iter()
+                .find(|p| p.provider_name == expected)
+                .unwrap_or_else(|| panic!("{expected} preset missing"));
+            assert!(
+                preset.oauth,
+                "{expected} preset should be marked oauth=true"
+            );
+            assert!(
+                preset.display_name.to_ascii_lowercase().contains("oauth"),
+                "display_name should signal OAuth: {}",
+                preset.display_name
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_preset_list_excludes_anthropic_by_design() {
+        let presets = provider_presets();
+        // Anthropic OAuth works technically but Anthropic
+        // actively enforces third-party-agent ToS. We don't
+        // advertise it in onboarding; power users can still
+        // run `anie login anthropic` directly.
+        let anthropic = presets
+            .iter()
+            .find(|p| p.provider_name == "anthropic")
+            .expect("anthropic API-key preset should still exist");
+        assert!(!anthropic.oauth);
+    }
+
+    #[test]
+    fn openrouter_preset_registered_and_in_onboarding_shortlist() {
+        let presets = provider_presets();
+        let openrouter = presets
+            .iter()
+            .find(|preset| preset.provider_name == "openrouter")
+            .expect("openrouter preset must appear in the onboarding shortlist");
+
+        assert_eq!(openrouter.model.provider, "openrouter");
+        assert_eq!(openrouter.model.api, ApiKind::OpenAICompletions);
+        assert_eq!(openrouter.model.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(openrouter.kind, ConfiguredProviderKind::ConfigBacked);
+        assert!(
+            openrouter.display_name.contains("OpenRouter"),
+            "display name should call out OpenRouter, got {:?}",
+            openrouter.display_name
+        );
+
+        // Ordering contract: OpenRouter appears within the first
+        // three third-party-API presets the user sees, so the
+        // shortlist keeps it prominent alongside Anthropic/OpenAI.
+        let openrouter_index = presets
+            .iter()
+            .position(|preset| preset.provider_name == "openrouter")
+            .expect("position");
+        assert!(
+            openrouter_index < 4,
+            "openrouter should be near the top of the shortlist, found at index {openrouter_index}"
+        );
+    }
+
+    #[test]
+    fn openrouter_preset_builds_discovery_request_with_expected_fields() {
+        // Mirrors the path taken after the user enters their API
+        // key on the OpenRouter preset: the worker builds a
+        // `ModelDiscoveryRequest` from the `ApiPreset` context and
+        // hands it to `discover_models`. We verify the request is
+        // addressed at OpenRouter's `/v1/models` with the user's
+        // key.
+        let preset = provider_presets()
+            .into_iter()
+            .find(|preset| preset.provider_name == "openrouter")
+            .expect("openrouter preset");
+
+        let context = ModelPickerContext::ApiPreset {
+            preset_index: 0,
+            preset,
+            api_key: "sk-or-example".into(),
+        };
+        let request = discovery_request_for_context(&context).expect("discovery request");
+        assert_eq!(request.provider_name, "openrouter");
+        assert_eq!(request.api, ApiKind::OpenAICompletions);
+        assert_eq!(request.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(request.api_key.as_deref(), Some("sk-or-example"));
     }
 
     #[test]
@@ -2042,12 +2322,43 @@ mod tests {
                 name: "Qwen 3 32B".into(),
                 provider: "ollama".into(),
                 context_length: Some(32_768),
+                max_output_tokens: None,
                 supports_images: Some(false),
                 supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
+                provider_capabilities: None,
             }]),
         });
 
         assert!(matches!(screen.state, OnboardingState::PickingModel { .. }));
+    }
+
+    #[test]
+    fn onboarding_converts_ollama_discovery_to_ollama_chat_api() {
+        let screen = OnboardingScreen::new_for_tests();
+        let context = ModelPickerContext::LocalServer {
+            selected: 0,
+            server: sample_local_server(),
+        };
+        let configured = screen.configured_provider_from_context(
+            &context,
+            &ModelInfo {
+                id: "qwen3:32b".into(),
+                name: "Qwen 3 32B".into(),
+                provider: "ollama".into(),
+                context_length: Some(32_768),
+                max_output_tokens: None,
+                supports_images: Some(false),
+                supports_reasoning: Some(true),
+                pricing: None,
+                supported_parameters: None,
+                provider_capabilities: None,
+            },
+        );
+
+        assert_eq!(configured.model.api, ApiKind::OllamaChatApi);
+        assert_eq!(configured.model.base_url, "http://localhost:11434");
     }
 
     #[test]
@@ -2105,8 +2416,12 @@ mod tests {
                     name: "Qwen 3 32B".into(),
                     provider: "ollama".into(),
                     context_length: Some(32_768),
+                    max_output_tokens: None,
                     supports_images: Some(false),
                     supports_reasoning: Some(true),
+                    pricing: None,
+                    supported_parameters: None,
+                    provider_capabilities: None,
                 }],
                 "ollama".into(),
                 "qwen3:32b".into(),

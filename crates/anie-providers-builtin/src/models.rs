@@ -1,6 +1,6 @@
 use anie_provider::{
-    ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
-    ReasoningOutputMode, ReplayCapabilities,
+    ApiKind, CostPerMillion, MaxTokensField, Model, ModelCompat, OpenAICompletionsCompat,
+    ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode, ReplayCapabilities,
 };
 
 fn native_separated_reasoning() -> Option<ReasoningCapabilities> {
@@ -17,6 +17,7 @@ fn anthropic_replay_capabilities() -> Option<ReplayCapabilities> {
         requires_thinking_signature: true,
         supports_redacted_thinking: true,
         supports_encrypted_reasoning: false,
+        supports_reasoning_details_replay: false,
     })
 }
 
@@ -42,6 +43,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 3.75,
             },
             replay_capabilities: anthropic_replay_capabilities(),
+            compat: ModelCompat::None,
         },
         Model {
             id: "claude-opus-4-6".into(),
@@ -61,6 +63,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 18.75,
             },
             replay_capabilities: anthropic_replay_capabilities(),
+            compat: ModelCompat::None,
         },
         Model {
             id: "claude-haiku-4-5-20251001".into(),
@@ -80,6 +83,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 1.0,
             },
             replay_capabilities: anthropic_replay_capabilities(),
+            compat: ModelCompat::None,
         },
         Model {
             id: "gpt-4o".into(),
@@ -99,6 +103,7 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 0.0,
             },
             replay_capabilities: None,
+            compat: ModelCompat::None,
         },
         Model {
             id: "o4-mini".into(),
@@ -118,6 +123,12 @@ pub fn builtin_models() -> Vec<Model> {
                 cache_write: 0.0,
             },
             replay_capabilities: None,
+            // OpenAI o-series requires `max_completion_tokens` on
+            // the wire — the legacy `max_tokens` 400s post-2024.
+            compat: ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+                max_tokens_field: Some(MaxTokensField::MaxCompletionTokens),
+                ..Default::default()
+            }),
         },
     ]
 }
@@ -145,5 +156,22 @@ mod tests {
         assert_eq!(o4_mini.reasoning_capabilities, native_separated_reasoning());
         assert_eq!(claude.reasoning_capabilities, native_separated_reasoning());
         assert_eq!(gpt_4o.reasoning_capabilities, None);
+    }
+
+    #[test]
+    fn builtin_openai_compatible_image_models_are_audited() {
+        let models = builtin_models();
+        let image_capable_openai = models
+            .iter()
+            .filter(|model| model.api == ApiKind::OpenAICompletions && model.supports_images)
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+
+        // Set A Plan 02 PR B audit: hosted OpenAI chat models that
+        // advertise image support are covered by the OpenAI converter's
+        // `image_url` content-part path. OpenRouter/local image support
+        // is discovered from live model metadata instead of this static
+        // catalog.
+        assert_eq!(image_capable_openai, vec!["gpt-4o", "o4-mini"]);
     }
 }

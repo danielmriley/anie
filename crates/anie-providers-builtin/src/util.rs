@@ -17,10 +17,19 @@ pub fn classify_http_error(
     match status.as_u16() {
         401 | 403 => anie_provider::ProviderError::Auth(body.to_string()),
         429 | 529 => anie_provider::ProviderError::RateLimited { retry_after_ms },
-        400 if body.to_ascii_lowercase().contains("context")
-            || body.to_ascii_lowercase().contains("token") =>
-        {
-            anie_provider::ProviderError::ContextOverflow(body.to_string())
+        400 => {
+            // Plan 06 PR-G: lowercase the body once per
+            // classification, not twice. Keeps both keyword
+            // checks pointing at the same allocation.
+            let body_lower = body.to_ascii_lowercase();
+            if body_lower.contains("context") || body_lower.contains("token") {
+                anie_provider::ProviderError::ContextOverflow(body.to_string())
+            } else {
+                anie_provider::ProviderError::Http {
+                    status: status.as_u16(),
+                    body: body.to_string(),
+                }
+            }
         }
         _ => anie_provider::ProviderError::Http {
             status: status.as_u16(),

@@ -1,22 +1,32 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::{Mutex, MutexGuard},
+};
 
 use super::*;
 use crate::bootstrap::build_tool_registry;
-use crate::runtime_state::RuntimeState;
-use anie_protocol::StopReason;
+use crate::runtime_state::{RuntimeState, load_runtime_state_from};
+use anie_protocol::{StopReason, ToolDef};
 use anie_provider::{
-    ApiKind, CostPerMillion, ProviderError,
+    ApiKind, CostPerMillion, LlmContext, LlmMessage, ModelCompat, Provider, ProviderError,
+    ProviderEvent, ProviderStream, StreamOptions,
     mock::{MockProvider, MockStreamScript},
 };
 use anie_session::SessionManager;
+use futures::stream;
 use tempfile::tempdir;
 
 fn model(id: &str, provider: &str) -> Model {
+    model_with_api(id, provider, ApiKind::OpenAICompletions)
+}
+
+fn model_with_api(id: &str, provider: &str, api: ApiKind) -> Model {
     Model {
         id: id.into(),
         name: id.into(),
         provider: provider.into(),
-        api: ApiKind::OpenAICompletions,
+        api,
         base_url: "http://localhost:11434/v1".into(),
         context_window: 32_768,
         max_tokens: 8_192,
@@ -25,6 +35,45 @@ fn model(id: &str, provider: &str) -> Model {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
+    }
+}
+
+struct RecordingProvider {
+    options: Arc<Mutex<Vec<StreamOptions>>>,
+}
+
+impl RecordingProvider {
+    fn lock_options(&self) -> MutexGuard<'_, Vec<StreamOptions>> {
+        self.options.lock().expect("recorded options")
+    }
+}
+
+impl Provider for RecordingProvider {
+    fn stream(
+        &self,
+        _model: &Model,
+        _context: LlmContext,
+        options: StreamOptions,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.lock_options().push(options);
+        Ok(Box::pin(stream::iter(vec![Ok(ProviderEvent::Done(
+            assistant_message("done"),
+        ))])))
+    }
+
+    fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage> {
+        messages
+            .iter()
+            .map(|message| LlmMessage {
+                role: "user".into(),
+                content: serde_json::to_value(message).expect("message json"),
+            })
+            .collect()
+    }
+
+    fn convert_tools(&self, _tools: &[ToolDef]) -> Vec<serde_json::Value> {
+        Vec::new()
     }
 }
 
@@ -39,6 +88,7 @@ fn assistant_message(text: &str) -> anie_protocol::AssistantMessage {
         provider: "openai".into(),
         model: "gpt-4o".into(),
         timestamp: 1,
+        reasoning_details: None,
     }
 }
 
@@ -142,6 +192,59 @@ fn agent_end_contains_text(events: &[AgentEvent], needle: &str) -> bool {
     })
 }
 
+fn controller_with_runtime_state_path(
+    runtime_state_path: std::path::PathBuf,
+) -> (InteractiveController, mpsc::Receiver<AgentEvent>) {
+    let tempdir = tempdir().expect("tempdir");
+    let cwd = tempdir.path().join("cwd");
+    let sessions_dir = tempdir.path().join("sessions");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+    let config = AnieConfig::default();
+    let tool_registry = build_tool_registry(&cwd, true);
+    let prompt_cache =
+        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+    let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
+    let mut config_state = ConfigState::new(
+        config.clone(),
+        RuntimeState::default(),
+        model("gpt-4o", "openai"),
+        ThinkingLevel::Medium,
+        None,
+    );
+    config_state.set_runtime_state_path_for_test(runtime_state_path);
+
+    let state = ControllerState {
+        config: config_state,
+        session: SessionHandle::from_manager(session, sessions_dir, cwd),
+        model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
+        provider_registry: Arc::new(ProviderRegistry::new()),
+        tool_registry,
+        request_options_resolver: Arc::new(AuthResolver::new(None, config)),
+        prompt_cache,
+        retry_config: RetryConfig::default(),
+        command_registry: crate::commands::CommandRegistry::with_builtins(),
+    };
+
+    let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(16);
+    (
+        InteractiveController::new(state, ui_action_rx, event_tx, false),
+        event_rx,
+    )
+}
+
+fn drain_system_messages(event_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<String> {
+    let mut messages = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event {
+            messages.push(text);
+        }
+    }
+    messages
+}
+
 #[test]
 fn no_tools_flag_builds_empty_registry() {
     let registry = build_tool_registry(Path::new("."), true);
@@ -160,6 +263,9 @@ fn tool_registry_contains_core_tools_by_default() {
     assert!(names.contains(&"write".to_string()));
     assert!(names.contains(&"edit".to_string()));
     assert!(names.contains(&"bash".to_string()));
+    assert!(names.contains(&"grep".to_string()));
+    assert!(names.contains(&"find".to_string()));
+    assert!(names.contains(&"ls".to_string()));
 }
 
 #[test]
@@ -167,6 +273,10 @@ fn parse_thinking_accepts_supported_levels() {
     assert_eq!(
         parse_thinking_level("off").expect("off"),
         ThinkingLevel::Off
+    );
+    assert_eq!(
+        parse_thinking_level("minimal").expect("minimal"),
+        ThinkingLevel::Minimal
     );
     assert_eq!(
         parse_thinking_level("low").expect("low"),
@@ -180,6 +290,17 @@ fn parse_thinking_accepts_supported_levels() {
         parse_thinking_level("high").expect("high"),
         ThinkingLevel::High
     );
+}
+
+#[test]
+fn thinking_levels_order_from_off_to_high() {
+    // Variant ordering is observable via PartialOrd and is
+    // documented in `anie-provider/src/thinking.rs`. The order
+    // is Off < Minimal < Low < Medium < High.
+    assert!(ThinkingLevel::Off < ThinkingLevel::Minimal);
+    assert!(ThinkingLevel::Minimal < ThinkingLevel::Low);
+    assert!(ThinkingLevel::Low < ThinkingLevel::Medium);
+    assert!(ThinkingLevel::Medium < ThinkingLevel::High);
 }
 
 #[tokio::test]
@@ -289,6 +410,31 @@ fn build_dispatch_controller(
     mpsc::Receiver<AgentEvent>,
     mpsc::UnboundedSender<UiAction>,
 ) {
+    build_dispatch_controller_with_runtime_state(catalog, event_capacity, RuntimeState::default())
+}
+
+fn build_dispatch_controller_with_runtime_state(
+    catalog: Vec<Model>,
+    event_capacity: usize,
+    runtime_state: RuntimeState,
+) -> (
+    InteractiveController,
+    mpsc::Receiver<AgentEvent>,
+    mpsc::UnboundedSender<UiAction>,
+) {
+    build_dispatch_controller_with_runtime_state_path(catalog, event_capacity, runtime_state, None)
+}
+
+fn build_dispatch_controller_with_runtime_state_path(
+    catalog: Vec<Model>,
+    event_capacity: usize,
+    runtime_state: RuntimeState,
+    runtime_state_path: Option<std::path::PathBuf>,
+) -> (
+    InteractiveController,
+    mpsc::Receiver<AgentEvent>,
+    mpsc::UnboundedSender<UiAction>,
+) {
     let tempdir = tempdir().expect("tempdir");
     let cwd = tempdir.path().join("cwd");
     let sessions_dir = tempdir.path().join("sessions");
@@ -305,14 +451,19 @@ fn build_dispatch_controller(
         .cloned()
         .unwrap_or_else(|| model("gpt-4o", "openai"));
 
+    let mut config_state = ConfigState::new(
+        config.clone(),
+        runtime_state,
+        default_model.clone(),
+        ThinkingLevel::Medium,
+        None,
+    );
+    if let Some(path) = runtime_state_path {
+        config_state.set_runtime_state_path_for_test(path);
+    }
+
     let state = ControllerState {
-        config: ConfigState::new(
-            config.clone(),
-            RuntimeState::default(),
-            default_model.clone(),
-            ThinkingLevel::Medium,
-            None,
-        ),
+        config: config_state,
         session: SessionHandle::from_manager(session, sessions_dir, cwd),
         model_catalog: if catalog.is_empty() {
             vec![default_model]
@@ -332,6 +483,42 @@ fn build_dispatch_controller(
     let controller = InteractiveController::new(state, ui_action_rx, event_tx, false);
 
     (controller, event_rx, ui_action_tx)
+}
+
+fn build_state_with_registry(
+    model: Model,
+    runtime_state: RuntimeState,
+    provider_registry: ProviderRegistry,
+) -> ControllerState {
+    let tempdir = tempdir().expect("tempdir");
+    let cwd = tempdir.path().join("cwd");
+    let sessions_dir = tempdir.path().join("sessions");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+    let config = AnieConfig::default();
+    let tool_registry = build_tool_registry(&cwd, true);
+    let prompt_cache =
+        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+    let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
+
+    ControllerState {
+        config: ConfigState::new(
+            config.clone(),
+            runtime_state,
+            model.clone(),
+            ThinkingLevel::Medium,
+            None,
+        ),
+        session: SessionHandle::from_manager(session, sessions_dir, cwd),
+        model_catalog: vec![model],
+        provider_registry: Arc::new(provider_registry),
+        tool_registry,
+        request_options_resolver: Arc::new(AuthResolver::new(None, config)),
+        prompt_cache,
+        retry_config: RetryConfig::default(),
+        command_registry: crate::commands::CommandRegistry::with_builtins(),
+    }
 }
 
 fn system_message_text(event: &AgentEvent) -> Option<&str> {
@@ -408,7 +595,373 @@ async fn valid_thinking_level_emits_success_message_and_updates_state() {
         msg.contains("Thinking level set to high"),
         "expected success confirmation, got: {msg}"
     );
-    assert_eq!(controller.state.config.current_thinking(), ThinkingLevel::High);
+    assert_eq!(
+        controller.state.config.current_thinking(),
+        ThinkingLevel::High
+    );
+}
+
+#[test]
+fn compaction_strategy_uses_effective_ollama_context_window() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let ollama_model = model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi);
+    let (controller, _event_rx, _tx) =
+        build_dispatch_controller_with_runtime_state(vec![ollama_model], 16, runtime_state);
+
+    let (config, _strategy) = controller.state.compaction_strategy(2_000);
+
+    assert_eq!(config.context_window, 16_384);
+    assert_eq!(config.keep_recent_tokens, 2_000);
+}
+
+#[test]
+fn status_event_uses_effective_ollama_context_window() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let ollama_model = model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi);
+    let (controller, _event_rx, _tx) =
+        build_dispatch_controller_with_runtime_state(vec![ollama_model], 16, runtime_state);
+
+    let event = controller.state.status_event();
+
+    assert!(matches!(
+        event,
+        AgentEvent::StatusUpdate {
+            context_window: 16_384,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
+    let recorded_options = Arc::new(Mutex::new(Vec::new()));
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        ApiKind::OllamaChatApi,
+        Box::new(RecordingProvider {
+            options: Arc::clone(&recorded_options),
+        }),
+    );
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let state = build_state_with_registry(
+        model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+        runtime_state,
+        provider_registry,
+    );
+    let agent = build_agent(&state);
+    let (event_tx, _event_rx) = mpsc::channel(16);
+
+    let result = agent
+        .run(
+            vec![user_message("hello")],
+            Vec::new(),
+            event_tx,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.terminal_error.is_none());
+    let options = recorded_options.lock().expect("recorded options");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].num_ctx_override, Some(16_384));
+}
+
+fn ollama_model() -> Model {
+    model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi)
+}
+
+fn controller_for_context_length_test(
+    runtime_state: RuntimeState,
+) -> (
+    tempfile::TempDir,
+    InteractiveController,
+    mpsc::Receiver<AgentEvent>,
+    mpsc::UnboundedSender<UiAction>,
+) {
+    let tempdir = tempdir().expect("tempdir");
+    let runtime_state_path = tempdir.path().join("state.json");
+    let (controller, event_rx, ui_tx) = build_dispatch_controller_with_runtime_state_path(
+        vec![ollama_model()],
+        32,
+        runtime_state,
+        Some(runtime_state_path),
+    );
+    (tempdir, controller, event_rx, ui_tx)
+}
+
+#[tokio::test]
+async fn context_length_sets_override_for_current_ollama_model() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        Some(16_384)
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("Context window set to 16 384"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_reset_clears_override() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(runtime_state);
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("reset".into())))
+        .await
+        .expect("reset context length");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    assert_eq!(
+        controller.state.config.effective_ollama_context_window(),
+        32_768
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("Context window reset to 32 768"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_on_non_ollama_model_emits_friendly_error() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("reject non-Ollama model");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("only applies to Ollama native /api/chat models")
+            && msg.contains("openai:gpt-4o"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_rejects_out_of_range_value() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("1024".into())))
+        .await
+        .expect("reject out of range");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("Invalid context length 1024") && msg.contains("2048"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_rejects_unparseable_argument() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("wide".into())))
+        .await
+        .expect("reject unparseable");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("Invalid context length 'wide'") && msg.contains("reset"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn context_length_set_rejected_while_run_active() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+    controller.current_run = Some(CurrentRun {
+        handle: tokio::spawn(async { anie_agent::AgentRunResult::default() }),
+        cancel: CancellationToken::new(),
+        already_compacted: false,
+        retry_attempt: 0,
+    });
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("reject while active");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("run is active"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_set_rejected_while_retry_pending() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: Instant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+    };
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("reject while retry pending");
+
+    assert_eq!(
+        controller.state.config.active_ollama_num_ctx_override(),
+        None
+    );
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("retry is pending"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_length_no_args_reports_current_effective_value_and_source() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(runtime_state);
+
+    controller
+        .handle_action(UiAction::ContextLength(None))
+        .await
+        .expect("query context length");
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert_eq!(
+        msg,
+        "Current context window: 16 384 (runtime override; baseline 32 768)"
+    );
+}
+
+#[tokio::test]
+async fn context_length_set_emits_status_update_with_effective_context_window() {
+    let (_tempdir, mut controller, mut event_rx, _tx) =
+        controller_for_context_length_test(RuntimeState::default());
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+
+    let event = event_rx.recv().await.expect("status update");
+    assert!(matches!(
+        event,
+        AgentEvent::StatusUpdate {
+            context_window: 16_384,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn context_length_override_persists_across_session_restart() {
+    let tempdir = tempdir().expect("tempdir");
+    let runtime_state_path = tempdir.path().join("state.json");
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller_with_runtime_state_path(
+        vec![ollama_model()],
+        16,
+        RuntimeState::default(),
+        Some(runtime_state_path.clone()),
+    );
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+
+    let loaded = load_runtime_state_from(&runtime_state_path).expect("load state");
+    assert_eq!(
+        loaded
+            .ollama_num_ctx_overrides
+            .get("ollama:qwen3:32b")
+            .copied(),
+        Some(16_384)
+    );
+    let restarted = ConfigState::new(
+        AnieConfig::default(),
+        loaded,
+        ollama_model(),
+        ThinkingLevel::Medium,
+        None,
+    );
+    assert_eq!(restarted.active_ollama_num_ctx_override(), Some(16_384));
+}
+
+#[tokio::test]
+async fn context_length_override_applies_to_next_request_without_reload() {
+    let tempdir = tempdir().expect("tempdir");
+    let recorded_options = Arc::new(Mutex::new(Vec::new()));
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        ApiKind::OllamaChatApi,
+        Box::new(RecordingProvider {
+            options: Arc::clone(&recorded_options),
+        }),
+    );
+    let mut state =
+        build_state_with_registry(ollama_model(), RuntimeState::default(), provider_registry);
+    state
+        .config
+        .set_runtime_state_path_for_test(tempdir.path().join("state.json"));
+    let (event_tx, _event_rx) = mpsc::channel(16);
+    let (_ui_tx, ui_rx) = mpsc::unbounded_channel();
+    let mut controller = InteractiveController::new(state, ui_rx, event_tx, false);
+
+    controller
+        .handle_action(UiAction::ContextLength(Some("16384".into())))
+        .await
+        .expect("set context length");
+    let agent = build_agent(&controller.state);
+    let (event_tx, _event_rx) = mpsc::channel(16);
+    let result = agent
+        .run(
+            vec![user_message("hello")],
+            Vec::new(),
+            event_tx,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(result.terminal_error.is_none());
+    let options = recorded_options.lock().expect("recorded options");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].num_ctx_override, Some(16_384));
 }
 
 #[tokio::test]
@@ -500,6 +1053,65 @@ async fn help_command_emits_system_message_with_registry_output() {
     ));
 }
 
+#[tokio::test]
+async fn model_change_with_runtime_persistence_failure_warns_but_updates_state() {
+    let tempdir = tempdir().expect("tempdir");
+    let unwritable_state_path = tempdir.path().join("state-directory");
+    fs::create_dir_all(&unwritable_state_path).expect("create state directory");
+    let (mut controller, mut event_rx) = controller_with_runtime_state_path(unwritable_state_path);
+
+    controller
+        .handle_action(UiAction::SetModel("gpt-4.1".into()))
+        .await
+        .expect("set model");
+
+    assert_eq!(controller.state.config.current_model().id, "gpt-4.1");
+    let messages = drain_system_messages(&mut event_rx);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("setting is active for this session")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("may revert after restart")),
+        "{messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn thinking_change_with_runtime_persistence_failure_warns_but_updates_state() {
+    let tempdir = tempdir().expect("tempdir");
+    let unwritable_state_path = tempdir.path().join("state-directory");
+    fs::create_dir_all(&unwritable_state_path).expect("create state directory");
+    let (mut controller, mut event_rx) = controller_with_runtime_state_path(unwritable_state_path);
+
+    controller
+        .handle_action(UiAction::SetThinking("high".into()))
+        .await
+        .expect("set thinking");
+
+    assert_eq!(
+        controller.state.config.current_thinking(),
+        ThinkingLevel::High
+    );
+    let messages = drain_system_messages(&mut event_rx);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("setting is active for this session")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("may revert after restart")),
+        "{messages:?}"
+    );
+}
+
 // =============================================================================
 // Plan 13 phase A — non-blocking retry backoff.
 //
@@ -549,7 +1161,7 @@ fn spawn_live_controller(
             None,
         ),
         session: SessionHandle::from_manager(session, sessions_dir, cwd),
-        model_catalog: vec![model("gpt-4o", "openai")],
+        model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
@@ -628,12 +1240,11 @@ async fn retry_backoff_polls_ui_actions() {
     // UI action during the backoff window arrives and is
     // processed promptly. If this test ever hangs, the
     // non-blocking backoff isn't in place.
-    ui_tx
-        .send(UiAction::GetState)
-        .expect("send GetState");
-    wait_for_event(&mut event_rx, |event| {
-        matches!(event, AgentEvent::SystemMessage { text } if text.contains("Session:"))
-    })
+    ui_tx.send(UiAction::GetState).expect("send GetState");
+    wait_for_event(
+        &mut event_rx,
+        |event| matches!(event, AgentEvent::SystemMessage { text } if text.contains("Session:")),
+    )
     .await;
 
     // Clean up: advance time past the retry deadline so the
@@ -698,6 +1309,82 @@ async fn abort_during_retry_backoff_cancels_retry() {
         agent_starts, 0,
         "no second AgentStart after abort; drained events: {remaining:#?}"
     );
+}
+
+async fn assert_run_affecting_action_cancels_armed_retry(action: UiAction) {
+    tokio::time::pause();
+
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![
+            MockStreamScript::from_error(ProviderError::Transport("dns".into())),
+            MockStreamScript::from_message(assistant_message("should never run")),
+        ],
+        retry_config_for_tests(60_000, 3),
+    );
+
+    ui_tx
+        .send(UiAction::SubmitPrompt("go".into()))
+        .expect("submit prompt");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::RetryScheduled { .. })
+    })
+    .await;
+
+    ui_tx.send(action).expect("send run setting change");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::SystemMessage { text }
+            if text == "Pending retry canceled because run settings changed.")
+    })
+    .await;
+
+    tokio::time::advance(Duration::from_millis(60_001)).await;
+    ui_tx.send(UiAction::Quit).expect("quit");
+    drop(ui_tx);
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+
+    let remaining: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    assert!(
+        !remaining
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentStart)),
+        "no continuation AgentStart after run setting change; drained events: {remaining:#?}"
+    );
+}
+
+#[tokio::test]
+async fn set_model_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::SetModel("gpt-4.1".into())).await;
+}
+
+#[tokio::test]
+async fn set_resolved_model_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::SetResolvedModel(Box::new(model(
+        "gpt-4.1", "openai",
+    ))))
+    .await;
+}
+
+#[tokio::test]
+async fn set_thinking_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::SetThinking("high".into())).await;
+}
+
+#[tokio::test]
+async fn compact_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::Compact).await;
+}
+
+#[tokio::test]
+async fn new_session_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::NewSession).await;
+}
+
+#[tokio::test]
+async fn fork_session_during_retry_backoff_cancels_retry() {
+    assert_run_affecting_action_cancels_armed_retry(UiAction::ForkSession).await;
 }
 
 #[tokio::test]
@@ -811,8 +1498,7 @@ async fn unbounded_action_channel_accepts_burst_without_drops() {
     let mut processed = 0;
     while processed < BURST {
         let event = event_rx.recv().await.expect("event");
-        if matches!(event, AgentEvent::SystemMessage { ref text } if text.starts_with("Session:"))
-        {
+        if matches!(event, AgentEvent::SystemMessage { ref text } if text.starts_with("Session:")) {
             processed += 1;
         }
     }

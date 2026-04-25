@@ -13,6 +13,14 @@ use crate::{
     shared::{required_string_arg, resolve_path, text_result},
 };
 
+pub(crate) const MAX_EDIT_COUNT: usize = 100;
+pub(crate) const MAX_EDIT_OLD_TEXT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_EDIT_NEW_TEXT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_EDIT_ARGUMENT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_EDIT_INPUT_FILE_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const MAX_EDIT_OUTPUT_FILE_BYTES: usize =
+    MAX_EDIT_INPUT_FILE_BYTES + (MAX_EDIT_ARGUMENT_BYTES / 2);
+
 /// Apply one or more exact text replacements to a file.
 pub struct EditTool {
     cwd: Arc<PathBuf>,
@@ -20,13 +28,15 @@ pub struct EditTool {
 }
 
 impl EditTool {
-    /// Create an edit tool with its own file-mutation queue.
+    /// Create an edit tool with its own file-mutation queue. Relative
+    /// paths resolve from `cwd`; absolute paths are allowed.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
         Self::with_queue(cwd, Arc::new(FileMutationQueue::new()))
     }
 
     /// Create an edit tool using a shared file-mutation queue.
+    /// Relative paths resolve from `cwd`; absolute paths are allowed.
     #[must_use]
     pub fn with_queue<P: Into<PathBuf>>(cwd: P, mutation_queue: Arc<FileMutationQueue>) -> Self {
         Self {
@@ -45,19 +55,20 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "edit".into(),
-            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits.".into(),
+            description: "Edit a single file using exact text replacement. Relative paths resolve from the session cwd; absolute paths are allowed. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
+                    "path": { "type": "string", "description": "Path to the file to edit. Relative paths resolve from the session cwd; absolute paths are allowed." },
                     "edits": {
                         "type": "array",
+                        "maxItems": MAX_EDIT_COUNT,
                         "description": "One or more targeted replacements. Each edit is matched against the original file, not after earlier edits are applied.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "oldText": { "type": "string", "description": "Exact text for one targeted replacement" },
-                                "newText": { "type": "string", "description": "Replacement text for this targeted edit" }
+                                "oldText": { "type": "string", "maxLength": MAX_EDIT_OLD_TEXT_BYTES, "description": "Exact text for one targeted replacement" },
+                                "newText": { "type": "string", "maxLength": MAX_EDIT_NEW_TEXT_BYTES, "description": "Replacement text for this targeted edit" }
                             },
                             "required": ["oldText", "newText"],
                             "additionalProperties": false
@@ -91,6 +102,12 @@ impl Tool for EditTool {
                 let bytes = tokio::fs::read(&abs_path).await.map_err(|error| {
                     ToolError::ExecutionFailed(format!("Failed to read {path}: {error}"))
                 })?;
+                if bytes.len() > MAX_EDIT_INPUT_FILE_BYTES {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "{path} is {} bytes; edit input files are limited to {MAX_EDIT_INPUT_FILE_BYTES} bytes. Split the file or use a smaller target.",
+                        bytes.len(),
+                    )));
+                }
                 let (has_bom, text) = decode_utf8_with_bom(&bytes).map_err(|error| {
                     ToolError::ExecutionFailed(format!(
                         "Failed to decode {path} as UTF-8 text: {error}"
@@ -101,6 +118,12 @@ impl Tool for EditTool {
                 let (new_normalized, diff) = apply_edits(&normalized, &edits, path)?;
                 let restored = restore_line_endings(&new_normalized, line_ending);
                 let output_bytes = encode_utf8_with_bom(&restored, has_bom);
+                if output_bytes.len() > MAX_EDIT_OUTPUT_FILE_BYTES {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "edited {path} would be {} bytes; edit outputs are limited to {MAX_EDIT_OUTPUT_FILE_BYTES} bytes. Split this into smaller edit calls.",
+                        output_bytes.len(),
+                    )));
+                }
 
                 tokio::fs::write(&abs_path, output_bytes)
                     .await
@@ -157,7 +180,14 @@ fn parse_edits(args: &serde_json::Value) -> Result<Vec<Edit>, ToolError> {
             "'edits' must contain at least one replacement".into(),
         ));
     }
+    if edits.len() > MAX_EDIT_COUNT {
+        return Err(ToolError::ExecutionFailed(format!(
+            "'edits' contains {} replacements; at most {MAX_EDIT_COUNT} are allowed per edit call. Split this into smaller edit calls.",
+            edits.len(),
+        )));
+    }
 
+    let mut total_edit_bytes = 0usize;
     edits
         .iter()
         .enumerate()
@@ -174,6 +204,16 @@ fn parse_edits(args: &serde_json::Value) -> Result<Vec<Edit>, ToolError> {
                 .ok_or_else(|| {
                     ToolError::ExecutionFailed(format!("edit #{index} is missing 'newText'"))
                 })?;
+            enforce_edit_text_limit(index, "oldText", old_text, MAX_EDIT_OLD_TEXT_BYTES)?;
+            enforce_edit_text_limit(index, "newText", new_text, MAX_EDIT_NEW_TEXT_BYTES)?;
+            total_edit_bytes = total_edit_bytes
+                .saturating_add(old_text.len())
+                .saturating_add(new_text.len());
+            if total_edit_bytes > MAX_EDIT_ARGUMENT_BYTES {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "edit arguments are {total_edit_bytes} bytes; at most {MAX_EDIT_ARGUMENT_BYTES} bytes are allowed per edit call. Split this into smaller edit calls.",
+                )));
+            }
             Ok(Edit {
                 old_text: normalize_to_lf(old_text),
                 new_text: normalize_to_lf(new_text),
@@ -182,8 +222,30 @@ fn parse_edits(args: &serde_json::Value) -> Result<Vec<Edit>, ToolError> {
         .collect()
 }
 
+fn enforce_edit_text_limit(
+    index: usize,
+    field: &str,
+    value: &str,
+    limit: usize,
+) -> Result<(), ToolError> {
+    if value.len() > limit {
+        return Err(ToolError::ExecutionFailed(format!(
+            "edit #{index} {field} is {} bytes; at most {limit} bytes are allowed. Split this into smaller edit calls.",
+            value.len(),
+        )));
+    }
+    Ok(())
+}
+
 fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<(String, String), ToolError> {
     let mut matched = Vec::with_capacity(edits.len());
+    // Plan 07 PR-D: lazily compute the normalized content +
+    // index map at most once per edit batch. Most batches
+    // hit the exact-match fast path on every edit and never
+    // need fuzzy normalization; the first fuzzy fallback
+    // materializes the cache, and subsequent fuzzy edits in
+    // the same batch reuse it.
+    let mut fuzzy_cache: Option<(String, Vec<usize>)> = None;
 
     for (index, edit) in edits.iter().enumerate() {
         if edit.old_text.is_empty() {
@@ -209,7 +271,13 @@ fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<(String, Str
             continue;
         }
 
-        let fuzzy_matches = fuzzy_find_all_occurrences(content, &edit.old_text);
+        let fuzzy_cache = fuzzy_cache.get_or_insert_with(|| normalize_for_fuzzy_match(content));
+        let fuzzy_matches = fuzzy_find_all_occurrences_in_normalized(
+            &fuzzy_cache.0,
+            &fuzzy_cache.1,
+            content.len(),
+            &edit.old_text,
+        );
         if fuzzy_matches.is_empty() {
             return Err(ToolError::ExecutionFailed(format!(
                 "edit #{index} for {path} did not match anything",
@@ -257,8 +325,12 @@ fn find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn fuzzy_find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)> {
-    let (normalized_content, index_map) = normalize_for_fuzzy_match(content);
+fn fuzzy_find_all_occurrences_in_normalized(
+    normalized_content: &str,
+    index_map: &[usize],
+    original_content_len: usize,
+    needle: &str,
+) -> Vec<(usize, usize)> {
     let normalized_needle = normalize_fuzzy_pattern(needle);
     if normalized_needle.is_empty() {
         return Vec::new();
@@ -274,7 +346,7 @@ fn fuzzy_find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)
             let end = if end_char < index_map.len() {
                 index_map[end_char]
             } else {
-                content.len()
+                original_content_len
             };
             (start, end)
         })
@@ -282,7 +354,26 @@ fn fuzzy_find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)
 }
 
 fn normalize_to_lf(value: &str) -> String {
-    value.replace("\r\n", "\n").replace('\r', "\n")
+    // Plan 07 PR-E: single-pass CRLF + CR → LF normalization.
+    // The previous shape was `replace("\r\n", "\n").replace('\r', "\n")`
+    // which allocates a new String on each `replace` call — two
+    // full passes over the input for a file that's already LF-
+    // normalized. Now: one allocation sized to the source, one
+    // pass.
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            // Collapse "\r\n" into "\n"; bare "\r" also becomes "\n".
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn detect_line_ending(value: &str) -> LineEnding {
@@ -316,7 +407,11 @@ fn decode_utf8_with_bom(bytes: &[u8]) -> Result<(bool, String), std::string::Fro
 
 fn encode_utf8_with_bom(value: &str, has_bom: bool) -> Vec<u8> {
     const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-    let mut bytes = Vec::new();
+    // Plan 07 PR-E: size the buffer up front so extend_from_slice
+    // doesn't grow it (one reallocation avoided for files with
+    // a BOM; the non-BOM path sizes exactly).
+    let capacity = value.len() + if has_bom { UTF8_BOM.len() } else { 0 };
+    let mut bytes = Vec::with_capacity(capacity);
     if has_bom {
         bytes.extend_from_slice(UTF8_BOM);
     }

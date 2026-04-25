@@ -13,14 +13,14 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use anie_agent::{AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry};
 use anie_auth::AuthResolver;
 use anie_config::{AnieConfig, collect_context_files};
 use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
 use anie_provider::{
-    Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
+    ApiKind, Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
 };
 use anie_session::{CompactionConfig, SessionContext, SessionInfo};
 use anie_tui::UiAction;
@@ -34,6 +34,8 @@ use crate::{
 };
 
 const DATE_FORMAT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day]");
+const MIN_OLLAMA_CONTEXT_LENGTH: u64 = 2_048;
+const MAX_OLLAMA_CONTEXT_LENGTH: u64 = 1_048_576;
 
 use crate::retry_policy::{RetryConfig, RetryDecision, RetryPolicy};
 
@@ -89,6 +91,12 @@ enum PendingRetry {
         attempt: u32,
         already_compacted: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextLengthMutation {
+    Set,
+    Reset,
 }
 
 impl InteractiveController {
@@ -201,7 +209,12 @@ impl InteractiveController {
                         }
                     }
                 }
-            } else if let PendingRetry::Armed { deadline, attempt, already_compacted } = self.pending_retry {
+            } else if let PendingRetry::Armed {
+                deadline,
+                attempt,
+                already_compacted,
+            } = self.pending_retry
+            {
                 tokio::select! {
                     maybe_action = self.ui_action_rx.recv() => {
                         match maybe_action {
@@ -299,7 +312,8 @@ impl InteractiveController {
                     self.send_system_message("Cannot change models while a run is active.")
                         .await;
                 } else {
-                    self.state.set_model(&requested).await?;
+                    let persistence_warning = self.state.set_model(&requested).await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Model set to {}:{}",
@@ -307,6 +321,9 @@ impl InteractiveController {
                         self.state.config.current_model().id,
                     ))
                     .await;
+                    if let Some(warning) = persistence_warning {
+                        self.send_system_message(&warning).await;
+                    }
                 }
             }
             UiAction::SetResolvedModel(model) => {
@@ -314,8 +331,12 @@ impl InteractiveController {
                     self.send_system_message("Cannot change models while a run is active.")
                         .await;
                 } else {
-                    self.state.set_model_resolved(model).await?;
+                    let persistence_warning = self.state.set_model_resolved(*model).await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    if let Some(warning) = persistence_warning {
+                        self.send_system_message(&warning).await;
+                    }
                 }
             }
             UiAction::SetThinking(level) => {
@@ -323,13 +344,70 @@ impl InteractiveController {
                     self.send_system_message("Cannot change thinking while a run is active.")
                         .await;
                 } else {
-                    self.state.set_thinking(&level).await?;
+                    let persistence_warning = self.state.set_thinking(&level).await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Thinking level set to {}",
                         format_thinking(self.state.config.current_thinking()),
                     ))
                     .await;
+                    if let Some(warning) = persistence_warning {
+                        self.send_system_message(&warning).await;
+                    }
+                }
+            }
+            UiAction::ContextLength(argument) => {
+                if !self.state.current_model_uses_ollama_chat_api() {
+                    self.send_system_message(&self.state.context_length_non_ollama_message())
+                        .await;
+                } else if argument.is_none() {
+                    self.send_system_message(&self.state.context_length_status_message())
+                        .await;
+                } else if self.current_run.is_some() {
+                    self.send_system_message("Cannot change context length while a run is active.")
+                        .await;
+                } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+                    self.send_system_message(
+                        "Cannot change context length while a retry is pending. Abort the retry first.",
+                    )
+                    .await;
+                } else if let Some(argument) = argument {
+                    match self.state.apply_context_length_argument(&argument) {
+                        Ok(ContextLengthMutation::Set) => {
+                            anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                            self.send_system_message(&format!(
+                                "Context window set to {}. Ollama will reload the model on the next request (~5-30 s for this model).",
+                                format_context_length(
+                                    self.state.config.effective_ollama_context_window()
+                                ),
+                            ))
+                            .await;
+                            if let Some(warning) = self
+                                .state
+                                .persist_runtime_state_warning("context_length_set")
+                            {
+                                self.send_system_message(&warning).await;
+                            }
+                        }
+                        Ok(ContextLengthMutation::Reset) => {
+                            anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                            self.send_system_message(&format!(
+                                "Context window reset to {}.",
+                                format_context_length(
+                                    self.state.config.effective_ollama_context_window()
+                                ),
+                            ))
+                            .await;
+                            if let Some(warning) = self
+                                .state
+                                .persist_runtime_state_warning("context_length_reset")
+                            {
+                                self.send_system_message(&warning).await;
+                            }
+                        }
+                        Err(message) => self.send_system_message(&message).await,
+                    }
                 }
             }
             UiAction::Compact => {
@@ -338,6 +416,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.force_compact(&self.event_tx).await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                 }
             }
             UiAction::ForkSession => {
@@ -346,6 +425,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let new_session_id = self.state.fork_session().await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     let transcript = self
                         .state
                         .session_context()
@@ -375,6 +455,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.new_session().await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     let _ = self
                         .event_tx
                         .send(AgentEvent::TranscriptReplace {
@@ -400,6 +481,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.switch_session(&session_id).await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     let transcript = self
                         .state
                         .session_context()
@@ -462,6 +544,7 @@ impl InteractiveController {
                     self.state
                         .reload_config(provider.as_deref(), model.as_deref())
                         .await?;
+                    self.cancel_pending_retry_for_run_affecting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message("Configuration reloaded.").await;
                 }
@@ -469,6 +552,14 @@ impl InteractiveController {
             UiAction::ClearOutput => {}
         }
         Ok(())
+    }
+
+    async fn cancel_pending_retry_for_run_affecting_change(&mut self) {
+        if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+            self.pending_retry = PendingRetry::Idle;
+            self.send_system_message("Pending retry canceled because run settings changed.")
+                .await;
+        }
     }
 
     async fn start_prompt_run(&mut self, text: String) -> Result<()> {
@@ -595,11 +686,26 @@ pub(crate) struct ControllerState {
 }
 
 impl ControllerState {
-    pub(crate) fn persist_runtime_state(&mut self) {
-        self.config.persist_runtime_state(self.session.id());
+    pub(crate) fn persist_runtime_state(&mut self) -> Result<()> {
+        self.config.persist_runtime_state(self.session.id())
     }
 
-    async fn set_model(&mut self, requested: &str) -> Result<()> {
+    fn persist_runtime_state_logged(&mut self, context: &'static str) {
+        if let Err(error) = self.persist_runtime_state() {
+            warn!(%error, context, "failed to persist runtime state");
+        }
+    }
+
+    fn persist_runtime_state_warning(&mut self, context: &'static str) -> Option<String> {
+        self.persist_runtime_state().err().map(|error| {
+            warn!(%error, context, "failed to persist runtime state");
+            format!(
+                "Warning: setting is active for this session, but anie could not save it for the next launch; it may revert after restart: {error}"
+            )
+        })
+    }
+
+    async fn set_model(&mut self, requested: &str) -> Result<Option<String>> {
         let model = resolve_requested_model(
             requested,
             &self.config.current_model().provider,
@@ -609,26 +715,75 @@ impl ControllerState {
         self.set_model_resolved(model).await
     }
 
-    async fn set_model_resolved(&mut self, model: Model) -> Result<()> {
+    async fn set_model_resolved(&mut self, model: Model) -> Result<Option<String>> {
         upsert_model(&mut self.model_catalog, &model);
         self.config.set_model(model);
         self.session.inner_mut().append_model_change(
             &self.config.current_model().provider,
             &self.config.current_model().id,
         )?;
-        self.config.persist_runtime_state(self.session.id());
-        Ok(())
+        Ok(self.persist_runtime_state_warning("set_model_resolved"))
     }
 
-    async fn set_thinking(&mut self, requested: &str) -> Result<()> {
+    async fn set_thinking(&mut self, requested: &str) -> Result<Option<String>> {
         let level = parse_thinking_level(requested)
             .map_err(|_| UserCommandError::InvalidThinkingLevel(requested.to_string()))?;
         self.config.set_thinking(level);
         self.session
             .inner_mut()
             .append_thinking_change(self.config.current_thinking())?;
-        self.config.persist_runtime_state(self.session.id());
-        Ok(())
+        Ok(self.persist_runtime_state_warning("set_thinking"))
+    }
+
+    fn current_model_uses_ollama_chat_api(&self) -> bool {
+        self.config.current_model().api == ApiKind::OllamaChatApi
+    }
+
+    fn context_length_non_ollama_message(&self) -> String {
+        let model = self.config.current_model();
+        format!(
+            "`/context-length` only applies to Ollama native /api/chat models -- selected model '{}:{}' uses {:?}.",
+            model.provider, model.id, model.api,
+        )
+    }
+
+    fn context_length_status_message(&self) -> String {
+        let effective = self.config.effective_ollama_context_window();
+        match self.config.active_ollama_num_ctx_override() {
+            Some(_) => format!(
+                "Current context window: {} (runtime override; baseline {})",
+                format_context_length(effective),
+                format_context_length(self.config.current_model().context_window),
+            ),
+            None => format!(
+                "Current context window: {}",
+                format_context_length(effective)
+            ),
+        }
+    }
+
+    fn apply_context_length_argument(
+        &mut self,
+        argument: &str,
+    ) -> Result<ContextLengthMutation, String> {
+        if argument.eq_ignore_ascii_case("reset") {
+            self.config.clear_ollama_num_ctx_override();
+            return Ok(ContextLengthMutation::Reset);
+        }
+
+        let value = argument.parse::<u64>().map_err(|_| {
+            format!(
+                "Invalid context length '{argument}'. Expected an integer from {MIN_OLLAMA_CONTEXT_LENGTH} to {MAX_OLLAMA_CONTEXT_LENGTH}, or reset.",
+            )
+        })?;
+        if !(MIN_OLLAMA_CONTEXT_LENGTH..=MAX_OLLAMA_CONTEXT_LENGTH).contains(&value) {
+            return Err(format!(
+                "Invalid context length {value}. Expected a value from {MIN_OLLAMA_CONTEXT_LENGTH} to {MAX_OLLAMA_CONTEXT_LENGTH}.",
+            ));
+        }
+
+        self.config.set_ollama_num_ctx_override(value);
+        Ok(ContextLengthMutation::Set)
     }
 
     /// Build the compaction config + summarizer for the current
@@ -638,7 +793,7 @@ impl ControllerState {
         keep_recent_tokens: u64,
     ) -> (CompactionConfig, CompactionStrategy) {
         let config = CompactionConfig {
-            context_window: self.config.current_model().context_window,
+            context_window: self.config.effective_ollama_context_window(),
             reserve_tokens: self.config.anie_config().compaction.reserve_tokens,
             keep_recent_tokens,
         };
@@ -646,6 +801,7 @@ impl ControllerState {
             self.config.current_model().clone(),
             Arc::clone(&self.provider_registry),
             Arc::clone(&self.request_options_resolver),
+            self.config.active_ollama_num_ctx_override(),
         );
         (config, strategy)
     }
@@ -673,13 +829,29 @@ impl ControllerState {
     async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
         let (config, strategy) =
             self.compaction_strategy(self.config.anie_config().compaction.keep_recent_tokens);
+
+        // Pre-check: if the session isn't past the threshold
+        // yet, skip without announcing anything — we don't want
+        // "Compacting context…" messages flickering past every
+        // turn. When we DO plan to compact, emit the start
+        // event BEFORE the (slow) LLM summarization call so the
+        // user sees the progress indicator while waiting
+        // instead of a silent pause followed by both the start
+        // and end messages at once.
+        let tokens_before = self.session.inner().estimate_context_tokens();
+        let threshold = config.context_window.saturating_sub(config.reserve_tokens);
+        if tokens_before <= threshold {
+            return Ok(());
+        }
+
+        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+
         if let Some(result) = self
             .session
             .inner_mut()
             .auto_compact(&config, &strategy)
             .await?
         {
-            anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
             self.emit_compaction_end(event_tx, &result).await;
             anie_agent::send_event(event_tx, self.status_event()).await;
         }
@@ -715,7 +887,7 @@ impl ControllerState {
 
     async fn new_session(&mut self) -> Result<()> {
         self.session.start_new()?;
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("new_session");
         Ok(())
     }
 
@@ -724,14 +896,14 @@ impl ControllerState {
             .switch_to(session_id)
             .map_err(|_| UserCommandError::UnknownSession(session_id.to_string()))?;
         self.apply_session_overrides();
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("switch_session");
         Ok(())
     }
 
     async fn fork_session(&mut self) -> Result<String> {
         let child_id = self.session.fork()?;
         self.apply_session_overrides();
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("fork_session");
         Ok(child_id)
     }
 
@@ -857,7 +1029,7 @@ impl ControllerState {
             model_name: self.config.current_model().id.clone(),
             thinking: format_thinking(self.config.current_thinking()),
             estimated_context_tokens: self.estimated_context_tokens(),
-            context_window: self.config.current_model().context_window,
+            context_window: self.config.effective_ollama_context_window(),
             cwd: self.session.cwd().display().to_string(),
             session_id: self.session.id().to_string(),
         }
@@ -896,7 +1068,7 @@ impl ControllerState {
         let cwd = self.session.cwd().to_path_buf();
         self.prompt_cache
             .replace(&cwd, &self.tool_registry, self.config.anie_config())?;
-        self.config.persist_runtime_state(self.session.id());
+        self.persist_runtime_state_logged("reload_config");
         Ok(())
     }
 
@@ -918,7 +1090,8 @@ fn build_agent(state: &ControllerState) -> AgentLoop {
             state.config.current_thinking(),
             ToolExecutionMode::Parallel,
             Arc::clone(&state.request_options_resolver),
-        ),
+        )
+        .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override()),
     )
 }
 
@@ -991,6 +1164,7 @@ fn current_date_ymd() -> Result<String> {
 pub(crate) fn parse_thinking_level(value: &str) -> Result<ThinkingLevel, String> {
     match value.to_ascii_lowercase().as_str() {
         "off" => Ok(ThinkingLevel::Off),
+        "minimal" => Ok(ThinkingLevel::Minimal),
         "low" => Ok(ThinkingLevel::Low),
         "medium" => Ok(ThinkingLevel::Medium),
         "high" => Ok(ThinkingLevel::High),
@@ -1001,11 +1175,24 @@ pub(crate) fn parse_thinking_level(value: &str) -> Result<ThinkingLevel, String>
 fn format_thinking(level: ThinkingLevel) -> String {
     match level {
         ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
         ThinkingLevel::Low => "low",
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
     }
     .to_string()
+}
+
+fn format_context_length(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String {

@@ -19,15 +19,33 @@ use anie_provider::LlmMessage;
 pub(super) fn assistant_message_to_openai_llm_message(
     assistant_message: &AssistantMessage,
 ) -> Option<LlmMessage> {
-    let text = assistant_message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Plan 08 PR-A: direct-buffer join — two-pass single-
+    // allocation build instead of Vec<&str> + join.
+    let text = {
+        let mut total = 0usize;
+        let mut count = 0usize;
+        for block in &assistant_message.content {
+            if let ContentBlock::Text { text } = block {
+                if count > 0 {
+                    total += 1; // '\n' separator
+                }
+                total += text.len();
+                count += 1;
+            }
+        }
+        let mut out = String::with_capacity(total);
+        let mut first = true;
+        for block in &assistant_message.content {
+            if let ContentBlock::Text { text } = block {
+                if !first {
+                    out.push('\n');
+                }
+                out.push_str(text);
+                first = false;
+            }
+        }
+        out
+    };
     let tool_calls = assistant_message
         .content
         .iter()
@@ -60,6 +78,20 @@ pub(super) fn assistant_message_to_openai_llm_message(
     if !tool_calls.is_empty() {
         payload.insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
     }
+    if let Some(details) = assistant_message.reasoning_details.as_ref()
+        && !details.is_empty()
+    {
+        // Round-trip OpenRouter's encrypted reasoning wrapper so
+        // the upstream's chain-of-thought stays connected across
+        // turns. Only populated on models whose catalog entry
+        // declared `supports_reasoning_details_replay`; the
+        // streaming layer drops it everywhere else so this branch
+        // is a no-op for non-opt-in providers.
+        payload.insert(
+            "reasoning_details".into(),
+            serde_json::Value::Array(details.clone()),
+        );
+    }
 
     Some(LlmMessage {
         role: "assistant".into(),
@@ -86,6 +118,9 @@ pub(super) fn llm_message_to_openai_message(message: &LlmMessage) -> serde_json:
                 if let Some(tool_calls) = content.get("tool_calls") {
                     payload.insert("tool_calls".into(), tool_calls.clone());
                 }
+                if let Some(details) = content.get("reasoning_details") {
+                    payload.insert("reasoning_details".into(), details.clone());
+                }
                 serde_json::Value::Object(payload)
             } else {
                 json!({ "role": "assistant", "content": message.content })
@@ -104,6 +139,46 @@ pub(super) fn llm_message_to_openai_message(message: &LlmMessage) -> serde_json:
         }
         _ => json!({ "role": message.role, "content": message.content }),
     }
+}
+
+/// Convert user content to OpenAI chat-completions content.
+///
+/// Text-only messages keep the legacy string shape for broad
+/// OpenAI-compatible backend support. When a user message includes an
+/// image, OpenAI requires ordered content parts; in that shape, anie's
+/// user-side thinking blocks pass through as text parts to preserve the
+/// previous `join_text_content` behavior. Redacted thinking remains
+/// provider-opaque and is not sent to OpenAI-compatible backends.
+pub(super) fn user_content_to_openai(content: &[ContentBlock]) -> serde_json::Value {
+    let has_image = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { .. }));
+    if !has_image {
+        return serde_json::Value::String(join_text_content(content));
+    }
+
+    let parts = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(json!({
+                "type": "text",
+                "text": text,
+            })),
+            ContentBlock::Thinking { thinking, .. } => Some(json!({
+                "type": "text",
+                "text": thinking,
+            })),
+            ContentBlock::Image { media_type, data } => Some(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{media_type};base64,{data}"),
+                },
+            })),
+            ContentBlock::RedactedThinking { .. } | ContentBlock::ToolCall(_) => None,
+        })
+        .collect();
+
+    serde_json::Value::Array(parts)
 }
 
 /// Flatten the text-bearing content of a message for wire formats that
@@ -136,6 +211,10 @@ mod tests {
     use anie_protocol::{AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage};
     use anie_provider::Provider;
 
+    use super::{
+        assistant_message_to_openai_llm_message, llm_message_to_openai_message,
+        user_content_to_openai,
+    };
     use crate::OpenAIProvider;
 
     #[test]
@@ -160,6 +239,7 @@ mod tests {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
                 timestamp: 2,
+                reasoning_details: None,
             }),
             Message::ToolResult(anie_protocol::ToolResultMessage {
                 tool_call_id: "call_1".into(),
@@ -199,6 +279,7 @@ mod tests {
                 provider: "ollama".into(),
                 model: "qwen3.5:9b".into(),
                 timestamp: 2,
+                reasoning_details: None,
             }),
             Message::User(anie_protocol::UserMessage {
                 content: vec![ContentBlock::Text {
@@ -226,9 +307,59 @@ mod tests {
             provider: "ollama".into(),
             model: "qwen3:32b".into(),
             timestamp: 1,
+            reasoning_details: None,
         })]);
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn text_only_user_content_keeps_legacy_string_shape_and_includes_thinking_text() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "question".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "scratchpad".into(),
+                signature: None,
+            },
+        ];
+
+        assert_eq!(
+            user_content_to_openai(&content),
+            json!("question\nscratchpad")
+        );
+    }
+
+    #[test]
+    fn image_user_content_uses_ordered_openai_content_parts() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "what is this?".into(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "inspect image".into(),
+                signature: None,
+            },
+        ];
+
+        assert_eq!(
+            user_content_to_openai(&content),
+            json!([
+                { "type": "text", "text": "what is this?" },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,iVBORw0KGgo="
+                    }
+                },
+                { "type": "text", "text": "inspect image" }
+            ])
+        );
     }
 
     #[test]
@@ -255,6 +386,7 @@ mod tests {
             provider: "ollama".into(),
             model: "qwen3:32b".into(),
             timestamp: 1,
+            reasoning_details: None,
         })]);
 
         assert_eq!(messages.len(), 1);
@@ -266,5 +398,52 @@ mod tests {
             json!("read")
         );
         assert!(!messages[0].content.to_string().contains("plan first"));
+    }
+
+    #[test]
+    fn assistant_message_reasoning_details_round_trip_via_llm_message() {
+        use anie_protocol::{StopReason, Usage};
+        let details = vec![json!({
+            "type": "reasoning.encrypted",
+            "id": "call_abc",
+            "data": "OPAQUE",
+        })];
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "openrouter".into(),
+            model: "openai/o3".into(),
+            timestamp: 1,
+            reasoning_details: Some(details.clone()),
+        };
+
+        let llm = assistant_message_to_openai_llm_message(&assistant).expect("llm message");
+        assert_eq!(llm.content["reasoning_details"], json!(details));
+
+        // Now flatten through the outbound converter: the replayed
+        // wire message should carry the reasoning_details array
+        // alongside content / tool_calls.
+        let wire = llm_message_to_openai_message(&llm);
+        assert_eq!(wire["role"], "assistant");
+        assert_eq!(wire["reasoning_details"], json!(details));
+    }
+
+    #[test]
+    fn assistant_message_without_reasoning_details_omits_field() {
+        use anie_protocol::{StopReason, Usage};
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        };
+        let llm = assistant_message_to_openai_llm_message(&assistant).expect("llm message");
+        assert!(llm.content.get("reasoning_details").is_none());
     }
 }

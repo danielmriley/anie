@@ -7,8 +7,12 @@ use anie_config::{CliOverrides, load_config};
 use anie_provider::{ProviderRegistry, RequestOptionsResolver};
 use anie_providers_builtin::register_builtin_providers;
 use anie_session::SessionManager;
-use anie_tools::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
+use anie_tools::{
+    BashPolicy, BashTool, EditTool, FileMutationQueue, FindTool, GrepTool, LsTool, ReadTool,
+    WriteTool,
+};
 use anie_tui::UiAction;
+use tracing::warn;
 
 use crate::{
     Cli,
@@ -71,7 +75,11 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         local_models_available,
     )?;
 
-    let tool_registry = build_tool_registry(&cwd, cli.no_tools);
+    let tool_registry = build_tool_registry_with_policy(
+        &cwd,
+        cli.no_tools,
+        bash_policy_from_config(&config.tools.bash.policy),
+    );
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
@@ -94,11 +102,22 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         command_registry: crate::commands::CommandRegistry::with_builtins(),
     };
     state.apply_session_overrides();
-    state.persist_runtime_state();
+    if let Err(error) = state.persist_runtime_state() {
+        warn!(%error, "failed to persist runtime state during bootstrap");
+    }
     Ok(state)
 }
 
+#[cfg(test)]
 pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistry> {
+    build_tool_registry_with_policy(cwd, no_tools, BashPolicy::default())
+}
+
+fn build_tool_registry_with_policy(
+    cwd: &Path,
+    no_tools: bool,
+    bash_policy: BashPolicy,
+) -> Arc<ToolRegistry> {
     let mut tools = ToolRegistry::new();
     if no_tools {
         return Arc::new(tools);
@@ -114,8 +133,22 @@ pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistr
         cwd.to_path_buf(),
         Arc::clone(&queue),
     )));
-    tools.register(Arc::new(BashTool::new(cwd.to_path_buf())));
+    tools.register(Arc::new(BashTool::with_policy(
+        cwd.to_path_buf(),
+        bash_policy,
+    )));
+    tools.register(Arc::new(GrepTool::new(cwd.to_path_buf())));
+    tools.register(Arc::new(FindTool::new(cwd.to_path_buf())));
+    tools.register(Arc::new(LsTool::new(cwd.to_path_buf())));
     Arc::new(tools)
+}
+
+fn bash_policy_from_config(config: &anie_config::BashPolicyConfig) -> BashPolicy {
+    BashPolicy {
+        enabled: config.enabled,
+        deny_commands: config.deny_commands.clone(),
+        deny_patterns: config.deny_patterns.clone(),
+    }
 }
 
 pub(crate) fn spawn_shutdown_signal_forwarder(

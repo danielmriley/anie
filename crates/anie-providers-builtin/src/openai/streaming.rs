@@ -53,6 +53,14 @@ pub(super) struct OpenAiStreamState {
     usage: Usage,
     finish_reason: Option<String>,
     finished: bool,
+    // OpenRouter forwards an opaque `reasoning_details` array
+    // alongside deltas for upstream reasoning models (notably
+    // openai/o* and openai/gpt-5*). These blobs must be replayed
+    // verbatim on subsequent turns or the upstream drops its
+    // reasoning context. We accumulate every detail we see and
+    // emit the aggregate on the final `AssistantMessage` for
+    // models flagged as `supports_reasoning_details_replay`.
+    reasoning_details: Vec<serde_json::Value>,
 }
 
 impl OpenAiStreamState {
@@ -70,6 +78,7 @@ impl OpenAiStreamState {
             usage: Usage::default(),
             finish_reason: None,
             finished: false,
+            reasoning_details: Vec::new(),
         }
     }
 
@@ -114,6 +123,17 @@ impl OpenAiStreamState {
                 } else {
                     false
                 };
+
+                if let Some(details) = delta
+                    .get("reasoning_details")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    // Accumulate opaque per-turn reasoning blobs that
+                    // OpenRouter forwards for upstreams requiring
+                    // verbatim replay. Stored only on models whose
+                    // catalog entry opts in (see `into_message`).
+                    self.reasoning_details.extend(details.iter().cloned());
+                }
 
                 if let Some(content) = delta.get("content").and_then(serde_json::Value::as_str) {
                     if has_native_reasoning {
@@ -193,13 +213,20 @@ impl OpenAiStreamState {
     ) {
         for part in parts {
             match part {
+                // Plan 06 PR-C: skip empty fragments. Tagged-
+                // reasoning split can produce empty halves when
+                // a delta is entirely inside or outside a tag.
                 StreamContentPart::Text(text) => {
-                    self.text.push_str(&text);
-                    events.push(ProviderEvent::TextDelta(text));
+                    if !text.is_empty() {
+                        self.text.push_str(&text);
+                        events.push(ProviderEvent::TextDelta(text));
+                    }
                 }
                 StreamContentPart::Thinking(thinking) => {
-                    self.thinking.push_str(&thinking);
-                    events.push(ProviderEvent::ThinkingDelta(thinking));
+                    if !thinking.is_empty() {
+                        self.thinking.push_str(&thinking);
+                        events.push(ProviderEvent::ThinkingDelta(thinking));
+                    }
                 }
             }
         }
@@ -216,6 +243,19 @@ impl OpenAiStreamState {
         let mut events = self.finish_tagged_content();
         events.extend(self.finish_tool_calls());
         if !self.has_meaningful_content() {
+            // Distinguish truncation (`finish_reason: "length"`)
+            // from a genuine "model only produced reasoning"
+            // termination. On OpenRouter, reasoning upstreams
+            // (notably free-tier models) routinely emit several
+            // thousand tokens of reasoning before the visible
+            // answer and then hit the output-token cap. That used
+            // to surface as `EmptyAssistantResponse` with advice
+            // to rephrase — the actual fix is a lower thinking
+            // level or a larger `max_tokens`. Route it
+            // separately so the error message is actionable.
+            if self.finish_reason.as_deref() == Some("length") {
+                return Err(ProviderError::ResponseTruncated);
+            }
             return Err(ProviderError::EmptyAssistantResponse);
         }
         events.push(ProviderEvent::Done(self.into_message()));
@@ -275,6 +315,21 @@ impl OpenAiStreamState {
             }));
         }
 
+        // Only surface `reasoning_details` for catalog entries that
+        // explicitly opt into round-trip replay. Everywhere else we
+        // drop the blob — persisting it would bloat session files
+        // without buying anything back on the wire.
+        let reasoning_details = if self
+            .model
+            .effective_replay_capabilities()
+            .supports_reasoning_details_replay
+            && !self.reasoning_details.is_empty()
+        {
+            Some(std::mem::take(&mut self.reasoning_details))
+        } else {
+            None
+        };
+
         AssistantMessage {
             content,
             usage: std::mem::take(&mut self.usage),
@@ -287,6 +342,7 @@ impl OpenAiStreamState {
             provider: self.model.provider.clone(),
             model: self.model.id.clone(),
             timestamp: now_millis(),
+            reasoning_details,
         }
     }
 }
@@ -303,7 +359,9 @@ struct OpenAiToolCallState {
 #[cfg(test)]
 mod tests {
     use anie_protocol::{AssistantMessage, ContentBlock, ToolCall};
-    use anie_provider::{ApiKind, CostPerMillion, Model, ProviderError, ProviderEvent};
+    use anie_provider::{
+        ApiKind, CostPerMillion, Model, ModelCompat, ProviderError, ProviderEvent,
+    };
 
     use super::*;
 
@@ -321,6 +379,7 @@ mod tests {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -338,6 +397,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -460,6 +520,28 @@ mod tests {
             vec![ProviderEvent::ThinkingDelta("hello from reasoning".into())]
         );
         assert!(matches!(error, ProviderError::EmptyAssistantResponse));
+    }
+
+    #[test]
+    fn reasoning_only_stream_with_length_finish_surfaces_truncated_error() {
+        // Regression: on OpenRouter, reasoning upstreams routinely
+        // hit max_tokens mid-reasoning and end with
+        // `finish_reason: "length"` and no visible content. That
+        // used to masquerade as "model returned only reasoning"
+        // — actually a truncation, fix is different.
+        let mut state = OpenAiStreamState::new(&sample_local_model());
+        let _ = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"","reasoning":"lots of reasoning here"},"finish_reason":"length"}]}"#,
+            )
+            .expect("events");
+        let error = state
+            .finish_stream()
+            .expect_err("finish stream should fail");
+        assert!(
+            matches!(error, ProviderError::ResponseTruncated),
+            "expected ResponseTruncated, got {error:?}"
+        );
     }
 
     #[test]
@@ -668,5 +750,67 @@ mod tests {
 
         assert!(events.is_empty());
         assert!(matches!(error, ProviderError::EmptyAssistantResponse));
+    }
+
+    fn reasoning_details_replay_model() -> Model {
+        use anie_provider::{ReasoningCapabilities, ReasoningControlMode, ReasoningOutputMode};
+        let mut model = sample_model();
+        model.id = "openai/o3".into();
+        model.provider = "openrouter".into();
+        model.base_url = "https://openrouter.ai/api/v1".into();
+        model.supports_reasoning = true;
+        model.reasoning_capabilities = Some(ReasoningCapabilities {
+            control: Some(ReasoningControlMode::Native),
+            output: Some(ReasoningOutputMode::Separated),
+            tags: None,
+            request_mode: Some(anie_provider::ThinkingRequestMode::NestedReasoning),
+        });
+        model.replay_capabilities = Some(anie_provider::ReplayCapabilities {
+            requires_thinking_signature: false,
+            supports_redacted_thinking: false,
+            supports_encrypted_reasoning: false,
+            supports_reasoning_details_replay: true,
+        });
+        model
+    }
+
+    #[test]
+    fn reasoning_details_captured_on_opt_in_models_only() {
+        let mut state = OpenAiStreamState::new(&reasoning_details_replay_model());
+        let _ = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"hi","reasoning_details":[{"type":"reasoning.encrypted","id":"call_xyz","data":"OPAQUE"}]}}]}"#,
+            )
+            .expect("first chunk");
+        let _ = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"call_abc","data":"OPAQUE2"}]},"finish_reason":"stop"}]}"#,
+            )
+            .expect("second chunk");
+        let events = state.process_event("[DONE]").expect("done");
+        let message = final_message(&events);
+
+        let details = message
+            .reasoning_details
+            .expect("reasoning_details populated for opt-in model");
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0]["type"], "reasoning.encrypted");
+        assert_eq!(details[0]["id"], "call_xyz");
+        assert_eq!(details[1]["data"], "OPAQUE2");
+    }
+
+    #[test]
+    fn reasoning_details_dropped_for_non_opt_in_models() {
+        // Model without replay_capabilities → never persist the
+        // reasoning_details even if the upstream sent them.
+        let mut state = OpenAiStreamState::new(&sample_model());
+        let _ = state
+            .process_event(
+                r#"{"choices":[{"index":0,"delta":{"content":"hi","reasoning_details":[{"type":"reasoning.encrypted","id":"x","data":"d"}]},"finish_reason":"stop"}]}"#,
+            )
+            .expect("chunk");
+        let events = state.process_event("[DONE]").expect("done");
+        let message = final_message(&events);
+        assert!(message.reasoning_details.is_none());
     }
 }

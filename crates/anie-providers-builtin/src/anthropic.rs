@@ -117,12 +117,22 @@ impl AnthropicProvider {
         context: &LlmContext,
         options: &StreamOptions,
     ) -> serde_json::Value {
+        // Plan 06 PR-A: compute `thinking_config` exactly once
+        // and use the stored value at both insertion points.
+        // The second insertion at the bottom re-asserts the
+        // `temperature = 1.0` contract AFTER an optional user
+        // temperature override — deleting that re-assertion
+        // would break Anthropic's requirement that thinking
+        // requests send temperature=1. Per-request savings:
+        // one `ThinkingConfig::serialize` pass.
+        let thinking = thinking_config(options, model);
+
         let mut body = serde_json::Map::new();
         body.insert("model".into(), json!(model.id));
         let base_max = options.max_tokens.unwrap_or(model.max_tokens);
-        if let Some((effective_max, thinking)) = thinking_config(options, model) {
-            body.insert("max_tokens".into(), json!(effective_max));
-            body.insert("thinking".into(), thinking);
+        if let Some((effective_max, thinking_value)) = thinking.as_ref() {
+            body.insert("max_tokens".into(), json!(*effective_max));
+            body.insert("thinking".into(), thinking_value.clone());
             body.insert("temperature".into(), json!(1.0));
         } else {
             body.insert("max_tokens".into(), json!(base_max));
@@ -160,8 +170,12 @@ impl AnthropicProvider {
         if let Some(temperature) = options.temperature {
             body.insert("temperature".into(), json!(temperature));
         }
-        if let Some(thinking) = thinking_config(options, model) {
-            body.insert("thinking".into(), thinking.1);
+        // Re-assert thinking's temperature contract AFTER the
+        // optional user-temperature override above. Must stay
+        // after `options.temperature` so user values don't
+        // leak into thinking requests.
+        if let Some((_, thinking_value)) = thinking {
+            body.insert("thinking".into(), thinking_value);
             body.insert("temperature".into(), json!(1.0));
         }
 
@@ -388,6 +402,13 @@ fn thinking_config(options: &StreamOptions, model: &Model) -> Option<(u64, serde
     // expanded to accommodate it rather than the budget being capped by it.
     let budget = match options.thinking {
         ThinkingLevel::Off => return None,
+        // Anthropic doesn't expose a "minimal" effort knob of
+        // its own — the API's minimum useful budget is ~1 k
+        // tokens. Treat `Minimal` as the smallest practical
+        // extended-thinking budget rather than skipping it
+        // entirely; if the caller truly wanted no reasoning
+        // they'd pick `Off`.
+        ThinkingLevel::Minimal => 1_024,
         ThinkingLevel::Low => 2_048,
         ThinkingLevel::Medium => 8_192,
         ThinkingLevel::High => 16_384,
@@ -417,6 +438,7 @@ struct AnthropicStreamState {
     usage: Usage,
     blocks: BTreeMap<usize, AnthropicBlockState>,
     stop_reason: StopReason,
+    raw_stop_reason: Option<String>,
     finished: bool,
 }
 
@@ -427,6 +449,7 @@ impl AnthropicStreamState {
             usage: Usage::default(),
             blocks: BTreeMap::new(),
             stop_reason: StopReason::Stop,
+            raw_stop_reason: None,
             finished: false,
         }
     }
@@ -536,27 +559,35 @@ impl AnthropicStreamState {
                 let delta = &payload["delta"];
                 match delta["type"].as_str() {
                     Some("text_delta") => {
-                        let text = delta["text"].as_str().unwrap_or_default().to_string();
-                        if let Some(AnthropicBlockState::Text(existing)) =
-                            self.blocks.get_mut(&index)
-                        {
-                            existing.push_str(&text);
+                        // Plan 06 PR-B: borrow the &str first and skip
+                        // empty fragments — the upstream emits them
+                        // occasionally between real tokens. Only
+                        // allocate when we have something to emit.
+                        let text = delta["text"].as_str().unwrap_or_default();
+                        if !text.is_empty() {
+                            if let Some(AnthropicBlockState::Text(existing)) =
+                                self.blocks.get_mut(&index)
+                            {
+                                existing.push_str(text);
+                            }
+                            events.push(ProviderEvent::TextDelta(text.to_string()));
                         }
-                        events.push(ProviderEvent::TextDelta(text));
                     }
                     Some("thinking_delta") => {
+                        // Plan 06 PR-B: skip empty thinking fragments.
                         let thinking = delta
                             .get("thinking")
                             .and_then(serde_json::Value::as_str)
                             .or_else(|| delta.get("text").and_then(serde_json::Value::as_str))
-                            .unwrap_or_default()
-                            .to_string();
-                        if let Some(AnthropicBlockState::Thinking(state)) =
-                            self.blocks.get_mut(&index)
-                        {
-                            state.thinking.push_str(&thinking);
+                            .unwrap_or_default();
+                        if !thinking.is_empty() {
+                            if let Some(AnthropicBlockState::Thinking(state)) =
+                                self.blocks.get_mut(&index)
+                            {
+                                state.thinking.push_str(thinking);
+                            }
+                            events.push(ProviderEvent::ThinkingDelta(thinking.to_string()));
                         }
-                        events.push(ProviderEvent::ThinkingDelta(thinking));
                     }
                     Some("input_json_delta") => {
                         let partial_json = delta["partial_json"]
@@ -615,6 +646,7 @@ impl AnthropicStreamState {
                 update_usage(&mut self.usage, &payload["usage"]);
                 if let Some(stop_reason) = payload["delta"]["stop_reason"].as_str() {
                     self.stop_reason = map_stop_reason(stop_reason);
+                    self.raw_stop_reason = Some(stop_reason.to_string());
                 }
             }
             "message_stop" => {
@@ -628,6 +660,9 @@ impl AnthropicStreamState {
                 // failure surfaces once and the user can adjust
                 // prompt or model.
                 if !self.has_visible_content() {
+                    if self.raw_stop_reason.as_deref() == Some("max_tokens") {
+                        return Err(ProviderError::ResponseTruncated);
+                    }
                     return Err(ProviderError::EmptyAssistantResponse);
                 }
                 events.push(ProviderEvent::Done(self.into_message()));
@@ -682,6 +717,7 @@ impl AnthropicStreamState {
             provider: self.model.provider.clone(),
             model: self.model.id.clone(),
             timestamp: now_millis(),
+            reasoning_details: None,
         }
     }
 }
@@ -752,7 +788,7 @@ fn map_stop_reason(stop_reason: &str) -> StopReason {
 
 #[cfg(test)]
 mod tests {
-    use anie_provider::{ApiKind, CostPerMillion};
+    use anie_provider::{ApiKind, CostPerMillion, ModelCompat};
 
     use super::*;
 
@@ -770,6 +806,7 @@ mod tests {
             supports_images: true,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -939,6 +976,70 @@ mod tests {
     }
 
     #[test]
+    fn raw_max_tokens_stop_reason_is_retained_with_existing_mapped_stop_reason() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text"}}"#,
+            )
+            .expect("text start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+            )
+            .expect("text delta");
+        state
+            .process_event(
+                "message_delta",
+                r#"{"delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8}}"#,
+            )
+            .expect("message delta");
+
+        assert_eq!(state.raw_stop_reason.as_deref(), Some("max_tokens"));
+
+        let done = state
+            .process_event("message_stop", "{}")
+            .expect("message stop");
+        let ProviderEvent::Done(message) = done.last().expect("done event") else {
+            panic!("expected done event");
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(message.usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn normal_anthropic_stop_reason_still_maps_to_existing_stop_reason() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"text"}}"#,
+            )
+            .expect("text start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"text_delta","text":"done"}}"#,
+            )
+            .expect("text delta");
+        state
+            .process_event("message_delta", r#"{"delta":{"stop_reason":"end_turn"}}"#)
+            .expect("message delta");
+
+        assert_eq!(state.raw_stop_reason.as_deref(), Some("end_turn"));
+
+        let done = state
+            .process_event("message_stop", "{}")
+            .expect("message stop");
+        let ProviderEvent::Done(message) = done.last().expect("done event") else {
+            panic!("expected done event");
+        };
+        assert_eq!(message.stop_reason, StopReason::Stop);
+    }
+
+    #[test]
     fn anthropic_provider_replays_thinking_blocks() {
         let provider = AnthropicProvider::new();
         assert!(provider.includes_thinking_in_replay());
@@ -1027,6 +1128,37 @@ mod tests {
         assert!(
             matches!(error, ProviderError::EmptyAssistantResponse),
             "expected EmptyAssistantResponse, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn message_stop_after_max_tokens_without_visible_content_returns_response_truncated() {
+        let mut state = AnthropicStreamState::new(sample_model());
+        state
+            .process_event(
+                "content_block_start",
+                r#"{"index":0,"content_block":{"type":"thinking"}}"#,
+            )
+            .expect("thinking start");
+        state
+            .process_event(
+                "content_block_delta",
+                r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"reasoning only"}}"#,
+            )
+            .expect("thinking delta");
+        state
+            .process_event("content_block_stop", r#"{"index":0}"#)
+            .expect("block stop");
+        state
+            .process_event("message_delta", r#"{"delta":{"stop_reason":"max_tokens"}}"#)
+            .expect("message delta");
+
+        let error = state
+            .process_event("message_stop", "{}")
+            .expect_err("message_stop must classify max_tokens truncation");
+        assert!(
+            matches!(error, ProviderError::ResponseTruncated),
+            "expected ResponseTruncated, got {error:?}"
         );
     }
 
@@ -1278,11 +1410,7 @@ mod tests {
     #[test]
     fn classifies_replay_fidelity_400_on_thinking_signature() {
         let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.thinking.signature: Field required"}}"#;
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, body, None);
         assert!(matches!(
             err,
             ProviderError::ReplayFidelity {
@@ -1295,22 +1423,14 @@ mod tests {
     #[test]
     fn classifies_replay_fidelity_400_on_redacted_thinking() {
         let body = r#"{"error":{"message":"redacted_thinking required"}}"#;
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, body, None);
         assert!(matches!(err, ProviderError::ReplayFidelity { .. }));
     }
 
     #[test]
     fn generic_400_falls_through_to_http() {
         let body = "missing required field messages";
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, body, None);
         assert!(matches!(err, ProviderError::Http { status: 400, .. }));
     }
 
@@ -1323,11 +1443,7 @@ mod tests {
     #[test]
     fn replay_fidelity_detail_is_truncated() {
         let body = "messages.0.content.0.thinking.signature: Field required. ".repeat(50);
-        let err = classify_anthropic_http_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            &body,
-            None,
-        );
+        let err = classify_anthropic_http_error(reqwest::StatusCode::BAD_REQUEST, &body, None);
         if let ProviderError::ReplayFidelity { detail, .. } = err {
             assert!(detail.len() <= 500);
         } else {
@@ -1444,6 +1560,7 @@ mod tests {
                 supports_images: true,
                 cost_per_million: anie_provider::CostPerMillion::zero(),
                 replay_capabilities: None,
+                compat: ModelCompat::None,
             }
         }
 
@@ -1468,5 +1585,96 @@ mod tests {
         assert_eq!(eff, 8_192);
         assert!(high_small["budget_tokens"].as_u64().unwrap() < eff);
         assert_eq!(high_small["budget_tokens"], json!(8_192 - 1_024));
+    }
+
+    /// Plan 06 PR-A: compute thinking_config exactly once but
+    /// preserve the end-of-body re-assertion so a user-supplied
+    /// temperature doesn't leak through into a thinking request.
+    /// Pins the correctness-sensitive ordering.
+    #[test]
+    fn anthropic_thinking_request_reasserts_temperature_after_user_override() {
+        fn model_with(max_tokens: u64) -> Model {
+            Model {
+                id: "claude-haiku-4-5-20251001".into(),
+                name: "Haiku".into(),
+                provider: "anthropic".into(),
+                api: anie_provider::ApiKind::AnthropicMessages,
+                base_url: "https://api.anthropic.com".into(),
+                context_window: 200_000,
+                max_tokens,
+                supports_reasoning: true,
+                reasoning_capabilities: None,
+                supports_images: true,
+                cost_per_million: anie_provider::CostPerMillion::zero(),
+                replay_capabilities: None,
+                compat: ModelCompat::None,
+            }
+        }
+        let model = model_with(64_000);
+        let context = LlmContext {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        // User tries to set temperature to 0.7 alongside a
+        // thinking request. Anthropic requires temperature=1
+        // when thinking is active; the provider must
+        // re-assert that requirement after the user's value.
+        let options = StreamOptions {
+            thinking: ThinkingLevel::High,
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
+        // Post-override, temperature must read 1.0, not 0.7.
+        assert_eq!(
+            body["temperature"],
+            json!(1.0),
+            "thinking request must force temperature=1 even when user set it: {body}"
+        );
+        // Thinking block must be present and well-formed.
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+        assert!(body["thinking"]["budget_tokens"].is_u64());
+    }
+
+    /// No thinking request + user temperature: the user value
+    /// must pass through untouched.
+    #[test]
+    fn anthropic_non_thinking_request_preserves_user_temperature() {
+        fn model_with(max_tokens: u64) -> Model {
+            Model {
+                id: "claude-haiku-4-5-20251001".into(),
+                name: "Haiku".into(),
+                provider: "anthropic".into(),
+                api: anie_provider::ApiKind::AnthropicMessages,
+                base_url: "https://api.anthropic.com".into(),
+                context_window: 200_000,
+                max_tokens,
+                supports_reasoning: true,
+                reasoning_capabilities: None,
+                supports_images: true,
+                cost_per_million: anie_provider::CostPerMillion::zero(),
+                replay_capabilities: None,
+                compat: ModelCompat::None,
+            }
+        }
+        let model = model_with(64_000);
+        let context = LlmContext {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            thinking: ThinkingLevel::Off,
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = AnthropicProvider::new().build_request_body_for_test(&model, &context, &options);
+        // f32 → serde_json::Value goes through f64, so
+        // `0.7_f32` serializes as `0.6999…`. Compare with a
+        // tolerance rather than byte-identical JSON.
+        let temp = body["temperature"].as_f64().expect("temperature f64");
+        assert!((temp - 0.7).abs() < 1e-4, "expected ~0.7, got {temp}");
+        assert!(body.get("thinking").is_none());
     }
 }

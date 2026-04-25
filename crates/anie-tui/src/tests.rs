@@ -6,10 +6,11 @@ use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StreamDelta, Usage, UserMessage,
 };
-use anie_provider::{ApiKind, CostPerMillion, Model};
+use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat};
 
 use crate::{
     AgentUiState, App, OutputPane, RenderedBlock,
+    app::{MAX_AGENT_EVENTS_PER_FRAME, drain_agent_event_batch},
     commands::{ArgumentSpec, SlashCommandInfo},
 };
 
@@ -23,7 +24,7 @@ use crate::{
 /// `registry_covers_every_dispatched_slash_command` in
 /// `anie-cli/src/commands.rs`.
 fn default_test_commands() -> Vec<SlashCommandInfo> {
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
     const SESSION_SUBS: &[&str] = &["list"];
     vec![
         SlashCommandInfo::builtin_with_args(
@@ -39,7 +40,13 @@ fn default_test_commands() -> Vec<SlashCommandInfo> {
                 values: LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Query or override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
         SlashCommandInfo::builtin("fork", "Fork session"),
@@ -48,7 +55,9 @@ fn default_test_commands() -> Vec<SlashCommandInfo> {
         SlashCommandInfo::builtin_with_args(
             "session",
             "Session info",
-            ArgumentSpec::Subcommands { known: SESSION_SUBS },
+            ArgumentSpec::Subcommands {
+                known: SESSION_SUBS,
+            },
             Some("[list|<id>]"),
         ),
         SlashCommandInfo::builtin("tools", "List tools"),
@@ -76,6 +85,7 @@ fn sample_models() -> Vec<Model> {
         supports_images: false,
         cost_per_million: CostPerMillion::zero(),
         replay_capabilities: None,
+        compat: ModelCompat::None,
     }]
 }
 
@@ -109,9 +119,87 @@ fn static_layout_renders_output_status_and_input() {
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
 
-    assert!(screen.contains("> You: Fix the bug in main.rs"));
+    assert!(screen.contains("› Fix the bug in main.rs"));
     assert!(screen.contains("anthropic:claude-sonnet-4-6 │ thinking: medium │ 12.4k/200k"));
-    assert!(screen.contains("> "));
+    // `render_to_string` trims trailing spaces per line, so the
+    // `> ` input prompt lands with the space stripped — anchor
+    // to `\n>` to prove the marker shows up on its own line.
+    assert!(
+        screen.contains("\n>"),
+        "input prompt missing, screen was:\n{screen}"
+    );
+}
+
+#[test]
+fn compaction_start_transitions_to_compacting_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::CompactionStart)
+        .expect("handle");
+
+    assert!(
+        matches!(app.agent_state(), AgentUiState::Compacting { .. }),
+        "expected Compacting, got {:?}",
+        app.agent_state()
+    );
+    // Permanent transcript record remains.
+    assert!(
+        app.output_blocks()
+            .iter()
+            .any(|block| matches!(block, RenderedBlock::SystemMessage { text } if text.contains("Compacting")))
+    );
+}
+
+#[test]
+fn compaction_end_transitions_back_to_idle() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::CompactionStart)
+        .expect("start");
+    app.handle_agent_event(AgentEvent::CompactionEnd {
+        summary: "Prior conversation covered setup work.".into(),
+        tokens_before: 150_000,
+        tokens_after: 8_000,
+    })
+    .expect("end");
+
+    assert!(matches!(app.agent_state(), AgentUiState::Idle));
+}
+
+#[test]
+fn status_bar_shows_elapsed_seconds_while_compacting() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    {
+        let status = app.status_bar_mut();
+        status.provider_name = "github-copilot".into();
+        status.model_name = "claude-sonnet-4.6".into();
+        status.thinking = "medium".into();
+        status.estimated_context_tokens = 150_000;
+        status.context_window = 200_000;
+        status.cwd = "~/project".into();
+    }
+    app.handle_agent_event(AgentEvent::CompactionStart)
+        .expect("start");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert!(
+        screen.contains("compacting"),
+        "status bar should show 'compacting': {screen}"
+    );
+    // 0s immediately after CompactionStart (Instant just set).
+    assert!(
+        screen.contains("compacting 0s"),
+        "expected '0s' suffix: {screen}"
+    );
 }
 
 #[test]
@@ -169,6 +257,7 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     })]);
 
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
@@ -177,13 +266,13 @@ fn replayed_assistant_renders_thinking_above_visible_response() {
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
     let thinking_index = screen
-        .find("thinking\n│ plan first")
+        .find("• Thinking\n  └ plan first")
         .expect("thinking section");
     let text_index = screen.find("final answer").expect("visible answer");
 
     assert!(thinking_index < text_index, "screen was:\n{screen}");
     assert!(
-        screen.contains("thinking\n│ plan first\n\nfinal answer"),
+        screen.contains("• Thinking\n  └ plan first\n\nfinal answer"),
         "screen was:\n{screen}"
     );
 }
@@ -205,6 +294,7 @@ fn streaming_assistant_renders_thinking_above_visible_response() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("assistant start");
@@ -217,31 +307,84 @@ fn streaming_assistant_renders_thinking_above_visible_response() {
     })
     .expect("thinking delta");
 
-    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
     let thinking_index = screen
-        .find("thinking\n│ plan first")
+        .find("• Thinking\n  └ plan first")
         .expect("thinking section");
     let text_index = screen.find("final answer").expect("visible answer");
-    let streaming_index = screen.find("responding...").expect("streaming status");
+    // The streaming activity indicator moved out of the
+    // transcript and onto a fixed row above the input box —
+    // `render_spinner_row` renders `⠋ Responding...` there.
+    let streaming_index = screen.find("Responding...").expect("streaming status");
 
     assert!(thinking_index < text_index, "screen was:\n{screen}");
     assert!(text_index < streaming_index, "screen was:\n{screen}");
     assert!(
-        screen.contains("thinking\n│ plan first\n\nfinal answer"),
+        screen.contains("• Thinking\n  └ plan first\n\nfinal answer"),
         "screen was:\n{screen}"
     );
 }
 
 #[test]
-fn wrapped_thinking_lines_keep_their_section_gutter() {
-    let screen = render_assistant_block("done", "abcdefghijklmnop", false, 10, 8);
+fn urgent_input_render_reuses_existing_output_snapshot() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
+    app.handle_agent_event(AgentEvent::SystemMessage {
+        text: "existing transcript".into(),
+    })
+    .expect("seed transcript");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("initial draw");
+    let builds_before = app.output_flat_build_count();
+
+    app.handle_agent_event(AgentEvent::SystemMessage {
+        text: "pending transcript update".into(),
+    })
+    .expect("queue transcript update");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    )))
+    .expect("type input");
+    terminal
+        .draw(|frame| app.render_urgent_for_test(frame))
+        .expect("urgent draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert_eq!(
+        app.output_flat_build_count(),
+        builds_before,
+        "urgent input paint should reuse the previous output snapshot"
+    );
+    assert_eq!(app.input_pane_contents(), "x");
     assert!(
-        screen.contains("thinking\n│ abcdefgh\n│ ijklmnop\n\ndone"),
+        screen.contains("> x"),
+        "urgent input paint should still show the typed input, screen was:\n{screen}"
+    );
+    assert!(
+        !screen.contains("pending transcript update"),
+        "urgent input paint should reuse the previous transcript snapshot, screen was:\n{screen}"
+    );
+}
+
+#[test]
+fn wrapped_thinking_lines_keep_their_section_gutter() {
+    let screen = render_assistant_block("done", "abcdefghijklmnop", false, 14, 8);
+
+    // First body line uses the `  └ ` indent; continuations
+    // use `    ` (four spaces) — both consume 4 chars, so at
+    // width=14 the body wraps to 10-char slices.
+    assert!(
+        screen.contains("• Thinking\n  └ abcdefghij\n    klmnop\n\ndone"),
         "screen was:\n{screen}"
     );
 }
@@ -257,25 +400,41 @@ fn answer_only_assistant_rendering_remains_plain() {
 fn thinking_only_assistant_rendering_remains_grouped() {
     let screen = render_assistant_block("", "plan first", false, 20, 6);
 
-    assert_eq!(non_empty_lines(&screen), vec!["thinking", "│ plan first"]);
+    assert_eq!(
+        non_empty_lines(&screen),
+        vec!["• Thinking", "  └ plan first"]
+    );
 }
 
 #[test]
 fn streaming_assistant_without_visible_answer_reports_thinking_status() {
     let screen = render_assistant_block("", "plan first", true, 20, 6);
 
+    // While thinking is streaming with no visible answer yet,
+    // the `•` bullet swaps to the animated spinner frame — the
+    // header itself is the "still thinking" indicator, so the
+    // old separate `⠋ thinking...` status line is redundant.
     assert!(
-        screen.contains("thinking\n│ plan first\n│ ⠋ thinking..."),
+        screen.contains("⠋ Thinking\n  └ plan first"),
         "screen was:\n{screen}"
     );
     assert!(!screen.contains("responding..."), "screen was:\n{screen}");
 }
 
 #[test]
-fn empty_streaming_assistant_uses_generic_status() {
+fn empty_streaming_assistant_block_renders_blank_in_output_pane() {
+    // The "⠋ streaming..." indicator moved out of the
+    // assistant block and onto the dedicated spinner row
+    // above the input box (rendered by `render_spinner_row`
+    // in `app.rs`). A streaming assistant block with no
+    // content yet therefore contributes nothing to the
+    // transcript — the spinner row is the sole "still
+    // working" cue.
     let screen = render_assistant_block("", "", true, 20, 4);
-
-    assert_eq!(non_empty_lines(&screen), vec!["⠋ streaming..."]);
+    assert!(
+        non_empty_lines(&screen).is_empty(),
+        "expected empty output pane, got: {screen}"
+    );
 }
 
 #[test]
@@ -295,6 +454,7 @@ fn event_to_render_streaming_and_tool_lifecycle() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("assistant start");
@@ -329,7 +489,10 @@ fn event_to_render_streaming_and_tool_lifecycle() {
     let screen = render_to_string(terminal.backend());
 
     assert!(screen.contains("I'll read the file first."));
-    assert!(screen.contains("┌─ read src/main.rs"));
+    assert!(
+        screen.contains("• Read src/main.rs"),
+        "tool header missing, screen was:\n{screen}"
+    );
     assert!(screen.contains("fn main() {}"));
 }
 
@@ -409,7 +572,10 @@ fn scroll_disables_auto_follow_until_scrolled_back_to_bottom() {
         .expect("user message");
     }
 
-    let mut terminal = Terminal::new(TestBackend::new(40, 8)).expect("test terminal");
+    // Chrome (spinner row + bordered input + status bar) now
+    // takes ~7 rows. Give the output pane enough room for
+    // the most recent message to be visible without scroll.
+    let mut terminal = Terminal::new(TestBackend::new(40, 14)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw initial frame");
@@ -635,14 +801,18 @@ fn single_long_wrapped_assistant_message_is_navigable() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     })]);
 
-    let mut terminal = Terminal::new(TestBackend::new(20, 8)).expect("test terminal");
+    // 32-col terminal keeps `FINAL-SUFFIX` (12 chars) on a
+    // single wrapped line regardless of where the preceding
+    // prose happens to break.
+    let mut terminal = Terminal::new(TestBackend::new(32, 8)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw initial frame");
     let initial = render_to_string(terminal.backend());
-    assert!(initial.contains("FINAL-SUFFIX"));
+    assert!(initial.contains("FINAL-SUFFIX"), "{initial}");
     assert!(!initial.contains("BEGIN-"));
 
     app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
@@ -765,7 +935,10 @@ fn alt_arrow_word_movement_and_bash_title_render() {
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
-    assert!(screen.contains("┌─ $ echo hello world"));
+    assert!(
+        screen.contains("• Ran echo hello world"),
+        "tool header missing, screen was:\n{screen}"
+    );
     assert!(screen.contains("hello world"));
 }
 
@@ -802,8 +975,11 @@ fn replayed_tool_results_restore_titles_from_details() {
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let screen = render_to_string(terminal.backend());
-    assert!(screen.contains("read src/main.rs"), "screen was:\n{screen}");
-    assert!(screen.contains("$ echo hello"), "screen was:\n{screen}");
+    assert!(
+        screen.contains("• Read src/main.rs"),
+        "screen was:\n{screen}"
+    );
+    assert!(screen.contains("• Ran echo hello"), "screen was:\n{screen}");
 }
 
 #[test]
@@ -831,7 +1007,12 @@ fn diff_rendering_shows_added_and_removed_lines() {
     })
     .expect("tool end");
 
-    let mut terminal = Terminal::new(TestBackend::new(50, 10)).expect("test terminal");
+    // Bordered input (5 rows) + spinner row (1) + status (1)
+    // = 7 rows of chrome. The boxed diff needs 4+ rows to
+    // render its top border, two content rows, and bottom
+    // border — bump the terminal to 14 rows so the full box
+    // fits above the chrome.
+    let mut terminal = Terminal::new(TestBackend::new(50, 14)).expect("test terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw frame");
@@ -845,7 +1026,12 @@ fn diff_rendering_shows_added_and_removed_lines() {
 fn model_command_opens_picker_in_bottom_pane_and_keeps_transcript_visible() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-    let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
     app.status_bar_mut().provider_name = "ollama".into();
     app.status_bar_mut().model_name = "qwen3:32b".into();
     app.handle_agent_event(AgentEvent::MessageStart {
@@ -946,7 +1132,12 @@ fn picker_selection_sends_resolved_model_action() {
 fn slash_commands_route_actions_and_render_help() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-    let mut app = App::new(event_rx, action_tx, sample_models(), default_test_commands());
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
 
     for ch in "/model qwen3:32b".chars() {
         app.handle_terminal_event(Event::Key(KeyEvent::new(
@@ -1132,26 +1323,29 @@ fn thinking_only_assistant_block_renders_error_footer() {
         10,
     );
     assert!(
-        screen.contains("thinking"),
+        screen.contains("• Thinking"),
         "thinking section should still render:\n{screen}"
     );
     assert!(
         screen.contains("no visible content"),
         "error footer must be visible after a thinking-only turn:\n{screen}"
     );
-    // Belt-and-suspenders: the warning glyph is the cue that
-    // this is an error line, not part of the thinking content.
-    assert!(screen.contains('⚠'), "error line should be flagged:\n{screen}");
+    // The `• Error` header is the cue that this is a provider-error
+    // row, not part of the thinking content.
+    assert!(
+        screen.contains("• Error"),
+        "error header should be flagged:\n{screen}"
+    );
 }
 
 #[test]
 fn assistant_block_without_error_renders_no_error_footer() {
     // Happy-path regression: healthy turns render untouched by
-    // the new error-footer path.
+    // the error-footer path.
     let screen = render_assistant_block("answer text", "a plan", false, 48, 10);
     assert!(
-        !screen.contains('⚠'),
-        "no warning glyph should appear on healthy turns:\n{screen}"
+        !screen.contains("• Error"),
+        "no error header should appear on healthy turns:\n{screen}"
     );
 }
 
@@ -1303,7 +1497,7 @@ fn render_assistant_block_with_error(
 fn render_output_pane_to_string(pane: &mut OutputPane, width: u16, height: u16) -> String {
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);
-    pane.render(area, &mut buffer, "⠋");
+    pane.render(area, &mut buffer, "⠋", false);
     render_buffer_to_string(&buffer)
 }
 
@@ -1347,18 +1541,19 @@ fn submit_command(app: &mut App, command: &str) {
 // Thinking block display regression tests
 // ---------------------------------------------------------------------------
 
-/// Thinking text must never appear outside the "thinking" gutter section.
-/// This helper asserts that every occurrence of `thinking_text` in the
-/// rendered screen is inside a `│`-prefixed gutter line or the heading.
+/// Thinking text must never appear outside the `• Thinking`
+/// section. Every occurrence of `thinking_text` in the
+/// rendered screen must be either the header itself or a
+/// `  └ ` / `    ` indented body line.
 fn assert_thinking_text_only_in_gutter(screen: &str, thinking_text: &str) {
     for (line_no, line) in screen.lines().enumerate() {
         if line.contains(thinking_text) {
-            let trimmed = line.trim();
-            let in_gutter = trimmed.starts_with('│');
-            let is_heading = trimmed == "thinking";
+            let trimmed_start = line.trim_start();
+            let in_body = trimmed_start.starts_with("└ ") || line.starts_with("    ");
+            let is_heading = line.trim() == "• Thinking";
             assert!(
-                in_gutter || is_heading,
-                "thinking text '{}' leaked outside gutter at line {}:\n  {}\nfull screen:\n{}",
+                in_body || is_heading,
+                "thinking text '{}' leaked outside thinking section at line {}:\n  {}\nfull screen:\n{}",
                 thinking_text,
                 line_no + 1,
                 line,
@@ -1404,6 +1599,7 @@ fn thinking_text_never_leaks_into_visible_answer_streamed() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("assistant start");
@@ -1432,6 +1628,7 @@ fn thinking_text_never_leaks_into_visible_answer_streamed() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
     })
     .expect("message end");
@@ -1471,6 +1668,7 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 1,
+            reasoning_details: None,
         }),
         Message::User(anie_protocol::UserMessage {
             content: vec![ContentBlock::Text {
@@ -1494,6 +1692,7 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
             provider: "mock".into(),
             model: "mock-model".into(),
             timestamp: 3,
+            reasoning_details: None,
         }),
     ]);
 
@@ -1512,31 +1711,35 @@ fn multi_turn_thinking_stays_contained_in_each_message() {
 #[test]
 fn thinking_only_completed_message_shows_only_gutter() {
     // A completed (non-streaming) message with only thinking and no text
-    // should render just the gutter section, no leaked text
+    // renders as `• Thinking` header + `  └ body` line — no leaked text.
     let screen = render_assistant_block("", "only reasoning here", false, 40, 8);
 
     assert_thinking_text_only_in_gutter(&screen, "only reasoning here");
     let lines = non_empty_lines(&screen);
-    // Should only have "thinking" heading and the gutter line
     assert_eq!(lines.len(), 2, "unexpected lines: {lines:?}");
-    assert_eq!(lines[0], "thinking");
-    assert!(lines[1].starts_with('│'), "line was: {}", lines[1]);
+    assert_eq!(lines[0], "• Thinking");
+    assert!(
+        lines[1].trim_start().starts_with("└ "),
+        "line was: {}",
+        lines[1]
+    );
 }
 
 #[test]
 fn long_thinking_does_not_bleed_past_gutter_boundary() {
-    // A long thinking block that wraps should stay entirely in the gutter
+    // A long thinking block that wraps should stay entirely in the
+    // bulleted body region — every wrapped line starts with `  └ ` or
+    // `    ` continuation indent.
     let long_thinking = "a]b".repeat(50); // 150 chars
     let screen = render_assistant_block("done", &long_thinking, false, 30, 20);
 
     assert!(screen.contains("done"), "screen was:\n{screen}");
-    // Every line containing thinking content must be in gutter
     for line in screen.lines() {
         if line.contains("a]b") {
-            let trimmed = line.trim();
+            let trimmed = line.trim_start();
             assert!(
-                trimmed.starts_with('│'),
-                "wrapped thinking leaked outside gutter: {line}\nfull screen:\n{screen}"
+                trimmed.starts_with("└ ") || line.starts_with("    "),
+                "wrapped thinking leaked outside section: {line}\nfull screen:\n{screen}"
             );
         }
     }
@@ -1550,7 +1753,16 @@ fn long_thinking_does_not_bleed_past_gutter_boundary() {
 /// regression tests. Mirrors the shape produced by the CLI's
 /// `builtin_commands()` without pulling in the full list.
 fn phase_c_catalog() -> Vec<SlashCommandInfo> {
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
+    const MARKDOWN_SWITCHES: &[&str] = &["on", "off"];
+    const TOOL_OUTPUT_MODES: &[&str] = &["verbose", "compact"];
+    const OAUTH_PROVIDERS: &[&str] = &[
+        "anthropic",
+        "openai-codex",
+        "github-copilot",
+        "google-antigravity",
+        "google-gemini-cli",
+    ];
     vec![
         SlashCommandInfo::builtin_with_args(
             "thinking",
@@ -1559,7 +1771,46 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
                 values: LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Query or override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "markdown",
+            "Toggle markdown rendering",
+            ArgumentSpec::Enumerated {
+                values: MARKDOWN_SWITCHES,
+                required: false,
+            },
+            Some("[on|off]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "tool-output",
+            "Set tool-output display mode",
+            ArgumentSpec::Enumerated {
+                values: TOOL_OUTPUT_MODES,
+                required: false,
+            },
+            Some("[verbose|compact]"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "login",
+            "OAuth login instructions",
+            ArgumentSpec::Enumerated {
+                values: OAUTH_PROVIDERS,
+                required: true,
+            },
+            Some("<provider>"),
+        ),
+        SlashCommandInfo::builtin_with_args(
+            "logout",
+            "Remove stored credential",
+            ArgumentSpec::FreeForm { required: true },
+            Some("<provider>"),
         ),
         SlashCommandInfo::builtin("compact", "Manually compact"),
         SlashCommandInfo::builtin("help", "Show help"),
@@ -1568,18 +1819,27 @@ fn phase_c_catalog() -> Vec<SlashCommandInfo> {
 
 fn submit_line(app: &mut App, line: &str) {
     for ch in line.chars() {
-        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
-            .expect("type char");
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type char");
     }
-    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
-        .expect("submit");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit");
 }
 
 fn last_system_message(app: &App) -> Option<String> {
-    app.output_blocks().iter().rev().find_map(|block| match block {
-        RenderedBlock::SystemMessage { text } => Some(text.clone()),
-        _ => None,
-    })
+    app.output_blocks()
+        .iter()
+        .rev()
+        .find_map(|block| match block {
+            RenderedBlock::SystemMessage { text } => Some(text.clone()),
+            _ => None,
+        })
 }
 
 #[test]
@@ -1612,6 +1872,49 @@ fn slash_thinking_valid_dispatches_set_thinking() {
 }
 
 #[test]
+fn context_length_slash_command_dispatches_ui_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/context-length 16384");
+
+    let action = action_rx.try_recv().expect("valid command must dispatch");
+    assert!(matches!(
+        action,
+        crate::UiAction::ContextLength(Some(value)) if value == "16384"
+    ));
+}
+
+#[test]
+fn context_length_slash_command_query_dispatches_none() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/context-length");
+
+    let action = action_rx.try_recv().expect("query command must dispatch");
+    assert!(matches!(action, crate::UiAction::ContextLength(None)));
+}
+
+#[test]
+fn context_length_slash_command_rejects_invalid_argument() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/context-length wide");
+
+    let msg = last_system_message(&app).expect("expected rejection");
+    assert!(msg.contains("wide") && msg.contains("reset"), "{msg}");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "invalid context-length argument must not dispatch"
+    );
+}
+
+#[test]
 fn slash_compact_with_arg_is_rejected_locally() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
@@ -1626,6 +1929,163 @@ fn slash_compact_with_arg_is_rejected_locally() {
         action_rx.try_recv().is_err(),
         "no UiAction should be dispatched for /compact with trailing arg"
     );
+}
+
+#[test]
+fn slash_markdown_no_arg_reports_current_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown");
+
+    let msg = last_system_message(&app).expect("expected status message");
+    assert!(msg.contains("Markdown rendering is"), "{msg}");
+    // Default is on.
+    assert!(msg.contains("on"), "{msg}");
+}
+
+#[test]
+fn slash_markdown_off_disables_rendering() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown off");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("disabled"), "{msg}");
+    // /markdown is UI-only; no UiAction should reach the controller.
+    assert!(
+        action_rx.try_recv().is_err(),
+        "no UiAction should be dispatched for /markdown"
+    );
+}
+
+#[test]
+fn slash_markdown_on_enables_rendering() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown off");
+    submit_line(&mut app, "/markdown on");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("enabled"), "{msg}");
+}
+
+#[test]
+fn slash_markdown_invalid_arg_is_rejected() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/markdown maybe");
+
+    let msg = last_system_message(&app).expect("expected rejection");
+    // The catalog's enumerated-arg validator rejects at the
+    // pre-dispatch layer, so the message comes from argument
+    // validation (cites the allowed values) rather than from
+    // the /markdown dispatch arm.
+    assert!(msg.contains("maybe"), "{msg}");
+    assert!(msg.contains("on") && msg.contains("off"), "{msg}");
+}
+
+// Plan 09 PR-C — `/tool-output [verbose|compact]` tests.
+
+#[test]
+fn slash_tool_output_reports_current_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output");
+
+    let msg = last_system_message(&app).expect("expected status message");
+    assert!(msg.contains("Tool output mode is"), "{msg}");
+    // Default is Verbose.
+    assert!(msg.contains("verbose"), "{msg}");
+}
+
+#[test]
+fn slash_tool_output_compact_is_ui_only() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output compact");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("compact"), "{msg}");
+    // /tool-output is UI-only; no UiAction should reach the controller.
+    assert!(
+        action_rx.try_recv().is_err(),
+        "/tool-output must not dispatch controller work"
+    );
+    assert_eq!(
+        app.tool_output_mode(),
+        anie_config::ToolOutputMode::Compact,
+        "OutputPane mode must reflect the slash-command change"
+    );
+}
+
+#[test]
+fn slash_tool_output_verbose_restores_default_mode() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output compact");
+    submit_line(&mut app, "/tool-output verbose");
+
+    let msg = last_system_message(&app).expect("expected ack");
+    assert!(msg.contains("verbose"), "{msg}");
+    assert_eq!(app.tool_output_mode(), anie_config::ToolOutputMode::Verbose,);
+}
+
+#[test]
+fn slash_tool_output_invalid_arg_is_rejected() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/tool-output maybe");
+
+    let msg = last_system_message(&app).expect("expected rejection");
+    assert!(msg.contains("maybe"), "{msg}");
+    // The enumerated-arg validator enumerates the allowed
+    // values in its error so the user sees what's accepted.
+    assert!(msg.contains("verbose") && msg.contains("compact"), "{msg}");
+}
+
+#[test]
+fn slash_login_points_user_at_cli_flow() {
+    // OAuth login needs a browser callback + localhost server
+    // that would interfere with the alternate-screen TUI, so
+    // the /login command is a documentation nudge, not an
+    // actual login runner.
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/login github-copilot");
+
+    let msg = last_system_message(&app).expect("expected instruction");
+    assert!(msg.contains("anie login github-copilot"), "{msg}");
+}
+
+#[test]
+fn slash_logout_without_stored_credential_reports_missing() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), phase_c_catalog());
+
+    submit_line(&mut app, "/logout no-such-provider");
+
+    let msg = last_system_message(&app).expect("expected status");
+    assert!(msg.contains("No stored credential"), "{msg}");
+    assert!(msg.contains("no-such-provider"), "{msg}");
 }
 
 #[test]
@@ -1651,14 +2111,24 @@ fn slash_unknown_command_reported_without_dispatch() {
 
 fn type_chars(app: &mut App, s: &str) {
     for ch in s.chars() {
-        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
-            .expect("type");
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type");
+        // Autocomplete refreshes are debounced to fire from
+        // the render loop. Tests don't drive a render cycle
+        // per keystroke, so flush synchronously here to keep
+        // the popup state matching what a user would see
+        // after a paused typing sequence.
+        app.flush_pending_autocomplete_for_test();
     }
 }
 
 fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     app.handle_terminal_event(Event::Key(KeyEvent::new(code, modifiers)))
         .expect("press");
+    app.flush_pending_autocomplete_for_test();
 }
 
 #[test]
@@ -1721,7 +2191,7 @@ fn typing_slash_thinking_space_opens_enumerated_popup() {
     terminal.draw(|frame| app.render(frame)).expect("draw");
     let screen = render_to_string(terminal.backend());
     assert!(screen.contains("/thinking values"), "{screen}");
-    for level in ["off", "low", "medium", "high"] {
+    for level in ["off", "minimal", "low", "medium", "high"] {
         assert!(screen.contains(level), "level {level} missing:\n{screen}");
     }
 }
@@ -1732,7 +2202,8 @@ fn enter_on_enumerated_value_applies_without_trailing_space() {
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
-    type_chars(&mut app, "/thinking m");
+    // Use `me` — after adding `minimal`, just `m` is ambiguous.
+    type_chars(&mut app, "/thinking me");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
     assert_eq!(app.input_pane_contents(), "/thinking medium");
@@ -1748,7 +2219,8 @@ fn second_enter_submits_fully_typed_command() {
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), default_test_commands());
 
-    type_chars(&mut app, "/thinking m");
+    // Use `me` — after adding `minimal`, just `m` is ambiguous.
+    type_chars(&mut app, "/thinking me");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // applies "medium"
 
     // After applying, the input is "/thinking medium". The popup
@@ -1907,7 +2379,7 @@ fn popup_description_exposes_same_argument_hint_as_help() {
     terminal.draw(|frame| app.render(frame)).expect("draw");
     let screen = render_to_string(terminal.backend());
     assert!(
-        screen.contains("[off|low|medium|high]"),
+        screen.contains("[off|minimal|low|medium|high]"),
         "popup description should expose the argument hint:\n{screen}"
     );
 }
@@ -1924,4 +2396,175 @@ fn slash_exit_alias_still_quits_even_without_catalog_entry() {
     let action = action_rx.try_recv().expect("exit must dispatch Quit");
     assert!(matches!(action, crate::UiAction::Quit));
     assert!(app.should_quit());
+}
+
+/// Phase 3.1: `handle_agent_event_batch` collapses
+/// consecutive TextDelta events into a single append, and
+/// preserves mixed-kind and non-delta event ordering.
+#[test]
+fn handle_agent_event_batch_coalesces_consecutive_text_deltas() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: Message::Assistant(AssistantMessage {
+            content: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        }),
+    })
+    .expect("assistant start");
+
+    // Five text deltas in one burst. After batch processing
+    // the streaming assistant must show the full concatenation.
+    let events = vec![
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("hel".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("lo ".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("wor".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("ld".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("!".into()),
+        },
+    ];
+    app.handle_agent_event_batch(events).expect("batch");
+
+    // The last assistant text is fully assembled.
+    let text = app
+        .output_blocks()
+        .iter()
+        .rev()
+        .find_map(|b| match b {
+            RenderedBlock::AssistantMessage { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("assistant block");
+    assert_eq!(text, "hello world!");
+}
+
+/// Mixed TextDelta / ThinkingDelta runs flush at kind
+/// boundaries so the two streams don't cross-contaminate.
+#[test]
+fn handle_agent_event_batch_flushes_on_kind_change() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::MessageStart {
+        message: Message::Assistant(AssistantMessage {
+            content: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: anie_protocol::StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        }),
+    })
+    .expect("assistant start");
+
+    let events = vec![
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("a".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::ThinkingDelta("b".into()),
+        },
+        AgentEvent::MessageDelta {
+            delta: StreamDelta::TextDelta("c".into()),
+        },
+    ];
+    app.handle_agent_event_batch(events).expect("batch");
+
+    let (text, thinking) = app
+        .output_blocks()
+        .iter()
+        .rev()
+        .find_map(|b| match b {
+            RenderedBlock::AssistantMessage { text, thinking, .. } => {
+                Some((text.clone(), thinking.clone()))
+            }
+            _ => None,
+        })
+        .expect("assistant block");
+    assert_eq!(text, "ac");
+    assert_eq!(thinking, "b");
+}
+
+fn text_delta_event(text: impl Into<String>) -> AgentEvent {
+    AgentEvent::MessageDelta {
+        delta: StreamDelta::TextDelta(text.into()),
+    }
+}
+
+fn text_delta_payload(event: &AgentEvent) -> &str {
+    let AgentEvent::MessageDelta {
+        delta: StreamDelta::TextDelta(text),
+    } = event
+    else {
+        panic!("expected text delta event");
+    };
+    text
+}
+
+#[test]
+fn agent_event_drain_limit_matches_saturated_interactive_burst() {
+    let (tx, mut rx) = mpsc::channel(MAX_AGENT_EVENTS_PER_FRAME);
+    for index in 0..MAX_AGENT_EVENTS_PER_FRAME {
+        tx.try_send(text_delta_event(index.to_string()))
+            .expect("saturated realistic burst should fit channel capacity");
+    }
+
+    let first = rx.try_recv().expect("first event");
+    let batch = drain_agent_event_batch(&mut rx, first);
+
+    assert_eq!(batch.len(), MAX_AGENT_EVENTS_PER_FRAME);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn bounded_agent_event_drain_preserves_order_and_leaves_remainder() {
+    const EXTRA_EVENTS: usize = 8;
+    let (tx, mut rx) = mpsc::channel(MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS);
+    for index in 0..(MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS) {
+        tx.try_send(text_delta_event(index.to_string()))
+            .expect("test channel capacity");
+    }
+
+    let first = rx.try_recv().expect("first event");
+    let first_batch = drain_agent_event_batch(&mut rx, first);
+
+    assert_eq!(first_batch.len(), MAX_AGENT_EVENTS_PER_FRAME);
+    assert_eq!(text_delta_payload(&first_batch[0]), "0");
+    assert_eq!(
+        text_delta_payload(first_batch.last().expect("last first-batch event")),
+        (MAX_AGENT_EVENTS_PER_FRAME - 1).to_string()
+    );
+
+    let first_remaining = rx.try_recv().expect("remainder should stay queued");
+    let second_batch = drain_agent_event_batch(&mut rx, first_remaining);
+
+    assert_eq!(second_batch.len(), EXTRA_EVENTS);
+    assert_eq!(
+        text_delta_payload(&second_batch[0]),
+        MAX_AGENT_EVENTS_PER_FRAME.to_string()
+    );
+    assert_eq!(
+        text_delta_payload(second_batch.last().expect("last second-batch event")),
+        (MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS - 1).to_string()
+    );
 }

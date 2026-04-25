@@ -1,12 +1,16 @@
-use std::io::{Stdout, stdout};
+use std::io::{self, Stdout, stdout};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Frame, Terminal, backend::Backend, backend::CrosstermBackend};
 
 /// RAII guard around the TUI terminal setup.
 ///
@@ -118,6 +122,81 @@ pub fn restore_terminal(guard: &mut TerminalGuard) -> Result<()> {
     guard.restore()
 }
 
+/// Draw a single frame wrapped in DECSET 2026 synchronized
+/// output (`\x1b[?2026h` … `\x1b[?2026l`). Supported by
+/// modern GPU-backed terminals (Ghostty, Kitty, Alacritty,
+/// WezTerm, Contour, current tmux, Windows Terminal) and
+/// ignored silently by terminals that don't understand it.
+///
+/// The payoff is visual: the terminal buffers the whole
+/// frame before compositing, so long transcripts never
+/// tear mid-frame. Terminals that ignore it see exactly the
+/// same behavior as a bare `terminal.draw(...)`.
+///
+/// Set `ANIE_DISABLE_SYNC_OUTPUT=1` to bypass the wrap if a
+/// buggy-sync terminal shows up in the wild. Read once per
+/// process; flipping the env var requires a restart.
+///
+/// Errors on `Begin`/`End` are forwarded — if the terminal
+/// write has failed at this point, the frame itself is
+/// already broken and surfacing it loudly is correct.
+pub fn draw_synchronized<B, F>(terminal: &mut Terminal<B>, render_callback: F) -> io::Result<()>
+where
+    B: Backend + io::Write,
+    F: FnOnce(&mut Frame),
+{
+    if sync_output_disabled() {
+        terminal.draw(render_callback)?;
+        return Ok(());
+    }
+    // Failures on Begin are surfaced — a downstream draw call
+    // that's also going to fail is strictly worse than reporting
+    // the earlier failure.
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let draw_result = terminal.draw(render_callback).map(|_| ());
+    // End runs regardless of whether draw succeeded so a failed
+    // frame doesn't leave the terminal in synchronized-buffering
+    // mode forever. draw's error takes precedence if present.
+    let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    draw_result?;
+    end_result?;
+    Ok(())
+}
+
+/// Draw a single frame WITHOUT the DECSET 2026 wrap —
+/// intended for keystroke-driven paints where input
+/// latency matters more than tearing avoidance. A single
+/// keystroke changes only a handful of cells (the typed
+/// char plus the cursor position); tearing that the sync
+/// wrap prevents isn't perceptible on that scale, and
+/// skipping BSU/ESU saves a terminal round-trip (on
+/// sync-capable terminals, it also skips a VSync-alignment
+/// wait that can add 8-16 ms).
+///
+/// Callers should use this only when they'd prefer lowest
+/// latency over atomic composition. Streaming paints,
+/// scroll redraws, and resize-final paints still want
+/// `draw_synchronized`.
+pub fn draw_urgent<B, F>(terminal: &mut Terminal<B>, render_callback: F) -> io::Result<()>
+where
+    B: Backend + io::Write,
+    F: FnOnce(&mut Frame),
+{
+    terminal.draw(render_callback)?;
+    Ok(())
+}
+
+/// Read-once toggle for the synchronized-output wrap. See
+/// `draw_synchronized` for the rationale.
+fn sync_output_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("ANIE_DISABLE_SYNC_OUTPUT")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// Install a panic hook that attempts to restore terminal state first.
 ///
 /// Duplicates a subset of `TerminalGuard::drop` so a panic while
@@ -132,4 +211,94 @@ pub fn install_panic_hook() {
         let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
         original_hook(panic_info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::CrosstermBackend, widgets::Paragraph};
+    use std::sync::{Arc, Mutex};
+
+    /// Write adapter backed by an `Arc<Mutex<Vec<u8>>>` so the
+    /// test can inspect emitted bytes after the terminal has
+    /// finished writing. ratatui 0.29's `CrosstermBackend::writer`
+    /// is gated behind an unstable feature, so we own the buffer
+    /// on our side.
+    #[derive(Clone)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("captured writer lock"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_backend() -> (Arc<Mutex<Vec<u8>>>, CrosstermBackend<CapturedWriter>) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturedWriter(buf.clone());
+        (buf, CrosstermBackend::new(writer))
+    }
+
+    /// BSU/ESU is applied around the draw when
+    /// `ANIE_DISABLE_SYNC_OUTPUT` is unset (the default). The
+    /// captured buffer must contain `\x1b[?2026h` before the
+    /// frame content and `\x1b[?2026l` after it.
+    #[test]
+    fn draw_synchronized_wraps_frame_in_decset_2026() {
+        let (captured, backend) = captured_backend();
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        draw_synchronized(&mut terminal, |f| {
+            let area = f.area();
+            f.render_widget(Paragraph::new("hi"), area);
+        })
+        .expect("draw");
+
+        let buf = captured.lock().expect("lock").clone();
+        assert!(
+            buf.windows(8).any(|w| w == b"\x1b[?2026h"),
+            "BSU escape sequence missing from output"
+        );
+        assert!(
+            buf.windows(8).any(|w| w == b"\x1b[?2026l"),
+            "ESU escape sequence missing from output"
+        );
+        let bsu_idx = buf
+            .windows(8)
+            .position(|w| w == b"\x1b[?2026h")
+            .expect("bsu");
+        let esu_idx = buf
+            .windows(8)
+            .position(|w| w == b"\x1b[?2026l")
+            .expect("esu");
+        assert!(bsu_idx < esu_idx, "ESU must follow BSU");
+    }
+
+    /// Regression: the frame's own render output must still
+    /// land between the BSU and ESU markers. A caller swapping
+    /// `terminal.draw` for `draw_synchronized` must see the
+    /// same pixels.
+    #[test]
+    fn draw_synchronized_still_writes_frame_content() {
+        let (captured, backend) = captured_backend();
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        draw_synchronized(&mut terminal, |f| {
+            let area = f.area();
+            f.render_widget(Paragraph::new("xyzz"), area);
+        })
+        .expect("draw");
+
+        let buf = captured.lock().expect("lock").clone();
+        assert!(
+            buf.windows(4).any(|w| w == b"xyzz"),
+            "frame content missing from synchronized-output write stream"
+        );
+    }
 }

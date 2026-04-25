@@ -25,3 +25,4 @@ anie-protocol.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+toml.workspace = true

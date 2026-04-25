@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -26,7 +26,16 @@ use anie_protocol::{
     AgentEvent, ContentBlock, Message, StreamDelta, ToolResult, ToolResultMessage,
 };
 use anie_provider::{ApiKind, Model, ModelInfo};
-use anie_providers_builtin::{ModelDiscoveryCache, ModelDiscoveryRequest};
+use anie_providers_builtin::{
+    ModelDiscoveryCache, ModelDiscoveryRequest, is_ollama_native_discovery_target,
+    ollama_native_base_url,
+};
+
+// Measured before Set A Plan 09 PR A: interactive mode uses
+// `mpsc::channel(256)`, so a saturated realistic streaming burst
+// can already drain 256 events in one frame. Keep the cap at that
+// observed burst size, counting the first awaited event.
+pub(crate) const MAX_AGENT_EVENTS_PER_FRAME: usize = 256;
 
 use crate::{
     InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
@@ -65,6 +74,83 @@ pub struct App {
     /// `handle_slash_command` for pre-dispatch validation and, in
     /// plan 12, by the inline autocomplete popup.
     commands: Vec<SlashCommandInfo>,
+    /// Last time a `MessageDelta` arrived. Used by the
+    /// stall-aware spinner logic in `needs_tick_redraw` — when
+    /// streaming is stuck (no delta for > STREAM_STALL_WINDOW
+    /// ms), idle-tick redraws are suppressed so the spinner
+    /// freezes rather than eating CPU. Plan 06 PR-B.
+    last_streaming_delta_at: Option<Instant>,
+}
+
+pub(crate) fn drain_agent_event_batch(
+    event_rx: &mut mpsc::Receiver<AgentEvent>,
+    first_event: AgentEvent,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::with_capacity(MAX_AGENT_EVENTS_PER_FRAME);
+    events.push(first_event);
+    while events.len() < MAX_AGENT_EVENTS_PER_FRAME {
+        let Ok(next) = event_rx.try_recv() else {
+            break;
+        };
+        events.push(next);
+    }
+    events
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    Full,
+    UrgentInput,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RenderDirty {
+    composer: bool,
+    full: bool,
+}
+
+impl RenderDirty {
+    const fn none() -> Self {
+        Self {
+            composer: false,
+            full: false,
+        }
+    }
+
+    const fn composer() -> Self {
+        Self {
+            composer: true,
+            full: false,
+        }
+    }
+
+    const fn full() -> Self {
+        Self {
+            composer: false,
+            full: true,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.composer |= other.composer;
+        self.full |= other.full;
+    }
+
+    const fn any(self) -> bool {
+        self.composer || self.full
+    }
+
+    fn clear_after_render(&mut self, mode: RenderMode) {
+        match mode {
+            RenderMode::Full => {
+                self.composer = false;
+                self.full = false;
+            }
+            RenderMode::UrgentInput => {
+                self.composer = false;
+            }
+        }
+    }
 }
 
 // The ModelPicker variant is intentionally large; the enum holds at most
@@ -105,6 +191,10 @@ pub enum AgentUiState {
     Streaming,
     /// A tool is currently executing.
     ToolExecuting { tool_name: String },
+    /// A context compaction is in flight — the LLM is
+    /// summarizing the transcript. The wall-clock start is
+    /// tracked so the status bar can show elapsed seconds.
+    Compacting { started_at: std::time::Instant },
 }
 
 /// Actions emitted from the TUI to the controller layer.
@@ -121,9 +211,11 @@ pub enum UiAction {
     /// Set the active model by ID or `provider:model`.
     SetModel(String),
     /// Set the active model using a fully-resolved model definition.
-    SetResolvedModel(Model),
+    SetResolvedModel(Box<Model>),
     /// Set the active thinking level.
     SetThinking(String),
+    /// Query, set, or reset the Ollama native context-length override.
+    ContextLength(Option<String>),
     /// Clear the output pane.
     ClearOutput,
     /// Request a manual context compaction.
@@ -244,9 +336,8 @@ impl App {
         let input_pane = if commands.is_empty() {
             InputPane::new()
         } else {
-            InputPane::new().with_autocomplete(Arc::new(CommandCompletionProvider::new(
-                commands.clone(),
-            )))
+            InputPane::new()
+                .with_autocomplete(Arc::new(CommandCompletionProvider::new(commands.clone())))
         };
         Self {
             output_pane: OutputPane::new(),
@@ -268,6 +359,7 @@ impl App {
             worker_tx,
             worker_rx,
             commands,
+            last_streaming_delta_at: None,
         }
     }
 
@@ -294,6 +386,63 @@ impl App {
         self
     }
 
+    /// Toggle markdown rendering for finalized assistant messages.
+    /// Takes effect immediately — the output pane invalidates its
+    /// line cache so the next frame re-renders with the new
+    /// setting. Streaming blocks always render plain regardless;
+    /// see the comment on `assistant_answer_lines` for rationale.
+    #[must_use]
+    pub fn with_markdown_enabled(mut self, enabled: bool) -> Self {
+        self.output_pane.set_markdown_enabled(enabled);
+        self
+    }
+
+    /// Set the interactive-transcript tool-output display mode
+    /// at startup. See `OutputPane::set_tool_output_mode` for
+    /// semantics.
+    #[must_use]
+    pub fn with_tool_output_mode(mut self, mode: anie_config::ToolOutputMode) -> Self {
+        self.output_pane.set_tool_output_mode(mode);
+        self
+    }
+
+    /// Record detected terminal capabilities so markdown
+    /// rendering can tailor hyperlink / image emission to the
+    /// terminal.
+    #[must_use]
+    pub fn with_terminal_capabilities(mut self, capabilities: crate::TerminalCapabilities) -> Self {
+        self.output_pane.set_terminal_capabilities(capabilities);
+        self
+    }
+
+    /// Flip markdown rendering at runtime. Used by the
+    /// `/markdown on|off` slash command.
+    pub fn set_markdown_enabled(&mut self, enabled: bool) {
+        self.output_pane.set_markdown_enabled(enabled);
+    }
+
+    /// Runtime flip for the tool-output display mode. Used by
+    /// the `/tool-output verbose|compact` slash command. Like
+    /// `/markdown`, this is UI-only: no controller action
+    /// dispatches.
+    pub fn set_tool_output_mode(&mut self, mode: anie_config::ToolOutputMode) {
+        self.output_pane.set_tool_output_mode(mode);
+    }
+
+    /// Current tool-output display mode.
+    #[must_use]
+    pub fn tool_output_mode(&self) -> anie_config::ToolOutputMode {
+        self.output_pane.tool_output_mode()
+    }
+
+    /// Read-only view of the current agent UI state. Primarily
+    /// for tests that verify transitions (`CompactionStart` →
+    /// `Compacting`, etc.).
+    #[must_use]
+    pub fn agent_state(&self) -> &AgentUiState {
+        &self.agent_state
+    }
+
     /// Read-only view of the current transcript blocks in the
     /// output pane.
     #[must_use]
@@ -314,6 +463,16 @@ impl App {
         self.input_pane.autocomplete_is_open()
     }
 
+    /// Test-only helper. Production-path popup refreshes are
+    /// debounced and fired from the render loop's
+    /// `tick_autocomplete` call; unit tests that assert popup
+    /// state without driving a render cycle call this to
+    /// flush any pending refresh synchronously.
+    #[cfg(test)]
+    pub(crate) fn flush_pending_autocomplete_for_test(&mut self) {
+        self.input_pane.flush_pending_autocomplete();
+    }
+
     /// Preload a transcript without routing through streaming events.
     pub fn load_transcript(&mut self, messages: &[Message]) {
         for message in messages {
@@ -323,29 +482,49 @@ impl App {
 
     /// Render the full app frame.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
-        let spinner_frame = self.spinner.tick().to_string();
+        self.render_with_mode(frame, RenderMode::Full);
+    }
+
+    fn render_with_mode(&mut self, frame: &mut Frame<'_>, mode: RenderMode) {
+        // Fire any pending autocomplete refresh whose debounce
+        // has elapsed. Cheap (one Option<Instant> comparison)
+        // when nothing is pending.
+        self.input_pane.tick_autocomplete();
+        // `Spinner::tick` returns a `&'static str` — borrow it
+        // directly instead of allocating a `String` per frame.
+        // Plan 04 PR-F.
+        let spinner_frame: &'static str = self.spinner.tick();
         let half_height = frame.area().height.saturating_sub(2).max(8) / 2;
         let bottom_height = match &self.bottom_pane {
-            BottomPane::Editor => self
-                .input_pane
-                .preferred_height(frame.area().width)
-                .clamp(3, 8),
+            // +2 so the TOP/BOTTOM border rows the input pane
+            // draws don't eat into the visible text area. The
+            // `preferred_height` return value is the number of
+            // *content* rows we want to show.
+            BottomPane::Editor => {
+                self.input_pane
+                    .preferred_height(frame.area().width)
+                    .clamp(3, 8)
+                    + 2
+            }
             BottomPane::ModelPicker(session) => session
                 .picker
                 .preferred_height(frame.area().width)
                 .clamp(8, half_height.max(8)),
         };
-        let (output_area, status_area, bottom_area) = layout(frame.area(), bottom_height);
+        let (output_area, spinner_area, bottom_area, status_area) =
+            layout(frame.area(), bottom_height);
 
-        self.output_pane
-            .render(output_area, frame.buffer_mut(), &spinner_frame);
-        render_status_bar(
-            &self.status_bar,
-            &self.agent_state,
-            self.output_pane.is_scrolled(),
-            status_area,
+        self.output_pane.render(
+            output_area,
             frame.buffer_mut(),
-            &spinner_frame,
+            spinner_frame,
+            matches!(mode, RenderMode::UrgentInput),
+        );
+        render_spinner_row(
+            &self.agent_state,
+            spinner_frame,
+            spinner_area,
+            frame.buffer_mut(),
         );
 
         let cursor = match &mut self.bottom_pane {
@@ -353,9 +532,16 @@ impl App {
             BottomPane::ModelPicker(session) => {
                 session
                     .picker
-                    .render(bottom_area, frame.buffer_mut(), &spinner_frame)
+                    .render(bottom_area, frame.buffer_mut(), spinner_frame)
             }
         };
+        render_status_bar(
+            &self.status_bar,
+            &self.agent_state,
+            self.output_pane.is_scrolled(),
+            status_area,
+            frame.buffer_mut(),
+        );
         frame.set_cursor_position(cursor);
 
         // Draw the inline autocomplete popup on top of the
@@ -374,37 +560,116 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn render_urgent_for_test(&mut self, frame: &mut Frame<'_>) {
+        self.render_with_mode(frame, RenderMode::UrgentInput);
+    }
+
     /// Handle an incoming terminal event.
     pub fn handle_terminal_event(&mut self, event: Event) -> Result<()> {
+        self.handle_terminal_event_dirty(event).map(|_| ())
+    }
+
+    fn handle_terminal_event_dirty(&mut self, event: Event) -> Result<RenderDirty> {
         if self.overlay.is_some() {
             match event {
-                Event::Key(key) => self.handle_overlay_key_event(key)?,
-                Event::Resize(_, _) => {}
+                Event::Key(key) => {
+                    self.handle_overlay_key_event(key)?;
+                    return Ok(RenderDirty::full());
+                }
+                Event::Resize(_, _) => return Ok(RenderDirty::full()),
                 _ => {}
             }
-            return Ok(());
+            return Ok(RenderDirty::none());
         }
 
         match event {
             Event::Key(key) => {
                 if matches!(self.bottom_pane, BottomPane::ModelPicker(_)) {
                     self.handle_model_picker_key(key);
+                    Ok(RenderDirty::full())
                 } else {
-                    self.handle_key_event(key);
+                    Ok(self.handle_key_event(key))
                 }
             }
-            Event::Mouse(mouse) => self.handle_mouse_event(mouse),
-            Event::Resize(_, _) => {}
-            _ => {}
+            Event::Mouse(mouse) => Ok(self.handle_mouse_event(mouse)),
+            Event::Resize(_, _) => Ok(RenderDirty::full()),
+            _ => Ok(RenderDirty::none()),
+        }
+    }
+
+    /// Handle an incoming agent/controller event.
+    /// Process a drained batch of agent events, coalescing
+    /// consecutive `MessageDelta::TextDelta` /
+    /// `MessageDelta::ThinkingDelta` runs into a single
+    /// append per run. For fast streams this cuts the cache-
+    /// invalidation rate from "once per delta" to "once per
+    /// contiguous delta run" — saving `flat_cache_valid`
+    /// bool flips and `invalidate_last` calls on the hot path.
+    pub fn handle_agent_event_batch(&mut self, events: Vec<AgentEvent>) -> Result<()> {
+        // Per-run accumulators; flushed when a non-delta
+        // event arrives, when the delta kind changes, or at
+        // the end of the batch.
+        let mut pending_text = String::new();
+        let mut pending_thinking = String::new();
+
+        for event in events {
+            match event {
+                AgentEvent::MessageDelta {
+                    delta: StreamDelta::TextDelta(text),
+                } => {
+                    if !pending_thinking.is_empty() {
+                        self.output_pane
+                            .append_thinking_to_last_assistant(&pending_thinking);
+                        pending_thinking.clear();
+                    }
+                    pending_text.push_str(&text);
+                    self.last_streaming_delta_at = Some(Instant::now());
+                }
+                AgentEvent::MessageDelta {
+                    delta: StreamDelta::ThinkingDelta(text),
+                } => {
+                    if !pending_text.is_empty() {
+                        self.output_pane.append_to_last_assistant(&pending_text);
+                        pending_text.clear();
+                    }
+                    pending_thinking.push_str(&text);
+                    self.last_streaming_delta_at = Some(Instant::now());
+                }
+                // Any other event flushes both accumulators
+                // first so message-level ordering is preserved.
+                other => {
+                    if !pending_text.is_empty() {
+                        self.output_pane.append_to_last_assistant(&pending_text);
+                        pending_text.clear();
+                    }
+                    if !pending_thinking.is_empty() {
+                        self.output_pane
+                            .append_thinking_to_last_assistant(&pending_thinking);
+                        pending_thinking.clear();
+                    }
+                    self.handle_agent_event(other)?;
+                }
+            }
+        }
+        if !pending_text.is_empty() {
+            self.output_pane.append_to_last_assistant(&pending_text);
+        }
+        if !pending_thinking.is_empty() {
+            self.output_pane
+                .append_thinking_to_last_assistant(&pending_thinking);
         }
         Ok(())
     }
 
-    /// Handle an incoming agent/controller event.
     pub fn handle_agent_event(&mut self, event: AgentEvent) -> Result<()> {
         match event {
             AgentEvent::AgentStart => {
                 self.agent_state = AgentUiState::Streaming;
+                // Reset the stall tracker so a previous
+                // stream's last delta doesn't make the new
+                // stream appear stalled from the start.
+                self.last_streaming_delta_at = None;
             }
             AgentEvent::MessageStart { message } => match message {
                 Message::User(user_message) => {
@@ -418,13 +683,18 @@ impl App {
                 }
                 Message::ToolResult(_) | Message::Custom(_) => {}
             },
-            AgentEvent::MessageDelta { delta } => match delta {
-                StreamDelta::TextDelta(text) => self.output_pane.append_to_last_assistant(&text),
-                StreamDelta::ThinkingDelta(text) => {
-                    self.output_pane.append_thinking_to_last_assistant(&text)
+            AgentEvent::MessageDelta { delta } => {
+                match delta {
+                    StreamDelta::TextDelta(text) => {
+                        self.output_pane.append_to_last_assistant(&text)
+                    }
+                    StreamDelta::ThinkingDelta(text) => {
+                        self.output_pane.append_thinking_to_last_assistant(&text)
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+                self.last_streaming_delta_at = Some(Instant::now());
+            }
             AgentEvent::MessageEnd { message } => {
                 if let Message::Assistant(assistant) = message {
                     self.output_pane.finalize_last_assistant(
@@ -497,8 +767,15 @@ impl App {
                 self.status_bar.last_known_input_tokens = None;
             }
             AgentEvent::CompactionStart => {
+                // Permanent record in the transcript + transition
+                // the agent state so the status bar shows the
+                // live elapsed counter while the summarization
+                // LLM call is in flight.
                 self.output_pane
                     .add_system_message("Compacting context…".to_string());
+                self.agent_state = AgentUiState::Compacting {
+                    started_at: std::time::Instant::now(),
+                };
             }
             AgentEvent::CompactionEnd {
                 summary,
@@ -511,6 +788,13 @@ impl App {
                     format_tokens(tokens_after),
                     summary,
                 ));
+                // Only return to Idle when no streaming / tool run
+                // is queued behind the compaction (the controller
+                // doesn't do this today but the guard costs
+                // nothing and keeps state transitions predictable).
+                if matches!(self.agent_state, AgentUiState::Compacting { .. }) {
+                    self.agent_state = AgentUiState::Idle;
+                }
             }
             AgentEvent::RetryScheduled {
                 attempt,
@@ -554,49 +838,91 @@ impl App {
         self.should_quit
     }
 
-    fn handle_key_event(&mut self, key: KeyEvent) {
+    /// Whether the next periodic tick should trigger a redraw.
+    ///
+    /// The tick is the heartbeat that advances the spinner and
+    /// polls overlay workers. When there is no active run, no
+    /// overlay, and no pending worker output, the tick changes
+    /// nothing visible — redrawing anyway would re-wrap the
+    /// entire transcript 10 times a second for no reason. We
+    /// return `true` only when one of those signals is live.
+    ///
+    /// Stall-aware spinner (Plan 06 PR-B): if we're in a
+    /// streaming state but no delta has arrived for
+    /// STREAM_STALL_WINDOW, suppress the redraw so a stuck
+    /// stream doesn't eat CPU animating a spinner. The spinner
+    /// appears frozen — which is accurate; the stream *is*
+    /// stalled. Any arriving delta immediately updates
+    /// `last_streaming_delta_at` and the spinner resumes.
+    #[must_use]
+    pub fn needs_tick_redraw(&self) -> bool {
+        if self.overlay.is_some() {
+            return true;
+        }
+        if matches!(self.agent_state, AgentUiState::Idle) {
+            return false;
+        }
+        if matches!(self.agent_state, AgentUiState::Streaming)
+            && self
+                .last_streaming_delta_at
+                .is_some_and(|t| t.elapsed() >= STREAM_STALL_WINDOW)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn handle_key_event(&mut self, key: KeyEvent) -> RenderDirty {
         match self.agent_state {
             AgentUiState::Idle => self.handle_idle_key(key),
-            AgentUiState::Streaming | AgentUiState::ToolExecuting { .. } => {
-                self.handle_active_key(key)
-            }
+            AgentUiState::Streaming
+            | AgentUiState::ToolExecuting { .. }
+            | AgentUiState::Compacting { .. } => self.handle_active_key(key),
         }
     }
 
-    fn handle_idle_key(&mut self, key: KeyEvent) {
+    fn handle_idle_key(&mut self, key: KeyEvent) -> RenderDirty {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
             }
-            (KeyModifiers::NONE, KeyCode::PageUp) => self.output_pane.scroll_page_up(),
-            (KeyModifiers::NONE, KeyCode::PageDown) => self.output_pane.scroll_page_down(),
+            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                self.output_pane.scroll_page_up();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                self.output_pane.scroll_page_down();
+                RenderDirty::full()
+            }
             (KeyModifiers::NONE, KeyCode::Home) if self.input_pane.content().is_empty() => {
-                self.output_pane.scroll_to_top()
+                self.output_pane.scroll_to_top();
+                RenderDirty::full()
             }
             (KeyModifiers::NONE, KeyCode::End) if self.input_pane.content().is_empty() => {
-                self.output_pane.scroll_to_bottom()
+                self.output_pane.scroll_to_bottom();
+                RenderDirty::full()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
                 self.open_model_picker_for_current_provider(None);
+                RenderDirty::full()
             }
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.output_pane.clear();
                 let _ = self.action_tx.send(UiAction::ClearOutput);
+                RenderDirty::full()
             }
-            _ => {
-                if let InputAction::Submit(text) = self.input_pane.handle_key(key) {
-                    self.handle_submit(text);
-                }
-            }
+            _ => self.handle_editor_key(key),
         }
     }
 
-    fn handle_active_key(&mut self, key: KeyEvent) {
+    fn handle_active_key(&mut self, key: KeyEvent) -> RenderDirty {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 if self
@@ -605,43 +931,101 @@ impl App {
                 {
                     self.should_quit = true;
                     let _ = self.action_tx.send(UiAction::Quit);
+                    RenderDirty::none()
                 } else {
                     self.last_ctrl_c = Some(Instant::now());
                     self.output_pane
                         .add_system_message("Aborting... (press Ctrl+C again to quit)".to_string());
                     let _ = self.action_tx.send(UiAction::Abort);
+                    RenderDirty::full()
                 }
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                 self.should_quit = true;
                 let _ = self.action_tx.send(UiAction::Quit);
+                RenderDirty::none()
             }
-            (KeyModifiers::NONE, KeyCode::PageUp) => self.output_pane.scroll_page_up(),
-            (KeyModifiers::NONE, KeyCode::PageDown) => self.output_pane.scroll_page_down(),
-            (KeyModifiers::NONE, KeyCode::Home) => self.output_pane.scroll_to_top(),
-            (KeyModifiers::NONE, KeyCode::End) => self.output_pane.scroll_to_bottom(),
+            (KeyModifiers::NONE, KeyCode::PageUp) => {
+                self.output_pane.scroll_page_up();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::PageDown) => {
+                self.output_pane.scroll_page_down();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::Home) => {
+                self.output_pane.scroll_to_top();
+                RenderDirty::full()
+            }
+            (KeyModifiers::NONE, KeyCode::End) => {
+                self.output_pane.scroll_to_bottom();
+                RenderDirty::full()
+            }
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
                 self.open_model_picker_for_current_provider(None);
+                RenderDirty::full()
             }
-            _ => {}
+            _ => RenderDirty::none(),
         }
     }
 
-    fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) -> RenderDirty {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.output_pane.scroll_line_up(3),
-            MouseEventKind::ScrollDown => self.output_pane.scroll_line_down(3),
-            _ => {}
+            MouseEventKind::ScrollUp => {
+                self.output_pane.scroll_line_up(3);
+                RenderDirty::full()
+            }
+            MouseEventKind::ScrollDown => {
+                self.output_pane.scroll_line_down(3);
+                RenderDirty::full()
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.handle_left_click(mouse.row, mouse.column);
+                RenderDirty::none()
+            }
+            _ => RenderDirty::none(),
         }
     }
 
-    fn handle_submit(&mut self, text: String) {
+    /// Handle a left-click in the output pane — currently only
+    /// used for clickable URL hit-testing. Clicks on prose are
+    /// inert; users expect text regions to do nothing in a TUI
+    /// with mouse capture.
+    fn handle_left_click(&mut self, row: u16, col: u16) {
+        if let Some(url) = self
+            .output_pane
+            .url_at_terminal_position(row, col)
+            .map(str::to_string)
+            && let Err(err) = opener::open_browser(&url)
+        {
+            // Don't spam the transcript with failures; a
+            // debug log is enough. Users will notice if their
+            // browser doesn't open.
+            tracing::debug!(%err, %url, "failed to open clicked URL");
+        }
+    }
+
+    fn handle_submit(&mut self, text: String) -> RenderDirty {
         let trimmed = text.trim();
         if trimmed.starts_with('/') {
             self.handle_slash_command(trimmed);
+            RenderDirty::full()
         } else {
             let _ = self.action_tx.send(UiAction::SubmitPrompt(text));
+            RenderDirty::composer()
         }
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) -> RenderDirty {
+        match self.input_pane.handle_key(key) {
+            InputAction::Submit(text) => self.handle_submit(text),
+            InputAction::None => RenderDirty::composer(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_flat_build_count(&self) -> u64 {
+        self.output_pane.flat_build_count()
     }
 
     fn handle_slash_command(&mut self, command: &str) {
@@ -662,12 +1046,7 @@ impl App {
             return;
         }
 
-        let Some(info) = self
-            .commands
-            .iter()
-            .find(|info| info.name == name)
-            .cloned()
-        else {
+        let Some(info) = self.commands.iter().find(|info| info.name == name).cloned() else {
             self.output_pane.add_system_message(format!(
                 "Unknown command: {raw_cmd}. Type /help for available commands."
             ));
@@ -712,6 +1091,11 @@ impl App {
                         .send(UiAction::SetThinking(level.to_string()));
                 }
             },
+            "context-length" => {
+                let _ = self
+                    .action_tx
+                    .send(UiAction::ContextLength(arg.map(str::to_string)));
+            }
             "compact" => {
                 let _ = self.action_tx.send(UiAction::Compact);
             }
@@ -744,6 +1128,112 @@ impl App {
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
             "copy" => self.copy_last_assistant_to_clipboard(),
+            "markdown" => match arg {
+                None => {
+                    let state = if self.output_pane.markdown_enabled() {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    self.output_pane
+                        .add_system_message(format!("Markdown rendering is {state}."));
+                }
+                Some("on") => {
+                    self.output_pane.set_markdown_enabled(true);
+                    self.output_pane
+                        .add_system_message("Markdown rendering enabled.".to_string());
+                }
+                Some("off") => {
+                    self.output_pane.set_markdown_enabled(false);
+                    self.output_pane
+                        .add_system_message("Markdown rendering disabled.".to_string());
+                }
+                Some(other) => {
+                    self.output_pane.add_system_message(format!(
+                        "Unknown /markdown argument: {other}. Expected on|off."
+                    ));
+                }
+            },
+            "tool-output" => match arg {
+                None => {
+                    // Report current state, same shape as /markdown.
+                    let state = match self.output_pane.tool_output_mode() {
+                        anie_config::ToolOutputMode::Verbose => "verbose",
+                        anie_config::ToolOutputMode::Compact => "compact",
+                    };
+                    self.output_pane
+                        .add_system_message(format!("Tool output mode is {state}."));
+                }
+                Some("verbose") => {
+                    self.output_pane
+                        .set_tool_output_mode(anie_config::ToolOutputMode::Verbose);
+                    self.output_pane.add_system_message(
+                        "Tool output mode set to verbose (full bodies).".to_string(),
+                    );
+                }
+                Some("compact") => {
+                    self.output_pane
+                        .set_tool_output_mode(anie_config::ToolOutputMode::Compact);
+                    self.output_pane.add_system_message(
+                        "Tool output mode set to compact (titles only for bash/read).".to_string(),
+                    );
+                }
+                Some(other) => {
+                    self.output_pane.add_system_message(format!(
+                        "Unknown /tool-output argument: {other}. Expected verbose|compact."
+                    ));
+                }
+            },
+            "login" => match arg {
+                Some(provider) => {
+                    // OAuth login needs a browser callback server
+                    // on a specific port per provider. That would
+                    // block the TUI event loop and doesn't play
+                    // nicely with the alternate-screen terminal
+                    // state, so we redirect the user to the CLI
+                    // flow rather than running it in-process.
+                    self.output_pane.add_system_message(format!(
+                        "To log in to {provider}, exit anie (Ctrl-C) and run \
+                         `anie login {provider}` in a regular shell. \
+                         When the flow completes, your credential will be \
+                         picked up automatically on the next `anie` run."
+                    ));
+                }
+                None => {
+                    self.output_pane.add_system_message(
+                        "Usage: /login <provider>. Providers that support \
+                         OAuth login: anthropic, openai-codex, github-copilot, \
+                         google-antigravity, google-gemini-cli."
+                            .to_string(),
+                    );
+                }
+            },
+            "logout" => match arg {
+                Some(provider) => {
+                    // Logout is synchronous and safe to run
+                    // in-process — no browser, no callback server.
+                    let store = anie_auth::CredentialStore::new();
+                    match store.get_credential(provider) {
+                        None => {
+                            self.output_pane.add_system_message(format!(
+                                "No stored credential for {provider}."
+                            ));
+                        }
+                        Some(_) => match store.delete(provider) {
+                            Ok(()) => self.output_pane.add_system_message(format!(
+                                "Removed stored credential for {provider}."
+                            )),
+                            Err(error) => self.output_pane.add_system_message(format!(
+                                "Failed to remove credential for {provider}: {error}"
+                            )),
+                        },
+                    }
+                }
+                None => {
+                    self.output_pane
+                        .add_system_message("Usage: /logout <provider>".to_string());
+                }
+            },
             "new" => {
                 let _ = self.action_tx.send(UiAction::NewSession);
             }
@@ -898,7 +1388,7 @@ impl App {
                 self.close_model_picker();
                 let _ = self
                     .action_tx
-                    .send(UiAction::SetResolvedModel(model.clone()));
+                    .send(UiAction::SetResolvedModel(Box::new(model.clone())));
                 self.output_pane
                     .add_system_message(format!("Model: {}", model.id));
             }
@@ -932,7 +1422,10 @@ impl App {
                             if !self.known_models.iter().any(|known| {
                                 known.provider == model.provider && known.id == model.id
                             }) {
-                                self.known_models.push(model.to_model(api, &base_url));
+                                let api = discovery_model_api(&provider_name, api, &base_url);
+                                self.known_models.push(
+                                    model.to_model(api, &discovery_model_base_url(api, &base_url)),
+                                );
                             }
                         }
                         if let BottomPane::ModelPicker(session) = &mut self.bottom_pane {
@@ -962,7 +1455,7 @@ impl App {
         };
         let _ = self
             .action_tx
-            .send(UiAction::SetResolvedModel(model.clone()));
+            .send(UiAction::SetResolvedModel(Box::new(model.clone())));
         self.output_pane
             .add_system_message(format!("Model: {}", model.id));
         true
@@ -1041,7 +1534,11 @@ impl App {
             .iter()
             .find(|model| model.provider == context.provider_name && model.id == model_info.id)
             .cloned()
-            .unwrap_or_else(|| model_info.to_model(context.api, &context.base_url))
+            .unwrap_or_else(|| {
+                let api =
+                    discovery_model_api(&context.provider_name, context.api, &context.base_url);
+                model_info.to_model(api, &discovery_model_base_url(api, &context.base_url))
+            })
     }
 
     fn spawn_model_discovery(&self, context: ModelPickerContext) {
@@ -1054,21 +1551,30 @@ impl App {
         }
 
         let api_key = resolve_provider_api_key(&context.provider_name);
+        // Provider-specific discovery headers (e.g. Copilot's
+        // editor identifiers) ride along on the same registry
+        // we use for chat requests.
         let request = ModelDiscoveryRequest {
             provider_name: context.provider_name.clone(),
             api: context.api,
             base_url: context.base_url.clone(),
             api_key,
-            headers: std::collections::HashMap::new(),
+            headers: anie_auth::oauth_request_headers(&context.provider_name),
         };
         let cache = Arc::clone(&self.discovery_cache);
         let tx = self.worker_tx.clone();
         tokio::spawn(async move {
+            // Plan 06 PR-E: cache now returns Arc<[ModelInfo]>.
+            // Convert to Vec at the event boundary so the
+            // AppWorkerEvent payload stays owned data; the
+            // Arc-sharing benefit applies to in-cache lookups,
+            // not to one-shot worker events.
             let result = cache
                 .lock()
                 .await
                 .refresh(&request)
                 .await
+                .map(|models| models.to_vec())
                 .map_err(|error| error.to_string());
             let _ = tx.send(AppWorkerEvent::ModelDiscoveryComplete {
                 provider_name: context.provider_name,
@@ -1254,23 +1760,200 @@ impl App {
 }
 
 /// Run the TUI event loop.
+/// Cap redraws at ~30 fps. A terminal UI with no animation
+/// faster than a spinner doesn't benefit from higher, and the
+/// cap bounds the worst-case rendering cost even when upstream
+/// events arrive much faster. Mirrors pi's `MIN_RENDER_INTERVAL_MS`
+/// pattern (pi picks 16 ms because it has per-component caching;
+/// we pick 33 ms pending PR 2's cache).
+const FRAME_BUDGET: Duration = Duration::from_millis(33);
+
+/// Idle poll interval when nothing is dirty. Matches the previous
+/// behavior so background worker polling cadence is unchanged.
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
+/// How long of a streaming-delta gap makes us declare the
+/// stream "stalled" and suppress spinner-only redraws. 500 ms
+/// is below typical timeout perception — a real stall holds
+/// much longer than this — but far enough above the normal
+/// inter-token interval (~10-100 ms) that healthy streams
+/// never trip it. Plan 06 PR-B.
+const STREAM_STALL_WINDOW: Duration = Duration::from_millis(500);
+
+/// Debounce window between terminal `Resize` events and the
+/// next full re-render. Drags (window-edge drag, tmux pane
+/// resize, terminal maximize) fire bursts of `Resize` events
+/// at ~100/s; each one invalidates every block's cache at the
+/// new width, so rendering one per intermediate size spends
+/// ~100 ms/frame rebuilding markdown for no visible benefit.
+/// Skipping paints inside a 50 ms window after the most recent
+/// resize means drag-in-progress stays cheap and the final
+/// size gets a single rebuild. Plan 05 PR-C.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
+
 pub async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
 ) -> Result<()> {
     let mut term_events = EventStream::new();
+    // Request-based rendering: handlers set `dirty` when they
+    // change visible state; the render below draws as soon as
+    // the constraints allow. See
+    // docs/tui_responsiveness/01_render_scheduling.md.
+    let mut dirty = RenderDirty {
+        composer: false,
+        full: true,
+    };
+    // Typed input needs sub-frame-budget response or the user
+    // feels lag. Set when a terminal event (keystroke, paste,
+    // focus change) arrived — we bypass FRAME_BUDGET for
+    // exactly one render cycle so every keystroke paints
+    // immediately. Streaming / tick paths still respect the
+    // budget for coalescing.
+    let mut input_urgent = false;
+    let mut last_render_at = Instant::now()
+        .checked_sub(FRAME_BUDGET)
+        .unwrap_or_else(Instant::now);
+    // When set, the most recent terminal `Resize`. The render
+    // gate waits `RESIZE_DEBOUNCE` from this instant before
+    // repainting; cleared on the next successful paint.
+    let mut last_resize_at: Option<Instant> = None;
+    // Opt-in tracing of keystroke → paint latency. Set
+    // `ANIE_TRACE_TYPING=1` and a line is emitted to the log
+    // file every keystroke-driven paint with the measured
+    // `t_key_to_paint_us`. Off by default (one atomic load
+    // per loop when unset).
+    let trace_typing = std::env::var("ANIE_TRACE_TYPING")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    // Time of the most recent key arrival in the term-events
+    // branch. `None` once its paint completes.
+    let mut key_arrival_at: Option<Instant> = None;
+
     loop {
-        terminal.draw(|frame| app.render(frame))?;
+        // Two gates: frame budget (coalesce streaming bursts)
+        // AND resize debounce (skip mid-drag paints). Both
+        // gated on `!input_urgent` so typing skips them.
+        let resize_ready = match last_resize_at {
+            Some(t) => t.elapsed() >= RESIZE_DEBOUNCE,
+            None => true,
+        };
+        let budget_ready = input_urgent || last_render_at.elapsed() >= FRAME_BUDGET;
+        if dirty.any() && budget_ready && resize_ready {
+            let frame = crate::render_debug::RenderFrame::begin();
+            let render_mode = if input_urgent {
+                RenderMode::UrgentInput
+            } else {
+                RenderMode::Full
+            };
+            // Fast-path keystroke paints bypass the DECSET 2026
+            // synchronized-output wrap: a single typed char
+            // changes only a handful of cells and the tearing
+            // sync prevents isn't visible on that scale, while
+            // the wrap itself can add a VSync-alignment wait on
+            // GPU terminals. Non-urgent paints (streaming,
+            // scrolling, resize-final) still wrap for atomic
+            // composition.
+            if matches!(render_mode, RenderMode::UrgentInput) {
+                crate::terminal::draw_urgent(terminal, |f| app.render_with_mode(f, render_mode))?;
+            } else {
+                crate::terminal::draw_synchronized(terminal, |f| {
+                    app.render_with_mode(f, render_mode)
+                })?;
+            }
+            frame.end(app.output_pane.blocks().len());
+            if trace_typing && let Some(arrived) = key_arrival_at.take() {
+                let us = arrived.elapsed().as_micros();
+                tracing::info!(
+                    target: "anie_tui::input_latency",
+                    t_key_to_paint_us = us as u64,
+                    urgent = input_urgent,
+                    "keystroke paint",
+                );
+            }
+            dirty.clear_after_render(render_mode);
+            input_urgent = false;
+            last_render_at = Instant::now();
+            last_resize_at = None;
+        }
+
+        // Wait at most until the next frame opportunity (when
+        // dirty) or until the next idle tick (when clean).
+        // When resize-debouncing, wait at least until the
+        // debounce elapses so the select loop doesn't spin.
+        let timeout = if dirty.any() {
+            let budget_remaining = FRAME_BUDGET.saturating_sub(last_render_at.elapsed());
+            if let Some(t) = last_resize_at {
+                let debounce_remaining = RESIZE_DEBOUNCE.saturating_sub(t.elapsed());
+                budget_remaining.max(debounce_remaining)
+            } else {
+                budget_remaining
+            }
+        } else {
+            IDLE_TICK
+        };
 
         tokio::select! {
             Some(Ok(event)) = term_events.next() => {
-                app.handle_terminal_event(event)?;
+                let mut saw_resize = matches!(event, Event::Resize(_, _));
+                let mut render_dirty = app.handle_terminal_event_dirty(event)?;
+                // Drain any terminal events already buffered in
+                // the stream. Mouse-motion tracking fires at
+                // ~100 events/sec while the cursor moves; without
+                // this drain we'd spin the select loop once per
+                // event, starving higher-signal events (keystrokes,
+                // agent deltas) even though we filter the mouse
+                // ones out of the dirty flag.
+                while let Some(Some(next)) = term_events.next().now_or_never() {
+                    let event = next?;
+                    if matches!(event, Event::Resize(_, _)) {
+                        saw_resize = true;
+                    }
+                    render_dirty.merge(app.handle_terminal_event_dirty(event)?);
+                }
+                if saw_resize {
+                    last_resize_at = Some(Instant::now());
+                }
+                if render_dirty.composer {
+                    // Typed input needs immediate paint; bypass
+                    // FRAME_BUDGET for exactly one frame so the
+                    // keystroke lands on screen without waiting
+                    // out the 33 ms coalescing budget.
+                    input_urgent = true;
+                    if trace_typing && key_arrival_at.is_none() {
+                        key_arrival_at = Some(Instant::now());
+                    }
+                }
+                dirty.merge(render_dirty);
             }
             Some(event) = app.event_rx.recv() => {
-                app.handle_agent_event(event)?;
+                // Drain any additional agent events that piled up
+                // while we were busy — without this, a burst of
+                // N TextDelta events during fast streaming forces
+                // N full redraws. One coalesced redraw per burst
+                // keeps keystroke latency bounded even when the
+                // agent is emitting tokens at hundreds/sec.
+                //
+                // Phase 3.1 (tui_perf 04 PR-A): consecutive text
+                // and thinking deltas inside the drained batch
+                // collapse into a single `append_to_last_assistant`
+                // call each, so the block cache invalidates once
+                // per contiguous delta-run rather than once per
+                // delta.
+                let events = drain_agent_event_batch(&mut app.event_rx, event);
+                app.handle_agent_event_batch(events)?;
+                dirty.full = true;
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            _ = tokio::time::sleep(timeout) => {
                 app.handle_tick()?;
+                // Only mark dirty when the tick actually changed
+                // something visible — during idle there is no
+                // spinner and no worker output, so suppressing
+                // these redraws eliminates 10fps background work
+                // that otherwise scales with transcript size.
+                if app.needs_tick_redraw() {
+                    dirty.full = true;
+                }
             }
         }
 
@@ -1281,16 +1964,24 @@ pub async fn run_tui(
     Ok(())
 }
 
-fn layout(area: Rect, bottom_height: u16) -> (Rect, Rect, Rect) {
+/// Vertical layout: output transcript takes the flexible top
+/// region; a 1-row spinner strip sits directly above the input
+/// box; the input box (editor or model picker) follows; the
+/// status bar anchors the very bottom. Moving the status row
+/// below the input matches pi's layout — the information that
+/// "belongs" to what you're typing lives under the typing box,
+/// not above it.
+fn layout(area: Rect, bottom_height: u16) -> (Rect, Rect, Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(bottom_height),
+            Constraint::Length(1),
         ])
         .split(area);
-    (chunks[0], chunks[1], chunks[2])
+    (chunks[0], chunks[1], chunks[2], chunks[3])
 }
 
 fn default_provider_context(provider_name: &str) -> Option<ModelPickerContext> {
@@ -1306,6 +1997,22 @@ fn default_provider_context(provider_name: &str) -> Option<ModelPickerContext> {
             base_url: "https://api.openai.com/v1".to_string(),
         }),
         _ => None,
+    }
+}
+
+fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
+    if is_ollama_native_discovery_target(provider_name, base_url) {
+        ApiKind::OllamaChatApi
+    } else {
+        api
+    }
+}
+
+fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
     }
 }
 
@@ -1341,17 +2048,18 @@ fn render_status_bar(
     transcript_scrolled: bool,
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
-    spinner_frame: &str,
 ) {
     let used_tokens = state
         .last_known_input_tokens
         .unwrap_or(state.estimated_context_tokens);
+    // `responding...` / `compacting Ns` used to live in the
+    // status bar as the leading char of the row. It moved to
+    // `render_spinner_row` so the activity indicator sits
+    // right above the input box (stable position, doesn't
+    // jitter into and out of the persistent info row).
+    let _ = agent_state;
     let status = format!(
-        " {} {}{}:{} │ thinking: {} │ {}/{} │ {}",
-        match agent_state {
-            AgentUiState::Idle => " ",
-            _ => spinner_frame,
-        },
+        " {}{}:{} │ thinking: {} │ {}/{} │ {}",
         if transcript_scrolled {
             "↑ history │ "
         } else {
@@ -1367,6 +2075,43 @@ fn render_status_bar(
     Paragraph::new(Line::from(Span::styled(
         status,
         Style::default().fg(Color::DarkGray),
+    )))
+    .render(area, buf);
+}
+
+/// Render the 1-row activity strip that sits directly above
+/// the input box. Shows the active agent state — streaming,
+/// tool-executing, compacting — or stays blank when idle. The
+/// position is load-bearing: it's what the user's eye is
+/// already anchored to (just above the thing they're typing
+/// in), so the "still working" cue never moves or fights with
+/// the transcript.
+fn render_spinner_row(
+    agent_state: &AgentUiState,
+    spinner_frame: &str,
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+) {
+    let text = match agent_state {
+        AgentUiState::Idle => String::new(),
+        AgentUiState::Streaming => format!("{spinner_frame} Responding..."),
+        AgentUiState::ToolExecuting { tool_name } => {
+            format!("{spinner_frame} Running {tool_name}...")
+        }
+        AgentUiState::Compacting { started_at } => {
+            let elapsed = started_at.elapsed().as_secs();
+            format!("{spinner_frame} compacting {elapsed}s")
+        }
+    };
+    if text.is_empty() {
+        // Still render an empty paragraph so ratatui clears
+        // any previous content in this cell region on a paint.
+        Paragraph::new(Line::default()).render(area, buf);
+        return;
+    }
+    Paragraph::new(Line::from(Span::styled(
+        format!(" {text}"),
+        Style::default().fg(Color::Yellow),
     )))
     .render(area, buf);
 }
@@ -1450,15 +2195,7 @@ fn tool_result_body(result: &ToolResult) -> String {
     {
         return diff.to_string();
     }
-    result
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_text_blocks(&result.content)
 }
 
 fn tool_result_message_body(result: &ToolResultMessage) -> String {
@@ -1469,15 +2206,41 @@ fn tool_result_message_body(result: &ToolResultMessage) -> String {
     {
         return diff.to_string();
     }
-    result
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_text_blocks(&result.content)
+}
+
+/// Concatenate the `ContentBlock::Text` blocks in `content`
+/// joined by newlines. Single-pass allocation: reserves the
+/// exact output capacity and writes in place, rather than
+/// collecting into an intermediate `Vec<&str>` + `.join()`
+/// (which allocates twice — once for the Vec, once for the
+/// joined String). Plan 04 PR-F / finding #52.
+fn join_text_blocks(content: &[ContentBlock]) -> String {
+    // First pass: compute output capacity + count the text
+    // blocks so we can write the join separators exactly.
+    let mut total_bytes = 0usize;
+    let mut text_blocks = 0usize;
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            if text_blocks > 0 {
+                total_bytes += 1; // '\n' separator
+            }
+            total_bytes += text.len();
+            text_blocks += 1;
+        }
+    }
+    let mut out = String::with_capacity(total_bytes);
+    let mut first = true;
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            if !first {
+                out.push('\n');
+            }
+            out.push_str(text);
+            first = false;
+        }
+    }
+    out
 }
 
 fn tool_result_args_display(result: &ToolResultMessage) -> String {
@@ -1521,4 +2284,24 @@ fn tool_result_elapsed_from_details(details: &serde_json::Value) -> Option<std::
         .get("elapsed_ms")
         .and_then(serde_json::Value::as_u64)
         .map(std::time::Duration::from_millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_model_picker_converts_ollama_discovery_to_ollama_chat_api() {
+        let api = discovery_model_api(
+            "ollama",
+            ApiKind::OpenAICompletions,
+            "http://localhost:11434/v1",
+        );
+
+        assert_eq!(api, ApiKind::OllamaChatApi);
+        assert_eq!(
+            discovery_model_base_url(api, "http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+    }
 }

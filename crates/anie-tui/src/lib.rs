@@ -5,10 +5,13 @@ mod app;
 mod autocomplete;
 pub mod commands;
 mod input;
+mod markdown;
 mod output;
 mod overlay;
 mod overlays;
+mod render_debug;
 mod terminal;
+mod terminal_capabilities;
 mod widgets;
 
 pub use app::{AgentUiState, App, Spinner, StatusBarState, ToolCallResult, UiAction, run_tui};
@@ -22,6 +25,7 @@ pub use overlays::{
     write_configured_providers,
 };
 pub use terminal::{TerminalGuard, install_panic_hook, restore_terminal, setup_terminal};
+pub use terminal_capabilities::{ImageProtocol, TerminalCapabilities};
 
 #[cfg(test)]
 mod tests;

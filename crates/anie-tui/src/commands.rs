@@ -80,6 +80,9 @@ pub enum ArgumentSpec {
     /// exists so the autocomplete popup can surface the known
     /// subcommands.
     Subcommands { known: &'static [&'static str] },
+    /// `/context-length [N|reset]`: accepts no argument for query,
+    /// `reset`, or an integer accepted by Ollama's `num_ctx`.
+    ContextLengthOverride,
 }
 
 /// Metadata for one registered slash command.
@@ -95,7 +98,7 @@ pub struct SlashCommandInfo {
     /// `/help` and the autocomplete popup.
     ///
     /// Convention: wrap with square brackets for optional
-    /// arguments (`[off|low|medium|high]`) and angle brackets for
+    /// arguments (`[off|minimal|low|medium|high]`) and angle brackets for
     /// required ones (`<provider:id>`). `None` means the command
     /// takes no arguments or the hint would be redundant with the
     /// summary.
@@ -172,6 +175,21 @@ impl SlashCommandInfo {
             // dispatcher — the spec exists to inform autocomplete,
             // not to gate dispatch.
             ArgumentSpec::Subcommands { .. } => Ok(()),
+            ArgumentSpec::ContextLengthOverride => match normalized {
+                None => Ok(()),
+                Some(value) if value.eq_ignore_ascii_case("reset") => Ok(()),
+                Some(value) => match value.parse::<u64>() {
+                    Ok(2_048..=1_048_576) => Ok(()),
+                    Ok(_) => Err(format!(
+                        "/{} expects an integer from 2048 to 1048576, or reset",
+                        self.name
+                    )),
+                    Err(_) => Err(format!(
+                        "/{} does not accept '{value}' (expected: integer or reset)",
+                        self.name
+                    )),
+                },
+            },
         }
     }
 }
@@ -180,7 +198,7 @@ impl SlashCommandInfo {
 mod tests {
     use super::*;
 
-    const LEVELS: &[&str] = &["off", "low", "medium", "high"];
+    const LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high"];
 
     fn thinking_info() -> SlashCommandInfo {
         SlashCommandInfo::builtin_with_args(
@@ -190,7 +208,7 @@ mod tests {
                 values: LEVELS,
                 required: false,
             },
-            Some("[off|low|medium|high]"),
+            Some("[off|minimal|low|medium|high]"),
         )
     }
 
@@ -214,7 +232,10 @@ mod tests {
     fn validate_none_rejects_trailing_argument() {
         let info = SlashCommandInfo::builtin("quit", "Quit anie");
         let err = info.validate(Some("now")).expect_err("reject");
-        assert!(err.contains("/quit") && err.contains("no arguments"), "{err}");
+        assert!(
+            err.contains("/quit") && err.contains("no arguments"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -249,6 +270,41 @@ mod tests {
         info.validate(Some("list")).expect("known subcommand ok");
         info.validate(Some("sess-xyz"))
             .expect("free-form id passes");
+    }
+
+    #[test]
+    fn context_length_arg_spec_accepts_query_set_and_reset() {
+        let info = SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
+        );
+
+        info.validate(None).expect("query form");
+        info.validate(Some("16384")).expect("set form");
+        info.validate(Some("reset")).expect("reset form");
+        info.validate(Some("RESET"))
+            .expect("case-insensitive reset");
+    }
+
+    #[test]
+    fn context_length_arg_spec_rejects_out_of_range_and_unparseable_values() {
+        let info = SlashCommandInfo::builtin_with_args(
+            "context-length",
+            "Override Ollama context length",
+            ArgumentSpec::ContextLengthOverride,
+            Some("[N|reset]"),
+        );
+
+        let low = info.validate(Some("1024")).expect_err("too low");
+        assert!(low.contains("2048") && low.contains("1048576"), "{low}");
+
+        let high = info.validate(Some("1048577")).expect_err("too high");
+        assert!(high.contains("2048") && high.contains("1048576"), "{high}");
+
+        let text = info.validate(Some("wide")).expect_err("not an integer");
+        assert!(text.contains("wide") && text.contains("reset"), "{text}");
     }
 
     #[test]

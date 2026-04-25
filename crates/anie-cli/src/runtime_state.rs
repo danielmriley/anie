@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -19,6 +20,10 @@ pub struct RuntimeState {
     pub thinking: Option<ThinkingLevel>,
     /// Last active session ID.
     pub last_session_id: Option<String>,
+    /// Per-model Ollama native `num_ctx` overrides, keyed by
+    /// "{provider}:{model_id}".
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ollama_num_ctx_overrides: HashMap<String, u64>,
 }
 
 /// Return the default runtime-state file path.
@@ -65,4 +70,52 @@ pub fn save_runtime_state_to(path: &Path, state: &RuntimeState) -> Result<()> {
     anie_config::atomic_write(path, contents.as_bytes())
         .with_context(|| format!("failed to write runtime state {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_state_forward_compat_loads_state_without_num_ctx_overrides() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{
+              "provider": "ollama",
+              "model": "qwen3:32b",
+              "thinking": "Off",
+              "last_session_id": "session-1"
+            }"#,
+        )
+        .expect("write state");
+
+        let state = load_runtime_state_from(&path).expect("load runtime state");
+
+        assert_eq!(state.provider.as_deref(), Some("ollama"));
+        assert_eq!(state.model.as_deref(), Some("qwen3:32b"));
+        assert!(state.ollama_num_ctx_overrides.is_empty());
+    }
+
+    #[test]
+    fn runtime_state_serializes_num_ctx_overrides_when_non_empty() {
+        let mut state = RuntimeState::default();
+        state
+            .ollama_num_ctx_overrides
+            .insert("ollama:qwen3:32b".into(), 16_384);
+
+        let serialized = serde_json::to_string(&state).expect("serialize state");
+
+        assert!(serialized.contains("ollama_num_ctx_overrides"));
+        assert!(serialized.contains("ollama:qwen3:32b"));
+        assert!(serialized.contains("16384"));
+    }
+
+    #[test]
+    fn runtime_state_omits_num_ctx_overrides_field_when_empty() {
+        let serialized = serde_json::to_string(&RuntimeState::default()).expect("serialize state");
+
+        assert!(!serialized.contains("ollama_num_ctx_overrides"));
+    }
 }

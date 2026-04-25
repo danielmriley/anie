@@ -49,6 +49,22 @@ pub enum ThinkingRequestMode {
     ReasoningEffort,
     /// Use a nested `reasoning.effort` field.
     NestedReasoning,
+    /// Top-level `enable_thinking: bool`. Used by vLLM /
+    /// SGLang serving Qwen3+ and by Z.ai's GLM models. Emits
+    /// `true` for any non-`Off` level and `false` for `Off`.
+    /// NOT honored by Ollama's OpenAI-compat layer (verified
+    /// empirically; see `docs/ollama_capability_discovery/README.md`).
+    ///
+    /// anie-specific deviation from pi: pi uses snake_case
+    /// serde renames for this enum (`enable_thinking_flag`).
+    /// anie keeps PascalCase consistent with the existing
+    /// variants so user-facing config values stay uniform.
+    EnableThinkingFlag,
+    /// Nested `chat_template_kwargs.enable_thinking: bool`.
+    /// Used by vLLM with chat-template kwargs forwarding. Same
+    /// semantics as `EnableThinkingFlag` (boolean, derived from
+    /// `Off` vs non-`Off`), different wire placement.
+    ChatTemplateEnableThinking,
 }
 
 /// Explicit opening/closing tags used for tagged reasoning output.
@@ -103,6 +119,120 @@ pub struct ReplayCapabilities {
     /// support; currently false everywhere.
     #[serde(default)]
     pub supports_encrypted_reasoning: bool,
+
+    /// The provider emits `reasoning_details` (OpenRouter's
+    /// normalized wrapper over encrypted reasoning blobs from
+    /// o-series / GPT-5 upstreams) that must be replayed verbatim
+    /// on subsequent turns or the upstream drops reasoning
+    /// context. Currently set for OpenRouter catalog entries
+    /// whose id matches `openai/o*` or `openai/gpt-5*`.
+    #[serde(default)]
+    pub supports_reasoning_details_replay: bool,
+}
+
+/// Provider-family compat knobs attached per model.
+///
+/// Each variant collects the flags that are semantically
+/// meaningful for one `ApiKind` family. Variants are open — the
+/// fields inside a variant are all optional so adding one later
+/// doesn't break serde roundtrips, and deserializing an older
+/// session file without the new field is safe.
+///
+/// This is the anie equivalent of pi's per-model compat blobs
+/// (pi: `packages/ai/src/types.ts:265` `OpenAICompletionsCompat`).
+/// It lets one provider module (the `OpenAICompletions` provider)
+/// cover many vendors — OpenAI, OpenRouter, xAI, Groq, Cerebras,
+/// local llama.cpp, etc. — by flipping flags per catalog entry
+/// instead of growing the `Provider` trait.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ModelCompat {
+    /// No compat knobs applicable for this model.
+    #[default]
+    None,
+    /// Compat knobs for models served by the OpenAI
+    /// Chat-Completions-compatible wire protocol.
+    #[serde(rename = "openai-completions")]
+    OpenAICompletions(OpenAICompletionsCompat),
+}
+
+/// Compat knobs for models on the `OpenAICompletions` wire
+/// protocol. Currently only carries OpenRouter routing
+/// preferences; future plans add fields for xAI, Groq, Azure,
+/// etc., without breaking existing catalog entries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OpenAICompletionsCompat {
+    /// OpenRouter provider-routing preferences. Only meaningful
+    /// when `base_url` resolves to OpenRouter; ignored
+    /// otherwise. When `None`, no `provider` field is emitted
+    /// into the outbound request body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter_routing: Option<OpenRouterRouting>,
+    /// Which outbound field name carries the output-token cap.
+    /// `None` (the default) emits `max_tokens`, matching anie's
+    /// existing behavior and the most widely-accepted wire
+    /// form. Set to `MaxCompletionTokens` for catalog entries
+    /// whose upstream rejects the legacy name — OpenAI's
+    /// o-series and GPT-5 family post-2024, for example. pi's
+    /// default is `max_completion_tokens`; we deviate for
+    /// backward compat with the broader set of OpenAI-compat
+    /// servers anie talks to (local, proxied, older).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens_field: Option<MaxTokensField>,
+}
+
+/// Outbound wire-name for the output-token cap.
+///
+/// OpenAI renamed `max_tokens` → `max_completion_tokens` when
+/// they shipped the o-series reasoning models, deprecating the
+/// legacy name for those models. Older OpenAI-compat servers
+/// still only understand `max_tokens`. Per-model selection via
+/// `OpenAICompletionsCompat::max_tokens_field`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// Legacy name, still accepted by most OpenAI-compat servers.
+    MaxTokens,
+    /// New name required by OpenAI's o-series + GPT-5 endpoints.
+    MaxCompletionTokens,
+}
+
+/// OpenRouter provider-routing preferences.
+///
+/// Subset of the shape OpenRouter accepts at
+/// <https://openrouter.ai/docs/provider-routing>. Only the
+/// fields we use in v1 are present; additional fields can be
+/// added later without breaking existing serialized values
+/// (every field is `Option<T>` with `skip_serializing_if`).
+///
+/// Consumed by the outbound-request builder when the target
+/// base URL resolves to OpenRouter and the model's compat blob
+/// carries this struct. The whole value serializes as the
+/// top-level `provider` object in the Chat Completions request
+/// body.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OpenRouterRouting {
+    /// Whether OpenRouter may fall back to upstreams outside
+    /// `order`/`only` if none of them are healthy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+    /// Ordered upstream provider slugs OpenRouter should try in
+    /// sequence, falling back to the next on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    /// Exclusive upstream allowlist for this request. Any
+    /// upstream not listed is skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+    /// Upstream provider slugs to skip for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+    /// Restrict routing to upstreams that offer Zero-Data-
+    /// Retention endpoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zdr: Option<bool>,
 }
 
 /// A model discovered from a provider endpoint.
@@ -116,10 +246,56 @@ pub struct ModelInfo {
     pub provider: String,
     /// Provider-advertised context window, when known.
     pub context_length: Option<u64>,
+    /// Provider-advertised cap on *output* tokens, when known.
+    /// OpenRouter reports this in `top_provider.max_completion_tokens`;
+    /// honoring it prevents `max_tokens` from defaulting to a
+    /// value too small for reasoning models that produce several
+    /// thousand tokens of reasoning before answering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     /// Whether the model accepts images, when known.
     pub supports_images: Option<bool>,
     /// Whether the model supports reasoning features, when known.
     pub supports_reasoning: Option<bool>,
+    /// Per-token pricing reported by the provider (currently
+    /// populated only by OpenRouter; `None` elsewhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+    /// Feature flags reported by the provider (e.g. `"tools"`,
+    /// `"reasoning"`, `"tool_choice"`). Populated by OpenRouter's
+    /// `/models` response; `None` for endpoints that don't report
+    /// this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_parameters: Option<Vec<String>>,
+    /// Provider-reported capability tokens (e.g. `"vision"`,
+    /// `"tools"`, `"thinking"`). Populated by Ollama's
+    /// `/api/show.capabilities` array. `None` for endpoints that
+    /// don't expose this. Distinct from `supported_parameters`,
+    /// which is OpenRouter's request-side parameter list. See
+    /// `docs/ollama_capability_discovery/README.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_capabilities: Option<Vec<String>>,
+}
+
+/// Per-token pricing reported by a discovery endpoint. OpenRouter
+/// returns prices as string decimals (per token, not per million),
+/// so fields are kept as `String` to preserve precision and match
+/// the upstream format without lossy conversion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelPricing {
+    /// Input-token price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Output-token price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
+    /// Flat per-request surcharge, when the provider charges one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    /// Per-image surcharge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// Registered model metadata used to route and parameterize provider calls.
@@ -152,6 +328,19 @@ pub struct Model {
     /// requirements. See `ReplayCapabilities`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_capabilities: Option<ReplayCapabilities>,
+    /// Per-model provider-family compat knobs. `None` = nothing
+    /// special. See `ModelCompat`.
+    #[serde(default, skip_serializing_if = "is_default_compat")]
+    pub compat: ModelCompat,
+}
+
+/// Helper for `Model::compat`'s `skip_serializing_if` so that
+/// `ModelCompat::None` is written as an omitted field rather than
+/// `{"kind":"none"}`. Keeps existing catalogs and session files
+/// byte-identical on the wire until a non-default compat is
+/// populated.
+fn is_default_compat(compat: &ModelCompat) -> bool {
+    matches!(compat, ModelCompat::None)
 }
 
 impl Model {
@@ -166,22 +355,72 @@ impl Model {
 
 impl ModelInfo {
     /// Convert a discovered model into a runtime model definition using conservative defaults.
+    ///
+    /// `max_tokens` is recorded on the `Model` for operator
+    /// reference and for the compaction summarization path (which
+    /// explicitly caps its output). The *main agent stream* does
+    /// not forward this value — see
+    /// `docs/max_tokens_handling/README.md` and the comment at
+    /// `agent_loop.rs` where `StreamOptions::max_tokens = None`.
+    /// That means this number doesn't need to be a carefully-
+    /// clamped "safe to send" value anymore; the provider-advertised
+    /// `max_output_tokens` is carried through verbatim when present,
+    /// and a simple fallback is used otherwise.
     #[must_use]
     pub fn to_model(&self, api: ApiKind, base_url: &str) -> Model {
+        // Regression guard for legacy Ollama OpenAI-compat entries:
+        // `/api/show` exposes the model's architectural max context
+        // length (e.g. 262 144 for qwen3.5), but Ollama's
+        // OpenAI-compat endpoint defaults `num_ctx` to 4 096 on the
+        // wire and silently ignores attempts to set it. Native
+        // `OllamaChatApi` sends `options.num_ctx`, so only the legacy
+        // `OpenAICompletions` path keeps the conservative 32 k guard.
+        let context_window = match (self.provider.eq_ignore_ascii_case("ollama"), api) {
+            (true, ApiKind::OpenAICompletions) => 32_768,
+            _ => self.context_length.unwrap_or(32_768),
+        };
+        let max_tokens = self.max_output_tokens.unwrap_or(8_192);
         Model {
             id: self.id.clone(),
             name: self.name.clone(),
             provider: self.provider.clone(),
             api,
             base_url: base_url.to_string(),
-            context_window: self.context_length.unwrap_or(32_768),
-            max_tokens: 8_192,
+            context_window,
+            max_tokens,
             supports_reasoning: self.supports_reasoning.unwrap_or(false),
-            reasoning_capabilities: None,
+            reasoning_capabilities: self.derive_ollama_reasoning_capabilities(),
             supports_images: self.supports_images.unwrap_or(false),
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
+    }
+
+    /// Derive `ReasoningCapabilities` directly from authoritative
+    /// Ollama `/api/show` data carried in `provider_capabilities`.
+    /// Returns `None` when the provider isn't Ollama or when
+    /// `"thinking"` isn't among the reported capabilities — in
+    /// either case the downstream `effective_reasoning_capabilities`
+    /// path falls back to the heuristic (see
+    /// `docs/ollama_capability_discovery/README.md` PR 5).
+    fn derive_ollama_reasoning_capabilities(&self) -> Option<ReasoningCapabilities> {
+        if !self.provider.eq_ignore_ascii_case("ollama") {
+            return None;
+        }
+        let capabilities = self.provider_capabilities.as_deref()?;
+        let has_thinking = capabilities
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case("thinking"));
+        if !has_thinking {
+            return None;
+        }
+        Some(ReasoningCapabilities {
+            control: Some(ReasoningControlMode::Native),
+            output: Some(ReasoningOutputMode::Separated),
+            tags: None,
+            request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+        })
     }
 }
 
@@ -192,8 +431,12 @@ impl From<&Model> for ModelInfo {
             name: value.name.clone(),
             provider: value.provider.clone(),
             context_length: Some(value.context_window),
+            max_output_tokens: Some(value.max_tokens),
             supports_images: Some(value.supports_images),
             supports_reasoning: Some(value.supports_reasoning),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: None,
         }
     }
 }
@@ -203,14 +446,184 @@ mod tests {
     use super::*;
 
     #[test]
+    fn to_model_preserves_advertised_max_output_tokens_verbatim() {
+        // After max_tokens/PR1, the main agent stream doesn't
+        // forward this value onto the wire (the compaction path
+        // still does, but caps explicitly). So we carry whatever
+        // the provider advertised — no client-side clamping, no
+        // bumping. Matches pi's approach of letting the upstream
+        // own the `input + output <= context_window` invariant.
+        let info = ModelInfo {
+            id: "x/huge-context-model".into(),
+            name: "huge".into(),
+            provider: "openrouter".into(),
+            context_length: Some(262_144),
+            max_output_tokens: Some(262_144),
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: None,
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
+        assert_eq!(model.max_tokens, 262_144);
+        assert_eq!(model.context_window, 262_144);
+    }
+
+    #[test]
+    fn to_model_populates_reasoning_capabilities_from_ollama_thinking_capability() {
+        // Authoritative path: when the discovered ModelInfo
+        // carries `thinking` in provider_capabilities, to_model
+        // emits the full Native + ReasoningEffort profile so
+        // `effective_reasoning_capabilities` no longer needs the
+        // substring heuristic.
+        let info = ModelInfo {
+            id: "qwen3:32b".into(),
+            name: "Qwen 3 32B".into(),
+            provider: "ollama".into(),
+            context_length: Some(32_768),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec![
+                "completion".into(),
+                "tools".into(),
+                "thinking".into(),
+            ]),
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        assert_eq!(
+            model.reasoning_capabilities,
+            Some(ReasoningCapabilities {
+                control: Some(ReasoningControlMode::Native),
+                output: Some(ReasoningOutputMode::Separated),
+                tags: None,
+                request_mode: Some(ThinkingRequestMode::ReasoningEffort),
+            })
+        );
+    }
+
+    #[test]
+    fn to_model_leaves_reasoning_capabilities_none_when_thinking_absent() {
+        // Same Ollama provider but `/api/show` did not report
+        // `thinking`. Must produce `reasoning_capabilities = None`
+        // so downstream falls back to the heuristic (and the
+        // heuristic in turn — post-PR 1 — rejects false positives
+        // like qwen3.5).
+        let info = ModelInfo {
+            id: "gemma3:1b".into(),
+            name: "Gemma 3 1B".into(),
+            provider: "ollama".into(),
+            context_length: Some(8_192),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec!["completion".into()]),
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        assert_eq!(model.reasoning_capabilities, None);
+    }
+
+    #[test]
+    fn to_model_retains_32k_guard_for_legacy_openai_completions_ollama() {
+        // Regression guard for the legacy wire path: discovery
+        // succeeds (context_length = 262 144 for qwen3.5 from
+        // /api/show), but OpenAI-compat Ollama still cannot honor
+        // num_ctx on the wire, so keep compaction conservative.
+        let info = ModelInfo {
+            id: "qwen3.5:9b".into(),
+            name: "Qwen 3.5 9B".into(),
+            provider: "ollama".into(),
+            context_length: Some(262_144),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec!["completion".into(), "tools".into()]),
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
+        assert_eq!(model.context_window, 32_768);
+    }
+
+    #[test]
+    fn to_model_propagates_ollama_context_length_under_ollama_chat_api() {
+        let info = ModelInfo {
+            id: "qwen3.5:9b".into(),
+            name: "Qwen 3.5 9B".into(),
+            provider: "ollama".into(),
+            context_length: Some(262_144),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: Some(vec!["completion".into(), "tools".into()]),
+        };
+        let model = info.to_model(ApiKind::OllamaChatApi, "http://localhost:11434");
+        assert_eq!(model.context_window, 262_144);
+    }
+
+    #[test]
+    fn to_model_propagates_non_ollama_context_length_unchanged() {
+        // Non-Ollama paths must continue to honor the advertised
+        // context length — the wire-layer-default regression only
+        // applies to Ollama's OpenAI-compat endpoint.
+        let info = ModelInfo {
+            id: "x/huge".into(),
+            name: "Huge".into(),
+            provider: "openrouter".into(),
+            context_length: Some(200_000),
+            max_output_tokens: None,
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: None,
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1");
+        assert_eq!(model.context_window, 200_000);
+    }
+
+    #[test]
+    fn to_model_falls_back_to_eight_k_when_no_max_is_advertised() {
+        // Catalog-level fallback for operators or for the
+        // compaction path. Simpler than the reasoning-specific
+        // bump we used to do — we don't need a higher default
+        // anymore because the main stream ignores this value.
+        let info = ModelInfo {
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+            provider: "openai".into(),
+            context_length: Some(128_000),
+            max_output_tokens: None,
+            supports_images: Some(true),
+            supports_reasoning: Some(false),
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: None,
+        };
+        let model = info.to_model(ApiKind::OpenAICompletions, "https://api.openai.com/v1");
+        assert_eq!(model.max_tokens, 8_192);
+    }
+
+    #[test]
     fn model_info_to_model_uses_conservative_defaults() {
         let info = ModelInfo {
             id: "qwen3:32b".into(),
             name: "Qwen 3 32B".into(),
             provider: "ollama".into(),
             context_length: None,
+            max_output_tokens: None,
             supports_images: None,
             supports_reasoning: None,
+            pricing: None,
+            supported_parameters: None,
+            provider_capabilities: None,
         };
 
         let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1");
@@ -225,5 +638,132 @@ mod tests {
         assert!(!model.supports_images);
         assert_eq!(model.cost_per_million, CostPerMillion::zero());
         assert_eq!(model.reasoning_capabilities, None);
+        assert_eq!(model.compat, ModelCompat::None);
+    }
+
+    fn sample_model(compat: ModelCompat) -> Model {
+        Model {
+            id: "m".into(),
+            name: "M".into(),
+            provider: "openrouter".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            context_window: 32_768,
+            max_tokens: 8_192,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat,
+        }
+    }
+
+    #[test]
+    fn model_compat_defaults_to_none_and_is_skipped_on_serialize() {
+        let model = sample_model(ModelCompat::None);
+        let json = serde_json::to_string(&model).expect("serialize model");
+        assert!(
+            !json.contains("\"compat\""),
+            "default compat must not appear in serialized form: {json}"
+        );
+
+        let roundtrip: Model = serde_json::from_str(&json).expect("deserialize model");
+        assert_eq!(roundtrip.compat, ModelCompat::None);
+    }
+
+    #[test]
+    fn model_compat_with_openai_completions_roundtrips() {
+        let compat = ModelCompat::OpenAICompletions(OpenAICompletionsCompat {
+            openrouter_routing: Some(OpenRouterRouting {
+                allow_fallbacks: Some(true),
+                order: Some(vec!["anthropic".into(), "openai".into()]),
+                only: None,
+                ignore: None,
+                zdr: Some(true),
+            }),
+            ..Default::default()
+        });
+        let model = sample_model(compat.clone());
+        let json = serde_json::to_string(&model).expect("serialize model");
+        assert!(json.contains("\"kind\":\"openai-completions\""));
+        assert!(json.contains("\"openrouter_routing\""));
+
+        let roundtrip: Model = serde_json::from_str(&json).expect("deserialize model");
+        assert_eq!(roundtrip.compat, compat);
+    }
+
+    #[test]
+    fn max_tokens_field_defaults_to_none_and_is_skipped_on_serialize() {
+        let compat = OpenAICompletionsCompat::default();
+        let json = serde_json::to_string(&compat).expect("serialize");
+        // Both optional fields should be skipped → the struct
+        // serializes as an empty object.
+        assert_eq!(json, "{}");
+        let roundtrip: OpenAICompletionsCompat = serde_json::from_str(&json).expect("deserialize");
+        assert!(roundtrip.max_tokens_field.is_none());
+    }
+
+    #[test]
+    fn max_tokens_field_variants_roundtrip() {
+        for variant in [
+            MaxTokensField::MaxTokens,
+            MaxTokensField::MaxCompletionTokens,
+        ] {
+            let compat = OpenAICompletionsCompat {
+                max_tokens_field: Some(variant),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&compat).expect("serialize");
+            let roundtrip: OpenAICompletionsCompat =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(roundtrip.max_tokens_field, Some(variant));
+        }
+    }
+
+    #[test]
+    fn max_tokens_field_serializes_as_snake_case() {
+        // Wire-compat: if we ever surface these through config
+        // they should be readable. snake_case matches the actual
+        // OpenAI field names.
+        let json = serde_json::to_string(&MaxTokensField::MaxCompletionTokens).unwrap();
+        assert_eq!(json, "\"max_completion_tokens\"");
+        let json = serde_json::to_string(&MaxTokensField::MaxTokens).unwrap();
+        assert_eq!(json, "\"max_tokens\"");
+    }
+
+    #[test]
+    fn openrouter_routing_default_has_no_preferences() {
+        let routing = OpenRouterRouting::default();
+        assert_eq!(routing.allow_fallbacks, None);
+        assert_eq!(routing.order, None);
+        assert_eq!(routing.only, None);
+        assert_eq!(routing.ignore, None);
+        assert_eq!(routing.zdr, None);
+
+        let json = serde_json::to_string(&routing).expect("serialize routing");
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn openrouter_routing_roundtrips_with_only_populated_fields() {
+        let routing = OpenRouterRouting {
+            allow_fallbacks: None,
+            order: Some(vec!["groq".into()]),
+            only: Some(vec!["groq".into(), "fireworks".into()]),
+            ignore: None,
+            zdr: None,
+        };
+
+        let json = serde_json::to_string(&routing).expect("serialize routing");
+        assert!(!json.contains("allow_fallbacks"));
+        assert!(!json.contains("ignore"));
+        assert!(!json.contains("zdr"));
+        assert!(json.contains("\"order\""));
+        assert!(json.contains("\"only\""));
+
+        let roundtrip: OpenRouterRouting =
+            serde_json::from_str(&json).expect("deserialize routing");
+        assert_eq!(roundtrip, routing);
     }
 }

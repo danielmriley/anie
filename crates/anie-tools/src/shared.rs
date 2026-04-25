@@ -1,13 +1,48 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use anie_agent::ToolError;
 use anie_protocol::{ContentBlock, ToolResult};
+
+// --- Plan 07 PR-A: shared truncation helpers used by grep,
+// bash, and any future tool that emits line- or byte-capped
+// output. One policy per cap type instead of slightly-
+// different implementations in every module.
+
+/// Truncate a line to at most `max_chars` characters, appending
+/// `…` when truncation happens. Zero-copy when the line already
+/// fits — the caller's `&str` is borrowed through `Cow`
+/// unchanged. Returns `(content, truncated)`.
+pub(crate) fn truncate_line_to_chars(line: &str, max_chars: usize) -> (Cow<'_, str>, bool) {
+    if line.chars().count() <= max_chars {
+        return (Cow::Borrowed(line), false);
+    }
+    let mut truncated: String = line.chars().take(max_chars).collect();
+    truncated.push('…');
+    (Cow::Owned(truncated), true)
+}
+
+/// Check whether appending `addition_len` bytes to a buffer at
+/// `current_len` would overflow a `byte_limit`. Saturating-add
+/// protected.
+#[must_use]
+pub(crate) fn would_exceed_byte_limit(
+    current_len: usize,
+    addition_len: usize,
+    byte_limit: usize,
+) -> bool {
+    current_len.saturating_add(addition_len) > byte_limit
+}
 
 pub(crate) const MAX_READ_LINES: usize = 2_000;
 pub(crate) const MAX_READ_BYTES: usize = 50 * 1024;
 pub(crate) const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const IO_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Resolve a tool path using `cwd` only as the base for relative
+/// paths. Absolute paths and parent traversal are intentionally
+/// preserved: anie tools currently have the same filesystem access as
+/// the process user, not a cwd sandbox.
 pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     let requested = Path::new(path);
     if requested.is_absolute() {
@@ -98,4 +133,37 @@ pub(crate) fn trim_to_char_boundary(value: &str, max_bytes: usize) -> &str {
         boundary -= 1;
     }
     &value[..boundary]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_path_uses_cwd_for_relative_paths() {
+        let cwd = PathBuf::from("workspace").join("project");
+
+        assert_eq!(resolve_path(&cwd, "src/main.rs"), cwd.join("src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_path_preserves_absolute_paths() {
+        let cwd = PathBuf::from("workspace").join("project");
+        let requested = std::env::current_dir().expect("current dir is available");
+
+        assert_eq!(
+            resolve_path(&cwd, requested.to_str().expect("current dir is utf-8")),
+            requested
+        );
+    }
+
+    #[test]
+    fn resolve_path_preserves_parent_traversal() {
+        let cwd = PathBuf::from("workspace").join("project");
+
+        assert_eq!(
+            resolve_path(&cwd, "../outside.txt"),
+            cwd.join("../outside.txt")
+        );
+    }
 }

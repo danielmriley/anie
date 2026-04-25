@@ -1,10 +1,16 @@
 //! TOML configuration loading, merging, and project-context discovery.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+#[cfg(windows)]
+compile_error!(
+    "anie-config::atomic_write is intentionally gated on Windows until ReplaceFileW-style replacement semantics are implemented; std::fs::rename does not provide the POSIX overwrite behavior this crate relies on."
+);
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
@@ -18,6 +24,8 @@ use anie_provider::{
 };
 
 pub use mutation::ConfigMutator;
+
+static ATOMIC_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Fully-resolved application configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -33,6 +41,63 @@ pub struct AnieConfig {
     /// Interactive TUI preferences.
     #[serde(default)]
     pub ui: UiConfig,
+    /// Built-in tool configuration.
+    #[serde(default)]
+    pub tools: ToolsConfig,
+    /// True if a loaded config file (`~/.anie/config.toml` or
+    /// a project-local `.anie/config.toml`) explicitly set the
+    /// `[model]` section. Lets callers distinguish "the user
+    /// declared a preferred model" from "we fell back to the
+    /// built-in default" so the resolver doesn't let
+    /// `state.json`'s last-used model override a user's
+    /// declared default. Not persisted — derived at load time.
+    #[serde(skip)]
+    pub model_explicitly_set: bool,
+}
+
+/// Built-in tool configuration. These settings are guardrails and
+/// presentation preferences; they are not a sandbox boundary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ToolsConfig {
+    /// Bash tool settings.
+    #[serde(default)]
+    pub bash: BashToolConfig,
+}
+
+/// Bash tool settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BashToolConfig {
+    /// Pre-spawn deny policy for bash commands.
+    #[serde(default)]
+    pub policy: BashPolicyConfig,
+}
+
+/// Pre-spawn deny policy for bash commands.
+///
+/// This policy reduces accidental execution of commands a user never
+/// wants anie to run. It is not a sandbox: shell indirection and other
+/// tools can still bypass textual checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BashPolicyConfig {
+    /// Whether the policy is evaluated before spawning the shell.
+    pub enabled: bool,
+    /// Exact command names to block, matched against command basenames
+    /// after simple shell-segment splitting.
+    #[serde(default)]
+    pub deny_commands: Vec<String>,
+    /// Regex patterns matched against the raw command string.
+    #[serde(default)]
+    pub deny_patterns: Vec<String>,
+}
+
+impl Default for BashPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            deny_commands: Vec::new(),
+            deny_patterns: Vec::new(),
+        }
+    }
 }
 
 /// Interactive-TUI-only preferences. None of these affect the
@@ -43,14 +108,55 @@ pub struct UiConfig {
     /// when the user types `/`. Disable for a minimal experience
     /// while keeping `/help` and direct dispatch intact.
     pub slash_command_popup_enabled: bool,
+    /// Whether finalized assistant messages render as markdown
+    /// (headings, lists, code blocks, tables, …) or as plain
+    /// wrapped text. Streaming blocks always render plain so the
+    /// render loop doesn't re-parse markdown on every delta —
+    /// the toggle only affects already-finalized blocks.
+    #[serde(default = "default_markdown_enabled")]
+    pub markdown_enabled: bool,
+    /// How successful `bash` / `read` tool results render in the
+    /// interactive transcript. `Verbose` shows the full body
+    /// inside the boxed tool block (today's default). `Compact`
+    /// shows only the tool title (e.g. `$ <command>` or
+    /// `read <path>`). Errors always render their body so
+    /// debugging stays available. See
+    /// `docs/code_review_performance_2026-04-21/09_tool_output_display_modes.md`.
+    #[serde(default = "default_tool_output_mode")]
+    pub tool_output_mode: ToolOutputMode,
+}
+
+/// Display mode for successful `bash` / `read` tool output in
+/// the interactive transcript. UI-only: never affects what the
+/// agent, provider, or session storage see.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolOutputMode {
+    /// Render the full tool-result body inside the boxed tool
+    /// block. Today's default.
+    Verbose,
+    /// Hide successful `bash` and `read` bodies; keep the
+    /// one-line title. `edit`, `write`, and other tools remain
+    /// fully visible. Errors always show their body.
+    Compact,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             slash_command_popup_enabled: true,
+            markdown_enabled: default_markdown_enabled(),
+            tool_output_mode: default_tool_output_mode(),
         }
     }
+}
+
+fn default_markdown_enabled() -> bool {
+    true
+}
+
+fn default_tool_output_mode() -> ToolOutputMode {
+    ToolOutputMode::Verbose
 }
 
 /// Default model selection.
@@ -123,13 +229,29 @@ pub struct CustomModelConfig {
 }
 
 /// Context-compaction settings.
+///
+/// The main agent stream does not send `max_tokens` — see
+/// `docs/max_tokens_handling/README.md` — so the upstream
+/// enforces `input + output <= context_window` with its own
+/// defaults. Our job here is to trigger compaction *before* the
+/// input gets close enough to the ceiling that the model has no
+/// room to answer. `reserve_tokens` is that headroom: compaction
+/// fires when `context_tokens > context_window - reserve_tokens`,
+/// which guarantees the next turn has at least `reserve_tokens`
+/// free for the response. 16 k is pi's default and covers the
+/// common case including reasoning-model runs; bump it if a
+/// specific model routinely runs up against it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactionConfig {
     /// Whether compaction is enabled.
     pub enabled: bool,
-    /// Reserved token budget.
+    /// Tokens of headroom to keep free of input so the upstream
+    /// has room for its response. Effective constraint:
+    /// compaction triggers when
+    /// `context_tokens > context_window - reserve_tokens`.
     pub reserve_tokens: u64,
-    /// Recent-token budget to keep verbatim.
+    /// Recent-token budget to keep verbatim past the compaction
+    /// boundary (the tail of the transcript isn't summarized).
     pub keep_recent_tokens: u64,
 }
 
@@ -198,8 +320,8 @@ pub fn anie_dir() -> Option<PathBuf> {
 
 /// Atomically write `contents` to `path`.
 ///
-/// The write goes to a same-directory temp file (`.{name}.tmp.{pid}`),
-/// fsyncs, then renames over the destination. On POSIX the
+/// The write goes to a same-directory temp file
+/// (`.{name}.tmp.{pid}.{counter}`), fsyncs, then renames over the destination. On POSIX the
 /// rename is atomic for same-filesystem moves, so a crash during
 /// the write leaves the original `path` intact.
 ///
@@ -216,10 +338,9 @@ pub fn anie_dir() -> Option<PathBuf> {
 ///
 /// # Platform
 ///
-/// POSIX-only today. On Windows, `rename` over an existing file
-/// has different semantics; if Windows support is ever added,
-/// this helper should grow a `cfg(windows)` branch using
-/// `ReplaceFileW`. anie is unix-targeted in CI.
+/// POSIX-only today. Windows builds are explicitly gated at compile
+/// time until this helper grows a `cfg(windows)` branch using
+/// `ReplaceFileW`-style replacement semantics.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -230,16 +351,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
     })?;
 
-    // PID in the temp name so concurrent anie processes writing
-    // the same target file don't collide on the temp. Logical
-    // concurrent write to the same file is still unsafe — this
-    // just avoids the temp-name clash.
-    let mut tmp = parent.to_path_buf();
-    tmp.push(format!(
-        ".{}.tmp.{}",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
+    let tmp = atomic_write_temp_path(parent, file_name);
 
     // Scope the file handle so the OS sees it fully closed before
     // the rename runs.
@@ -262,6 +374,20 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             Err(err)
         }
     }
+}
+
+fn atomic_write_temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    // PID separates concurrent anie processes; the in-process
+    // counter separates concurrent writes from the same process.
+    let nonce = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut tmp = parent.to_path_buf();
+    tmp.push(format!(
+        ".{}.tmp.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+    tmp
 }
 
 /// Return the default global config path (`~/.anie/config.toml`).
@@ -342,6 +468,7 @@ pub fn load_config_with_paths(
     }
 
     apply_cli_overrides(&mut config, cli_overrides);
+    warn_legacy_ollama_openai_api(&config);
     Ok(config)
 }
 
@@ -382,10 +509,48 @@ pub fn configured_models(config: &AnieConfig) -> Vec<Model> {
                 supports_images: model.supports_images,
                 cost_per_million: CostPerMillion::zero(),
                 replay_capabilities: None,
+                compat: anie_provider::ModelCompat::None,
             });
         }
     }
     models
+}
+
+fn warn_legacy_ollama_openai_api(config: &AnieConfig) {
+    for provider_name in legacy_ollama_openai_api_providers(config) {
+        tracing::warn!(
+            provider = %provider_name,
+            "Ollama provider config uses legacy api = \"OpenAICompletions\"; newly discovered Ollama models use api = \"OllamaChatApi\" for native /api/chat support"
+        );
+    }
+}
+
+fn legacy_ollama_openai_api_providers(config: &AnieConfig) -> Vec<String> {
+    config
+        .providers
+        .iter()
+        .filter_map(|(provider_name, provider_config)| {
+            if provider_config.api != Some(ApiKind::OpenAICompletions) {
+                return None;
+            }
+            if provider_name.eq_ignore_ascii_case("ollama")
+                || provider_config
+                    .base_url
+                    .as_deref()
+                    .is_some_and(is_ollama_endpoint)
+            {
+                Some(provider_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_ollama_endpoint(base_url: &str) -> bool {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    root.contains(":11434")
 }
 
 fn custom_model_reasoning_capabilities(model: &CustomModelConfig) -> Option<ReasoningCapabilities> {
@@ -461,7 +626,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 /// Return the default config template written on first run.
 #[must_use]
 pub fn default_config_template() -> &'static str {
-    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
+    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
 }
 
 fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
@@ -473,6 +638,15 @@ fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
 
 fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
     if let Some(model) = partial.model {
+        // A file that has *any* `[model]` field counts as an
+        // explicit user preference. We only set the flag when
+        // at least one field was provided — a `[model]` section
+        // with no sub-keys is unusual but would otherwise trick
+        // us into treating an effectively-empty declaration as
+        // explicit.
+        if model.provider.is_some() || model.id.is_some() || model.thinking.is_some() {
+            config.model_explicitly_set = true;
+        }
         if let Some(provider) = model.provider {
             config.model.provider = provider;
         }
@@ -523,6 +697,21 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.context.max_total_bytes = max_total_bytes;
         }
     }
+
+    if let Some(tools) = partial.tools
+        && let Some(bash) = tools.bash
+        && let Some(policy) = bash.policy
+    {
+        if let Some(enabled) = policy.enabled {
+            config.tools.bash.policy.enabled = enabled;
+        }
+        if let Some(deny_commands) = policy.deny_commands {
+            config.tools.bash.policy.deny_commands = deny_commands;
+        }
+        if let Some(deny_patterns) = policy.deny_patterns {
+            config.tools.bash.policy.deny_patterns = deny_patterns;
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -547,6 +736,8 @@ struct PartialAnieConfig {
     compaction: Option<PartialCompactionConfig>,
     #[serde(default)]
     context: Option<PartialContextConfig>,
+    #[serde(default)]
+    tools: Option<PartialToolsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -578,8 +769,31 @@ struct PartialContextConfig {
     max_total_bytes: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct PartialToolsConfig {
+    bash: Option<PartialBashToolConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialBashToolConfig {
+    policy: Option<PartialBashPolicyConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialBashPolicyConfig {
+    enabled: Option<bool>,
+    deny_commands: Option<Vec<String>>,
+    deny_patterns: Option<Vec<String>>,
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier, Mutex},
+        thread,
+    };
+
     use tempfile::tempdir;
 
     use super::*;
@@ -592,6 +806,37 @@ mod tests {
             config.model.and_then(|model| model.id),
             Some("gpt-4o".into())
         );
+    }
+
+    /// Plan 09 PR-A: the new `tool_output_mode` setting
+    /// defaults to `Verbose` so today's behavior is preserved
+    /// for every user who doesn't opt in.
+    #[test]
+    fn ui_config_tool_output_mode_defaults_to_verbose() {
+        assert_eq!(
+            UiConfig::default().tool_output_mode,
+            ToolOutputMode::Verbose
+        );
+    }
+
+    /// Forward-compat: a user's config written before the
+    /// field existed must still load cleanly, with the default
+    /// filled in.
+    #[test]
+    fn ui_config_without_tool_output_mode_loads_with_default() {
+        let toml_str = "slash_command_popup_enabled = true\nmarkdown_enabled = true\n";
+        let config: UiConfig = toml::from_str(toml_str).expect("parse legacy UiConfig");
+        assert_eq!(config.tool_output_mode, ToolOutputMode::Verbose);
+    }
+
+    /// `tool_output_mode = "compact"` round-trips through
+    /// serde; the lowercase rename is stable so any user who
+    /// opts into compact survives a restart.
+    #[test]
+    fn ui_config_tool_output_mode_compact_roundtrips() {
+        let toml_str = "slash_command_popup_enabled = true\nmarkdown_enabled = true\ntool_output_mode = \"compact\"\n";
+        let config: UiConfig = toml::from_str(toml_str).expect("parse compact");
+        assert_eq!(config.tool_output_mode, ToolOutputMode::Compact);
     }
 
     #[test]
@@ -651,11 +896,11 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_temp_name_includes_pid_and_dot_prefix() {
+    fn atomic_write_temp_name_includes_pid_counter_and_dot_prefix() {
         // Document the temp-name convention. The temp file is a
         // sibling of the target (same parent), dot-prefixed, and
-        // tagged with the process pid so concurrent anie
-        // processes don't clash.
+        // tagged with the process pid plus a same-process counter
+        // so concurrent anie writes don't clash.
         let dir = tempdir().expect("tempdir");
         let target = dir.path().join("out.txt");
         atomic_write(&target, b"x").expect("write ok");
@@ -665,10 +910,52 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        let has_temp = entries
-            .iter()
-            .any(|name| name.starts_with(".out.txt.tmp."));
-        assert!(!has_temp, "temp file must be cleaned after rename: {entries:?}");
+        let has_temp = entries.iter().any(|name| name.starts_with(".out.txt.tmp."));
+        assert!(
+            !has_temp,
+            "temp file must be cleaned after rename: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_temp_names_are_unique_for_same_process_concurrency() {
+        let dir = tempdir().expect("tempdir");
+        let parent = Arc::new(dir.path().to_path_buf());
+        let file_name = Arc::new(std::ffi::OsString::from("state.json"));
+        let barrier = Arc::new(Barrier::new(16));
+        let names = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles = (0..16)
+            .map(|_| {
+                let parent = Arc::clone(&parent);
+                let file_name = Arc::clone(&file_name);
+                let barrier = Arc::clone(&barrier);
+                let names = Arc::clone(&names);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let tmp = atomic_write_temp_path(&parent, &file_name);
+                    let file_name = tmp
+                        .file_name()
+                        .expect("temp file name")
+                        .to_string_lossy()
+                        .into_owned();
+                    names.lock().expect("names lock").insert(file_name);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().expect("thread join");
+        }
+
+        let names = names.lock().expect("names lock");
+        assert_eq!(names.len(), 16, "temp names must be unique: {names:?}");
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with(".state.json.tmp.")),
+            "temp names must keep the documented prefix: {names:?}"
+        );
     }
 
     #[test]
@@ -677,6 +964,71 @@ mod tests {
             load_config_with_paths(None, None, CliOverrides::default()).expect("load defaults");
         assert_eq!(config.model.provider, "openai");
         assert_eq!(config.context.max_total_bytes, 65_536);
+        assert!(config.tools.bash.policy.enabled);
+        assert!(config.tools.bash.policy.deny_commands.is_empty());
+        assert!(config.tools.bash.policy.deny_patterns.is_empty());
+    }
+
+    #[test]
+    fn bash_policy_loads_from_config() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.bash.policy]
+            enabled = true
+            deny_commands = ["rm", "dd"]
+            deny_patterns = ["git\\s+push\\s+--force"]
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert!(config.tools.bash.policy.enabled);
+        assert_eq!(config.tools.bash.policy.deny_commands, vec!["rm", "dd"]);
+        assert_eq!(
+            config.tools.bash.policy.deny_patterns,
+            vec!["git\\s+push\\s+--force"]
+        );
+    }
+
+    #[test]
+    fn bash_policy_layer_merging_replaces_lists() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.toml");
+        let project_path = tempdir.path().join("project.toml");
+        fs::write(
+            &global_path,
+            r#"
+            [tools.bash.policy]
+            deny_commands = ["rm", "dd"]
+            deny_patterns = ["curl"]
+            "#,
+        )
+        .expect("write global config");
+        fs::write(
+            &project_path,
+            r#"
+            [tools.bash.policy]
+            enabled = false
+            deny_commands = ["git"]
+            "#,
+        )
+        .expect("write project config");
+
+        let config = load_config_with_paths(
+            Some(&global_path),
+            Some(&project_path),
+            CliOverrides::default(),
+        )
+        .expect("load config");
+
+        assert!(!config.tools.bash.policy.enabled);
+        assert_eq!(config.tools.bash.policy.deny_commands, vec!["git"]);
+        assert_eq!(config.tools.bash.policy.deny_patterns, vec!["curl"]);
     }
 
     #[test]
@@ -838,6 +1190,38 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].provider, "local");
         assert_eq!(models[0].base_url, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn config_toml_with_legacy_ollama_api_logs_warning_but_loads_unchanged() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [providers.ollama]
+            base_url = "http://localhost:11434/v1"
+            api = "OpenAICompletions"
+
+            [[providers.ollama.models]]
+            id = "qwen3:32b"
+            name = "Qwen 3 32B"
+            context_window = 32768
+            max_tokens = 8192
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert_eq!(
+            legacy_ollama_openai_api_providers(&config),
+            vec!["ollama".to_string()]
+        );
+        let provider = config.providers.get("ollama").expect("ollama provider");
+        assert_eq!(provider.api, Some(ApiKind::OpenAICompletions));
+        assert_eq!(provider.models[0].id, "qwen3:32b");
     }
 
     #[test]

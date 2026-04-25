@@ -64,8 +64,8 @@ async fn agent_events_render_prompt_assistant_and_tool_blocks() {
         "final answer missing from:\n{screen}"
     );
     assert!(
-        screen.contains("read example.txt"),
-        "tool title missing from:\n{screen}"
+        screen.contains("• Read example.txt"),
+        "tool header missing from:\n{screen}"
     );
     assert!(
         screen.contains("hello from disk"),
@@ -93,6 +93,7 @@ async fn agent_thinking_events_render_thinking_section_above_answer() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     };
 
     let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![
@@ -111,8 +112,8 @@ async fn agent_thinking_events_render_thinking_section_above_answer() {
     let screen = replay_events_and_render(&events, 80, 24);
 
     assert!(
-        screen.contains("thinking"),
-        "thinking heading missing from:\n{screen}"
+        screen.contains("• Thinking"),
+        "thinking header missing from:\n{screen}"
     );
     assert!(
         screen.contains("Let me reason about this."),
@@ -123,7 +124,7 @@ async fn agent_thinking_events_render_thinking_section_above_answer() {
         "answer missing from:\n{screen}"
     );
 
-    let thinking_pos = screen.find("thinking").expect("thinking heading");
+    let thinking_pos = screen.find("• Thinking").expect("thinking header");
     let answer_pos = screen.find(answer_text).expect("answer text");
     assert!(
         thinking_pos < answer_pos,
@@ -185,15 +186,16 @@ async fn thinking_only_provider_response_becomes_error_not_visible_thinking() {
 
     let screen = replay_events_and_render(&events, 80, 24);
 
-    // The thinking text should be visible (it was streamed before the error)
-    // but it must be in the gutter, not as plain text
+    // The thinking text should be visible (it was streamed before
+    // the error) but it must be inside the `• Thinking` section,
+    // indented with `  └ ` or `    ` — never as free-floating text.
     if screen.contains("internal reasoning only") {
         for line in screen.lines() {
             if line.contains("internal reasoning only") {
-                let trimmed = line.trim();
+                let trimmed = line.trim_start();
                 assert!(
-                    trimmed.starts_with('\u{2502}'),
-                    "thinking leaked outside gutter: {line}\nfull screen:\n{screen}"
+                    trimmed.starts_with("└ ") || line.starts_with("    "),
+                    "thinking leaked outside section: {line}\nfull screen:\n{screen}"
                 );
             }
         }
@@ -219,6 +221,7 @@ async fn multi_turn_with_thinking_keeps_thinking_in_gutter() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     };
 
     let provider = anie_provider::mock::MockProvider::new(vec![MockStreamScript::new(vec![
@@ -236,13 +239,14 @@ async fn multi_turn_with_thinking_keeps_thinking_in_gutter() {
 
     let screen = replay_events_and_render(&events, 80, 30);
 
-    // Thinking from turn 1 must be in gutter
+    // Thinking from turn 1 must be inside the `• Thinking`
+    // section, indented with `  └ ` or `    ` continuation.
     for line in screen.lines() {
         if line.contains("plan step one") {
-            let trimmed = line.trim();
+            let trimmed = line.trim_start();
             assert!(
-                trimmed.starts_with('\u{2502}'),
-                "thinking leaked outside gutter: {line}\nfull screen:\n{screen}"
+                trimmed.starts_with("└ ") || line.starts_with("    "),
+                "thinking leaked outside section: {line}\nfull screen:\n{screen}"
             );
         }
     }

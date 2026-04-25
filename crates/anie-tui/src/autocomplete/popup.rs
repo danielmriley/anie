@@ -49,7 +49,11 @@ impl AutocompletePopup {
     }
 
     pub(crate) fn with_max_visible(set: SuggestionSet, max_visible: usize) -> Self {
-        let SuggestionSet { items, prefix, kind } = set;
+        let SuggestionSet {
+            items,
+            prefix,
+            kind,
+        } = set;
         let mut list = SelectList::new(items, max_visible.max(1));
         let prefix_for_seed = prefix_without_slash(&prefix);
         if !prefix_for_seed.is_empty() {
@@ -151,7 +155,9 @@ impl AutocompletePopup {
             .borders(Borders::ALL)
             .title(Line::from(Span::styled(
                 title,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )))
             .border_style(Style::default().fg(Color::DarkGray));
         let inner = block.inner(area);
@@ -262,7 +268,10 @@ mod tests {
     fn renders_label_and_description_columns() {
         let popup = AutocompletePopup::from_suggestions(set(
             vec![
-                ("thinking", Some("[off|low|medium|high] — Set effort")),
+                (
+                    "thinking",
+                    Some("[off|minimal|low|medium|high] — Set effort"),
+                ),
                 ("help", Some("Show help")),
             ],
             "/",
@@ -312,7 +321,10 @@ mod tests {
         let frame_area = Rect::new(0, 0, 80, 24);
         let input_area = Rect::new(0, 20, 80, 3);
         let rect = popup.layout_rect(frame_area, input_area).expect("rect");
-        assert!(rect.y < input_area.y, "{rect:?} should be above {input_area:?}");
+        assert!(
+            rect.y < input_area.y,
+            "{rect:?} should be above {input_area:?}"
+        );
         assert_eq!(rect.x, input_area.x);
         assert_eq!(rect.width, input_area.width);
     }

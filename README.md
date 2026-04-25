@@ -8,7 +8,7 @@ The workspace is split into focused crates for protocol types, provider abstract
 
 - **Interactive TUI** built with `ratatui` + `crossterm`
 - **Streaming output** with separate thinking and final-answer rendering when providers expose it
-- **Four built-in coding tools**: `read`, `write`, `edit`, `bash`
+- **Seven built-in coding tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
 - **Session persistence** in append-only JSONL files with fork/resume support
 - **Automatic context compaction** when token budgets get tight
 - **Provider support** for Anthropic, OpenAI-compatible backends, and local servers such as Ollama and LM Studio
@@ -18,11 +18,25 @@ The workspace is split into focused crates for protocol types, provider abstract
 - **First-run onboarding** with a full-screen TUI, local-server detection, provider presets, and provider management overlays
 - **CI coverage** for build/test and secret scanning
 
+## Architecture summary
+
+`anie` is organized around a small set of explicit boundaries:
+
+- `anie-cli` owns CLI parsing, mode dispatch, onboarding commands, controller orchestration, retry policy, and runtime-state persistence.
+- `anie-tui` owns terminal UI state, input handling, overlays, transcript rendering, and slash-command UX; it sends user intent to the controller as `UiAction` values and renders `AgentEvent` updates.
+- `anie-agent` owns the provider/tool-agnostic agent loop. It receives owned prompt/context state, streams provider events, validates and executes tool calls, and returns generated messages to the caller for persistence.
+- `anie-provider` defines the provider contract, model metadata, request options, normalized streaming events, and the typed `ProviderError` taxonomy used for retry decisions.
+- `anie-providers-builtin` implements the registered provider backends: Anthropic Messages and OpenAI-compatible Chat Completions. OpenRouter, Ollama, LM Studio, and custom OpenAI-compatible endpoints are routed through config/model/base-url behavior on top of those shapes.
+- `anie-tools` implements the built-in tools. `write` and `edit` share a file-mutation queue so file writes are serialized.
+- `anie-session`, `anie-config`, and `anie-auth` own persistence boundaries: append-only session JSONL, layered TOML config, runtime state, keyring/JSON credentials, and OAuth refresh locking.
+
+The canonical design reference is [`docs/arch/anie-rs_architecture.md`](docs/arch/anie-rs_architecture.md). Update it alongside architecture-significant changes; it is intended to be the source of truth for crate ownership, runtime flow, persistence formats, provider/tool contracts, hot paths, and known refactor risks.
+
 ## Status and safety
 
-`anie` is local coding-agent software: it can read files, write files, edit files, and run shell commands.
+`anie` is local coding-agent software: it can read files, write files, edit files, search directories, list directories, and run shell commands.
 
-**Important:** tools currently run **without sandboxing or approvals**. Only use `anie` in working trees you trust it to modify.
+**Important:** tools currently run **without sandboxing or approvals**. This is intentional for now: relative paths resolve from the session cwd, but absolute paths and `..` traversal are allowed, and shell commands have the same system access as the `anie` process. Only use `anie` in environments you trust it to access. Future work may add WASM/containerized tool execution for stronger isolation.
 
 ## Quick start
 
@@ -144,6 +158,24 @@ max_tokens = 8192
 
 For custom models, you can optionally describe richer reasoning and image support with fields such as `supports_reasoning`, `reasoning_control`, `reasoning_output`, `reasoning_tag_open`, `reasoning_tag_close`, and `supports_images`.
 
+### Bash deny policy
+
+You can configure a pre-spawn bash deny policy as an accidental-risk guardrail:
+
+```toml
+[tools.bash.policy]
+enabled = true
+deny_commands = ["rm", "dd", "mkfs"]
+deny_patterns = [
+  'git\s+push\s+--force',
+  'curl\b.*\|\s*(sh|bash)',
+]
+```
+
+`deny_commands` matches simple command names and basenames such as `rm` or `/bin/rm`. `deny_patterns` are regular expressions matched against the raw command string before the shell is spawned.
+
+This policy is **not a sandbox** and should not be treated as a security boundary. Shell indirection, scripts, interpreters, and non-bash tools can bypass textual checks. It is meant to reduce accidental execution of commands a user never wants anie to run.
+
 ### Project context files
 
 `anie` can load project guidance files into the system prompt. By default it looks for:
@@ -222,6 +254,9 @@ The core toolset is intentionally small and focused:
 - `write` — writes or overwrites files, creating parent directories as needed
 - `edit` — applies exact text replacements and returns diffs
 - `bash` — runs shell commands in the current working directory with timeout/cancellation support
+- `grep` — searches file contents
+- `find` — finds files by name/pattern
+- `ls` — lists files and directories
 
 ## Sessions and runtime files
 
@@ -254,7 +289,7 @@ The workspace is split into focused crates:
 - `crates/anie-cli` — CLI entry point, onboarding, controller logic, and print/RPC/interactive dispatch
 - `crates/anie-tui` — terminal UI rendering and input handling
 - `crates/anie-agent` — agent loop, streaming orchestration, and tool execution flow
-- `crates/anie-tools` — built-in tools (`read`, `write`, `edit`, `bash`)
+- `crates/anie-tools` — built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`)
 - `crates/anie-session` — session persistence and compaction
 - `crates/anie-auth` — API key storage and request-option resolution
 - `crates/anie-config` — config loading, merging, and project-context discovery

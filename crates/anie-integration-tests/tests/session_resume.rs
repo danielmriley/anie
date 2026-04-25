@@ -80,6 +80,7 @@ async fn thinking_blocks_survive_session_roundtrip_into_agent_context() {
         provider: "mock".into(),
         model: "mock-model".into(),
         timestamp: 1,
+        reasoning_details: None,
     });
     session
         .append_messages(&[assistant])
@@ -144,6 +145,7 @@ async fn compacted_session_context_drives_agent_run() {
             summary: "Prior discussion covered questions 0 through 2.".into(),
             first_kept_entry_id: first_kept_id,
             tokens_before: 5000,
+            details: None,
         }])
         .expect("add compaction");
 
@@ -295,6 +297,7 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             timestamp: 1,
+            reasoning_details: None,
         })])
         .expect("persist assistant");
 
@@ -339,6 +342,7 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
         provider: "spy".into(),
         model: "claude-sonnet-4-6".into(),
         timestamp: now_millis(),
+        reasoning_details: None,
     };
     let (spy, captured) = SignatureRequiringSpy::new(response);
 
@@ -364,7 +368,9 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
             requires_thinking_signature: true,
             supports_redacted_thinking: true,
             supports_encrypted_reasoning: false,
+            supports_reasoning_details_replay: false,
         }),
+        compat: anie_provider::ModelCompat::None,
     };
     let agent = AgentLoop::new(
         Arc::new(registry),

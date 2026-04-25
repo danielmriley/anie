@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use regex::Regex;
 use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -17,17 +18,53 @@ use crate::shared::{
     required_string_arg, text_result,
 };
 
-/// Execute a shell command in the current working directory.
+/// Execute a shell command with the session cwd as the starting
+/// directory. The command is not sandboxed.
 pub struct BashTool {
     cwd: Arc<PathBuf>,
+    policy: BashPolicy,
+}
+
+/// Pre-spawn bash command deny policy.
+///
+/// This is an accidental-risk guardrail, not a sandbox. It checks the
+/// raw command string and simple command words before any process is
+/// spawned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashPolicy {
+    /// Whether the policy is active.
+    pub enabled: bool,
+    /// Exact command names to deny. Basenames are matched, so
+    /// `/bin/rm` matches `rm`.
+    pub deny_commands: Vec<String>,
+    /// Regex patterns matched against the raw command string.
+    pub deny_patterns: Vec<String>,
+}
+
+impl Default for BashPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            deny_commands: Vec::new(),
+            deny_patterns: Vec::new(),
+        }
+    }
 }
 
 impl BashTool {
-    /// Create a bash tool rooted at the provided working directory.
+    /// Create a bash tool using the provided working directory as the
+    /// process start directory.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(cwd: P) -> Self {
+        Self::with_policy(cwd, BashPolicy::default())
+    }
+
+    /// Create a bash tool using a pre-spawn deny policy.
+    #[must_use]
+    pub fn with_policy<P: Into<PathBuf>>(cwd: P, policy: BashPolicy) -> Self {
         Self {
             cwd: Arc::new(cwd.into()),
+            policy,
         }
     }
 }
@@ -37,7 +74,7 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "bash".into(),
-            description: "Execute a bash command in the current working directory. Returns combined stdout and stderr. Supports timeout and cancellation.".into(),
+            description: "Execute a bash command with the session cwd as the starting directory. The command is not sandboxed and has the same system access as the anie process. Returns combined stdout and stderr. Supports timeout and cancellation.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -58,6 +95,7 @@ impl Tool for BashTool {
         update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let command = required_string_arg(&args, "command")?;
+        self.policy.check(command)?;
         let timeout = parse_optional_timeout_secs(&args)?;
         let started = Instant::now();
         let (shell, shell_args) = shell_command(command);
@@ -180,6 +218,68 @@ impl Tool for BashTool {
     }
 }
 
+impl BashPolicy {
+    fn check(&self, command: &str) -> Result<(), ToolError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        for command_name in command_names(command) {
+            if self
+                .deny_commands
+                .iter()
+                .any(|denied| denied == &command_name)
+            {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "blocked by bash policy: command '{command_name}' is denied"
+                )));
+            }
+        }
+
+        for pattern in &self.deny_patterns {
+            let regex = Regex::new(pattern).map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "invalid bash policy deny pattern '{pattern}': {error}"
+                ))
+            })?;
+            if regex.is_match(command) {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "blocked by bash policy: matched deny pattern '{pattern}'"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn command_names(command: &str) -> Vec<String> {
+    command
+        .split([';', '|', '&', '\n'])
+        .filter_map(first_command_name)
+        .collect()
+}
+
+fn first_command_name(segment: &str) -> Option<String> {
+    let mut tokens = segment.split_whitespace();
+    loop {
+        let token = tokens.next()?;
+        let token = token.trim_matches(|ch| matches!(ch, '(' | ')' | '{' | '}'));
+        if token.is_empty() || token.contains('=') {
+            continue;
+        }
+        let basename = token
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(token)
+            .trim_matches(|ch| matches!(ch, '"' | '\''));
+        if matches!(basename, "sudo" | "command" | "env" | "nohup" | "time") {
+            continue;
+        }
+        return Some(basename.to_string());
+    }
+}
+
 async fn forward_pipe<R>(mut reader: R, sender: mpsc::Sender<String>) -> std::io::Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -286,21 +386,26 @@ impl OutputCollector {
     }
 
     fn render(&self) -> String {
-        let mut output = self.tail.clone();
-        if output.len() > MAX_READ_BYTES {
-            let keep_from = output.len() - MAX_READ_BYTES;
+        // Plan 07 PR-C: slice directly from `self.tail`
+        // without cloning the full tail string first. The
+        // final `lines[start..].join("\n")` still allocates
+        // the output, but we save the intermediate tail-clone
+        // which was up to 2×MAX_READ_BYTES (100 KB) on busy
+        // shells.
+        let tail_slice: &str = if self.tail.len() > MAX_READ_BYTES {
+            let keep_from = self.tail.len() - MAX_READ_BYTES;
             let mut boundary = keep_from;
-            while boundary < output.len() && !output.is_char_boundary(boundary) {
+            while boundary < self.tail.len() && !self.tail.is_char_boundary(boundary) {
                 boundary += 1;
             }
-            output = output[boundary..].to_string();
-        }
+            &self.tail[boundary..]
+        } else {
+            &self.tail
+        };
 
-        let mut lines: Vec<&str> = output.lines().collect();
-        if lines.len() > MAX_READ_LINES {
-            lines = lines[lines.len() - MAX_READ_LINES..].to_vec();
-        }
-        let mut rendered = lines.join("\n");
+        let lines: Vec<&str> = tail_slice.lines().collect();
+        let start = lines.len().saturating_sub(MAX_READ_LINES);
+        let mut rendered = lines[start..].join("\n");
         if self.was_truncated() {
             if !rendered.is_empty() {
                 rendered.push('\n');

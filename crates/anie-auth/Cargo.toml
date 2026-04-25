@@ -16,10 +16,19 @@ keyring-native = ["dep:keyring"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 dirs.workspace = true
+fs4.workspace = true
 keyring = { workspace = true, optional = true, features = ["apple-native", "windows-native", "linux-native"] }
+rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 anie-config.workspace = true
 anie-provider.workspace = true
@@ -28,3 +37,4 @@ anie-protocol.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
+wiremock = "0.6"

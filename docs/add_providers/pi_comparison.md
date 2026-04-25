@@ -140,6 +140,96 @@ pattern with a minimal `OpenAICompletionsCompat` on `Model`:
 Every subsequent OpenAI-compat provider ships as a catalog entry
 + a compat flip, matching pi's architectural precedent.
 
+## Architecture: one unified type layer + one provider per API family
+
+For anyone wondering whether pi "generalizes" over providers in
+some abstract way that we should be copying: it does not. The
+architecture is simpler, and it's the architecture we already
+have at smaller scale.
+
+### The three layers
+
+**Top — provider-agnostic conversation types.**
+`Message`, `AssistantMessage`, `Context`, `Tool`, `ContentBlock`.
+One set of types every provider translates to and from. This is
+the only cross-family generalization — and it's at the
+*conversation* level, not the wire level. Our equivalents live
+in `crates/anie-protocol/`.
+
+**Middle — one typed provider per `Api` value.** Pi has nine
+providers, each owning its native wire protocol:
+`openai-completions`, `openai-responses`, `openai-codex-responses`,
+`azure-openai-responses`, `anthropic-messages`,
+`google-generative-ai`, `google-gemini-cli`, `google-vertex`,
+`bedrock-converse-stream`, `mistral-conversations`. No meta-
+abstract base class. No shared "provider trait" that OpenAI
+and Anthropic both implement. Each module owns its format end to
+end. Our equivalents are `crates/anie-providers-builtin/src/`
+modules behind `ApiKind` values.
+
+**Bottom — shared helpers within a family.**
+`openai-responses-shared.ts` is imported by three OpenAI
+Responses variants; `google-shared.ts` is imported by three
+Google variants. These are file-level code-sharing modules, not a
+generalized abstraction. Our `openai/` submodule (`convert.rs`,
+`reasoning_strategy.rs`, `streaming.rs`, `tagged_reasoning.rs`)
+plays the same role.
+
+### Where the leverage lives
+
+Two places only:
+
+**The unified message layer at the top.** Every provider
+translates into/out of the same `Message` shape. No plan in this
+folder changes that.
+
+**Per-model compat flags inside a family.** This is pi's real
+leverage and where Milestone 0 takes us. Inside
+`openai-completions`, one provider module covers ~10 vendors
+because `Model<TApi>` carries an `OpenAICompletionsCompat` blob
+with ~12 flags — reasoning request format, `max_tokens` field
+name, tool-result `name` requirement, developer-role support,
+OpenRouter routing preferences, and more. One module, many
+vendors, via compat configuration.
+
+### What pi does *not* do
+
+There's no meta-format like "OpenAI-shaped" that specializes
+into OpenRouter, xAI, and Groq. No abstract base that all
+OpenAI-compatible providers inherit from. No cross-family
+generalization at the wire level. Just:
+
+1. One provider file per API family.
+2. A compat type shaped to that family's variations.
+3. Different model entries flip different flags.
+
+### Mapping to anie
+
+| pi | anie |
+|---|---|
+| `Message` / `ContentBlock` unified types | `anie-protocol::{Message, ContentBlock, AssistantMessage}` |
+| `Api` string union (9 values) | `ApiKind` enum (4 values, 2 stubbed) |
+| One provider module per `Api` value | One `Box<dyn Provider>` per `ApiKind` |
+| `*-shared.ts` helpers within a family | `openai/` submodule; analogous structure for future families |
+| `OpenAICompletionsCompat` on `Model<TApi>` | **Milestone 0 PR A** — `Model.compat: ModelCompat` |
+
+### Implication for the OpenRouter work
+
+Milestone 0 PR A is us adopting pi's per-model compat pattern.
+After it lands, OpenRouter is: one preset entry + one
+capability-mapping function + compat-blob values on discovered
+models. Auth, request-body assembly, streaming parse —
+all inherited from the existing `OpenAIProvider`.
+
+Subsequent providers in the OpenAI family (xAI, Groq, Cerebras,
+direct Mistral fallback, Azure Chat Completions) ship as
+compat-flag additions without touching the provider module.
+New API families (Gemini native, Bedrock, Responses) each get
+their own provider module plus a family-specific compat type.
+
+This is the answer to "how do we expand" for every plan in this
+folder.
+
 ## What we're not adopting from pi
 
 1. **Auto-generated model catalog.** Pi runs a nightly script

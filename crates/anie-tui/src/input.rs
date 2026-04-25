@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 
 use crate::autocomplete::{AutocompletePopup, AutocompleteProvider, SuggestionKind};
@@ -142,8 +142,30 @@ impl InputPane {
         }
 
         let action = self.dispatch_editor_key(key);
+        // Slash-command completion is cheap (prefix match over
+        // a small catalog). Refresh synchronously per keystroke
+        // so "/pro" shows `/providers` immediately — the
+        // previous debounce was premature optimization that
+        // created visible input→popup lag. See
+        // docs/refactor_worklist_2026-04-22/tui_perf_06_quick_wins.md.
         self.refresh_autocomplete();
         action
+    }
+
+    /// Retained as a no-op for backward compatibility with the
+    /// render loop's per-frame tick. The autocomplete refresh
+    /// now fires synchronously from `handle_key`, so there's
+    /// nothing to tick. Safe to remove once the caller is
+    /// updated.
+    pub fn tick_autocomplete(&mut self) -> bool {
+        false
+    }
+
+    /// Retained as a no-op helper for tests that previously
+    /// relied on the debounce flush path. The refresh is
+    /// synchronous now; nothing is ever pending.
+    pub fn flush_pending_autocomplete(&mut self) -> bool {
+        false
     }
 
     /// Whether applying the highlighted suggestion would be a
@@ -250,8 +272,15 @@ impl InputPane {
     }
 
     /// Render the input pane and return the cursor position.
+    ///
+    /// Draws a thin top + bottom border around the editor so
+    /// the input region reads as a discrete box separate from
+    /// the transcript and the status strip — matching pi's and
+    /// Claude Code's input styling.
     pub fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Position {
-        let block = Block::default();
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -658,4 +687,72 @@ fn next_boundary(content: &str, cursor: usize) -> Option<usize> {
 
 fn is_text_input_modifiers(modifiers: KeyModifiers) -> bool {
     modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::autocomplete::{AutocompleteProvider, SuggestionSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts suggestions() invocations. Every call the input
+    /// pane delegates to a real provider increments the
+    /// counter; tests assert on how many fired.
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AutocompleteProvider for CountingProvider {
+        fn suggestions(&self, _line: &str, _cursor: usize) -> Option<SuggestionSet> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+    }
+
+    fn input_with_counter() -> (InputPane, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: counter.clone(),
+        };
+        let pane = InputPane::new().with_autocomplete(Arc::new(provider));
+        (pane, counter)
+    }
+
+    fn type_char(pane: &mut InputPane, ch: char) {
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+
+    /// Autocomplete now fires synchronously — every keystroke
+    /// queries the provider exactly once. Pins the "no
+    /// debounce" contract so any future re-introduction has
+    /// to update this test.
+    #[test]
+    fn autocomplete_fires_synchronously_per_keystroke() {
+        let (mut pane, calls) = input_with_counter();
+        for ch in ['h', 'e', 'l', 'l', 'o'] {
+            type_char(&mut pane, ch);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "every keystroke must query the provider exactly once"
+        );
+    }
+
+    /// tick_autocomplete is a no-op after the debounce was
+    /// removed. Pinned so callers that still invoke it (like
+    /// `App::render`) don't accidentally trigger unrelated
+    /// work.
+    #[test]
+    fn tick_autocomplete_is_noop() {
+        let (mut pane, calls) = input_with_counter();
+        type_char(&mut pane, 'a');
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!pane.tick_autocomplete());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "tick must not fire an extra refresh"
+        );
+    }
 }

@@ -8,7 +8,7 @@
 use anyhow::{Result, anyhow};
 
 use anie_config::{AnieConfig, CliOverrides, load_config};
-use anie_provider::{Model, ThinkingLevel};
+use anie_provider::{ApiKind, Model, ThinkingLevel};
 use anie_session::SessionContext;
 
 use crate::{
@@ -32,6 +32,8 @@ pub(crate) struct ConfigState {
     current_model: Model,
     current_thinking: ThinkingLevel,
     cli_api_key: Option<String>,
+    #[cfg(test)]
+    runtime_state_path_override: Option<std::path::PathBuf>,
 }
 
 impl ConfigState {
@@ -48,6 +50,8 @@ impl ConfigState {
             current_model,
             current_thinking,
             cli_api_key,
+            #[cfg(test)]
+            runtime_state_path_override: None,
         }
     }
 
@@ -75,6 +79,33 @@ impl ConfigState {
         self.current_thinking = thinking;
     }
 
+    pub(crate) fn active_ollama_num_ctx_override(&self) -> Option<u64> {
+        if self.current_model.api != ApiKind::OllamaChatApi {
+            return None;
+        }
+        self.runtime_state
+            .ollama_num_ctx_overrides
+            .get(&ollama_num_ctx_key(&self.current_model))
+            .copied()
+    }
+
+    pub(crate) fn effective_ollama_context_window(&self) -> u64 {
+        self.active_ollama_num_ctx_override()
+            .unwrap_or(self.current_model.context_window)
+    }
+
+    pub(crate) fn set_ollama_num_ctx_override(&mut self, value: u64) {
+        self.runtime_state
+            .ollama_num_ctx_overrides
+            .insert(ollama_num_ctx_key(&self.current_model), value);
+    }
+
+    pub(crate) fn clear_ollama_num_ctx_override(&mut self) {
+        self.runtime_state
+            .ollama_num_ctx_overrides
+            .remove(&ollama_num_ctx_key(&self.current_model));
+    }
+
     pub(crate) fn apply_session_overrides(
         &mut self,
         session_context: &SessionContext,
@@ -91,6 +122,7 @@ impl ConfigState {
                         model_id,
                         &self.anie_config,
                         model_catalog,
+                        &anie_auth::CredentialStore::new(),
                     )
                 })
         {
@@ -102,14 +134,16 @@ impl ConfigState {
         }
     }
 
-    pub(crate) fn persist_runtime_state(&mut self, session_id: &str) {
+    pub(crate) fn persist_runtime_state(&mut self, session_id: &str) -> Result<()> {
         self.runtime_state.provider = Some(self.current_model.provider.clone());
         self.runtime_state.model = Some(self.current_model.id.clone());
         self.runtime_state.thinking = Some(self.current_thinking);
         self.runtime_state.last_session_id = Some(session_id.to_string());
-        if let Err(error) = save_runtime_state(&self.runtime_state) {
-            tracing::warn!(%error, "failed to persist runtime state");
+        #[cfg(test)]
+        if let Some(path) = &self.runtime_state_path_override {
+            return crate::runtime_state::save_runtime_state_to(path, &self.runtime_state);
         }
+        save_runtime_state(&self.runtime_state)
     }
 
     pub(crate) async fn reload_from_disk(
@@ -145,8 +179,14 @@ impl ConfigState {
             local_models_available,
         )
         .or_else(|_| {
-            fallback_model_from_provider(current_provider, current_model, &config, &model_catalog)
-                .ok_or_else(|| anyhow!("no model named '{current_model}' was found"))
+            fallback_model_from_provider(
+                current_provider,
+                current_model,
+                &config,
+                &model_catalog,
+                &anie_auth::CredentialStore::new(),
+            )
+            .ok_or_else(|| anyhow!("no model named '{current_model}' was found"))
         })
         .or_else(|_| {
             resolve_model(
@@ -162,6 +202,7 @@ impl ConfigState {
                 &config.model.id,
                 &config,
                 &model_catalog,
+                &anie_auth::CredentialStore::new(),
             )
             .ok_or_else(|| anyhow!("no model named '{}' was found", config.model.id))
         })?;
@@ -184,20 +225,33 @@ impl ConfigState {
         self.runtime_state.last_session_id = Some(session_id.to_string());
         crate::runtime_state::save_runtime_state_to(path, &self.runtime_state)
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_runtime_state_path_for_test(&mut self, path: std::path::PathBuf) {
+        self.runtime_state_path_override = Some(path);
+    }
+}
+
+fn ollama_num_ctx_key(model: &Model) -> String {
+    format!("{}:{}", model.provider, model.id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime_state::load_runtime_state_from;
-    use anie_provider::{ApiKind, CostPerMillion};
+    use anie_provider::{CostPerMillion, ModelCompat};
 
     fn model(id: &str, provider: &str) -> Model {
+        model_with_api(id, provider, ApiKind::OpenAICompletions)
+    }
+
+    fn model_with_api(id: &str, provider: &str, api: ApiKind) -> Model {
         Model {
             id: id.into(),
             name: id.into(),
             provider: provider.into(),
-            api: ApiKind::OpenAICompletions,
+            api,
             base_url: "http://localhost:11434/v1".into(),
             context_window: 32_768,
             max_tokens: 8_192,
@@ -206,6 +260,7 @@ mod tests {
             supports_images: false,
             cost_per_million: CostPerMillion::zero(),
             replay_capabilities: None,
+            compat: ModelCompat::None,
         }
     }
 
@@ -233,6 +288,27 @@ mod tests {
     }
 
     #[test]
+    fn persist_runtime_state_to_returns_write_errors() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model("qwen3:32b", "ollama"),
+            ThinkingLevel::High,
+            None,
+        );
+
+        let error = state
+            .persist_runtime_state_to(tempdir.path(), "session-123")
+            .expect_err("directory path cannot be written as runtime state file");
+
+        assert!(
+            error.to_string().contains("failed to write"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
     fn apply_session_overrides_updates_current_model_and_thinking() {
         let mut state = ConfigState::new(
             AnieConfig::default(),
@@ -251,6 +327,36 @@ mod tests {
         assert_eq!(state.current_model().provider, "ollama");
         assert_eq!(state.current_model().id, "qwen3:32b");
         assert_eq!(state.current_thinking(), ThinkingLevel::High);
+    }
+
+    #[test]
+    fn switching_to_non_thinking_model_preserves_user_thinking_preference() {
+        // PR 5 invariant. The user's thinking level is a
+        // preference applied across model switches, not a
+        // per-model setting. Flipping the active model to a
+        // non-thinking one (e.g. gemma3:1b) must NOT reset the
+        // preference — it silently drops at request build, and
+        // switching back re-applies it automatically.
+        let mut state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model("qwen3:32b", "ollama"),
+            ThinkingLevel::Medium,
+            None,
+        );
+        assert_eq!(state.current_thinking(), ThinkingLevel::Medium);
+
+        // Switch to a non-thinking model.
+        state.set_model(model("gemma3:1b", "ollama"));
+        assert_eq!(
+            state.current_thinking(),
+            ThinkingLevel::Medium,
+            "thinking level must not be reset when switching to a non-thinking model"
+        );
+
+        // Switch back — thinking still Medium.
+        state.set_model(model("qwen3:32b", "ollama"));
+        assert_eq!(state.current_thinking(), ThinkingLevel::Medium);
     }
 
     #[test]
@@ -276,5 +382,110 @@ mod tests {
         assert_eq!(outcome.current_thinking, ThinkingLevel::Medium);
         assert_eq!(state.current_model().provider, "ollama");
         assert_eq!(state.current_thinking(), ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_returns_none_when_no_runtime_entry() {
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), None);
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_returns_some_when_runtime_entry_present() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama:qwen3:32b".into(), 16_384);
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(16_384));
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_keyed_by_provider_and_model_tuple() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama1:qwen3:32b".into(), 16_384);
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama2:qwen3:32b".into(), 65_536);
+        let mut state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model_with_api("qwen3:32b", "ollama1", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(16_384));
+
+        state.set_model(model_with_api(
+            "qwen3:32b",
+            "ollama2",
+            ApiKind::OllamaChatApi,
+        ));
+
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(65_536));
+    }
+
+    #[test]
+    fn active_ollama_num_ctx_override_ignores_non_ollama_chat_api_model() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama:qwen3:32b".into(), 16_384);
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model("qwen3:32b", "ollama"),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.active_ollama_num_ctx_override(), None);
+    }
+
+    #[test]
+    fn effective_ollama_context_window_uses_override_when_present() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama:qwen3:32b".into(), 16_384);
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.effective_ollama_context_window(), 16_384);
+    }
+
+    #[test]
+    fn effective_ollama_context_window_uses_model_context_when_no_override() {
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+            ThinkingLevel::Off,
+            None,
+        );
+
+        assert_eq!(state.effective_ollama_context_window(), 32_768);
     }
 }
