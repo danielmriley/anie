@@ -277,6 +277,12 @@ pub struct StatusBarState {
     pub context_window: u64,
     /// Current working directory label.
     pub cwd: String,
+    /// Cached shortened cwd for the status bar. Recomputed
+    /// only when `cwd` changes between paints — avoids the
+    /// `env::var` + `Vec` allocation that used to fire on
+    /// every render. Skipped during serialization-style
+    /// equality checks since it's a derived view of `cwd`.
+    cached_short_cwd: Option<(String, String)>,
 }
 
 impl Default for StatusBarState {
@@ -290,7 +296,27 @@ impl Default for StatusBarState {
             estimated_context_tokens: 0,
             context_window: 0,
             cwd: String::new(),
+            cached_short_cwd: None,
         }
+    }
+}
+
+impl StatusBarState {
+    /// Return the abbreviated cwd for the status bar, computing
+    /// lazily and caching the (cwd, shortened) pair so repeat
+    /// reads at the same cwd are O(1).
+    fn shortened_cwd(&mut self) -> &str {
+        let stale = self
+            .cached_short_cwd
+            .as_ref()
+            .is_none_or(|(input, _)| input != &self.cwd);
+        if stale {
+            let computed = shorten_path(&self.cwd);
+            self.cached_short_cwd = Some((self.cwd.clone(), computed));
+        }
+        self.cached_short_cwd
+            .as_ref()
+            .map_or("", |(_, shortened)| shortened.as_str())
     }
 }
 
@@ -563,7 +589,7 @@ impl App {
             }
         };
         render_status_bar(
-            &self.status_bar,
+            &mut self.status_bar,
             &self.agent_state,
             self.output_pane.is_scrolled(),
             status_area,
@@ -2097,7 +2123,7 @@ fn display_path(path: &Path) -> String {
 }
 
 fn render_status_bar(
-    state: &StatusBarState,
+    state: &mut StatusBarState,
     agent_state: &AgentUiState,
     transcript_scrolled: bool,
     area: Rect,
@@ -2112,6 +2138,10 @@ fn render_status_bar(
     // right above the input box (stable position, doesn't
     // jitter into and out of the persistent info row).
     let _ = agent_state;
+    // Resolve the cached cwd before the format!, since the
+    // shortened_cwd accessor takes &mut self and the
+    // remaining state reads inside format! are immutable.
+    let short_cwd = state.shortened_cwd().to_string();
     let status = format!(
         " {}{}:{} │ thinking: {} │ {}/{} │ {}",
         if transcript_scrolled {
@@ -2124,7 +2154,7 @@ fn render_status_bar(
         state.thinking,
         format_tokens(used_tokens),
         format_tokens(state.context_window),
-        shorten_path(&state.cwd),
+        short_cwd,
     );
     Paragraph::new(Line::from(Span::styled(
         status,

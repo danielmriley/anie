@@ -5,7 +5,6 @@ use anie_config::ToolOutputMode;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 
 use crate::markdown::{LinkRange, MarkdownTheme, find_link_ranges};
@@ -230,6 +229,15 @@ pub struct OutputPane {
     /// invalidates the cache because block → line computations
     /// depend on it.
     render_context: RenderContext,
+    /// Cached count of blocks with active animation (streaming
+    /// assistants + executing tools). Maintained by the four
+    /// state-flip methods (add_streaming_assistant,
+    /// finalize_last_assistant, add_tool_call,
+    /// finalize_tool_result) plus `clear`. Reading is O(1)
+    /// instead of an O(blocks) walk per frame; correctness is
+    /// guarded by `cfg(debug_assertions)` parity assert in
+    /// `has_animated_blocks`.
+    animated_block_count: usize,
     #[cfg(test)]
     flat_build_count: u64,
 }
@@ -252,6 +260,7 @@ impl OutputPane {
             last_total_lines: 0,
             last_viewport_height: 1,
             render_context: RenderContext::default(),
+            animated_block_count: 0,
             #[cfg(test)]
             flat_build_count: 0,
         }
@@ -318,6 +327,9 @@ impl OutputPane {
 
     /// Add a transcript block.
     pub fn add_block(&mut self, block: RenderedBlock) {
+        if block_has_animated_content(&block) {
+            self.animated_block_count = self.animated_block_count.saturating_add(1);
+        }
         self.blocks.push(block);
         self.caches.push(None);
         self.streaming_assistant_renders.push(None);
@@ -421,11 +433,15 @@ impl OutputPane {
         {
             *current_text = text;
             *current_thinking = thinking;
+            let was_streaming = *is_streaming;
             *is_streaming = false;
             *current_timestamp = timestamp;
             *current_error = error_message;
             if let Some(slot) = self.streaming_assistant_renders.last_mut() {
                 *slot = None;
+            }
+            if was_streaming {
+                self.animated_block_count = self.animated_block_count.saturating_sub(1);
             }
             self.invalidate_last();
         }
@@ -485,7 +501,11 @@ impl OutputPane {
                 is_error,
                 elapsed,
             });
+            let was_executing = *is_executing;
             *is_executing = false;
+            if was_executing {
+                self.animated_block_count = self.animated_block_count.saturating_sub(1);
+            }
             self.invalidate_at(index);
         }
     }
@@ -508,6 +528,7 @@ impl OutputPane {
         self.auto_scroll = true;
         self.last_total_lines = 0;
         self.last_viewport_height = 1;
+        self.animated_block_count = 0;
     }
 
     /// Scroll the pane upward by a number of rendered lines.
@@ -602,10 +623,10 @@ impl OutputPane {
         let end = start
             .saturating_add(viewport_height)
             .min(self.flat_lines.len());
-        let visible = if start < end {
-            self.flat_lines[start..end].to_vec()
+        let visible: &[Line<'static>] = if start < end {
+            &self.flat_lines[start..end]
         } else {
-            Vec::new()
+            &[]
         };
         let mut paragraph_span = PerfSpan::enter(PerfSpanKind::ParagraphRender);
         if let Some(s) = paragraph_span.as_mut() {
@@ -613,7 +634,22 @@ impl OutputPane {
             s.record("area_w", u64::from(area.width));
             s.record("area_h", u64::from(area.height));
         }
-        Paragraph::new(visible).render(area, buf);
+        // Render the borrowed slice directly via Buffer::set_line.
+        // Skips the ratatui `Paragraph` wrap/scroll/alignment
+        // pipeline (we don't use any of those features — lines
+        // are pre-wrapped during build_flat_lines) and avoids
+        // the per-frame deep clone that `Paragraph::new(Vec<Line>)`
+        // forces. Cache-hit floor cost falls accordingly.
+        for (row_offset, line) in visible.iter().enumerate() {
+            let Ok(offset_u16) = u16::try_from(row_offset) else {
+                break;
+            };
+            let y = area.y.saturating_add(offset_u16);
+            if y >= area.y.saturating_add(area.height) {
+                break;
+            }
+            buf.set_line(area.x, y, line, area.width);
+        }
         drop(paragraph_span);
     }
 
@@ -621,8 +657,19 @@ impl OutputPane {
     /// (streaming assistant / executing tool). Animated blocks
     /// update their spinner every frame, so the flat cache
     /// cannot be reused when any are present.
+    ///
+    /// Reads `animated_block_count`, maintained by the four
+    /// state-flip methods. A `debug_assertions`-only parity
+    /// check guards against drift; if the count ever disagrees
+    /// with a fresh walk, debug builds panic with a clear
+    /// message. Release builds trust the count.
     fn has_animated_blocks(&self) -> bool {
-        self.blocks.iter().any(block_has_animated_content)
+        debug_assert_eq!(
+            self.animated_block_count,
+            self.blocks.iter().filter(|b| block_has_animated_content(b)).count(),
+            "animated_block_count drifted from the actual block state",
+        );
+        self.animated_block_count > 0
     }
 
     /// Test-only wrapper: rebuilds the flat cache and returns

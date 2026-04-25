@@ -87,22 +87,30 @@ The OutputPane numbers haven't moved materially. The user's
 complaint is real even though the bench numbers are stable,
 which is itself the finding behind PR 02.
 
-**App + InputPane (PR 02 baseline → PR 01 result):**
+**Full progression: baseline → PR 01 → PR 03:**
 
-| Scenario | PR 02 | After PR 01 | Δ |
-|----------|------:|------------:|--:|
-| `keystroke_into_idle_app_600` | 500.23 µs | 423.18 µs | -12.5% |
-| `keystroke_during_stream_600` | 496.44 µs | 420.31 µs | -12.3% |
-| `keystroke_into_long_buffer` | 504.14 µs | 423.80 µs | -13.0% |
+| Scenario | Baseline | After PR 01 | After PR 03 | Total Δ |
+|----------|---------:|------------:|------------:|--------:|
+| `scroll_static_600` (OutputPane only) | 316.68 µs | — | 243.63 µs | **-23.1%** |
+| `stream_into_static_600` (OutputPane only) | 2.0047 ms | — | 1.9235 ms | -4.0% |
+| `keystroke_into_idle_app_600` | 500.23 µs | 423.18 µs | 376.91 µs | **-24.7%** |
+| `keystroke_during_stream_600` | 496.44 µs | 420.31 µs | 375.08 µs | **-24.4%** |
+| `keystroke_into_long_buffer` | 504.14 µs | 423.80 µs | 377.42 µs | **-25.1%** |
 
-PR 01 cut ~77 µs/keystroke consistently across all three
-scenarios — exactly what the model predicts when one of two
-`layout_lines` walks is eliminated. The 30% target the plan
-sketched was speculative ("doubled → singled is 50%
-theoretical"); the actual layout step is one of several costs
-in the keystroke paint, so its elimination shows up as a
-consistent ~75 µs floor reduction rather than a long-buffer-
-specific scaling win.
+PR 01 cut ~77 µs/keystroke (input-pane layout dedupe). PR 03
+cut another ~46 µs/keystroke on top, dominated by the visible-
+slice borrow win — F-4 turned out to be the single biggest
+per-frame cost. Cumulative: ~123 µs/keystroke removed, ~25%
+off baseline.
 
-PR 03 targets the remaining per-frame floor (visible-slice
-clone, status-bar formatting, animated-block walk).
+The `scroll_static_600` improvement (23%) confirms the
+visible-slice clone was the per-frame floor. That bench
+exercises only `OutputPane::render` against a TestBackend, so
+its win is pure F-4 attribution.
+
+`resize_during_stream` was unchanged (within noise) — PR 03
+didn't touch the resize path. PR 03 was the wrong place to
+attack resize.
+
+PR 04 targets the streaming-specific link-scan + bullet/box
+header costs (F-8, F-9, F-15).
