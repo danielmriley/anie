@@ -1,6 +1,11 @@
 //! TOML configuration loading, merging, and project-context discovery.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+#[cfg(windows)]
+compile_error!(
+    "anie-config::atomic_write is intentionally gated on Windows until ReplaceFileW-style replacement semantics are implemented; std::fs::rename does not provide the POSIX overwrite behavior this crate relies on."
+);
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -285,10 +290,9 @@ pub fn anie_dir() -> Option<PathBuf> {
 ///
 /// # Platform
 ///
-/// POSIX-only today. On Windows, `rename` over an existing file
-/// has different semantics; if Windows support is ever added,
-/// this helper should grow a `cfg(windows)` branch using
-/// `ReplaceFileW`. anie is unix-targeted in CI.
+/// POSIX-only today. Windows builds are explicitly gated at compile
+/// time until this helper grows a `cfg(windows)` branch using
+/// `ReplaceFileW`-style replacement semantics.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
