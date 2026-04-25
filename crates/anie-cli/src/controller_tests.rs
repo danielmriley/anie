@@ -572,7 +572,7 @@ fn spawn_live_controller(
             None,
         ),
         session: SessionHandle::from_manager(session, sessions_dir, cwd),
-        model_catalog: vec![model("gpt-4o", "openai")],
+        model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
@@ -720,6 +720,86 @@ async fn abort_during_retry_backoff_cancels_retry() {
         agent_starts, 0,
         "no second AgentStart after abort; drained events: {remaining:#?}"
     );
+}
+
+async fn assert_run_setting_change_cancels_armed_retry(
+    action: UiAction,
+    success_message: Option<&'static str>,
+) {
+    tokio::time::pause();
+
+    let (ui_tx, mut event_rx, handle) = spawn_live_controller(
+        vec![
+            MockStreamScript::from_error(ProviderError::Transport("dns".into())),
+            MockStreamScript::from_message(assistant_message("should never run")),
+        ],
+        retry_config_for_tests(60_000, 3),
+    );
+
+    ui_tx
+        .send(UiAction::SubmitPrompt("go".into()))
+        .expect("submit prompt");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::RetryScheduled { .. })
+    })
+    .await;
+
+    ui_tx.send(action).expect("send run setting change");
+    wait_for_event(&mut event_rx, |event| {
+        matches!(event, AgentEvent::SystemMessage { text }
+            if text == "Pending retry canceled because run settings changed.")
+    })
+    .await;
+    if let Some(success_message) = success_message {
+        wait_for_event(
+            &mut event_rx,
+            |event| matches!(event, AgentEvent::SystemMessage { text } if text == success_message),
+        )
+        .await;
+    }
+
+    tokio::time::advance(Duration::from_millis(60_001)).await;
+    ui_tx.send(UiAction::Quit).expect("quit");
+    drop(ui_tx);
+    handle
+        .await
+        .expect("controller join")
+        .expect("controller run");
+
+    let remaining: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    assert!(
+        !remaining
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AgentStart)),
+        "no continuation AgentStart after run setting change; drained events: {remaining:#?}"
+    );
+}
+
+#[tokio::test]
+async fn set_model_during_retry_backoff_cancels_retry() {
+    assert_run_setting_change_cancels_armed_retry(
+        UiAction::SetModel("gpt-4.1".into()),
+        Some("Model set to openai:gpt-4.1"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn set_resolved_model_during_retry_backoff_cancels_retry() {
+    assert_run_setting_change_cancels_armed_retry(
+        UiAction::SetResolvedModel(Box::new(model("gpt-4.1", "openai"))),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn set_thinking_during_retry_backoff_cancels_retry() {
+    assert_run_setting_change_cancels_armed_retry(
+        UiAction::SetThinking("high".into()),
+        Some("Thinking level set to high"),
+    )
+    .await;
 }
 
 #[tokio::test]

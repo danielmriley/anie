@@ -305,6 +305,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_model(&requested).await?;
+                    self.cancel_pending_retry_for_run_setting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Model set to {}:{}",
@@ -320,6 +321,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_model_resolved(*model).await?;
+                    self.cancel_pending_retry_for_run_setting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                 }
             }
@@ -329,6 +331,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.set_thinking(&level).await?;
+                    self.cancel_pending_retry_for_run_setting_change().await;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message(&format!(
                         "Thinking level set to {}",
@@ -474,6 +477,14 @@ impl InteractiveController {
             UiAction::ClearOutput => {}
         }
         Ok(())
+    }
+
+    async fn cancel_pending_retry_for_run_setting_change(&mut self) {
+        if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+            self.pending_retry = PendingRetry::Idle;
+            self.send_system_message("Pending retry canceled because run settings changed.")
+                .await;
+        }
     }
 
     async fn start_prompt_run(&mut self, text: String) -> Result<()> {
