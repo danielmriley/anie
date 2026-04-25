@@ -356,7 +356,7 @@ fn urgent_input_render_reuses_existing_output_snapshot() {
     )))
     .expect("type input");
     terminal
-        .draw(|frame| app.render_urgent_for_test(frame))
+        .draw(|frame| app.render_urgent(frame))
         .expect("urgent draw");
     let screen = render_to_string(terminal.backend());
 

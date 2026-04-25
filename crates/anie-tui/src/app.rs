@@ -587,9 +587,27 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn render_urgent_for_test(&mut self, frame: &mut Frame<'_>) {
+    /// Render in `UrgentInput` mode. Equivalent to what the
+    /// real event loop does for a keystroke paint, but exposed
+    /// so unit tests and the criterion bench can exercise the
+    /// same path without going through `run_tui`.
+    pub fn render_urgent(&mut self, frame: &mut Frame<'_>) {
         self.render_with_mode(frame, RenderMode::UrgentInput);
+    }
+
+    /// Construct an `App` for benchmarking with a pre-populated
+    /// `OutputPane`. The channel halves are dropped — callers
+    /// must not enter `run_tui`; the intended use is timing
+    /// `handle_terminal_event` + `render_urgent` against a
+    /// `TestBackend`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_bench(output_pane: OutputPane) -> Self {
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (action_tx, _action_rx) = mpsc::unbounded_channel();
+        let mut app = Self::new(event_rx, action_tx, Vec::new(), Vec::new());
+        app.output_pane = output_pane;
+        app
     }
 
     /// Handle an incoming terminal event.
