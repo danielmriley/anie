@@ -594,6 +594,50 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn contended_provider_lock_does_not_block_unrelated_async_work() {
+        let persistence =
+            InMemoryPersistence::with("anthropic", oauth("expired", &rfc3339_in(-60)));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            refresh_calls: refresh_calls.clone(),
+            next_token: "fresh-token".into(),
+            new_expires_at: rfc3339_in(3_600),
+        };
+        let tempdir = tempdir().expect("tempdir");
+        let lock_dir = tempdir.path().to_path_buf();
+        std::fs::create_dir_all(&lock_dir).expect("lock dir");
+        let lock_path = lock_dir.join("anthropic.lock");
+        let held_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+            .expect("open held lock");
+        FileExt::lock_exclusive(&held_lock).expect("hold provider lock");
+
+        let refresher = OAuthRefresher::new(&provider, &persistence, lock_dir)
+            .with_lock_timeout(Duration::from_millis(200));
+        let progress = tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let (refresh_result, progress) = tokio::join!(refresher.resolve_access_token(), progress);
+        FileExt::unlock(&held_lock).expect("unlock held provider lock");
+        let err = refresh_result.expect_err("refresh should time out while lock is held");
+
+        assert!(
+            progress.is_ok(),
+            "unrelated async work should complete while lock polling waits on a blocking thread"
+        );
+        assert!(matches!(err, RefreshError::LockTimeout { .. }), "{err:?}");
+        assert_eq!(
+            refresh_calls.load(Ordering::SeqCst),
+            0,
+            "refresh must not run when the provider lock cannot be acquired"
+        );
+    }
+
     #[tokio::test]
     async fn missing_credential_surfaces_typed_error() {
         let persistence = InMemoryPersistence::default();
