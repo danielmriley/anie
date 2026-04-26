@@ -233,7 +233,20 @@ struct RenderContext {
     /// other tools are unaffected. See
     /// `docs/code_review_performance_2026-04-21/09_tool_output_display_modes.md`.
     tool_output_mode: ToolOutputMode,
+    /// Background color applied to user-message blocks for
+    /// visual differentiation from assistant turns. `None`
+    /// disables the tint (also used by terminals without
+    /// truecolor that would render the RGB value as a
+    /// distracting palette mismatch). PR 04 of
+    /// `docs/tui_polish_2026-04-26/`.
+    user_message_bg: Option<Color>,
 }
+
+/// Default tint for dark terminals: a subtle midnight-gray
+/// that reads as a visible-but-unobtrusive highlight on most
+/// dark themes (~12% white blend onto pure black). Adopted
+/// from codex's user-message styling.
+const DEFAULT_USER_MESSAGE_BG: Color = Color::Rgb(28, 28, 32);
 
 impl Default for RenderContext {
     fn default() -> Self {
@@ -242,6 +255,7 @@ impl Default for RenderContext {
             capabilities: TerminalCapabilities::default(),
             theme: MarkdownTheme::default_dark(),
             tool_output_mode: ToolOutputMode::Verbose,
+            user_message_bg: Some(DEFAULT_USER_MESSAGE_BG),
         }
     }
 }
@@ -1053,24 +1067,27 @@ fn block_lines(
     streaming_render: Option<&mut StreamingAssistantRender>,
 ) -> Vec<Line<'static>> {
     match block {
-        RenderedBlock::UserMessage { text, .. } => wrap_spans(
+        RenderedBlock::UserMessage { text, .. } => {
             // Shorter, quieter inbound-message marker. Codex
             // uses `› ` as a bold-dim prefix in
             // `codex-rs/tui/src/history_cell.rs:367-388`;
             // borrowing it shrinks the cyan "> You: " banner
             // that cluttered long transcripts without
             // sacrificing the "this is a user turn" cue.
-            vec![
-                Span::styled(
-                    "› ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD | Modifier::DIM),
-                ),
-                Span::raw(text.clone()),
-            ],
-            width,
-        ),
+            let wrapped = wrap_spans(
+                vec![
+                    Span::styled(
+                        "› ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD | Modifier::DIM),
+                    ),
+                    Span::raw(text.clone()),
+                ],
+                width,
+            );
+            apply_user_message_tint(wrapped, ctx, width)
+        }
         RenderedBlock::AssistantMessage {
             text,
             thinking,
@@ -1162,6 +1179,51 @@ fn compact_hides_body(tool_name: &str, result: &ToolCallResult, mode: ToolOutput
     matches!(mode, ToolOutputMode::Compact)
         && !result.is_error
         && (tool_name == "bash" || tool_name == "read")
+}
+
+/// PR 04 of `docs/tui_polish_2026-04-26/`. Apply the user-
+/// message background tint to every span on every line, and
+/// pad each line out to `width` cells so the tint extends
+/// across the full row instead of stopping at the end of the
+/// text. Padding is applied as a styled space span so the
+/// background is visible across the trailing area.
+///
+/// Returns the original lines unchanged when no tint is
+/// configured (e.g., light-terminal user disabled it via
+/// config or the terminal-bg detection said "skip tinting").
+fn apply_user_message_tint(
+    lines: Vec<Line<'static>>,
+    ctx: &RenderContext,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let Some(bg) = ctx.user_message_bg else {
+        return lines;
+    };
+    let bg_style = Style::default().bg(bg);
+    let width_usize = width as usize;
+    lines
+        .into_iter()
+        .map(|line| {
+            let used: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            let pad = width_usize.saturating_sub(used);
+            let mut spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| Span {
+                    style: span.style.patch(bg_style),
+                    ..span
+                })
+                .collect();
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), bg_style));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn assistant_block_lines(
@@ -2295,6 +2357,62 @@ mod wrap_tests {
         // args is per-call &str → unavoidable owned String.
         assert!(matches!(spans[3].content, std::borrow::Cow::Owned(_)),
             "args span owns its String (input is &str, not 'static)");
+    }
+
+    /// PR 04 of `docs/tui_polish_2026-04-26/`. User messages
+    /// render with a background tint applied to every span on
+    /// every line, plus padding-spaces extending the tint
+    /// across the full row width.
+    #[test]
+    fn user_message_lines_carry_background_tint() {
+        let mut pane = OutputPane::new();
+        pane.add_user_message("hello".into(), 1);
+        let lines = pane.build_lines(40, ".");
+        // Find the user-message line (the one containing the
+        // "› " prefix). The flat output is:
+        //   [user lines, blank separator, ...]
+        let user_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.contains('›'))
+            })
+            .expect("user-message line missing");
+        // Every span on the line must carry a non-default bg.
+        for (idx, span) in user_line.spans.iter().enumerate() {
+            assert!(
+                span.style.bg.is_some(),
+                "span {idx} ({:?}) lacks user-message bg tint",
+                span.content,
+            );
+        }
+        // Last span is the trailing-pad span filling out to
+        // width — it should be all spaces and styled with the
+        // tint.
+        let last = user_line.spans.last().expect("at least one span");
+        assert!(
+            last.content.chars().all(|c| c == ' '),
+            "trailing pad should be only spaces: {:?}",
+            last.content,
+        );
+        assert!(last.style.bg.is_some(), "pad span lacks bg tint");
+    }
+
+    /// Tint can be disabled by setting `user_message_bg = None`
+    /// on the RenderContext. Used by users on terminals that
+    /// don't render Color::Rgb cleanly.
+    #[test]
+    fn user_message_tint_skipped_when_user_message_bg_is_none() {
+        let ctx = RenderContext {
+            user_message_bg: None,
+            ..RenderContext::default()
+        };
+        let wrapped = vec![Line::from(vec![Span::raw("hi")])];
+        let out = apply_user_message_tint(wrapped.clone(), &ctx, 40);
+        // No tint applied; original lines passed through.
+        assert_eq!(out.len(), wrapped.len());
+        assert!(out[0].spans[0].style.bg.is_none());
     }
 }
 
