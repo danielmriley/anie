@@ -153,13 +153,14 @@ impl AutocompletePopup {
         };
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .title(Line::from(Span::styled(
                 title,
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )))
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().add_modifier(Modifier::DIM));
         let inner = block.inner(area);
         block.render(area, buf);
 

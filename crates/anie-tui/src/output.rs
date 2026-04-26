@@ -1140,7 +1140,7 @@ fn block_lines(
             }
         }
         RenderedBlock::SystemMessage { text } => {
-            wrap_text(text, width, Style::default().fg(Color::DarkGray))
+            wrap_text(text, width, Style::default().add_modifier(Modifier::DIM))
         }
     }
 }
@@ -1327,9 +1327,7 @@ fn thinking_label_style() -> Style {
 }
 
 fn thinking_gutter_style() -> Style {
-    Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM)
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 fn thinking_body_style() -> Style {
@@ -1462,7 +1460,7 @@ fn boxed_lines(
     } else if is_executing {
         Style::default().fg(Color::Yellow)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().add_modifier(Modifier::DIM)
     };
 
     let mut lines = vec![Line::from(Span::styled(top, border_style))];
@@ -1488,7 +1486,7 @@ fn diff_line_style(line: &str, is_error: bool) -> Style {
     } else if line.starts_with('-') || is_error {
         Style::default().fg(Color::Red)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().add_modifier(Modifier::DIM)
     }
 }
 
@@ -1568,7 +1566,7 @@ fn format_tool_header_spans(
         // String here is unavoidable for the 'static span.
         spans.push(Span::styled(
             args_display.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().add_modifier(Modifier::DIM),
         ));
     }
     spans
@@ -1590,10 +1588,8 @@ struct PrefixBodyStyle {
 impl PrefixBodyStyle {
     fn tool_success() -> Self {
         Self {
-            indent: Style::default().fg(Color::DarkGray),
-            body: Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            indent: Style::default().add_modifier(Modifier::DIM),
+            body: Style::default().add_modifier(Modifier::DIM),
         }
     }
 }

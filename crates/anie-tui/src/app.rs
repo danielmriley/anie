@@ -14,7 +14,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
@@ -2144,7 +2144,7 @@ fn render_status_bar(
     );
     Paragraph::new(Line::from(Span::styled(
         status,
-        Style::default().fg(Color::DarkGray),
+        Style::default().add_modifier(Modifier::DIM),
     )))
     .render(area, buf);
 }

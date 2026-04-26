@@ -234,7 +234,8 @@ impl ProviderManagementScreen {
                     .add_modifier(Modifier::BOLD),
             )]))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().add_modifier(Modifier::DIM));
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
@@ -632,7 +633,7 @@ impl ProviderManagementScreen {
 
         Paragraph::new(Line::from(Span::styled(
             "To add a new provider, run /onboard.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().add_modifier(Modifier::DIM),
         )))
         .wrap(Wrap { trim: false })
         .render(chunks[1], frame.buffer_mut());
@@ -702,7 +703,10 @@ impl ProviderManagementScreen {
             self.selected_provider_name().unwrap_or_default()
         ))
         .render(chunks[0], frame.buffer_mut());
-        let block = Block::default().borders(Borders::ALL).title("API Key");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .title("API Key");
         let inner = block.inner(chunks[1]);
         block.render(chunks[1], frame.buffer_mut());
         Paragraph::new(input.render_value())

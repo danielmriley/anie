@@ -118,7 +118,8 @@ impl ModelPickerPane {
                     .add_modifier(Modifier::BOLD),
             )))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().add_modifier(Modifier::DIM));
         let inner = block.inner(area);
         block.render(area, buf);
         if inner.height == 0 || inner.width == 0 {
@@ -135,7 +136,7 @@ impl ModelPickerPane {
         let list_height = list_bottom_exclusive.saturating_sub(list_top).max(1);
 
         Paragraph::new(Line::from(vec![
-            Span::styled("Search: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Search: ", Style::default().add_modifier(Modifier::DIM)),
             Span::styled(
                 self.search.render_value(),
                 Style::default().fg(Color::White),
@@ -158,7 +159,7 @@ impl ModelPickerPane {
 
         Paragraph::new(Line::from(Span::styled(
             footer,
-            Style::default().fg(Color::DarkGray),
+            Style::default().add_modifier(Modifier::DIM),
         )))
         .render(Rect::new(inner.x, footer_y, inner.width, 1), buf);
 
@@ -258,7 +259,7 @@ impl ModelPickerPane {
                 Line::from(""),
                 Line::from(Span::styled(
                     "No matching models",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().add_modifier(Modifier::DIM),
                 )),
             ];
         }
@@ -410,14 +411,16 @@ fn render_model_row(
     if pad > 0 {
         spans.push(Span::styled(" ".repeat(pad), row_style));
     }
-    spans.push(Span::styled(
-        badge,
-        row_style.fg(if is_selected {
-            Color::Gray
-        } else {
-            Color::DarkGray
-        }),
-    ));
+    // Selected row gets a slightly brighter badge color so the
+    // metadata stays readable against the row's filled bg;
+    // unselected rows use DIM modifier so the badge fades into
+    // the surrounding text adaptively.
+    let badge_style = if is_selected {
+        row_style.fg(Color::Gray)
+    } else {
+        row_style.add_modifier(Modifier::DIM)
+    };
+    spans.push(Span::styled(badge, badge_style));
     if is_current {
         spans.push(Span::styled(marker, row_style.fg(Color::Green)));
     }

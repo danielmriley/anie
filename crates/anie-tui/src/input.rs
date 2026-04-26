@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Position, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Paragraph, Widget},
 };
@@ -303,7 +303,7 @@ impl InputPane {
     pub fn render(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Position {
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().add_modifier(Modifier::DIM));
         let inner = block.inner(area);
         block.render(area, buf);
 
