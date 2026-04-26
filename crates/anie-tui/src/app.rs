@@ -14,7 +14,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
@@ -573,15 +573,14 @@ impl App {
             spinner_frame,
             matches!(mode, RenderMode::UrgentInput),
         );
-        render_spinner_row(
-            &self.agent_state,
-            spinner_frame,
-            spinner_area,
-            frame.buffer_mut(),
-        );
+        render_spinner_row(&self.agent_state, spinner_area, frame.buffer_mut());
 
+        let input_locked = !matches!(self.agent_state, AgentUiState::Idle);
         let cursor = match &mut self.bottom_pane {
-            BottomPane::Editor => self.input_pane.render(bottom_area, frame.buffer_mut()),
+            BottomPane::Editor => {
+                self.input_pane
+                    .render(bottom_area, frame.buffer_mut(), input_locked)
+            }
             BottomPane::ModelPicker(session) => {
                 session
                     .picker
@@ -2144,7 +2143,7 @@ fn render_status_bar(
     );
     Paragraph::new(Line::from(Span::styled(
         status,
-        Style::default().fg(Color::DarkGray),
+        Style::default().add_modifier(Modifier::DIM),
     )))
     .render(area, buf);
 }
@@ -2156,34 +2155,68 @@ fn render_status_bar(
 /// already anchored to (just above the thing they're typing
 /// in), so the "still working" cue never moves or fights with
 /// the transcript.
+///
+/// PR 05 of `docs/tui_polish_2026-04-26/`: replaced the braille
+/// spinner glyph with a single `•` bullet that alternates
+/// between Yellow and Yellow+DIM on a 600 ms period. The
+/// breathing effect reads as "alive" without the rectangular-
+/// blob look braille glyphs have in some monospace fonts. The
+/// trailing `...` is gone from the activity strings — the
+/// live spinner is the live indicator; the static dots were
+/// noise.
 fn render_spinner_row(
     agent_state: &AgentUiState,
-    spinner_frame: &str,
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
 ) {
-    let text = match agent_state {
+    let label: String = match agent_state {
         AgentUiState::Idle => String::new(),
-        AgentUiState::Streaming => format!("{spinner_frame} Responding..."),
-        AgentUiState::ToolExecuting { tool_name } => {
-            format!("{spinner_frame} Running {tool_name}...")
-        }
+        AgentUiState::Streaming => "Responding".into(),
+        AgentUiState::ToolExecuting { tool_name } => format!("Running {tool_name}"),
         AgentUiState::Compacting { started_at } => {
             let elapsed = started_at.elapsed().as_secs();
-            format!("{spinner_frame} compacting {elapsed}s")
+            format!("compacting {elapsed}s")
         }
     };
-    if text.is_empty() {
+    if label.is_empty() {
         // Still render an empty paragraph so ratatui clears
         // any previous content in this cell region on a paint.
         Paragraph::new(Line::default()).render(area, buf);
         return;
     }
-    Paragraph::new(Line::from(Span::styled(
-        format!(" {text}"),
-        Style::default().fg(Color::Yellow),
-    )))
-    .render(area, buf);
+    let elapsed = animation_reference().elapsed();
+    let bullet = breathing_bullet(elapsed);
+    let line = Line::from(vec![
+        Span::raw(" "),
+        bullet,
+        Span::styled(format!(" {label}"), Style::default().fg(Color::Yellow)),
+    ]);
+    Paragraph::new(line).render(area, buf);
+}
+
+/// Process-relative reference time for live UI animations.
+/// Lazily initialized on first call. Uses `OnceLock` so the
+/// reference is shared across all callers without any per-app
+/// plumbing.
+fn animation_reference() -> &'static Instant {
+    static REF: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    REF.get_or_init(Instant::now)
+}
+
+/// Return the styled `•` bullet for a given animation-elapsed
+/// duration. Alternates Yellow / Yellow+DIM on a 600 ms cycle.
+/// Pure function so tests can pin the cycle without touching
+/// real time.
+fn breathing_bullet(elapsed: Duration) -> Span<'static> {
+    let phase = elapsed.as_millis() / 600 % 2;
+    let style = if phase == 0 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM)
+    };
+    Span::styled("•", style)
 }
 
 /// Map a slash-command name to the `UiAction` it forwards
@@ -2385,6 +2418,33 @@ fn tool_result_elapsed_from_details(details: &serde_json::Value) -> Option<std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR 05 of `docs/tui_polish_2026-04-26/`: bullet alternates
+    /// between Yellow and Yellow+DIM on a 600 ms cycle.
+    #[test]
+    fn breathing_bullet_alternates_on_600ms_period() {
+        // Phase 0: t=0, t=300ms (within first half-cycle)
+        let early = breathing_bullet(Duration::from_millis(0));
+        let late_first_phase = breathing_bullet(Duration::from_millis(599));
+        assert_eq!(early.content, "•");
+        assert_eq!(late_first_phase.content, "•");
+        assert!(!early.style.add_modifier.contains(Modifier::DIM));
+        assert!(!late_first_phase.style.add_modifier.contains(Modifier::DIM));
+        // Phase 1: t=600ms — DIM kicks in.
+        let dim_phase = breathing_bullet(Duration::from_millis(600));
+        assert!(dim_phase.style.add_modifier.contains(Modifier::DIM));
+        // Phase 0 again at t=1200ms.
+        let next_bright = breathing_bullet(Duration::from_millis(1200));
+        assert!(!next_bright.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn breathing_bullet_uses_yellow_foreground_in_both_phases() {
+        let bright = breathing_bullet(Duration::from_millis(0));
+        let dim = breathing_bullet(Duration::from_millis(600));
+        assert_eq!(bright.style.fg, Some(Color::Yellow));
+        assert_eq!(dim.style.fg, Some(Color::Yellow));
+    }
 
     #[test]
     fn tui_model_picker_converts_ollama_discovery_to_ollama_chat_api() {

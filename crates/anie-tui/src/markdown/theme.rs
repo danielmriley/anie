@@ -36,6 +36,12 @@ impl MarkdownTheme {
     /// Tested under iTerm2, Kitty, xterm, and tmux.
     #[must_use]
     pub const fn default_dark() -> Self {
+        // PR 03 of `docs/tui_polish_2026-04-26/`: muted text
+        // uses `Modifier::DIM` instead of fixed
+        // `Color::DarkGray` so it stays legible across light
+        // and dark terminal palettes. DIM adapts to whatever
+        // the current foreground is; DarkGray was a fixed
+        // ANSI index that some themes render too dark to read.
         Self {
             h1: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             h2: Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
@@ -45,21 +51,21 @@ impl MarkdownTheme {
             emphasis: Style::new().add_modifier(Modifier::ITALIC),
             strikethrough: Style::new().add_modifier(Modifier::CROSSED_OUT),
             inline_code: Style::new().fg(Color::Yellow),
-            code_block_border: Style::new().fg(Color::DarkGray),
+            code_block_border: Style::new().add_modifier(Modifier::DIM),
             code_block_lang: Style::new()
-                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
                 .add_modifier(Modifier::ITALIC),
             list_bullet: Style::new().fg(Color::Cyan),
-            blockquote_gutter: Style::new().fg(Color::DarkGray),
+            blockquote_gutter: Style::new().add_modifier(Modifier::DIM),
             blockquote_body: Style::new().add_modifier(Modifier::ITALIC),
-            horizontal_rule: Style::new().fg(Color::DarkGray),
-            table_border: Style::new().fg(Color::DarkGray),
+            horizontal_rule: Style::new().add_modifier(Modifier::DIM),
+            table_border: Style::new().add_modifier(Modifier::DIM),
             table_header: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             table_cell: Style::new(),
             link_text: Style::new()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::UNDERLINED),
-            link_url: Style::new().fg(Color::DarkGray),
+            link_url: Style::new().add_modifier(Modifier::DIM),
         }
     }
 }

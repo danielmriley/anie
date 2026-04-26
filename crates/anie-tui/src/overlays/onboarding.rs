@@ -322,7 +322,8 @@ impl OnboardingScreen {
                     .add_modifier(Modifier::BOLD),
             )]))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().add_modifier(Modifier::DIM));
         let inner = block.inner(popup);
         block.render(popup, frame.buffer_mut());
 
@@ -1416,7 +1417,10 @@ impl OnboardingScreen {
         ])
         .render(chunks[0], frame.buffer_mut());
 
-        let input_block = Block::default().borders(Borders::ALL).title("API Key");
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .title("API Key");
         let input_area = input_block.inner(chunks[1]);
         input_block.render(chunks[1], frame.buffer_mut());
         Paragraph::new(input.render_value())
@@ -1486,7 +1490,10 @@ impl OnboardingScreen {
 
         let selected_field = form.selected_field_ref();
         let field_area = [chunks[1], chunks[2], chunks[3], chunks[4]][form.selected_field];
-        let inner = Block::default().borders(Borders::ALL).inner(field_area);
+        let inner = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .inner(field_area);
         frame.set_cursor_position((
             inner.x + selected_field.cursor_x().min(inner.width.saturating_sub(1)),
             inner.y,
@@ -1508,11 +1515,12 @@ impl OnboardingScreen {
     ) {
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .title(label)
             .border_style(if focused {
                 Style::default().fg(Color::Cyan)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().add_modifier(Modifier::DIM)
             });
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());

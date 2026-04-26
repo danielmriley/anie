@@ -472,7 +472,19 @@ impl<'a> LineBuilder<'a> {
             // Blank lines don't carry list or blockquote prefixes
             // — matches conventional rendering where a blank row
             // between paragraphs is truly blank.
-            self.push_blank_separator();
+            //
+            // PR 02 of `docs/tui_polish_2026-04-26/`: skip the
+            // blank when we're inside a list. Start(Item) calls
+            // flush_line before begin_list_item to handle any
+            // pending pre-item content, but on the common path
+            // there is none — and the previous behavior pushed
+            // a blank separator between every item, making
+            // tight lists render as if they were loose. Loose
+            // lists still get their blanks via End(Paragraph)
+            // which goes through a separate emit path.
+            if self.list_stack.is_empty() {
+                self.push_blank_separator();
+            }
             return;
         }
 
@@ -1768,6 +1780,44 @@ mod tests {
         assert!(joined.contains("• one"), "{out:?}");
         assert!(joined.contains("• two"), "{out:?}");
         assert!(joined.contains("• three"), "{out:?}");
+    }
+
+    /// PR 02 of `docs/tui_polish_2026-04-26/`. Tight lists
+    /// must render compact — no blank line between consecutive
+    /// items. The previous behavior pushed a blank separator
+    /// at every Start(Item) because flush_line on empty
+    /// content emitted one even inside a list. Lock the fix.
+    #[test]
+    fn tight_list_has_no_blank_lines_between_items() {
+        let out = render_plain("- one\n- two\n- three", 80);
+        // Content lines: 3. Plus possibly trailing blanks
+        // depending on EOF trim. Count non-empty.
+        let non_empty: Vec<&String> = out.iter().filter(|s| !s.trim().is_empty()).collect();
+        assert_eq!(
+            non_empty.len(),
+            3,
+            "tight list should produce exactly 3 non-empty lines: {out:?}",
+        );
+        // Find the indices of "• one", "• two", "• three" and
+        // assert they're adjacent with no intervening blanks.
+        let one_idx = out
+            .iter()
+            .position(|s| s.contains("• one"))
+            .expect("one missing");
+        let two_idx = out
+            .iter()
+            .position(|s| s.contains("• two"))
+            .expect("two missing");
+        let three_idx = out
+            .iter()
+            .position(|s| s.contains("• three"))
+            .expect("three missing");
+        assert_eq!(two_idx, one_idx + 1, "one→two should be adjacent: {out:?}");
+        assert_eq!(
+            three_idx,
+            two_idx + 1,
+            "two→three should be adjacent: {out:?}",
+        );
     }
 
     #[test]

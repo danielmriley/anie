@@ -131,72 +131,77 @@ impl LineCache {
     }
 }
 
+/// Per-streaming-block render state.
+///
+/// PR 01 of `docs/tui_polish_2026-04-26/`: the previous design
+/// split accumulated text at the last `\n\n` boundary outside
+/// a code fence, rendering the committed prefix as full
+/// markdown and the tail as plain wrapped text. That was a
+/// performance compromise that left literal markdown
+/// characters (`**bold**`, `# heading`, `- item`) visible in
+/// the tail until the paragraph ended, at which point the
+/// view "snapped" to styled output.
+///
+/// New design: render the entire accumulated text as markdown
+/// every frame, with a single-slot cache keyed by
+/// `(text_len, width, theme, markdown_enabled)`. The cache
+/// invalidates on every delta because `text_len` bumps; idle
+/// frames between deltas are cache hits. Per-delta re-parse
+/// of <10 KB of markdown is sub-millisecond on modern
+/// hardware (PR 06's Arc<Line> sharing made the rest of the
+/// pipeline cheap enough that the re-parse fits comfortably
+/// inside one frame). Matches pi's and codex's streaming
+/// rendering shape.
 #[derive(Debug, Clone, Default)]
 struct StreamingAssistantRender {
-    committed_text: String,
-    tail_text: String,
-    cached_committed_width: Option<u16>,
-    cached_committed_markdown_enabled: bool,
-    /// Theme captured at the time the cache was filled. Theme
-    /// changes (e.g., a future light/dark switch) invalidate
-    /// the committed prefix even though width / markdown_enabled
-    /// agree. Without this the cache could serve stale-themed
-    /// lines until the next mutation.
-    cached_committed_theme: Option<MarkdownTheme>,
-    cached_committed_lines: Vec<Line<'static>>,
+    text: String,
+    cache: Option<StreamingRenderCache>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingRenderCache {
+    text_len: usize,
+    width: u16,
+    theme: MarkdownTheme,
+    markdown_enabled: bool,
+    lines: Vec<Line<'static>>,
 }
 
 impl StreamingAssistantRender {
     fn append_delta(&mut self, delta: &str) {
-        let mut remaining = delta;
-        let mut committed_changed = false;
-        while let Some(newline_index) = remaining.find('\n') {
-            let (line_chunk, rest) = remaining.split_at(newline_index + 1);
-            self.tail_text.push_str(line_chunk);
-            self.committed_text.push_str(&self.tail_text);
-            self.tail_text.clear();
-            remaining = rest;
-            committed_changed = true;
+        if delta.is_empty() {
+            return;
         }
-        self.tail_text.push_str(remaining);
-        if committed_changed {
-            self.invalidate_cache();
-        }
-    }
-
-    fn invalidate_cache(&mut self) {
-        self.cached_committed_width = None;
-        self.cached_committed_theme = None;
-        self.cached_committed_lines.clear();
+        self.text.push_str(delta);
+        // Cache invalidates because text_len changed; the next
+        // render call will re-parse.
+        self.cache = None;
     }
 
     fn render_lines(&mut self, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
-        let mut out = self.render_committed_lines(width, ctx);
-        if !self.tail_text.is_empty() {
-            out.extend(wrap_text(&self.tail_text, width, Style::default()));
-        }
-        out
-    }
-
-    fn render_committed_lines(&mut self, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
-        if self.committed_text.is_empty() {
+        if self.text.is_empty() {
             return Vec::new();
         }
-        if self.cached_committed_width == Some(width)
-            && self.cached_committed_markdown_enabled == ctx.markdown_enabled
-            && self.cached_committed_theme == Some(ctx.theme)
+        if let Some(c) = &self.cache
+            && c.text_len == self.text.len()
+            && c.width == width
+            && c.markdown_enabled == ctx.markdown_enabled
+            && c.theme == ctx.theme
         {
-            return self.cached_committed_lines.clone();
+            return c.lines.clone();
         }
         let rendered = if ctx.markdown_enabled {
-            crate::markdown::render_markdown(&self.committed_text, width, &ctx.theme)
+            crate::markdown::render_markdown(&self.text, width, &ctx.theme)
         } else {
-            wrap_text(&self.committed_text, width, Style::default())
+            wrap_text(&self.text, width, Style::default())
         };
-        self.cached_committed_width = Some(width);
-        self.cached_committed_markdown_enabled = ctx.markdown_enabled;
-        self.cached_committed_theme = Some(ctx.theme);
-        self.cached_committed_lines = rendered.clone();
+        self.cache = Some(StreamingRenderCache {
+            text_len: self.text.len(),
+            width,
+            theme: ctx.theme,
+            markdown_enabled: ctx.markdown_enabled,
+            lines: rendered.clone(),
+        });
         rendered
     }
 }
@@ -228,7 +233,20 @@ struct RenderContext {
     /// other tools are unaffected. See
     /// `docs/code_review_performance_2026-04-21/09_tool_output_display_modes.md`.
     tool_output_mode: ToolOutputMode,
+    /// Background color applied to user-message blocks for
+    /// visual differentiation from assistant turns. `None`
+    /// disables the tint (also used by terminals without
+    /// truecolor that would render the RGB value as a
+    /// distracting palette mismatch). PR 04 of
+    /// `docs/tui_polish_2026-04-26/`.
+    user_message_bg: Option<Color>,
 }
+
+/// Default tint for dark terminals: a subtle midnight-gray
+/// that reads as a visible-but-unobtrusive highlight on most
+/// dark themes (~12% white blend onto pure black). Adopted
+/// from codex's user-message styling.
+const DEFAULT_USER_MESSAGE_BG: Color = Color::Rgb(28, 28, 32);
 
 impl Default for RenderContext {
     fn default() -> Self {
@@ -237,6 +255,7 @@ impl Default for RenderContext {
             capabilities: TerminalCapabilities::default(),
             theme: MarkdownTheme::default_dark(),
             tool_output_mode: ToolOutputMode::Verbose,
+            user_message_bg: Some(DEFAULT_USER_MESSAGE_BG),
         }
     }
 }
@@ -387,7 +406,9 @@ impl OutputPane {
         }
         for state in &mut self.streaming_assistant_renders {
             if let Some(state) = state.as_mut() {
-                state.invalidate_cache();
+                // PR 01 of tui_polish_2026-04-26: streaming
+                // render cache is a single Option slot now.
+                state.cache = None;
             }
         }
         self.flat_cache_valid = false;
@@ -1046,24 +1067,27 @@ fn block_lines(
     streaming_render: Option<&mut StreamingAssistantRender>,
 ) -> Vec<Line<'static>> {
     match block {
-        RenderedBlock::UserMessage { text, .. } => wrap_spans(
+        RenderedBlock::UserMessage { text, .. } => {
             // Shorter, quieter inbound-message marker. Codex
             // uses `› ` as a bold-dim prefix in
             // `codex-rs/tui/src/history_cell.rs:367-388`;
             // borrowing it shrinks the cyan "> You: " banner
             // that cluttered long transcripts without
             // sacrificing the "this is a user turn" cue.
-            vec![
-                Span::styled(
-                    "› ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD | Modifier::DIM),
-                ),
-                Span::raw(text.clone()),
-            ],
-            width,
-        ),
+            let wrapped = wrap_spans(
+                vec![
+                    Span::styled(
+                        "› ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD | Modifier::DIM),
+                    ),
+                    Span::raw(text.clone()),
+                ],
+                width,
+            );
+            apply_user_message_tint(wrapped, ctx, width)
+        }
         RenderedBlock::AssistantMessage {
             text,
             thinking,
@@ -1140,7 +1164,7 @@ fn block_lines(
             }
         }
         RenderedBlock::SystemMessage { text } => {
-            wrap_text(text, width, Style::default().fg(Color::DarkGray))
+            wrap_text(text, width, Style::default().add_modifier(Modifier::DIM))
         }
     }
 }
@@ -1155,6 +1179,51 @@ fn compact_hides_body(tool_name: &str, result: &ToolCallResult, mode: ToolOutput
     matches!(mode, ToolOutputMode::Compact)
         && !result.is_error
         && (tool_name == "bash" || tool_name == "read")
+}
+
+/// PR 04 of `docs/tui_polish_2026-04-26/`. Apply the user-
+/// message background tint to every span on every line, and
+/// pad each line out to `width` cells so the tint extends
+/// across the full row instead of stopping at the end of the
+/// text. Padding is applied as a styled space span so the
+/// background is visible across the trailing area.
+///
+/// Returns the original lines unchanged when no tint is
+/// configured (e.g., light-terminal user disabled it via
+/// config or the terminal-bg detection said "skip tinting").
+fn apply_user_message_tint(
+    lines: Vec<Line<'static>>,
+    ctx: &RenderContext,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let Some(bg) = ctx.user_message_bg else {
+        return lines;
+    };
+    let bg_style = Style::default().bg(bg);
+    let width_usize = width as usize;
+    lines
+        .into_iter()
+        .map(|line| {
+            let used: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            let pad = width_usize.saturating_sub(used);
+            let mut spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| Span {
+                    style: span.style.patch(bg_style),
+                    ..span
+                })
+                .collect();
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), bg_style));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn assistant_block_lines(
@@ -1327,9 +1396,7 @@ fn thinking_label_style() -> Style {
 }
 
 fn thinking_gutter_style() -> Style {
-    Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM)
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 fn thinking_body_style() -> Style {
@@ -1462,7 +1529,7 @@ fn boxed_lines(
     } else if is_executing {
         Style::default().fg(Color::Yellow)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().add_modifier(Modifier::DIM)
     };
 
     let mut lines = vec![Line::from(Span::styled(top, border_style))];
@@ -1488,7 +1555,7 @@ fn diff_line_style(line: &str, is_error: bool) -> Style {
     } else if line.starts_with('-') || is_error {
         Style::default().fg(Color::Red)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().add_modifier(Modifier::DIM)
     }
 }
 
@@ -1568,7 +1635,7 @@ fn format_tool_header_spans(
         // String here is unavoidable for the 'static span.
         spans.push(Span::styled(
             args_display.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().add_modifier(Modifier::DIM),
         ));
     }
     spans
@@ -1590,10 +1657,8 @@ struct PrefixBodyStyle {
 impl PrefixBodyStyle {
     fn tool_success() -> Self {
         Self {
-            indent: Style::default().fg(Color::DarkGray),
-            body: Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            indent: Style::default().add_modifier(Modifier::DIM),
+            body: Style::default().add_modifier(Modifier::DIM),
         }
     }
 }
@@ -2106,6 +2171,109 @@ mod streaming_markdown_tests {
             "code content missing:\n{rendered}"
         );
     }
+
+    // -----------------------------------------------------
+    // PR 01 of `docs/tui_polish_2026-04-26/`: streaming
+    // markdown is rendered for the entire accumulated text
+    // each frame. No more "raw markdown until paragraph
+    // closer" → snap-to-styled transition.
+    // -----------------------------------------------------
+
+    /// A complete inline emphasis span (bold/italic) styles
+    /// the moment it arrives, not when a later paragraph
+    /// closer happens. This is the headline UX promise of the
+    /// rewrite — `**bold**` mid-stream renders styled, no
+    /// literal asterisks waiting for `\n\n`.
+    #[test]
+    fn streaming_renders_complete_inline_styles_immediately() {
+        let mut state = StreamingAssistantRender::default();
+        // No trailing newline: the entire text is "tail" under
+        // the old design, would render as literal asterisks.
+        state.append_delta("before **bold** after");
+        let ctx = RenderContext::default();
+        let lines = state.render_lines(80, &ctx);
+        // Concatenate all visible text.
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            !text.contains("**"),
+            "literal asterisks leaked mid-stream: {text}",
+        );
+        assert!(text.contains("bold"), "bold content missing: {text}");
+        // Verify a span carrying the strong style exists.
+        let theme = MarkdownTheme::default_dark();
+        let has_bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(theme.strong.add_modifier));
+        assert!(has_bold, "no span styled bold mid-stream: {lines:?}");
+    }
+
+    /// Same shape for an inline link. The fallback `(url)`
+    /// renders styled (link_url) the moment the closing `)`
+    /// arrives, even if no paragraph break has happened yet.
+    #[test]
+    fn streaming_renders_complete_link_immediately() {
+        let mut state = StreamingAssistantRender::default();
+        state.append_delta("see [docs](https://example.com) for more");
+        let ctx = RenderContext::default();
+        let lines = state.render_lines(80, &ctx);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        // The plain "[docs](...)" markdown must NOT show literal.
+        assert!(
+            !text.contains("[docs]"),
+            "literal markdown link leaked: {text}",
+        );
+        assert!(
+            text.contains("https://example.com"),
+            "URL missing: {text}",
+        );
+    }
+
+    /// Cache: identical render at the same text_len/width/theme
+    /// is served from cache, not re-parsed.
+    #[test]
+    fn streaming_cache_serves_repeat_render_at_same_text_len() {
+        let mut state = StreamingAssistantRender::default();
+        state.append_delta("**bold** body");
+        let ctx = RenderContext::default();
+        let _first = state.render_lines(80, &ctx);
+        let cache_text_len_after_first = state
+            .cache
+            .as_ref()
+            .map(|c| c.text_len)
+            .expect("cache populated after first render");
+        let _second = state.render_lines(80, &ctx);
+        let cache_text_len_after_second = state
+            .cache
+            .as_ref()
+            .map(|c| c.text_len)
+            .expect("cache still populated");
+        assert_eq!(
+            cache_text_len_after_first, cache_text_len_after_second,
+            "cache key stable across repeat renders",
+        );
+    }
+
+    /// Cache: a delta invalidates the cache.
+    #[test]
+    fn streaming_cache_invalidates_on_delta() {
+        let mut state = StreamingAssistantRender::default();
+        state.append_delta("hello");
+        let ctx = RenderContext::default();
+        let _ = state.render_lines(80, &ctx);
+        assert!(state.cache.is_some(), "cache populated after first render");
+        state.append_delta(" world");
+        assert!(
+            state.cache.is_none(),
+            "cache invalidated after append_delta",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2189,6 +2357,62 @@ mod wrap_tests {
         // args is per-call &str → unavoidable owned String.
         assert!(matches!(spans[3].content, std::borrow::Cow::Owned(_)),
             "args span owns its String (input is &str, not 'static)");
+    }
+
+    /// PR 04 of `docs/tui_polish_2026-04-26/`. User messages
+    /// render with a background tint applied to every span on
+    /// every line, plus padding-spaces extending the tint
+    /// across the full row width.
+    #[test]
+    fn user_message_lines_carry_background_tint() {
+        let mut pane = OutputPane::new();
+        pane.add_user_message("hello".into(), 1);
+        let lines = pane.build_lines(40, ".");
+        // Find the user-message line (the one containing the
+        // "› " prefix). The flat output is:
+        //   [user lines, blank separator, ...]
+        let user_line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.contains('›'))
+            })
+            .expect("user-message line missing");
+        // Every span on the line must carry a non-default bg.
+        for (idx, span) in user_line.spans.iter().enumerate() {
+            assert!(
+                span.style.bg.is_some(),
+                "span {idx} ({:?}) lacks user-message bg tint",
+                span.content,
+            );
+        }
+        // Last span is the trailing-pad span filling out to
+        // width — it should be all spaces and styled with the
+        // tint.
+        let last = user_line.spans.last().expect("at least one span");
+        assert!(
+            last.content.chars().all(|c| c == ' '),
+            "trailing pad should be only spaces: {:?}",
+            last.content,
+        );
+        assert!(last.style.bg.is_some(), "pad span lacks bg tint");
+    }
+
+    /// Tint can be disabled by setting `user_message_bg = None`
+    /// on the RenderContext. Used by users on terminals that
+    /// don't render Color::Rgb cleanly.
+    #[test]
+    fn user_message_tint_skipped_when_user_message_bg_is_none() {
+        let ctx = RenderContext {
+            user_message_bg: None,
+            ..RenderContext::default()
+        };
+        let wrapped = vec![Line::from(vec![Span::raw("hi")])];
+        let out = apply_user_message_tint(wrapped.clone(), &ctx, 40);
+        // No tint applied; original lines passed through.
+        assert_eq!(out.len(), wrapped.len());
+        assert!(out[0].spans[0].style.bg.is_none());
     }
 }
 

@@ -37,7 +37,7 @@ pub(crate) fn centered_rect(
 pub(crate) fn footer_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().add_modifier(Modifier::DIM),
     ))
 }
 
@@ -54,7 +54,8 @@ pub(crate) fn render_placeholder_panel(frame: &mut Frame<'_>, area: Rect, title:
                 .add_modifier(Modifier::BOLD),
         )]))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().add_modifier(Modifier::DIM));
     let inner = block.inner(panel);
 
     Clear.render(panel, frame.buffer_mut());
@@ -122,11 +123,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_line_applies_dark_gray() {
+    fn footer_line_applies_dim_modifier() {
         let line = footer_line("hello");
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].content, "hello");
-        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(line.spans[0].style.fg, None);
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
