@@ -318,8 +318,11 @@ fn streaming_assistant_renders_thinking_above_visible_response() {
     let text_index = screen.find("final answer").expect("visible answer");
     // The streaming activity indicator moved out of the
     // transcript and onto a fixed row above the input box —
-    // `render_spinner_row` renders `⠋ Responding...` there.
-    let streaming_index = screen.find("Responding...").expect("streaming status");
+    // `render_spinner_row` renders `• Responding` there.
+    // PR 05 of `docs/tui_polish_2026-04-26/` dropped the
+    // trailing `...` and replaced the braille spinner with a
+    // breathing `•`.
+    let streaming_index = screen.find("Responding").expect("streaming status");
 
     assert!(thinking_index < text_index, "screen was:\n{screen}");
     assert!(text_index < streaming_index, "screen was:\n{screen}");
