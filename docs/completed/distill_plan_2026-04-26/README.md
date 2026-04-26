@@ -1,8 +1,24 @@
 # distill — Rust browser/reader tool plan
 
+> **Status (2026-04-26): superseded.** This plan described
+> `distill` as a *standalone* Rust crate / CLI tool with its
+> own workspace and distribution. After review, the user
+> redirected the work to a *native anie tool* that lives
+> inside anie's workspace and shells out to Defuddle via
+> system install rather than vendoring or embedding a JS
+> runtime. The replacement plan is at
+> [`../../web_tool_2026-04-26/`](../../web_tool_2026-04-26/).
+>
+> This doc is kept under `docs/completed/` as a record of the
+> standalone-tool design study. Most of the technical
+> reasoning (the four-path evaluation, the V8 snapshot
+> approach, the Tera template structure) carries over to the
+> native plan; what changed is the *product shape* — anie
+> tool, not free-standing crate.
+
 Date: 2026-04-26
 Branch: `plan/browser-tool` (off main)
-Status: planning only
+Status: superseded
 
 ## What we're building
 
