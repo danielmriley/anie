@@ -286,12 +286,17 @@ impl InputPane {
     }
 
     /// Compute the preferred input height for the given width.
+    ///
+    /// Floor of 1 (input grows from a single row); ceiling of 8
+    /// unchanged. PR 07 of `docs/tui_polish_2026-04-26/`:
+    /// previously the floor was 3, which reserved three rows
+    /// for an empty buffer and made the input feel heavy.
     #[must_use]
     pub fn preferred_height(&mut self, width: u16) -> u16 {
         let width = width.max(1);
         let cached = self.layout(width);
         let line_count = u16::try_from(cached.lines.len()).unwrap_or(u16::MAX);
-        line_count.clamp(3, 8)
+        line_count.clamp(1, 8)
     }
 
     /// Render the input pane and return the cursor position.
@@ -300,10 +305,29 @@ impl InputPane {
     /// the input region reads as a discrete box separate from
     /// the transcript and the status strip — matching pi's and
     /// Claude Code's input styling.
-    pub fn render(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Position {
+    ///
+    /// `input_locked` toggles the border color. When true (the
+    /// agent is running so the editor doesn't accept input
+    /// other than abort), the border renders dim. When false
+    /// (idle, ready for typing), the border picks up a subtle
+    /// cyan to signal "input is live." PR 07 of
+    /// `docs/tui_polish_2026-04-26/`.
+    pub fn render(
+        &mut self,
+        area: Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        input_locked: bool,
+    ) -> Position {
+        let border_style = if input_locked {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::DIM)
+        };
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().add_modifier(Modifier::DIM));
+            .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -828,6 +852,47 @@ mod tests {
         pane.layout_misses.get()
     }
 
+    /// PR 07 of `docs/tui_polish_2026-04-26/`: empty input
+    /// prefers a single content row. Previously the floor was
+    /// 3, which reserved three rows for an empty buffer.
+    #[test]
+    fn empty_input_box_prefers_one_line() {
+        let mut pane = InputPane::new();
+        assert_eq!(pane.preferred_height(80), 1);
+    }
+
+    #[test]
+    fn one_line_buffer_prefers_one_line() {
+        let mut pane = InputPane::new();
+        for ch in "hello".chars() {
+            type_char(&mut pane, ch);
+        }
+        assert_eq!(pane.preferred_height(80), 1);
+    }
+
+    #[test]
+    fn buffer_that_wraps_grows_height() {
+        let mut pane = InputPane::new();
+        // At width 20, a 60-char buffer wraps to several lines.
+        for ch in "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".chars() {
+            type_char(&mut pane, ch);
+        }
+        assert!(
+            pane.preferred_height(20) > 1,
+            "wrapped buffer should grow above one line",
+        );
+    }
+
+    #[test]
+    fn very_long_buffer_clamps_to_eight() {
+        let mut pane = InputPane::new();
+        // 1000 chars at width 20 wraps to ~50 lines; clamp at 8.
+        for ch in std::iter::repeat_n('x', 1000) {
+            type_char(&mut pane, ch);
+        }
+        assert_eq!(pane.preferred_height(20), 8);
+    }
+
     #[test]
     fn layout_cache_serves_repeat_reads_at_same_key() {
         let mut pane = InputPane::new();
@@ -889,7 +954,7 @@ mod tests {
         let after_pref = miss_count(&pane);
         let area = Rect::new(0, 0, 80, 5);
         let mut buf = Buffer::empty(area);
-        let _ = pane.render(area, &mut buf);
+        let _ = pane.render(area, &mut buf, false);
         // render uses inner.width = area.width = 80 (no border
         // truncation on a Borders::TOP|BOTTOM block in this
         // direction), so the cache key matches.

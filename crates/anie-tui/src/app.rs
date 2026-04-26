@@ -580,8 +580,12 @@ impl App {
             frame.buffer_mut(),
         );
 
+        let input_locked = !matches!(self.agent_state, AgentUiState::Idle);
         let cursor = match &mut self.bottom_pane {
-            BottomPane::Editor => self.input_pane.render(bottom_area, frame.buffer_mut()),
+            BottomPane::Editor => {
+                self.input_pane
+                    .render(bottom_area, frame.buffer_mut(), input_locked)
+            }
             BottomPane::ModelPicker(session) => {
                 session
                     .picker
