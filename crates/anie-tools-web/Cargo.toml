@@ -23,6 +23,7 @@ async-trait.workspace = true
 futures.workspace = true
 governor.workspace = true
 reqwest = { workspace = true, features = ["gzip", "brotli"] }
+scraper.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 texting_robots.workspace = true

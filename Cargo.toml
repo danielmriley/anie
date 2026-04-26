@@ -85,6 +85,7 @@ governor = "0.6"
 texting_robots = "0.2"
 url = "2"
 urlencoding = "2"
+scraper = "0.20"
 httpmock = "0.7"
 
 # Internal

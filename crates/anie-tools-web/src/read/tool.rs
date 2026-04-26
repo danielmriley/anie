@@ -27,7 +27,7 @@ pub struct WebReadTool {
     client: reqwest::Client,
     fetch_opts: FetchOptions,
     robots: RobotsCache,
-    rate_limiter: HostRateLimiter,
+    rate_limiter: Arc<HostRateLimiter>,
     runner: Arc<dyn DefuddleRunner>,
     respect_robots_txt: bool,
 }
@@ -42,10 +42,27 @@ impl WebReadTool {
             client,
             fetch_opts: opts,
             robots: RobotsCache::new(),
-            rate_limiter: HostRateLimiter::new(
+            rate_limiter: Arc::new(HostRateLimiter::new(
                 DEFAULT_RATE_LIMIT_RPS,
                 DEFAULT_RATE_LIMIT_BURST,
-            ),
+            )),
+            runner: Arc::new(SubprocessDefuddleRunner),
+            respect_robots_txt: true,
+        })
+    }
+
+    /// Build with a shared rate limiter (so `web_read` and
+    /// `web_search` share per-host bucket state).
+    pub fn with_rate_limiter(
+        rate_limiter: Arc<HostRateLimiter>,
+    ) -> Result<Self, WebToolError> {
+        let opts = FetchOptions::default();
+        let client = fetch::build_client(&opts)?;
+        Ok(Self {
+            client,
+            fetch_opts: opts,
+            robots: RobotsCache::new(),
+            rate_limiter,
             runner: Arc::new(SubprocessDefuddleRunner),
             respect_robots_txt: true,
         })
@@ -64,10 +81,10 @@ impl WebReadTool {
             client,
             fetch_opts: opts,
             robots: RobotsCache::new(),
-            rate_limiter: HostRateLimiter::new(
+            rate_limiter: Arc::new(HostRateLimiter::new(
                 DEFAULT_RATE_LIMIT_RPS,
                 DEFAULT_RATE_LIMIT_BURST,
-            ),
+            )),
             runner,
             respect_robots_txt,
         })

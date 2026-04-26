@@ -32,18 +32,31 @@ use anie_agent::Tool;
 
 pub mod error;
 pub mod read;
+pub mod search;
 
 pub use error::WebToolError;
 pub use read::WebReadTool;
+pub use search::WebSearchTool;
 
 /// Build the default set of web tools registered with anie.
 /// Returns the list of `Arc<dyn Tool>` ready for
 /// [`anie_agent::ToolRegistry::register`].
 ///
-/// Currently exposes:
+/// Exposes:
 /// - `web_read`
+/// - `web_search`
 ///
-/// `web_search` will join this list when its PR lands.
+/// Both tools share a per-host rate limiter so a search-then-read
+/// chain doesn't double-spend the budget for a single host.
 pub fn web_tools() -> Result<Vec<Arc<dyn Tool>>, WebToolError> {
-    Ok(vec![Arc::new(WebReadTool::new()?)])
+    use read::fetch::{DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, HostRateLimiter};
+
+    let limiter = Arc::new(HostRateLimiter::new(
+        DEFAULT_RATE_LIMIT_RPS,
+        DEFAULT_RATE_LIMIT_BURST,
+    ));
+    Ok(vec![
+        Arc::new(WebReadTool::with_rate_limiter(limiter.clone())?),
+        Arc::new(WebSearchTool::with_rate_limiter(limiter)?),
+    ])
 }
