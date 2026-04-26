@@ -140,6 +140,24 @@ fn build_tool_registry_with_policy(
     tools.register(Arc::new(GrepTool::new(cwd.to_path_buf())));
     tools.register(Arc::new(FindTool::new(cwd.to_path_buf())));
     tools.register(Arc::new(LsTool::new(cwd.to_path_buf())));
+
+    // Web tools — optional via the `web` cargo feature so
+    // lean builds can compile them out entirely. The
+    // `web_tools()` factory may fail if the reqwest client
+    // can't be built (e.g., no TLS roots); we log and
+    // continue without web tools rather than refuse to start.
+    #[cfg(feature = "web")]
+    match anie_tools_web::web_tools() {
+        Ok(web) => {
+            for tool in web {
+                tools.register(tool);
+            }
+        }
+        Err(error) => {
+            warn!(%error, "failed to initialize web tools; continuing without them");
+        }
+    }
+
     Arc::new(tools)
 }
 

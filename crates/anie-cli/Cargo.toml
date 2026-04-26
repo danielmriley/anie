@@ -13,6 +13,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Default build includes the web tools (web_read).
+# Compile out via `--no-default-features` when targeting
+# a lean build that doesn't need network reading.
+default = ["web"]
+web = ["dep:anie-tools-web"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -40,6 +47,7 @@ anie-protocol.workspace = true
 anie-providers-builtin.workspace = true
 anie-session.workspace = true
 anie-tools.workspace = true
+anie-tools-web = { workspace = true, optional = true }
 anie-tui.workspace = true
 
 [dev-dependencies]

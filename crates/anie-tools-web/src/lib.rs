@@ -26,7 +26,24 @@
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+use std::sync::Arc;
+
+use anie_agent::Tool;
+
 pub mod error;
 pub mod read;
 
 pub use error::WebToolError;
+pub use read::WebReadTool;
+
+/// Build the default set of web tools registered with anie.
+/// Returns the list of `Arc<dyn Tool>` ready for
+/// [`anie_agent::ToolRegistry::register`].
+///
+/// Currently exposes:
+/// - `web_read`
+///
+/// `web_search` will join this list when its PR lands.
+pub fn web_tools() -> Result<Vec<Arc<dyn Tool>>, WebToolError> {
+    Ok(vec![Arc::new(WebReadTool::new()?)])
+}
