@@ -843,15 +843,19 @@ fn infer_openai_images(
 }
 
 /// Model-id families known to support leveled thinking (Ollama's
-/// native `think: "low"|"medium"|"high"`). Kept in sync with
-/// `local::REASONING_FAMILIES`.
-const REASONING_FAMILIES: &[&str] = &["qwen3", "qwq", "deepseek-r1", "gpt-oss"];
+/// native `think: "low"|"medium"|"high"`).
+///
+/// Single source of truth — re-exported via
+/// `is_reasoning_capable_family_id` for callers in
+/// `local.rs` and similar local-discovery paths so the list
+/// can't drift between sites. PR 01 of
+/// `docs/code_consolidation_2026-04-26/`.
+pub(crate) const REASONING_FAMILIES: &[&str] = &["qwen3", "qwq", "deepseek-r1", "gpt-oss"];
 
 /// True when `id` equals `family`, or starts with `family:` or
-/// `family-`. See `local::id_matches_reasoning_family` for the
-/// rationale (the substring match used to mis-classify
-/// `qwen3.5:9b` as the `qwen3` family).
-fn id_matches_reasoning_family(id: &str, family: &str) -> bool {
+/// `family-`. The substring match used to mis-classify
+/// `qwen3.5:9b` as the `qwen3` family.
+pub(crate) fn id_matches_reasoning_family(id: &str, family: &str) -> bool {
     if id == family {
         return true;
     }
@@ -859,6 +863,15 @@ fn id_matches_reasoning_family(id: &str, family: &str) -> bool {
         Some(rest) => matches!(rest.chars().next(), Some(':' | '-')),
         None => false,
     }
+}
+
+/// Convenience: `true` if `model_id` matches any known
+/// leveled-thinking family. Pre-lowercased internally.
+pub(crate) fn is_reasoning_capable_family_id(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    REASONING_FAMILIES
+        .iter()
+        .any(|family| id_matches_reasoning_family(&id, family))
 }
 
 fn infer_reasoning(

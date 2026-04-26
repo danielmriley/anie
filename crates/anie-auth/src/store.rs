@@ -433,13 +433,8 @@ fn delete_provider_from_path(path: Option<&Path>, provider: &str) -> Result<()> 
 }
 
 fn write_store_to_path(path: &Path, store: &AuthStore) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let contents = serde_json::to_string_pretty(store).context("failed to serialize auth store")?;
-    anie_config::atomic_write(path, contents.as_bytes())
+    anie_config::atomic_write_create_parent(path, contents.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     #[cfg(unix)]

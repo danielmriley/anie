@@ -341,17 +341,15 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_model(&requested).await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
-                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    self.cancel_and_emit_status().await;
                     self.send_system_message(&format!(
                         "Model set to {}:{}",
                         self.state.config.current_model().provider,
                         self.state.config.current_model().id,
                     ))
                     .await;
-                    if let Some(warning) = persistence_warning {
-                        self.send_system_message(&warning).await;
-                    }
+                    self.send_persistence_warning_if_present(persistence_warning)
+                        .await;
                 }
             }
             UiAction::SetResolvedModel(model) => {
@@ -360,11 +358,9 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_model_resolved(*model).await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
-                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
-                    if let Some(warning) = persistence_warning {
-                        self.send_system_message(&warning).await;
-                    }
+                    self.cancel_and_emit_status().await;
+                    self.send_persistence_warning_if_present(persistence_warning)
+                        .await;
                 }
             }
             UiAction::SetThinking(level) => {
@@ -373,16 +369,14 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_thinking(&level).await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
-                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    self.cancel_and_emit_status().await;
                     self.send_system_message(&format!(
                         "Thinking level set to {}",
                         format_thinking(self.state.config.current_thinking()),
                     ))
                     .await;
-                    if let Some(warning) = persistence_warning {
-                        self.send_system_message(&warning).await;
-                    }
+                    self.send_persistence_warning_if_present(persistence_warning)
+                        .await;
                 }
             }
             UiAction::ContextLength(argument) => {
@@ -418,12 +412,10 @@ impl InteractiveController {
                             if let Some(warning) = above_cap_warning {
                                 self.send_system_message(&warning).await;
                             }
-                            if let Some(warning) = self
+                            let warning = self
                                 .state
-                                .persist_runtime_state_warning("context_length_set")
-                            {
-                                self.send_system_message(&warning).await;
-                            }
+                                .persist_runtime_state_warning("context_length_set");
+                            self.send_persistence_warning_if_present(warning).await;
                         }
                         Ok(ContextLengthMutation::Reset) => {
                             anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
@@ -434,12 +426,10 @@ impl InteractiveController {
                                 ),
                             ))
                             .await;
-                            if let Some(warning) = self
+                            let warning = self
                                 .state
-                                .persist_runtime_state_warning("context_length_reset")
-                            {
-                                self.send_system_message(&warning).await;
-                            }
+                                .persist_runtime_state_warning("context_length_reset");
+                            self.send_persistence_warning_if_present(warning).await;
                         }
                         Err(message) => self.send_system_message(&message).await,
                     }
@@ -486,7 +476,7 @@ impl InteractiveController {
                 }
             }
             UiAction::ShowDiff => {
-                self.send_system_message(&self.state.session_diff()).await;
+                self.send_system_message(&self.state.session.diff()).await;
             }
             UiAction::NewSession => {
                 if self.current_run.is_some() {
@@ -510,7 +500,7 @@ impl InteractiveController {
                 }
             }
             UiAction::ListSessions => {
-                let sessions = self.state.list_sessions()?;
+                let sessions = self.state.session.list()?;
                 self.send_system_message(&format_sessions(&sessions, self.state.session.id()))
                     .await;
             }
@@ -630,7 +620,10 @@ impl InteractiveController {
         if self.state.config.anie_config().compaction.enabled {
             self.state.maybe_auto_compact(&self.event_tx).await?;
         }
-        let context = self.state.context_without_entry(Some(&prompt_entry_id));
+        let context = self
+            .state
+            .session
+            .context_without_entry(Some(&prompt_entry_id));
         let agent = build_agent(&self.state);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -686,6 +679,27 @@ impl InteractiveController {
                 text: text.to_string(),
             })
             .await;
+    }
+
+    /// Send a system-message follow-up containing a persistence
+    /// warning if the persistence call returned one. Several
+    /// config-mutation arms share this exact shape; the helper
+    /// removes 3 lines per call site.
+    /// PR 01 of `docs/code_consolidation_2026-04-26/`.
+    async fn send_persistence_warning_if_present(&self, warning: Option<String>) {
+        if let Some(text) = warning {
+            self.send_system_message(&text).await;
+        }
+    }
+
+    /// Cancel any pending retry whose continuation depends on
+    /// model / thinking / context state, then push a fresh
+    /// `StatusUpdate` to the UI. Several config-mutation arms
+    /// share this two-step pattern; the helper consolidates.
+    /// PR 01 of `docs/code_consolidation_2026-04-26/`.
+    async fn cancel_and_emit_status(&mut self) {
+        self.cancel_pending_retry_for_run_affecting_change().await;
+        anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
     }
 }
 
@@ -1084,16 +1098,8 @@ impl ControllerState {
         }
     }
 
-    fn session_diff(&self) -> String {
-        self.session.diff()
-    }
-
     pub(crate) fn session_context(&self) -> SessionContext {
         self.session.context()
-    }
-
-    fn context_without_entry(&self, entry_id: Option<&str>) -> Vec<Message> {
-        self.session.context_without_entry(entry_id)
     }
 
     fn estimated_context_tokens(&self) -> u64 {
@@ -1133,10 +1139,6 @@ impl ControllerState {
 
     pub(crate) fn model_catalog(&self) -> &[Model] {
         &self.model_catalog
-    }
-
-    fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        self.session.list()
     }
 
     pub(crate) fn apply_session_overrides(&mut self) {
