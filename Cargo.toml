@@ -6,6 +6,7 @@ members = [
     "crates/anie-providers-builtin",
     "crates/anie-agent",
     "crates/anie-tools",
+    "crates/anie-tools-web",
     "crates/anie-session",
     "crates/anie-config",
     "crates/anie-auth",
@@ -78,6 +79,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["serde", "v4"] }
 which = "8"
+# Web-tool deps (used by anie-tools-web; declared at workspace
+# scope so test crates and benches can pin the same versions).
+governor = "0.6"
+texting_robots = "0.2"
+url = "2"
+urlencoding = "2"
+httpmock = "0.7"
 
 # Internal
 anie-agent = { path = "crates/anie-agent" }
@@ -89,6 +97,7 @@ anie-protocol = { path = "crates/anie-protocol" }
 anie-providers-builtin = { path = "crates/anie-providers-builtin" }
 anie-session = { path = "crates/anie-session" }
 anie-tools = { path = "crates/anie-tools" }
+anie-tools-web = { path = "crates/anie-tools-web" }
 anie-tui = { path = "crates/anie-tui" }
 
 [workspace.lints.clippy]
