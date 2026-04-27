@@ -98,7 +98,7 @@ impl Tool for WebSearchTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "web_search".into(),
-            description: "Search the web and return ranked URLs with titles and snippets. Use this to find pages worth reading; pair with web_read to fetch the actual content. Returns up to max_results items (default 10, hard cap 25).".into(),
+            description: "Search the live web and return ranked URLs with titles and snippets. Use this for any question that needs current, real-world information — weather, news, current events, library/package docs, pricing, definitions, public facts — not just for coding research. Pair with web_read to fetch the actual content of a hit. Returns up to max_results items (default 10, hard cap 25).".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

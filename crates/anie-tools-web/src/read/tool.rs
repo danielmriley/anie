@@ -143,7 +143,7 @@ impl Tool for WebReadTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "web_read".into(),
-            description: "Fetch a URL and return its main content as clean Markdown with YAML frontmatter metadata (title, author, date, source, etc.). Use this for reading articles, documentation, blog posts, and similar content. Pass javascript=true for SPA / heavily JS-rendered pages — slower, requires Chrome/Chromium installed and the crate built with --features headless.".into(),
+            description: "Fetch a URL from the live web and return its main content as clean Markdown with YAML frontmatter metadata (title, author, date, source, etc.). Use this whenever you need information from a specific web page — articles, documentation, news stories, weather pages, blog posts, reference material, or any URL surfaced by web_search. Not just for coding research. Pass javascript=true for SPA / heavily JS-rendered pages — slower, requires Chrome/Chromium installed and the crate built with --features headless.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
