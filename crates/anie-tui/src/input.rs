@@ -583,40 +583,118 @@ impl InputPane {
     fn layout_lines_uncached(&self, width: u16) -> (Vec<String>, (u16, u16)) {
         let width = width.max(1) as usize;
         let prefix = "> ";
-        let mut lines = vec![String::new()];
+        let mut lines: Vec<String> = vec![String::new()];
         let mut row = 0usize;
         let mut col = 0usize;
         let mut cursor_visual = (prefix.len() as u16, 0u16);
+
+        // The first row carries the `> ` prefix, so its usable
+        // width is shorter by `prefix.len()`. Subsequent rows
+        // wrap into the full width.
+        let prefix_offset = |row: usize| if row == 0 { prefix.len() } else { 0 };
+        let line_available =
+            |row: usize, width: usize| width.saturating_sub(prefix_offset(row)).max(1);
 
         if self.cursor == 0 {
             cursor_visual = (prefix.len() as u16, 0);
         }
 
-        for (index, ch) in self.content.char_indices() {
-            if index == self.cursor {
-                cursor_visual = (
-                    (if row == 0 { prefix.len() } else { 0 } + col) as u16,
-                    row as u16,
-                );
-            }
+        // Single-pass word-wrap. We track the column where the
+        // *current* word started ("word anchor"); when a wrap
+        // happens mid-word we drain that anchor's chars off the
+        // tail of the current line and onto a fresh one. This
+        // gives us word-boundary wrapping without buffering the
+        // whole input or a second pass. Whitespace at a wrap
+        // boundary is dropped so wrapped lines don't lead with
+        // an orphan space.
+        //
+        // Cursor visual position is computed from byte offsets
+        // tracked alongside the wrap, so it stays correct even
+        // after a word gets retroactively moved to a new line.
+        let mut word_anchor_col: Option<usize> = None;
+        let mut word_byte_start: Option<usize> = None;
+        let mut cursor_set = self.cursor == 0;
 
-            let available = if row == 0 {
-                width.saturating_sub(prefix.len()).max(1)
-            } else {
-                width
-            };
+        for (idx, ch) in self.content.char_indices() {
+            if !cursor_set && idx == self.cursor {
+                cursor_visual = ((prefix_offset(row) + col) as u16, row as u16);
+                cursor_set = true;
+            }
 
             if ch == '\n' {
                 lines.push(String::new());
                 row += 1;
                 col = 0;
+                word_anchor_col = None;
+                word_byte_start = None;
                 continue;
             }
 
-            if col >= available {
-                lines.push(String::new());
-                row += 1;
-                col = 0;
+            let avail = line_available(row, width);
+            let is_ws = ch == ' ' || ch == '\t';
+
+            if is_ws {
+                word_anchor_col = None;
+                word_byte_start = None;
+                if col >= avail {
+                    // Drop space at wrap boundary, start fresh
+                    // line; the next non-space char goes there.
+                    lines.push(String::new());
+                    row += 1;
+                    col = 0;
+                    continue;
+                }
+                lines[row].push(ch);
+                col += 1;
+                continue;
+            }
+
+            // Non-whitespace, non-newline: word character.
+            if col >= avail {
+                // Wrap point. If we're inside a word that
+                // started after column 0, retro-move the word
+                // tail to a fresh line.
+                if let (Some(anchor_col), Some(anchor_byte)) =
+                    (word_anchor_col, word_byte_start)
+                    && anchor_col > 0
+                {
+                    let line_str = &mut lines[row];
+                    // The current line contains the word's
+                    // already-pushed chars from `anchor_byte`
+                    // onward. Strip them off and stash for the
+                    // new line.
+                    let split_pos = line_str.len()
+                        - self.content[anchor_byte..idx].len();
+                    let tail = line_str.split_off(split_pos);
+                    let tail_chars = tail.chars().count();
+                    lines.push(tail);
+                    row += 1;
+                    col = tail_chars;
+                    word_anchor_col = Some(0);
+                    // Adjust cursor if it landed inside the
+                    // moved tail.
+                    if cursor_set
+                        && self.cursor > anchor_byte
+                        && self.cursor <= idx
+                    {
+                        let chars_into_tail = self.content[anchor_byte..self.cursor]
+                            .chars()
+                            .count();
+                        cursor_visual =
+                            ((prefix_offset(row) + chars_into_tail) as u16, row as u16);
+                    }
+                } else {
+                    // Hard break: word longer than line width
+                    // (or at column 0 with no preceding space).
+                    lines.push(String::new());
+                    row += 1;
+                    col = 0;
+                    word_anchor_col = Some(0);
+                }
+                word_byte_start = Some(idx);
+            } else if word_anchor_col.is_none() {
+                word_anchor_col = Some(col);
+                word_byte_start = Some(idx);
             }
 
             lines[row].push(ch);
@@ -624,10 +702,7 @@ impl InputPane {
         }
 
         if self.cursor == self.content.len() {
-            cursor_visual = (
-                (if row == 0 { prefix.len() } else { 0 } + col) as u16,
-                row as u16,
-            );
+            cursor_visual = ((prefix_offset(row) + col) as u16, row as u16);
         }
 
         if let Some(first) = lines.first_mut() {
@@ -939,6 +1014,57 @@ mod tests {
         let before = miss_count(&pane);
         let _ = pane.preferred_height(120);
         assert_eq!(miss_count(&pane), before + 1);
+    }
+
+    /// Words crossing the wrap point move whole to the next
+    /// line, instead of splitting mid-word. The space at the
+    /// wrap boundary is dropped so the wrapped line doesn't
+    /// lead with an orphan space.
+    #[test]
+    fn wrap_breaks_on_word_boundary_not_mid_word() {
+        let mut pane = InputPane::new();
+        for ch in "hello world".chars() {
+            type_char(&mut pane, ch);
+        }
+        // Effective width after the "> " prefix is 5 → "hello"
+        // fills row 0, then the space wraps to row 1 and is
+        // dropped, then "world" starts row 1.
+        let cached = pane.layout(7);
+        assert_eq!(cached.lines.len(), 2);
+        assert_eq!(cached.lines[0], "> hello");
+        assert_eq!(cached.lines[1], "world");
+    }
+
+    /// A word longer than the available width still hard-breaks
+    /// mid-character — there's nowhere else to put it.
+    #[test]
+    fn wrap_hard_breaks_word_longer_than_line() {
+        let mut pane = InputPane::new();
+        for ch in "abcdefghij".chars() {
+            type_char(&mut pane, ch);
+        }
+        // Effective width 5; 10-char unbreakable word occupies
+        // two rows.
+        let cached = pane.layout(7);
+        assert_eq!(cached.lines.len(), 2);
+        assert_eq!(cached.lines[0], "> abcde");
+        assert_eq!(cached.lines[1], "fghij");
+    }
+
+    /// When the cursor sits inside a word that gets retro-moved
+    /// to a new line by the soft wrap, the cursor follows the
+    /// word to the new row.
+    #[test]
+    fn wrap_carries_cursor_with_retro_moved_word() {
+        let mut pane = InputPane::new();
+        for ch in "hello world".chars() {
+            type_char(&mut pane, ch);
+        }
+        // After typing, cursor is at end (index 11). At width 7
+        // (effective 5 after prefix), "world" wrapped to row 1;
+        // cursor at end of "world" should be (5, 1).
+        let cached = pane.layout(7);
+        assert_eq!(cached.cursor_visual, (5, 1));
     }
 
     #[test]

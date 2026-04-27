@@ -1832,14 +1832,16 @@ impl App {
 }
 
 /// Run the TUI event loop.
-/// Cap redraws at ~60 fps. The previous 33 ms (~30 fps) cap was
-/// chosen as a stopgap "pending PR 2's cache" — that cache has
-/// since landed (`tui_responsiveness/PR2`, commit `bfd2628`),
-/// so the cheap-render assumption pi relies on is now true here
-/// too. A 33 ms gap between keystroke and screen update is
-/// noticeable as input lag; 16 ms is below the perceptual
-/// threshold while still bounding worst-case render cost.
-const FRAME_BUDGET: Duration = Duration::from_millis(16);
+/// Cap redraws at ~120 fps. Per-keystroke paint cost measured
+/// at ~420 µs in `tui_render::keystroke_during_stream_600`, so
+/// the cap exists to bound CPU during streaming bursts, not to
+/// throttle individual keystrokes. An 8 ms cap puts worst-case
+/// keystroke→paint latency at ~7.6 ms (avg ~4 ms), comfortably
+/// below the ~15 ms perceptual threshold even for fast typists,
+/// while still capping render rate during a burst of upstream
+/// agent events. Earlier values (33 ms, then 16 ms) left
+/// detectable input lag.
+const FRAME_BUDGET: Duration = Duration::from_millis(8);
 
 /// Idle poll interval when nothing is dirty. Matches the previous
 /// behavior so background worker polling cadence is unchanged.
