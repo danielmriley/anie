@@ -45,6 +45,25 @@ struct ControllerCompactionGate {
 - `budget` is an `AtomicU32` shared with the controller so
   decrement/check is atomic. Reset by `run_prompt` per plan 02.
 
+### Token estimate for the agent loop's context
+
+The agent loop's local `context` is `Vec<Message>` (the
+protocol-level type from `anie-protocol`). The existing session-
+side helper `estimate_context_tokens`
+(`crates/anie-session/src/lib.rs:1147`) takes a
+`&[SessionContextMessage]` — the session-wrapped variant that
+carries cached usage data. Different types; the existing helper
+does not work on the gate's input directly.
+
+The fix is a small primitive: a free function
+`estimate_message_tokens(messages: &[Message]) -> u64` that
+falls back to the content-based estimate already used inside
+`estimate_context_tokens` when usage is unavailable. Add it
+alongside the existing helper in `anie-session/src/lib.rs` in
+PR A of this plan (so PR B's gate can call it directly), and
+have `estimate_context_tokens` call into it for entries that
+lack cached usage. Keeps the two callsites consistent.
+
 ### Gate logic
 
 ```rust
@@ -53,7 +72,7 @@ async fn maybe_compact(
     context: &[Message],
 ) -> Result<CompactionGateOutcome, anyhow::Error> {
     let config = (self.config_provider)();
-    let tokens = estimate_context_tokens(context);
+    let tokens = estimate_message_tokens(context);
     let threshold = config.context_window
         .saturating_sub(config.reserve_tokens);
     if tokens <= threshold {
@@ -75,7 +94,7 @@ async fn maybe_compact(
     send_event(&self.event_tx, AgentEvent::CompactionEnd {
         summary: result.summary,
         tokens_before: tokens,
-        tokens_after: estimate_context_tokens(&result.messages),
+        tokens_after: estimate_message_tokens(&result.messages),
     }).await;
 
     Ok(CompactionGateOutcome::Compacted {
@@ -154,8 +173,15 @@ cleanly.
     `compact_messages_inline` helper.
   - `Session::auto_compact` calls into the new helper, then does
     its own session-state splicing.
-  - Public re-export of `compact_messages_inline` and
-    `InlineCompactionResult`.
+  - Add `pub fn estimate_message_tokens(messages: &[Message]) -> u64`
+    that produces a content-based token estimate from
+    protocol-level messages (no `SessionContextMessage` wrapping
+    required). Have the existing
+    `estimate_context_tokens(messages: &[SessionContextMessage])`
+    delegate to it for content-only estimation when usage data
+    is unavailable, so the two callsites stay consistent.
+  - Public re-export of `compact_messages_inline`,
+    `InlineCompactionResult`, and `estimate_message_tokens`.
 - `crates/anie-cli/src/controller.rs`
   - Define `ControllerCompactionGate` struct.
   - In `build_agent` (line ~1179), apply
@@ -169,24 +195,32 @@ cleanly.
 
 ## Phased PRs
 
-### PR A — Refactor `compact_internal` into a pure helper
+### PR A — Refactor `compact_internal` into a pure helper + token estimator
 
 **Change:**
 
 - New free function `compact_messages_inline`.
-- `Session::auto_compact` calls it.
-- No behavioral change yet (no callers of the new helper outside
-  `Session::auto_compact`).
+- New free function `estimate_message_tokens(&[Message]) -> u64`
+  in `anie-session` for content-based token estimation on
+  protocol-level messages.
+- `Session::auto_compact` calls `compact_messages_inline`.
+- `estimate_context_tokens` delegates to
+  `estimate_message_tokens` for entries lacking cached usage.
+- No behavioral change yet (no callers of the new helpers
+  outside `Session::auto_compact` and the existing token-estimate
+  callsite).
 
 **Tests:**
 
 - All existing compaction tests pass unchanged.
 - New unit test for `compact_messages_inline` directly:
   `compact_messages_inline_summarizes_older_messages_and_keeps_recent`.
+- New unit test for `estimate_message_tokens`:
+  `estimate_message_tokens_falls_back_to_content_when_no_usage`.
 
 **Exit criteria:**
 
-- Test surface is the same; one new helper exists for plan 04 PR B.
+- Test surface is the same; two new helpers exist for plan 04 PR B.
 
 ### PR B — Install `ControllerCompactionGate`
 

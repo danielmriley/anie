@@ -86,7 +86,7 @@ diagnose context pressure when it shows up in real workloads.
 | 02 | [`02_per_turn_compaction_budget.md`](02_per_turn_compaction_budget.md) | Cap compactions per user turn (default 2). Anti-thrash. | none |
 | 03 | [`03_agent_loop_compaction_signal.md`](03_agent_loop_compaction_signal.md) | Introduce a callback / event so the agent loop can ask the controller to compact before the next sampling request. Pure infra. | none |
 | 04 | [`04_midturn_compaction_execution.md`](04_midturn_compaction_execution.md) | Use the signal from 03 to fire compaction mid-turn, then resume the loop with the compacted context. The codex pattern. | 01, 02, 03 |
-| 05 | [`05_tool_output_caps_scale_with_context.md`](05_tool_output_caps_scale_with_context.md) | Make per-tool output budgets scale with `effective_context_window`. | 01 (uses the same effective-window readout) |
+| 05 | [`05_tool_output_caps_scale_with_context.md`](05_tool_output_caps_scale_with_context.md) | Make per-tool output budgets scale with the configured context window (Ollama via `effective_ollama_context_window()`, other providers via `model.context_window`). | 01 (conceptual — same effective-window concept) |
 | 06 | [`06_compaction_telemetry.md`](06_compaction_telemetry.md) | Per-session counters and structured logs for pre-turn / mid-turn / overflow compactions. | 04 |
 
 ## Suggested landing order

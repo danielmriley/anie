@@ -135,10 +135,19 @@ breadcrumb trail, not a notification.
 **Change:**
 
 - Add the enum.
-- Extend the two events.
-- Plumb `phase` into the existing pre-prompt callsite.
-- Default mid-turn / reactive to placeholder values until those
-  paths consume them in their own PRs.
+- Extend `CompactionStart` and `CompactionEnd` with
+  `phase: CompactionPhase`.
+- Plumb `phase` into all three existing callsites:
+  - Pre-prompt: `maybe_auto_compact` →
+    `CompactionPhase::PrePrompt`.
+  - Mid-turn (added in plan 04): `ControllerCompactionGate::maybe_compact`
+    → `CompactionPhase::MidTurn`. Plan 04 lands before plan 06
+    per the roadmap, so this callsite already exists when this
+    PR ships.
+  - Reactive (`RetryDecision::Compact`-driven retry):
+    `CompactionPhase::ReactiveOverflow`.
+- Schema-version bump on the session log if the new field is
+  persisted (see Risks for the forward-compat contract).
 
 **Tests:**
 

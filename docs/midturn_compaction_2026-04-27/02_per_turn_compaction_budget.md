@@ -25,23 +25,48 @@ clean failure rather than a silent grind.
 
 ## Design
 
-### Counter on the controller
+### Budget on the controller
 
-A per-user-turn counter incremented on every successful
-`CompactionEnd`:
+A per-user-turn remaining-budget counter, stored as an
+`Arc<AtomicU32>` so the controller (which resets it) and the
+agent-loop gate from plan 04 (which decrements it from a
+spawned task) can share storage cleanly. Decrement-from-max so
+the value at any point IS the remaining budget — no subtraction
+math at the read site.
 
 ```rust
 struct InteractiveController {
     // ...
-    compactions_this_turn: u32,
+    /// Compactions still allowed in the current user turn. Reset
+    /// to `compaction.max_per_turn` at the start of every
+    /// `run_prompt`. Decremented at every successful
+    /// `CompactionEnd`. Reads use `Ordering::Acquire`; writes
+    /// use `Ordering::Release`. Cloned (`Arc::clone`) into the
+    /// `ControllerCompactionGate` from plan 04 so mid-turn
+    /// compactions decrement the same atomic.
+    compactions_remaining_this_turn: Arc<AtomicU32>,
 }
 ```
 
-- Reset to 0 in the `run_prompt` entry point, just before
-  `maybe_auto_compact`.
-- Incremented inside `emit_compaction_end`
-  (`crates/anie-cli/src/controller.rs:908-923`) — that's the single
-  funnel for every successful compaction.
+- Reset to `max_per_turn` in the `run_prompt` entry point, just
+  before `maybe_auto_compact`.
+- Decremented at every site that emits a successful
+  `CompactionEnd` event:
+  - **Pre-prompt path** decrements inside `emit_compaction_end`
+    (`crates/anie-cli/src/controller.rs:908-923`).
+  - **Reactive path** (the `RetryDecision::Compact`-driven
+    compact-and-retry) also routes through
+    `emit_compaction_end`.
+  - **Mid-turn path** (plan 04) constructs and emits its own
+    `CompactionStart`/`CompactionEnd` events from the gate
+    task. The gate decrements the atomic directly, immediately
+    before sending its `CompactionEnd`. That keeps the
+    invariant "every successful `CompactionEnd` corresponds to
+    exactly one decrement" without forcing the gate to route
+    its events through the controller's helper.
+- Read-only accessor `compaction_budget_remaining(&self) -> u32`
+  used by the reactive path (`retry_policy::decide`) and the
+  mid-turn gate's pre-check.
 
 ### Budget config
 
@@ -103,18 +128,20 @@ shrink its context in service of answering it?"
   - Add `max_per_turn: u32` to `CompactionConfig` and
     `PartialCompactionConfig` with default 2 and range 1..=8.
 - `crates/anie-cli/src/controller.rs`
-  - Add `compactions_this_turn: Arc<AtomicU32>` field. The atomic
-    is required so the agent-loop gate (plan 04) and the
-    controller can share storage cleanly. Decrementing on
-    compaction and resetting at turn start are single `fetch_*`
-    calls.
-  - Reset in `run_prompt` via `store(max_per_turn, Ordering::Release)`.
-  - Decrement in `emit_compaction_end` (or in the gate, depending
-    on which path drives the compaction). The site of decrement
-    must be exactly the site that emits `CompactionEnd`, so the
-    counter is increment-on-success only.
-  - Add `compaction_budget_remaining()` accessor (synchronous
-    `Acquire` load) used by mid-turn and reactive paths.
+  - Add `compactions_remaining_this_turn: Arc<AtomicU32>` field
+    (see Design section above for the rationale on the atomic +
+    decrement-from-max shape).
+  - Reset in `run_prompt` via
+    `store(max_per_turn, Ordering::Release)`.
+  - Decrement once per successful `CompactionEnd`. Pre-prompt and
+    reactive paths decrement inside the controller's
+    `emit_compaction_end`. The mid-turn gate from plan 04
+    decrements directly (it doesn't route through
+    `emit_compaction_end`); see the Design section above for
+    why both sites carry the responsibility.
+  - Add `compaction_budget_remaining(&self) -> u32` accessor
+    (synchronous `Acquire` load) used by mid-turn and reactive
+    paths.
 - `crates/anie-cli/src/retry_policy.rs`
   - Extend `RetryDecision::decide` to take a fourth arg
     `compaction_budget_remaining: u32` (current signature is
