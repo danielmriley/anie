@@ -350,6 +350,27 @@ pub async fn fetch_html(
         return Err(WebToolError::PrivateAddress(final_host.to_string()));
     }
 
+    // Reject non-HTML responses up front. Defuddle's HTML parser
+    // crashes with `Cannot destructure property 'firstElementChild'
+    // of 'documentElement' as it is null` when fed plain text or
+    // JSON (caught by smoke runs against `wttr.in` and a Yahoo
+    // weather endpoint). A typed error here is much better than a
+    // confusing Defuddle stack trace.
+    if let Some(ct) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        let lower = ct.to_ascii_lowercase();
+        let is_html = lower.starts_with("text/html")
+            || lower.starts_with("application/xhtml")
+            || lower.starts_with("application/xml")
+            || lower.starts_with("text/xml");
+        if !is_html {
+            return Err(WebToolError::UnsupportedContentType(ct.to_string()));
+        }
+    }
+
     // Stream the body, enforcing the size cap as we go.
     use futures::stream::StreamExt;
     let mut buf = Vec::with_capacity(64 * 1024);

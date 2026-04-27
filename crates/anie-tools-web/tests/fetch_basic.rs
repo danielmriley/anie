@@ -137,3 +137,52 @@ async fn fetch_caps_redirect_chain() {
     let err = fetch_html(&client, &url, &opts).await.unwrap_err();
     assert!(matches!(err, WebToolError::Fetch(_)), "got: {err:?}");
 }
+
+#[tokio::test]
+async fn fetch_rejects_non_html_content_type() {
+    // Caught by smoke runs against `wttr.in` and a Yahoo
+    // weather endpoint: Defuddle's HTML parser crashes on
+    // non-HTML bodies with a confusing
+    // "Cannot destructure property 'firstElementChild' of
+    // 'documentElement' as it is null". Reject up front with a
+    // typed error instead.
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/text");
+            then.status(200)
+                .header("content-type", "text/plain")
+                .body("Tallahassee: 79°F sunny");
+        })
+        .await;
+
+    let url = Url::parse(&format!("{}/text", server.base_url())).unwrap();
+    let opts = opts_for_test(true);
+    let client = build_client(&opts).expect("build client");
+    let err = fetch_html(&client, &url, &opts).await.unwrap_err();
+    match err {
+        WebToolError::UnsupportedContentType(ct) => {
+            assert!(ct.starts_with("text/plain"), "got: {ct}");
+        }
+        other => panic!("expected UnsupportedContentType, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fetch_accepts_xhtml_and_xml_content_types() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/xhtml");
+            then.status(200)
+                .header("content-type", "application/xhtml+xml")
+                .body("<html><body>ok</body></html>");
+        })
+        .await;
+
+    let url = Url::parse(&format!("{}/xhtml", server.base_url())).unwrap();
+    let opts = opts_for_test(true);
+    let client = build_client(&opts).expect("build client");
+    let html = fetch_html(&client, &url, &opts).await.expect("fetch ok");
+    assert!(html.contains("ok"));
+}

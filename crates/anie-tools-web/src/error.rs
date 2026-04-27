@@ -93,6 +93,15 @@ pub enum WebToolError {
     /// Search backend (DuckDuckGo, etc.) failed.
     #[error("search backend failed: {0}")]
     SearchBackend(String),
+
+    /// Server returned a non-HTML content type. Defuddle's
+    /// parser crashes on plain-text or JSON bodies, so we
+    /// reject these up front with a clear error rather than
+    /// passing through a confusing stack trace.
+    #[error(
+        "unsupported response content-type: {0}. web_read expects HTML; try a web-page URL or a different endpoint."
+    )]
+    UnsupportedContentType(String),
 }
 
 impl WebToolError {

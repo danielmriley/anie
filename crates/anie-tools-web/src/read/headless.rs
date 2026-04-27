@@ -88,9 +88,24 @@ pub async fn render_with_chrome(
 
     let chrome_path = locate_chrome()?;
 
+    // chromiumoxide defaults to `/tmp/chromiumoxide-runner` for
+    // the user-data-dir. A second launch in the same session
+    // finds the previous run's `SingletonLock` and aborts with
+    // "Failed to create a ProcessSingleton for your profile
+    // directory". Give every launch its own tempdir; drop it
+    // after Chrome shuts down. (Caught by smoke runs against
+    // qwen3.6 — once the agent makes two `javascript: true`
+    // calls in a row, the second one was failing 100% of the
+    // time on shared CI-style hosts.)
+    let user_data_dir = tempfile::Builder::new()
+        .prefix("anie-chrome-")
+        .tempdir()
+        .map_err(|e| WebToolError::HeadlessFailure(format!("user-data-dir: {e}")))?;
+
     let render = async {
         let config = BrowserConfig::builder()
             .chrome_executable(chrome_path)
+            .user_data_dir(user_data_dir.path())
             .build()
             .map_err(|e| WebToolError::HeadlessFailure(format!("browser config: {e}")))?;
 
