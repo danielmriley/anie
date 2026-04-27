@@ -1,6 +1,36 @@
 # 06 — Layout simplification: catch up to pi's LOC count
 
-## Rationale
+## Status: closed (2026-04-27)
+
+Audit pass before implementation found that 4 of the 5 phases
+were no-ops against the actual code, and the 5th (table
+simplification) was deferred by the user because current
+table rendering is acceptable.
+
+| Phase | Plan claim | Reality after audit | Outcome |
+|---|---|---|---|
+| 1 | PR 01 leaves `committed_text`, `tail_text`, `cached_committed_*`, `find_safe_markdown_boundary` as dead | PR 01 (`c9ecad2`) deleted those cleanly when it landed; `StreamingAssistantRender` is already 2 fields | no-op |
+| 2 | Multi-pass table negotiation can be replaced with pi's greedy single-pass | True, but rendering is acceptable today and the user has follow-on UI work that wants stable table behavior | deferred by user |
+| 3 | List side-stack duplicates pulldown-cmark's depth tracking | `ListFrame.next_number` tracks ordered-list numbering, which pulldown-cmark does not give you between `Tag::Item` events; necessary state | no-op |
+| 4 | Inline single-call `push_*` / `flush_*` helpers | The 1-call-site helpers (`build_top_border`, `build_bottom_border`, `build_code_body_line`, `heading_style`, `wrap_spans`) are 15–30 LOC each with clear single purpose; inlining hurts readability | no-op |
+| 5 | Three separate code-block helpers can collapse into one match arm | `Tag::CodeBlock(kind)` is already a single match arm with inline language extraction (layout.rs:246) | no-op |
+
+The one real cleanup the audit surfaced lived in
+`crates/anie-tui/src/markdown/mod.rs`: stale
+`#[allow(unused_imports)]` on the `render_markdown` and
+`MarkdownTheme` re-exports, plus a stale module docstring
+claiming `render_markdown` was unused in production. PR 01 of
+this plan set wired both into `OutputPane`. Cleaned up in the
+same commit that closed this plan.
+
+The plan's 1,866 → 1,200 LOC target was based on assumptions
+about the post-PR-01 codebase that didn't materialize. Holding
+to the LOC number would have meant churning well-factored code
+to hit a benchmark, against CLAUDE.md's "match pi's shape
+unless there's a documented reason not to" principle and the
+project's "code that reads like a human wrote it" guideline.
+
+## Rationale (original)
 
 Finding F-9. `crates/anie-tui/src/markdown/layout.rs` is 1,866
 LOC. Pi's `packages/tui/src/components/markdown.ts` is 852 LOC
