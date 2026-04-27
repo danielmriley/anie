@@ -666,25 +666,35 @@ impl<'a> LineBuilder<'a> {
         }
 
         // Natural widths — the column size each cell would
-        // prefer if we had infinite viewport space.
+        // prefer if we had infinite viewport space. `min_required`
+        // is the lower bound: the longest single unbreakable
+        // token (whitespace-split substring) in any cell of
+        // that column. Squeezing a column below its longest
+        // token would force `wrap_plain_text_cell` to char-break
+        // mid-word, which mangles things like long filenames
+        // (`plan-001-edit.md` → `plan-001-e` / `dit.md`).
         let mut natural: Vec<usize> = vec![1; cols];
-        if let Some(header) = state.header.as_ref() {
-            for (idx, cell) in header.iter().enumerate() {
-                if idx < cols {
-                    natural[idx] = natural[idx].max(cell.chars().count());
+        let mut min_required: Vec<usize> = vec![MIN_COL_WIDTH; cols];
+        let record_cells = |natural: &mut [usize], floors: &mut [usize], cells: &[String]| {
+            for (idx, cell) in cells.iter().enumerate() {
+                if idx >= cols {
+                    continue;
+                }
+                natural[idx] = natural[idx].max(cell.chars().count());
+                for word in cell.split_whitespace() {
+                    floors[idx] = floors[idx].max(word.chars().count());
                 }
             }
+        };
+        if let Some(header) = state.header.as_ref() {
+            record_cells(&mut natural, &mut min_required, header);
         }
         for row in &state.rows {
-            for (idx, cell) in row.iter().enumerate() {
-                if idx < cols {
-                    natural[idx] = natural[idx].max(cell.chars().count());
-                }
-            }
+            record_cells(&mut natural, &mut min_required, row);
         }
 
         let available = self.width.max(1) as usize;
-        let Some(widths) = compute_column_widths(&natural, available) else {
+        let Some(widths) = compute_column_widths(&natural, &min_required, available) else {
             // Fallback: render the table as wrapped raw
             // markdown text. Less pretty, but readable on
             // narrow terminals and pipelines.
@@ -884,11 +894,20 @@ fn table_data_row(
 const MIN_COL_WIDTH: usize = 3;
 
 /// Compute per-column content widths that fit the available
-/// viewport width. Returns `None` when every column would
-/// need to shrink below `MIN_COL_WIDTH` — callers should fall
-/// back to raw wrapped markdown in that case. Plan 10 PR-C.
-fn compute_column_widths(natural: &[usize], available: usize) -> Option<Vec<usize>> {
+/// viewport width. Each column is held at or above its
+/// `min_required` width — the longest unbreakable token in any
+/// of its cells — so squeezing the layout never char-breaks a
+/// long filename or URL inside a cell. When even those minimums
+/// don't fit, returns `None` and callers fall back to raw
+/// wrapped markdown text. Plan 10 PR-C; per-column-floor
+/// hardening on top.
+fn compute_column_widths(
+    natural: &[usize],
+    min_required: &[usize],
+    available: usize,
+) -> Option<Vec<usize>> {
     let cols = natural.len();
+    debug_assert_eq!(cols, min_required.len());
     if cols == 0 {
         return Some(Vec::new());
     }
@@ -900,50 +919,47 @@ fn compute_column_widths(natural: &[usize], available: usize) -> Option<Vec<usiz
         return None;
     }
     let budget = available - overhead;
+
+    // If every column can render at its natural width, do that.
     let natural_total: usize = natural.iter().sum();
     if natural_total <= budget {
         return Some(natural.to_vec());
     }
-    // Too wide — shrink. Reject when even min-per-column
-    // won't fit so callers hit the fallback.
-    if cols * MIN_COL_WIDTH > budget {
+
+    // Otherwise we have to shrink. Per-column floors prevent
+    // mid-token char-breaks; if their sum already exceeds the
+    // budget, no layout fits — fall back to raw text.
+    let floor_total: usize = min_required.iter().sum();
+    if floor_total > budget {
         return None;
     }
-    // Proportional distribution (floored), then shave excess
-    // off the largest column until the sum matches budget.
-    let mut widths: Vec<usize> = natural
+
+    // Start every column at its floor, then distribute the
+    // remaining budget proportional to each column's "slack"
+    // (how much room it would need above the floor to reach
+    // its natural width). Columns whose natural already
+    // equals their floor get nothing extra.
+    let extra_budget = budget - floor_total;
+    let mut widths: Vec<usize> = min_required.to_vec();
+    let slacks: Vec<usize> = natural
         .iter()
-        .map(|&n| ((n * budget) / natural_total.max(1)).max(MIN_COL_WIDTH))
+        .zip(min_required.iter())
+        .map(|(n, f)| n.saturating_sub(*f))
         .collect();
-    let mut sum: usize = widths.iter().sum();
-    while sum > budget {
-        // Shave 1 from the widest column that's above the min.
-        let idx = widths
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| **w > MIN_COL_WIDTH)
-            .max_by_key(|(_, w)| **w)
-            .map(|(i, _)| i);
-        match idx {
-            Some(i) => {
-                widths[i] -= 1;
-                sum -= 1;
-            }
-            None => break, // every column at min; caller should fall back
+    let slack_total: usize = slacks.iter().sum();
+    if slack_total > 0 {
+        for i in 0..cols {
+            widths[i] += (slacks[i] * extra_budget) / slack_total;
         }
     }
-    if sum > budget {
-        return None;
-    }
-    // If we still have spare budget (floor division losses),
-    // distribute it back to the widest-natural columns so the
-    // table doesn't leave whitespace on the right.
+
+    // Floor-division rounding loss: distribute leftovers to
+    // columns with the most remaining gap to natural.
+    let mut sum: usize = widths.iter().sum();
     while sum < budget {
-        let idx = natural
-            .iter()
-            .enumerate()
-            .max_by_key(|(i, n)| (**n, widths[*i]))
-            .map(|(i, _)| i);
+        let idx = (0..cols)
+            .filter(|&i| widths[i] < natural[i])
+            .max_by_key(|&i| natural[i] - widths[i]);
         match idx {
             Some(i) => {
                 widths[i] += 1;
@@ -1640,7 +1656,7 @@ mod tests {
     /// table fits the viewport.
     #[test]
     fn compute_column_widths_keeps_natural_when_fits() {
-        let widths = compute_column_widths(&[5, 5, 5], 80).expect("fits");
+        let widths = compute_column_widths(&[5, 5, 5], &[MIN_COL_WIDTH; 3], 80).expect("fits");
         assert_eq!(widths, vec![5, 5, 5]);
     }
 
@@ -1652,7 +1668,8 @@ mod tests {
         // Two-column table at natural widths 30+10. Viewport 40
         // (budget 30 after borders). Proportional split: 30 →
         // ~23, 10 → ~7, sum 30.
-        let widths = compute_column_widths(&[30, 10], 40).expect("fits");
+        let widths =
+            compute_column_widths(&[30, 10], &[MIN_COL_WIDTH; 2], 40).expect("fits");
         assert!(widths.iter().all(|w| *w >= MIN_COL_WIDTH));
         let overhead = 2 * 2 + (2 + 1);
         assert!(
@@ -1671,9 +1688,45 @@ mod tests {
     fn compute_column_widths_returns_none_for_too_narrow_viewport() {
         // Three columns × MIN_COL_WIDTH = 9 content + overhead
         // (6 pad + 4 border) = 19. Viewport 15 is too narrow.
-        assert!(compute_column_widths(&[10, 10, 10], 15).is_none());
+        assert!(compute_column_widths(&[10, 10, 10], &[MIN_COL_WIDTH; 3], 15).is_none());
         // Pathological: viewport smaller than the overhead alone.
-        assert!(compute_column_widths(&[1, 1, 1], 5).is_none());
+        assert!(compute_column_widths(&[1, 1, 1], &[MIN_COL_WIDTH; 3], 5).is_none());
+    }
+
+    /// A column whose longest unbreakable token exceeds the
+    /// proportional share never compresses below that token —
+    /// `wrap_plain_text_cell` would otherwise hard-break the
+    /// token mid-character. Regression for the
+    /// `plan-001-edit.md` → `plan-001-e` / `dit.md` case.
+    #[test]
+    fn compute_column_widths_respects_per_column_floor() {
+        // Two-column table: col 0 has a 26-char filename floor,
+        // col 1 has a wide natural with no token longer than 8.
+        // Viewport 80 (budget 73 after borders): plenty for col 0
+        // to keep 26, with the rest going to col 1.
+        let widths = compute_column_widths(&[26, 300], &[26, 8], 80).expect("fits");
+        assert!(
+            widths[0] >= 26,
+            "col 0 must hold its 26-char floor: {widths:?}"
+        );
+        let overhead = 2 * 2 + (2 + 1);
+        assert!(
+            widths.iter().sum::<usize>() + overhead <= 80,
+            "computed widths exceed available: {widths:?}"
+        );
+    }
+
+    /// When the per-column floors alone won't fit, return None
+    /// so the caller falls back to the raw-text path. Without
+    /// this, `wrap_plain_text_cell` would silently char-break
+    /// the long tokens anyway — the fallback at least preserves
+    /// readability without the misleading box-drawing frame.
+    #[test]
+    fn compute_column_widths_returns_none_when_floors_exceed_budget() {
+        // Two columns each with a 30-char unbreakable token.
+        // Budget 40 after borders → can't seat 30+30=60.
+        let result = compute_column_widths(&[30, 30], &[30, 30], 47);
+        assert!(result.is_none(), "should fall back: {result:?}");
     }
 
     /// Wide markdown table wraps cells into the viewport rather
