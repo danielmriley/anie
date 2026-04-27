@@ -1,15 +1,20 @@
-# Implementation roadmap — code-review remediation + active input
+# Implementation roadmap — code-review remediation + active input + mid-turn compaction
 
-This roadmap coordinates the two April 27 plan sets:
+This roadmap coordinates the three April 27 plan sets:
 
 - `docs/code_review_2026-04-27/` — hardening and correctness follow-ups
   from the comprehensive code review.
 - `docs/active_input_2026-04-27/` — editable input, queued follow-ups,
   and interrupt-and-send while the agent is running.
+- `docs/midturn_compaction_2026-04-27/` — mid-turn compaction, context-
+  aware reserve sizing, adaptive tool output caps, and compaction
+  telemetry. Targets the small-context local-model use case where a
+  single user turn can fan out into enough sampling requests to
+  overrun the configured context window.
 
 The goal is to land these changes in reviewable increments without
-mixing mechanical formatting, security hardening, and UX/controller
-semantics in the same commits.
+mixing mechanical formatting, security hardening, UX/controller
+semantics, and context-handling infrastructure in the same commits.
 
 ## Roadmap principles
 
@@ -30,6 +35,11 @@ semantics in the same commits.
    controller queue semantics, and network boundary changes.
 6. **Preserve session order.** Queued prompts should persist only when
    they actually start, after the current run has finished or aborted.
+7. **Local models are first-class.** The mid-turn compaction work
+   targets workstation-class hosts running Ollama. Defaults must keep
+   small-context models usable end-to-end without manual tuning, and
+   no change in this roadmap may regress the cloud-model pre-prompt
+   compaction behavior.
 
 ## Dependency overview
 
@@ -43,7 +53,9 @@ Format baseline
   ├─ web cancellation → bounded side channels → configurable budgets
   ├─ streaming read cap
   ├─ Ollama num_ctx message fix
-  └─ atomic-write durability clarification
+  ├─ atomic-write durability clarification
+  └─ mid-turn compaction: context-aware reserve → per-turn budget → agent-loop hook
+       → mid-turn execution → context-aware tool output caps → telemetry
 ```
 
 ## Phase 0 — Clean baseline
@@ -480,6 +492,162 @@ after queued prompts are stable.
 
 ---
 
+## Phase 8 — Mid-turn compaction and small-context handling
+
+This phase ports codex's mid-turn compaction pattern to anie and
+adds the small-context-aware sizing the cloud-targeted reference
+implementations don't bother with. It is **independent of Phases
+1–7** in implementation; the only loose dependency is on Phase 1.3
+(Ollama `num_ctx` message), since this phase formalizes the
+"effective" reserve and tool-output budgets that surface in user-
+facing error and `/state` text.
+
+The full plan set lives at
+`docs/midturn_compaction_2026-04-27/`. Detailed PR-level scope
+and tests are in the per-plan files; the phase entries here track
+ordering and gates only.
+
+### PR 8.1 — Context-aware compaction reserve
+
+**Plan:** `docs/midturn_compaction_2026-04-27/01_context_aware_reserve.md` PR A
+
+**Scope:**
+
+- `effective_reserve(window, configured, min_reserve)` helper.
+- `Controller::compaction_strategy` uses it.
+- Optional `min_reserve_tokens` config knob (PR B, follow-up).
+
+**Why first:** unblocks both 8.2 (budget assumes reasonable
+threshold) and 8.4 (mid-turn execution uses the effective value).
+
+**Validation:**
+
+- Property test on `effective_reserve` over a range of windows.
+- Existing compaction integration tests still pass for large
+  windows.
+
+### PR 8.2 — Per-turn compaction budget (counter + reactive)
+
+**Plan:** `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md` PRs A + B
+
+**Scope:**
+
+- Add `compactions_this_turn: u32` counter on the controller.
+- Add `[compaction] max_per_turn` (default 2).
+- Reactive overflow path consults the budget;
+  `GiveUpReason::CompactionBudgetExhausted` for exhaustion.
+
+**Why early:** anti-thrash protection lands before mid-turn so
+the moment 8.4 is on, runaway compaction storms are already
+bounded.
+
+**Validation:**
+
+- `retry_policy_gives_up_when_budget_exhausted`.
+- End-to-end test injecting consecutive `ContextOverflow`s.
+
+### PR 8.3 — Agent-loop compaction signal
+
+**Plan:** `docs/midturn_compaction_2026-04-27/03_agent_loop_compaction_signal.md`
+
+**Scope:**
+
+- `CompactionGate` trait + `CompactionGateOutcome` enum.
+- `AgentConfig::compaction_gate: Option<Arc<dyn CompactionGate>>`.
+- Hook fires at the top of each post-first agent-loop iteration.
+- `build_agent` passes `None` for now; behavior unchanged.
+
+**Why early:** pure plumbing, default-off, lets 8.4 land as a
+focused behavior change against a stable hook.
+
+**Validation:**
+
+- `agent_run_with_no_gate_behaves_like_today`.
+- `agent_run_calls_compaction_gate_between_iterations`.
+
+### PR 8.4 — Mid-turn compaction execution
+
+**Plan:** `docs/midturn_compaction_2026-04-27/04_midturn_compaction_execution.md` PRs A + B
+
+**Scope:**
+
+- Refactor `Session::compact_internal` into a pure
+  `compact_messages_inline` helper.
+- `ControllerCompactionGate` installed via `build_agent`.
+- Mid-turn compactions emit `CompactionStart` / `CompactionEnd`.
+- `TranscriptReplace` fires after a successful mid-turn
+  compaction so the TUI re-renders.
+
+**Validation:**
+
+- `midturn_compaction_fires_when_context_exceeds_threshold`.
+- `midturn_compaction_does_not_fire_under_threshold`.
+- Tool-call correlation preservation test.
+- Cancellation-during-compaction test.
+- Manual smoke against a small-context Ollama model.
+
+### PR 8.5 — Mid-turn path consults the budget
+
+**Plan:** `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md` PR C
+
+**Scope:**
+
+- The mid-turn gate handler checks the budget before initiating
+  compaction; when exhausted, returns
+  `CompactionGateOutcome::Skipped` with a reason.
+
+**Why here:** must follow 8.4 because the gate doesn't exist
+until then.
+
+**Validation:**
+
+- `midturn_compaction_skipped_when_budget_exhausted`.
+
+### PR 8.6 — Tool output caps scale with context
+
+**Plan:** `docs/midturn_compaction_2026-04-27/05_tool_output_caps_scale_with_context.md`
+
+**Scope:**
+
+- Plumb `context_window` into `ToolExecutionContext`.
+- `effective_tool_output_budget(window, base_default)` helper.
+- Apply to `bash`, built-in `read`, and `web_read`.
+- `[tools] context_share_for_output` config knob (default 0.1).
+
+**Why now:** independent of 8.3/8.4 in code but complements them.
+Land after 8.4 so the activity row labels (8.7) capture both
+mid-turn compactions and any tool-cap-driven shrinkage uniformly.
+
+**Validation:**
+
+- Cloud-vs-local regression test.
+- `bash_truncates_stdout_to_effective_budget_for_small_window`.
+
+### PR 8.7 — Compaction telemetry and visibility
+
+**Plan:** `docs/midturn_compaction_2026-04-27/06_compaction_telemetry.md`
+
+**Scope:**
+
+- Add `CompactionPhase` enum on `CompactionStart` /
+  `CompactionEnd` events.
+- `CompactionStats` per session in the controller.
+- TUI activity row distinguishes pre-prompt / mid-turn /
+  reactive labels.
+- `/state` summary shows the counts.
+- Optional `/compaction-stats` slash command.
+
+**Why last:** lands against the now-stable mid-turn machinery
+so the labels and counts reflect real behavior.
+
+**Validation:**
+
+- Forward-compat session-log load test.
+- `compaction_stats_increments_pre_prompt_counter`,
+  `..._mid_turn_counter`, `..._reactive_overflow_counter`.
+
+---
+
 ## Parallelization opportunities
 
 After Phase 0, these workstreams can proceed mostly independently:
@@ -487,20 +655,37 @@ After Phase 0, these workstreams can proceed mostly independently:
 - **Active input track:** Phases 1.2, 2, and 7.
 - **Web safety track:** Phases 3 and 4.
 - **Small correctness track:** Phase 1.3, Phase 5, Phase 6.3.
+- **Context handling track:** Phase 8 (8.1 → 8.2 → 8.3 → 8.4 → 8.5 → 8.6 → 8.7).
+  Independent of all other phases at the source-file level except for
+  shared edits to `crates/anie-cli/src/controller.rs` (see below).
 
 Avoid parallel edits to the same files:
 
-- `crates/anie-tui/src/app.rs` is touched by active input and may also
-  need help/discoverability updates.
+- `crates/anie-tui/src/app.rs` is touched by active input, may also
+  need help/discoverability updates, and gets the per-phase activity-
+  row labels in Phase 8.7. Sequence the active-input PRs before 8.7.
 - `crates/anie-cli/src/controller.rs` is touched by queue semantics,
-  interrupt/send, and Ollama message fix. Land the small Ollama fix
-  before larger queue refactors if possible.
+  interrupt/send, the Ollama message fix, and every Phase 8 PR (8.1
+  effective reserve, 8.2 budget counter, 8.4 gate installation, 8.7
+  stats). Land the small Ollama fix and the queue refactors before
+  the Phase 8 controller changes if possible — Phase 8's controller
+  edits are concentrated around the compaction call sites, but a
+  careful merge is required if the queue work is in flight.
 - `crates/anie-config/src/lib.rs` is touched by `[ui]`, `[tools.web]`,
-  streaming read config only if added, and atomic-write docs. Sequence
-  config PRs carefully.
+  streaming read config only if added, atomic-write docs, and Phase 8's
+  `min_reserve_tokens`, `max_per_turn`, and `context_share_for_output`
+  knobs. Sequence config PRs carefully; the Phase 8 knobs do not
+  conflict with the other phases at the field level.
 - `crates/anie-tools-web/src/read/fetch.rs` is touched by SSRF,
-  cancellation/bounds, and robots correctness. Prefer the order:
-  manual redirects → DNS validation → side-channel caps → robots.
+  cancellation/bounds, robots correctness, and Phase 8.6's effective
+  byte budget. Prefer the order: manual redirects → DNS validation →
+  side-channel caps → robots → effective byte budget.
+- `crates/anie-session/src/lib.rs` is touched by Phase 8.4's refactor
+  of `compact_internal` into `compact_messages_inline`. No conflict
+  with other phases.
+- `crates/anie-agent/src/agent_loop.rs` is touched by Phase 8.3's
+  `CompactionGate` hook and Phase 8.6's `context_window` plumbing.
+  Land 8.3 before 8.6 so the agent-loop edits stack cleanly.
 
 ## Validation gates
 
@@ -530,6 +715,22 @@ Run unless the PR is docs-only:
   - Ctrl+C still aborts;
   - interrupt-and-send after Phase 7.
 
+### Mid-turn compaction PRs
+
+- `cargo test -p anie-session compact`
+- `cargo test -p anie-cli compaction`
+- `cargo test -p anie-agent` (covers `CompactionGate` hook tests).
+- Property test on `effective_reserve` over a range of windows
+  (Phase 8.1).
+- Compaction-storm fault-injection test (Phase 8.2 PR B).
+- Forward-compat session-log load test for `CompactionPhase`
+  (Phase 8.7 PR A).
+- Manual smoke against a small-context Ollama model:
+  - run a coding task with several large file reads;
+  - observe at least one mid-turn compaction in the activity row;
+  - confirm the turn completes without `ContextOverflow`;
+  - confirm `/state` shows non-zero `mid_turn` count.
+
 ### Milestone end-to-end smoke
 
 Before calling the roadmap complete:
@@ -545,6 +746,13 @@ Before calling the roadmap complete:
 7. Set `[ui]` config values and confirm TUI startup honors them.
 8. Trigger an Ollama load-resource error with an active `/context-length`
    override, or run the regression test if manual setup is unavailable.
+9. Run a small-context Ollama coding task (e.g. 16K window) that
+   exercises multiple tool calls; confirm at least one mid-turn
+   compaction fires, the budget is respected, and the run completes
+   without surfacing `ContextOverflow` to the user.
+10. On a large-context cloud model, confirm the same task profile
+    runs without firing mid-turn compaction (no regression for the
+    non-local case).
 
 ## Definition of done
 
@@ -556,5 +764,11 @@ Before calling the roadmap complete:
 - Web timing/budget policy is centralized and configurable for
   persistent-agent deployments.
 - Large file reads are bounded in memory.
+- Mid-turn compaction fires when warranted, is bounded by a per-turn
+  budget, surfaces visibly in the TUI, and is observable via
+  per-session counters.
+- Tool output caps scale with the configured context window so a
+  single tool result never claims a disproportionate share of a small
+  model's context.
 - The small correctness/durability fixes are either landed or explicitly
   deferred with rationale in their execution trackers.
