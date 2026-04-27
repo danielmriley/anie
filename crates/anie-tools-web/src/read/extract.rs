@@ -7,8 +7,17 @@
 //! For testing, [`DefuddleRunner`] is a trait so tests can
 //! inject a mock implementation that returns canned output.
 //! The real implementation, [`SubprocessDefuddleRunner`],
-//! locates `defuddle` (or falls through to `npx`), spawns it,
-//! pipes HTML to stdin, and parses stdout.
+//! locates `defuddle` (or falls through to `npx`), writes the
+//! fetched HTML to a tempfile, runs `defuddle parse <file>
+//! --markdown --json`, and parses stdout.
+//!
+//! Defuddle 0.7+ merged the `defuddle-cli` package into the
+//! main `defuddle` package and replaced the stdin-pipe
+//! invocation with a `parse <source>` subcommand that takes a
+//! file path or URL. We pass a tempfile so anie's SSRF guard,
+//! robots check, rate limit, and size cap remain in force —
+//! handing the URL directly to Defuddle would let it bypass
+//! all of those.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -17,6 +26,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::task::spawn_blocking;
 
 use crate::error::WebToolError;
 
@@ -24,12 +34,23 @@ use crate::error::WebToolError;
 /// `npx`. Bump deliberately — bumping should be paired with
 /// regenerating any output fixtures and rerunning the
 /// integration tests.
-pub const DEFUDDLE_VERSION: &str = "0.6.x";
+///
+/// Pinned to the 0.18 line, which is the first release where
+/// `defuddle-cli` was deprecated in favor of the merged
+/// `defuddle` package. Earlier `0.6.x` pins targeted the old
+/// stdin-pipe CLI shape and no longer work.
+pub const DEFUDDLE_VERSION: &str = "0.18.x";
 
 /// Defuddle's JSON output. Optional fields use
 /// `#[serde(default)]` so a Defuddle release that adds or
 /// drops a field doesn't break parsing. Field names follow
 /// Defuddle's camelCase convention via `rename_all`.
+///
+/// Defuddle's `content` field carries the cleaned body —
+/// markdown when the CLI was invoked with `--markdown` (which
+/// `SubprocessDefuddleRunner` always does), HTML otherwise.
+/// `parse_defuddle_output` accepts both shapes so fixtures
+/// remain stable across CLI flag changes.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct DefuddleOutput {
@@ -57,11 +78,12 @@ pub struct DefuddleOutput {
     pub word_count: Option<u64>,
     /// Estimated reading time in minutes.
     pub reading_time: Option<u32>,
-    /// Cleaned Markdown body. Present when the CLI was run
-    /// with the `--markdown` flag.
+    /// Cleaned body. Markdown when `SubprocessDefuddleRunner`
+    /// invoked the CLI with `--markdown` (the default). The
+    /// JSON key is plain `content`; we keep the Rust field
+    /// name to make `markdown_body()` self-documenting.
+    #[serde(rename = "content")]
     pub content_markdown: Option<String>,
-    /// Cleaned HTML body. Always present.
-    pub content: Option<String>,
 }
 
 impl DefuddleOutput {
@@ -102,29 +124,47 @@ impl DefuddleRunner for SubprocessDefuddleRunner {
     async fn run(
         &self,
         html: &str,
-        source_url: &str,
+        _source_url: &str,
     ) -> Result<DefuddleOutput, WebToolError> {
+        // The Defuddle 0.18 CLI takes a file path or URL — no
+        // stdin. We write the already-fetched HTML to a tempfile
+        // so anie's SSRF guard, robots check, rate limit, and
+        // size cap stay in force; passing the URL would let
+        // Defuddle re-fetch and bypass all of those.
+        let tmp = spawn_blocking(|| {
+            tempfile::Builder::new()
+                .prefix("anie-web-")
+                .suffix(".html")
+                .tempfile()
+        })
+        .await
+        .map_err(|e| WebToolError::DefuddleSpawn(format!("tempfile join: {e}")))?
+        .map_err(|e| WebToolError::DefuddleSpawn(format!("tempfile create: {e}")))?;
+        let tmp_path = tmp.path().to_path_buf();
+        {
+            let mut f = tokio::fs::File::create(&tmp_path).await?;
+            f.write_all(html.as_bytes()).await?;
+            f.flush().await?;
+        }
+
         let cmd = locate_defuddle()?;
         let mut command = Command::new(&cmd.binary);
         command.args(&cmd.args);
-        command.args(["--url", source_url, "--markdown", "--json"]);
-        command.stdin(Stdio::piped());
+        command.arg("parse");
+        command.arg(&tmp_path);
+        command.args(["--markdown", "--json"]);
+        command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child = command
+        let child = command
             .spawn()
             .map_err(|e| WebToolError::DefuddleSpawn(e.to_string()))?;
 
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WebToolError::DefuddleSpawn("no stdin pipe".into()))?;
-        stdin.write_all(html.as_bytes()).await?;
-        // Explicit drop closes stdin so defuddle sees EOF.
-        drop(stdin);
-
         let output = child.wait_with_output().await?;
+        // Keep `tmp` alive until after the child has read it.
+        drop(tmp);
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(WebToolError::DefuddleFailed {
@@ -184,6 +224,9 @@ mod tests {
 
     #[test]
     fn parse_defuddle_output_handles_full_document() {
+        // Mirrors the JSON shape Defuddle 0.18 emits when run
+        // with `--markdown --json`: `content` carries the
+        // markdown body, no separate `contentMarkdown` field.
         let json = r##"{
             "title": "Hello world",
             "author": "Jane Doe",
@@ -193,8 +236,7 @@ mod tests {
             "language": "en",
             "published": "2024-08-15T10:30:00Z",
             "wordCount": 1234,
-            "contentMarkdown": "# Hello\n\nBody.",
-            "content": "<p>Body.</p>"
+            "content": "# Hello\n\nBody."
         }"##;
         let parsed = parse_defuddle_output(json.as_bytes()).expect("parses");
         assert_eq!(parsed.title.as_deref(), Some("Hello world"));
@@ -206,8 +248,8 @@ mod tests {
 
     #[test]
     fn parse_defuddle_output_handles_minimal_document() {
-        // No required fields. Only title and content.
-        let json = r#"{"title": "Minimal", "content": "<p>x</p>"}"#;
+        // No required fields. Only title.
+        let json = r#"{"title": "Minimal"}"#;
         let parsed = parse_defuddle_output(json.as_bytes()).expect("parses");
         assert_eq!(parsed.title.as_deref(), Some("Minimal"));
         assert!(parsed.author.is_none());

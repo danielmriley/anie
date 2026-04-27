@@ -27,6 +27,7 @@ reqwest = { workspace = true, features = ["gzip", "brotli"] }
 scraper.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile.workspace = true
 texting_robots.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -39,5 +40,4 @@ which.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
