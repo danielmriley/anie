@@ -74,6 +74,16 @@ pub struct App {
     /// `handle_slash_command` for pre-dispatch validation and, in
     /// plan 12, by the inline autocomplete popup.
     commands: Vec<SlashCommandInfo>,
+    /// Time of the most recent streaming delta (text or
+    /// thinking). Used by `render_spinner_row` to surface a
+    /// `· Ns since last token` hint when the model goes silent
+    /// for more than a few seconds — the indicator distinguishes
+    /// "anie is alive but waiting on a slow model" from "anie
+    /// is genuinely hung." Anie does not impose a total request
+    /// timeout (`http.rs::build_client`), so this hint is the
+    /// only feedback the user gets about whether tokens are
+    /// flowing.
+    last_streaming_delta_at: Option<Instant>,
     /// Workspace-wide cap on Ollama `num_ctx` from
     /// `[ollama] default_max_num_ctx`. Applied to every
     /// `ModelInfo::to_model` call the TUI makes when
@@ -394,6 +404,7 @@ impl App {
             worker_tx,
             worker_rx,
             commands,
+            last_streaming_delta_at: None,
             ollama_default_max_num_ctx: None,
         }
     }
@@ -573,7 +584,23 @@ impl App {
             spinner_frame,
             matches!(mode, RenderMode::UrgentInput),
         );
-        render_spinner_row(&self.agent_state, spinner_area, frame.buffer_mut());
+        // Surface time since the last streaming delta when the
+        // model has gone silent for a few seconds. Hidden under
+        // the threshold so healthy fast streams don't show a
+        // jittery counter on every paint.
+        let silence = self
+            .last_streaming_delta_at
+            .map(|t| t.elapsed())
+            .filter(|d| {
+                matches!(self.agent_state, AgentUiState::Streaming)
+                    && *d >= Duration::from_secs(3)
+            });
+        render_spinner_row(
+            &self.agent_state,
+            silence,
+            spinner_area,
+            frame.buffer_mut(),
+        );
 
         let input_locked = !matches!(self.agent_state, AgentUiState::Idle);
         let cursor = match &mut self.bottom_pane {
@@ -694,6 +721,7 @@ impl App {
                         pending_thinking.clear();
                     }
                     pending_text.push_str(&text);
+                    self.last_streaming_delta_at = Some(Instant::now());
                 }
                 AgentEvent::MessageDelta {
                     delta: StreamDelta::ThinkingDelta(text),
@@ -703,6 +731,7 @@ impl App {
                         pending_text.clear();
                     }
                     pending_thinking.push_str(&text);
+                    self.last_streaming_delta_at = Some(Instant::now());
                 }
                 // Any other event flushes both accumulators
                 // first so message-level ordering is preserved.
@@ -734,6 +763,9 @@ impl App {
         match event {
             AgentEvent::AgentStart => {
                 self.agent_state = AgentUiState::Streaming;
+                // Reset so the next stream's "Xs since last
+                // token" hint counts from the new run's start.
+                self.last_streaming_delta_at = None;
             }
             AgentEvent::MessageStart { message } => match message {
                 Message::User(user_message) => {
@@ -757,6 +789,7 @@ impl App {
                     }
                     _ => {}
                 }
+                self.last_streaming_delta_at = Some(Instant::now());
             }
             AgentEvent::MessageEnd { message } => {
                 if let Message::Assistant(assistant) = message {
@@ -2151,6 +2184,7 @@ fn render_status_bar(
 /// noise.
 fn render_spinner_row(
     agent_state: &AgentUiState,
+    silence_since_last_delta: Option<Duration>,
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
 ) {
@@ -2171,12 +2205,35 @@ fn render_spinner_row(
     }
     let elapsed = animation_reference().elapsed();
     let bullet = breathing_bullet(elapsed);
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::raw(" "),
         bullet,
         Span::styled(format!(" {label}"), Style::default().fg(Color::Yellow)),
-    ]);
-    Paragraph::new(line).render(area, buf);
+    ];
+    if let Some(silence) = silence_since_last_delta {
+        spans.push(Span::styled(
+            format!(" · {} since last token", format_silence(silence)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).render(area, buf);
+}
+
+/// Format an inter-token gap for the activity row. Sub-minute
+/// gaps render as bare seconds (`12s`); longer gaps split into
+/// minutes + seconds (`2m 14s`) so a long stall doesn't read
+/// as an inscrutable three-digit second count.
+fn format_silence(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m {s:02}s")
+    }
 }
 
 /// Process-relative reference time for live UI animations.
@@ -2429,6 +2486,20 @@ mod tests {
         let dim = breathing_bullet(Duration::from_millis(600));
         assert_eq!(bright.style.fg, Some(Color::Yellow));
         assert_eq!(dim.style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn format_silence_uses_bare_seconds_under_a_minute() {
+        assert_eq!(format_silence(Duration::from_secs(0)), "0s");
+        assert_eq!(format_silence(Duration::from_secs(7)), "7s");
+        assert_eq!(format_silence(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_silence_splits_into_minutes_and_seconds_above_one_minute() {
+        assert_eq!(format_silence(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(format_silence(Duration::from_secs(94)), "1m 34s");
+        assert_eq!(format_silence(Duration::from_secs(605)), "10m 05s");
     }
 
     #[test]
