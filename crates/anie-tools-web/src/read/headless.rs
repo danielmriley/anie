@@ -116,6 +116,14 @@ pub async fn render_with_chrome(
             page.wait_for_navigation()
                 .await
                 .map_err(|e| WebToolError::HeadlessFailure(format!("navigation: {e}")))?;
+            // wait_for_navigation only resolves on the document
+            // `load` event. SPAs typically render the article
+            // body via XHR fired after that, so capturing
+            // immediately gets the empty shell. A short fixed
+            // grace period covers the common case without
+            // building a full network-idle tracker. Bounded by
+            // the outer `tokio::time::timeout`.
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
             let html = page
                 .content()
                 .await

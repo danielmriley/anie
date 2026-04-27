@@ -4,6 +4,8 @@
 //!     cargo run --example smoke -p anie-tools-web -- search "rust async"
 //!     cargo run --example smoke -p anie-tools-web -- read https://example.com
 //!     cargo run --example smoke -p anie-tools-web --features headless -- \
+//!         readjs https://weather.com/...
+//!     cargo run --example smoke -p anie-tools-web --features headless -- \
 //!         render https://example.com
 //!
 //! Not part of the test suite. This is a network-touching tool
@@ -39,6 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             print_result(&result);
         }
+        "readjs" => {
+            let url = target.ok_or("usage: smoke readjs <url>")?;
+            let tool = WebReadTool::new()?;
+            let payload = serde_json::json!({ "url": url, "javascript": true });
+            let result = tool
+                .execute("smoke", payload, CancellationToken::new(), None)
+                .await?;
+            print_result(&result);
+        }
         #[cfg(feature = "headless")]
         "render" => {
             let url_str = target.ok_or("usage: smoke render <url>")?;
@@ -48,11 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::time::Duration::from_secs(30),
             )
             .await?;
-            println!(
-                "[render] {} bytes of post-DOM HTML\n--- first 500 ---\n{}",
-                html.len(),
-                html.chars().take(500).collect::<String>()
-            );
+            // Print the full HTML so it can be redirected.
+            print!("{html}");
+            eprintln!("[render] {} bytes of post-DOM HTML", html.len());
         }
         #[cfg(not(feature = "headless"))]
         "render" => {
@@ -68,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  commands:\n  \
                    search <query>   — run web_search against DuckDuckGo\n  \
                    read <url>       — run web_read (Defuddle, no JS)\n  \
+                   readjs <url>     — run web_read with javascript=true (--features headless)\n  \
                    render <url>     — headless Chrome render only (--features headless)"
             );
             std::process::exit(1);
