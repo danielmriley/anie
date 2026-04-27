@@ -74,12 +74,6 @@ pub struct App {
     /// `handle_slash_command` for pre-dispatch validation and, in
     /// plan 12, by the inline autocomplete popup.
     commands: Vec<SlashCommandInfo>,
-    /// Last time a `MessageDelta` arrived. Used by the
-    /// stall-aware spinner logic in `needs_tick_redraw` — when
-    /// streaming is stuck (no delta for > STREAM_STALL_WINDOW
-    /// ms), idle-tick redraws are suppressed so the spinner
-    /// freezes rather than eating CPU. Plan 06 PR-B.
-    last_streaming_delta_at: Option<Instant>,
     /// Workspace-wide cap on Ollama `num_ctx` from
     /// `[ollama] default_max_num_ctx`. Applied to every
     /// `ModelInfo::to_model` call the TUI makes when
@@ -400,7 +394,6 @@ impl App {
             worker_tx,
             worker_rx,
             commands,
-            last_streaming_delta_at: None,
             ollama_default_max_num_ctx: None,
         }
     }
@@ -701,7 +694,6 @@ impl App {
                         pending_thinking.clear();
                     }
                     pending_text.push_str(&text);
-                    self.last_streaming_delta_at = Some(Instant::now());
                 }
                 AgentEvent::MessageDelta {
                     delta: StreamDelta::ThinkingDelta(text),
@@ -711,7 +703,6 @@ impl App {
                         pending_text.clear();
                     }
                     pending_thinking.push_str(&text);
-                    self.last_streaming_delta_at = Some(Instant::now());
                 }
                 // Any other event flushes both accumulators
                 // first so message-level ordering is preserved.
@@ -743,10 +734,6 @@ impl App {
         match event {
             AgentEvent::AgentStart => {
                 self.agent_state = AgentUiState::Streaming;
-                // Reset the stall tracker so a previous
-                // stream's last delta doesn't make the new
-                // stream appear stalled from the start.
-                self.last_streaming_delta_at = None;
             }
             AgentEvent::MessageStart { message } => match message {
                 Message::User(user_message) => {
@@ -770,7 +757,6 @@ impl App {
                     }
                     _ => {}
                 }
-                self.last_streaming_delta_at = Some(Instant::now());
             }
             AgentEvent::MessageEnd { message } => {
                 if let Message::Assistant(assistant) = message {
@@ -924,29 +910,26 @@ impl App {
     /// entire transcript 10 times a second for no reason. We
     /// return `true` only when one of those signals is live.
     ///
-    /// Stall-aware spinner (Plan 06 PR-B): if we're in a
-    /// streaming state but no delta has arrived for
-    /// STREAM_STALL_WINDOW, suppress the redraw so a stuck
-    /// stream doesn't eat CPU animating a spinner. The spinner
-    /// appears frozen — which is accurate; the stream *is*
-    /// stalled. Any arriving delta immediately updates
-    /// `last_streaming_delta_at` and the spinner resumes.
+    /// Note on streaming pauses (was: Plan 06 PR-B). An earlier
+    /// version of this method suppressed redraws when streaming
+    /// went silent for `STREAM_STALL_WINDOW`, on the theory that
+    /// "the stream is stalled — freeze the spinner." Real-world
+    /// usage made it clear that's the wrong heuristic: slow
+    /// model APIs (e.g. local Ollama composing a long reply),
+    /// reasoning-heavy turns that don't emit deltas, and tools
+    /// that take seconds all look identical to a "stuck stream"
+    /// from a UI perspective, but the agent is still working.
+    /// Freezing the spinner made anie *appear* frozen, which is
+    /// worse than the few extra frames of CPU we save. The
+    /// cached render path is cheap (~420 µs / frame at the
+    /// 8 ms cap, <5% CPU under sustained pressure), so we
+    /// always tick while the run is active.
     #[must_use]
     pub fn needs_tick_redraw(&self) -> bool {
         if self.overlay.is_some() {
             return true;
         }
-        if matches!(self.agent_state, AgentUiState::Idle) {
-            return false;
-        }
-        if matches!(self.agent_state, AgentUiState::Streaming)
-            && self
-                .last_streaming_delta_at
-                .is_some_and(|t| t.elapsed() >= STREAM_STALL_WINDOW)
-        {
-            return false;
-        }
-        true
+        !matches!(self.agent_state, AgentUiState::Idle)
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> RenderDirty {
@@ -1846,14 +1829,6 @@ const FRAME_BUDGET: Duration = Duration::from_millis(8);
 /// Idle poll interval when nothing is dirty. Matches the previous
 /// behavior so background worker polling cadence is unchanged.
 const IDLE_TICK: Duration = Duration::from_millis(100);
-
-/// How long of a streaming-delta gap makes us declare the
-/// stream "stalled" and suppress spinner-only redraws. 500 ms
-/// is below typical timeout perception — a real stall holds
-/// much longer than this — but far enough above the normal
-/// inter-token interval (~10-100 ms) that healthy streams
-/// never trip it. Plan 06 PR-B.
-const STREAM_STALL_WINDOW: Duration = Duration::from_millis(500);
 
 /// Debounce window between terminal `Resize` events and the
 /// next full re-render. Drags (window-edge drag, tmux pane
