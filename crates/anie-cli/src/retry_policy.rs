@@ -27,6 +27,18 @@ pub(crate) struct RetryConfig {
 /// instead of watching the agent churn.
 const MAX_RATE_LIMIT_RETRIES: u32 = 1;
 
+/// Cap on retries for `ProviderError::ModelOutputMalformed`. A
+/// fresh sample at the same context is usually a different
+/// generation, so a retry has a real chance of succeeding —
+/// but if the model keeps producing parse-failing output at
+/// this context size, the underlying cause is context
+/// pressure, not transient sampling. Two attempts strikes the
+/// balance: one retry catches the random-bad-sample case;
+/// stopping after that surfaces a clean error so the user can
+/// react (lower context, switch models, wait for the planned
+/// mid-turn compaction work to land).
+const MAX_MODEL_OUTPUT_MALFORMED_RETRIES: u32 = 2;
+
 /// Minimum delay (ms) to wait before retrying a rate-limited
 /// request when the provider did not send a `Retry-After` header.
 /// OpenRouter's `:free` tier and similar gated endpoints drop
@@ -154,6 +166,30 @@ impl<'a> RetryPolicy<'a> {
             | ProviderError::InvalidStreamJson(_)
             | ProviderError::MalformedStreamEvent(_) => {
                 if attempt >= self.config.max_retries {
+                    RetryDecision::GiveUp {
+                        reason: GiveUpReason::AttemptsExhausted,
+                    }
+                } else {
+                    RetryDecision::Retry {
+                        attempt: attempt + 1,
+                        delay_ms: self.delay_for(error, attempt + 1),
+                    }
+                }
+            }
+            ProviderError::ModelOutputMalformed(_) => {
+                // The provider rejected the model's output (Ollama's
+                // XML/JSON parser failed on a Qwen-family
+                // `<tool_call>` block, etc.). A fresh sample at the
+                // same context tends to produce different tokens —
+                // retry, but with a tighter cap than the transient
+                // network errors above. If the model keeps emitting
+                // bad output at this context size, the underlying
+                // cause is usually context pressure, not transient
+                // sampling; the answer is mid-turn compaction (see
+                // `docs/midturn_compaction_2026-04-27/`), not more
+                // retries.
+                let cap = MAX_MODEL_OUTPUT_MALFORMED_RETRIES.min(self.config.max_retries);
+                if attempt >= cap {
                     RetryDecision::GiveUp {
                         reason: GiveUpReason::AttemptsExhausted,
                     }
@@ -579,6 +615,42 @@ mod tests {
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
+            }
+        );
+    }
+
+    /// `ModelOutputMalformed` is auto-retryable up to its own
+    /// cap. First and second attempts retry; the third hits the
+    /// cap and gives up.
+    #[test]
+    fn retry_policy_decide_retries_model_output_malformed_under_cap() {
+        let policy = deterministic_policy(deterministic_config());
+        let error = ProviderError::ModelOutputMalformed(
+            "xml syntax error on line 5: unexpected EOF".into(),
+        );
+        // Attempt 0 → retry.
+        assert!(matches!(
+            policy.decide(&error, 0, false),
+            RetryDecision::Retry { attempt: 1, .. }
+        ));
+        // Attempt 1 → retry (still under MAX_MODEL_OUTPUT_MALFORMED_RETRIES = 2).
+        assert!(matches!(
+            policy.decide(&error, 1, false),
+            RetryDecision::Retry { attempt: 2, .. }
+        ));
+    }
+
+    /// At the cap, give up cleanly so the user sees the
+    /// rendered `ModelOutputMalformed` message rather than a
+    /// silent retry storm.
+    #[test]
+    fn retry_policy_decide_gives_up_on_model_output_malformed_at_cap() {
+        let policy = deterministic_policy(deterministic_config());
+        let error = ProviderError::ModelOutputMalformed("xml: unexpected eof".into());
+        assert_eq!(
+            policy.decide(&error, MAX_MODEL_OUTPUT_MALFORMED_RETRIES, false),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::AttemptsExhausted,
             }
         );
     }

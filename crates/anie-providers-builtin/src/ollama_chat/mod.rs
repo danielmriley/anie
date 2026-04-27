@@ -273,6 +273,19 @@ pub(crate) fn classify_ollama_error_body(
                     suggested_num_ctx,
                 };
             }
+            // 400 with a body that names a parser failure on the
+            // *model's* output (not the request). Observed shapes
+            // from Ollama at v0.20.x with Qwen-family models that
+            // emit `<tool_call>` XML-style blocks: the Go XML
+            // parser fails with `xml syntax error on line N:
+            // unexpected EOF` when the model emits a truncated
+            // tag. JSON-mode tool calls can produce the matching
+            // `json: cannot unmarshal ...` shape. Both are
+            // server-side parses of model output — a fresh sample
+            // is the natural fix, so a retry is appropriate.
+            if status.as_u16() == 400 && looks_like_model_output_parse_failure(&lower) {
+                return ProviderError::ModelOutputMalformed(body.to_string());
+            }
             let has_think = lower.contains("think") || lower.contains("thinking");
             let unsupported_or_invalid = lower.contains("unsupported")
                 || lower.contains("not supported")
@@ -315,6 +328,33 @@ fn looks_like_load_resource_failure(body_lower: &str) -> bool {
         // "memory" with "available" — covers wordings like
         // "X bytes required, Y bytes available".
         || (body_lower.contains("memory") && body_lower.contains("available"))
+}
+
+/// Recognize Ollama 400 bodies that mean "your model emitted
+/// output that I, the server, couldn't parse." These are
+/// transient — a fresh sample at the same context will
+/// almost certainly produce different tokens — so the caller
+/// classifies the error as `ModelOutputMalformed` and the
+/// retry policy can attempt the request again.
+///
+/// Verified empirically (April 2026, Ollama v0.20.x with
+/// `qwen3.6:latest` at 65 K context) — the model emitted a
+/// truncated `<tool_call>` block and Ollama's Go XML parser
+/// returned `xml syntax error on line 5: unexpected EOF`
+/// in the body of an HTTP 400. The match list includes both
+/// the XML-parser shape and the JSON-parser shape Ollama
+/// surfaces when running models that emit JSON tool calls.
+///
+/// Conservative on positive matches: a 400 with `invalid model`
+/// or `bad request` should not be misclassified as a parse
+/// failure. The substrings here name parser-specific failure
+/// modes; nothing else uses the same wording.
+fn looks_like_model_output_parse_failure(body_lower: &str) -> bool {
+    body_lower.contains("xml syntax error")
+        || body_lower.contains("xml: ")
+        || body_lower.contains("json: cannot unmarshal")
+        || body_lower.contains("unexpected eof")
+        || body_lower.contains("parse error in tool call")
 }
 
 #[cfg(test)]
@@ -531,6 +571,84 @@ mod tests {
         assert!(
             !matches!(error, ProviderError::ContextOverflow(_)),
             "explicit guard against the wrong direction"
+        );
+    }
+
+    /// Ollama returns HTTP 400 with `xml syntax error on line N:
+    /// unexpected EOF` when a Qwen-family model emits a truncated
+    /// `<tool_call>` block. Anie should classify this as
+    /// `ModelOutputMalformed` (auto-retryable) rather than the
+    /// generic `Http { 400, .. }` (terminal) — the model's output
+    /// is what's wrong, not the request.
+    #[test]
+    fn classify_ollama_error_body_routes_xml_syntax_to_model_output_malformed() {
+        let body =
+            r#"{"error":"xml syntax error on line 5: unexpected EOF"}"#;
+        let error = classify_ollama_error_body(
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            None,
+            Some(65_536),
+        );
+        assert!(
+            matches!(error, ProviderError::ModelOutputMalformed(_)),
+            "expected ModelOutputMalformed, got: {error:?}",
+        );
+    }
+
+    /// JSON-mode tool-call parse failures show the same shape
+    /// from a different parser. The classifier should catch both
+    /// XML and JSON parser-failure phrasings.
+    #[test]
+    fn classify_ollama_error_body_routes_json_parse_to_model_output_malformed() {
+        let body = r#"{"error":"json: cannot unmarshal string into Go struct field"}"#;
+        let error = classify_ollama_error_body(
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            None,
+            None,
+        );
+        assert!(
+            matches!(error, ProviderError::ModelOutputMalformed(_)),
+            "expected ModelOutputMalformed, got: {error:?}",
+        );
+    }
+
+    /// Negative case: a 400 that's a real client-side bad
+    /// request — `invalid model name`, etc. — must continue to
+    /// classify through the existing unsupported/feature path,
+    /// not get swallowed by the new model-output-parse branch.
+    #[test]
+    fn classify_ollama_error_body_does_not_misclassify_invalid_model_as_output_malformed() {
+        let body = r#"{"error":"invalid model name"}"#;
+        let error = classify_ollama_error_body(
+            reqwest::StatusCode::BAD_REQUEST,
+            body,
+            None,
+            None,
+        );
+        // "invalid" is in the body, so this routes to the
+        // unsupported/feature path, not to ModelOutputMalformed.
+        assert!(
+            matches!(error, ProviderError::FeatureUnsupported(_)),
+            "expected FeatureUnsupported (existing behavior preserved), got: {error:?}",
+        );
+    }
+
+    /// The model-output-parse branch is gated on status 400.
+    /// A 500 with similar body wording should not slip through.
+    #[test]
+    fn classify_ollama_error_body_only_routes_400_to_model_output_malformed() {
+        let body = r#"{"error":"xml syntax error: unexpected EOF"}"#;
+        let error = classify_ollama_error_body(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body,
+            None,
+            None,
+        );
+        assert!(
+            !matches!(error, ProviderError::ModelOutputMalformed(_)),
+            "ModelOutputMalformed must be 400-only; got: {error:?}",
         );
     }
 

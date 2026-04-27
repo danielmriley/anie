@@ -93,6 +93,29 @@ pub enum ProviderError {
     #[error("tool call arguments not valid JSON: {0}")]
     ToolCallMalformed(String),
 
+    /// The *provider's* parser rejected the *model's* own output —
+    /// not the request. Concrete observed shape: Ollama returns an
+    /// HTTP 400 with body `xml syntax error on line N: unexpected
+    /// EOF` when a Qwen-family model emits a truncated `<tool_call>`
+    /// XML block. The request is fine; the model's stream just had
+    /// a bad sample.
+    ///
+    /// Distinct from:
+    /// - `ToolCallMalformed`: anie's *own* validator on
+    ///   tool-call argument JSON.
+    /// - `Http { 400, .. }`: a genuinely bad client request.
+    /// - `MalformedStreamEvent`: anie's stream parser hit a frame
+    ///   it can't decode.
+    ///
+    /// Retryable with a small attempt cap. A fresh sample at the
+    /// same context will produce different tokens, so a retry has
+    /// a real chance of succeeding without any state mutation.
+    /// If the same context repeatedly produces malformed output,
+    /// the underlying cause is usually context pressure — the
+    /// fix there is mid-turn compaction, not unbounded retries.
+    #[error("model output rejected by provider parser: {0}")]
+    ModelOutputMalformed(String),
+
     /// The provider rejected our native-reasoning request fields
     /// (`reasoning_effort` / `reasoning.effort`). Caller should
     /// retry with `NoNativeFields` strategy; not a user-facing error

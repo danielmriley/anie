@@ -73,6 +73,19 @@ pub(crate) fn render_user_facing_provider_error(
                  (provider response: {body_excerpt})"
             ))
         }
+        ProviderError::ModelOutputMalformed(body) => {
+            let body_excerpt = truncate_excerpt(body, PROVIDER_BODY_EXCERPT_CHARS);
+            Some(format!(
+                "Model '{model_provider}:{model_id}' emitted output the provider couldn't parse. \
+                 Anie retried automatically; if you're seeing this message the retry also failed.\n\
+                 \n\
+                 This usually happens when context pressure causes a smaller model to produce a \
+                 malformed tool call. Try /context-length with a smaller value, switch to a \
+                 larger model, or shorten your prompt.\n\
+                 \n\
+                 (provider response: {body_excerpt})"
+            ))
+        }
         _ => None,
     }
 }
