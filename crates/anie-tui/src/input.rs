@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, BorderType, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget},
 };
 
 use crate::autocomplete::{AutocompletePopup, AutocompleteProvider, SuggestionKind};
@@ -325,13 +325,8 @@ impl InputPane {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::DIM)
         };
-        // `BorderType::Thick` swaps the light `─` glyph for the
-        // heavy `━` glyph — same single row, slightly heavier
-        // stroke weight so the input box reads more clearly as
-        // a discrete element.
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
-            .border_type(BorderType::Thick)
             .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);

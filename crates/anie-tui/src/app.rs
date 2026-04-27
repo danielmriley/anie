@@ -1832,13 +1832,14 @@ impl App {
 }
 
 /// Run the TUI event loop.
-/// Cap redraws at ~30 fps. A terminal UI with no animation
-/// faster than a spinner doesn't benefit from higher, and the
-/// cap bounds the worst-case rendering cost even when upstream
-/// events arrive much faster. Mirrors pi's `MIN_RENDER_INTERVAL_MS`
-/// pattern (pi picks 16 ms because it has per-component caching;
-/// we pick 33 ms pending PR 2's cache).
-const FRAME_BUDGET: Duration = Duration::from_millis(33);
+/// Cap redraws at ~60 fps. The previous 33 ms (~30 fps) cap was
+/// chosen as a stopgap "pending PR 2's cache" — that cache has
+/// since landed (`tui_responsiveness/PR2`, commit `bfd2628`),
+/// so the cheap-render assumption pi relies on is now true here
+/// too. A 33 ms gap between keystroke and screen update is
+/// noticeable as input lag; 16 ms is below the perceptual
+/// threshold while still bounding worst-case render cost.
+const FRAME_BUDGET: Duration = Duration::from_millis(16);
 
 /// Idle poll interval when nothing is dirty. Matches the previous
 /// behavior so background worker polling cadence is unchanged.
