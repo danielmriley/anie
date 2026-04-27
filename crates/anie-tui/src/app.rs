@@ -84,6 +84,11 @@ pub struct App {
     /// only feedback the user gets about whether tokens are
     /// flowing.
     last_streaming_delta_at: Option<Instant>,
+    /// When the current agent run started (set on `AgentStart`,
+    /// cleared on `AgentEnd`). Powers the "Brewed for 3m 28s"
+    /// style turn-duration footer the TUI appends to the
+    /// transcript when each run wraps up.
+    current_run_started_at: Option<Instant>,
     /// Workspace-wide cap on Ollama `num_ctx` from
     /// `[ollama] default_max_num_ctx`. Applied to every
     /// `ModelInfo::to_model` call the TUI makes when
@@ -405,6 +410,7 @@ impl App {
             worker_rx,
             commands,
             last_streaming_delta_at: None,
+            current_run_started_at: None,
             ollama_default_max_num_ctx: None,
         }
     }
@@ -766,6 +772,7 @@ impl App {
                 // Reset so the next stream's "Xs since last
                 // token" hint counts from the new run's start.
                 self.last_streaming_delta_at = None;
+                self.current_run_started_at = Some(Instant::now());
             }
             AgentEvent::MessageStart { message } => match message {
                 Message::User(user_message) => {
@@ -909,6 +916,19 @@ impl App {
             AgentEvent::AgentEnd { .. } => {
                 self.agent_state = AgentUiState::Idle;
                 self.last_ctrl_c = None;
+                if let Some(started) = self.current_run_started_at.take() {
+                    let elapsed = started.elapsed();
+                    // Suppress the footer for trivially-short
+                    // runs (e.g. failed streams that ended in
+                    // <1s — the message would just add noise).
+                    if elapsed >= Duration::from_secs(1) {
+                        let verb = pick_run_verb(elapsed);
+                        self.output_pane.add_system_message(format!(
+                            "{verb} for {}",
+                            format_turn_duration(elapsed)
+                        ));
+                    }
+                }
             }
             AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
         }
@@ -2236,6 +2256,50 @@ fn format_silence(d: Duration) -> String {
     }
 }
 
+/// Format a whole-turn duration for the post-run footer.
+/// Sub-minute → bare seconds (`12s`); sub-hour → `Mm SSs`;
+/// hour-plus → `Hh MMm`. Drops the seconds at the hour mark
+/// because at that scale they're noise.
+fn format_turn_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m {s:02}s")
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{h}h {m:02}m")
+    }
+}
+
+/// Pick a run-completion verb. Indexed deterministically off
+/// the duration's nanos so the choice varies turn-to-turn
+/// without pulling in a random-number dep — same effect as
+/// rotating verbs, no pseudo-random plumbing. Verb list is a
+/// loose grab-bag of "did some thoughtful work" connotations
+/// that suit an agent harness.
+fn pick_run_verb(elapsed: Duration) -> &'static str {
+    const VERBS: &[&str] = &[
+        "Brewed",
+        "Pondered",
+        "Mulled",
+        "Crunched",
+        "Cooked",
+        "Forged",
+        "Hammered",
+        "Stewed",
+        "Simmered",
+        "Worked",
+        "Reasoned",
+        "Drafted",
+    ];
+    let idx = elapsed.subsec_nanos() as usize % VERBS.len();
+    VERBS[idx]
+}
+
 /// Process-relative reference time for live UI animations.
 /// Lazily initialized on first call. Uses `OnceLock` so the
 /// reference is shared across all callers without any per-app
@@ -2500,6 +2564,44 @@ mod tests {
         assert_eq!(format_silence(Duration::from_secs(60)), "1m 00s");
         assert_eq!(format_silence(Duration::from_secs(94)), "1m 34s");
         assert_eq!(format_silence(Duration::from_secs(605)), "10m 05s");
+    }
+
+    #[test]
+    fn format_turn_duration_uses_seconds_minutes_and_hours() {
+        assert_eq!(format_turn_duration(Duration::from_secs(7)), "7s");
+        assert_eq!(format_turn_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(format_turn_duration(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(format_turn_duration(Duration::from_secs(208)), "3m 28s");
+        assert_eq!(format_turn_duration(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(format_turn_duration(Duration::from_secs(3600)), "1h 00m");
+        assert_eq!(format_turn_duration(Duration::from_secs(3725)), "1h 02m");
+    }
+
+    #[test]
+    fn pick_run_verb_returns_a_known_verb() {
+        // Sample a few different sub-second values and verify
+        // each lands on something from the list. Deterministic
+        // mapping via `subsec_nanos % len`, so any 12 distinct
+        // nanos values that are co-prime with 12 will hit every
+        // index over time — but here we just check membership.
+        let known: &[&str] = &[
+            "Brewed",
+            "Pondered",
+            "Mulled",
+            "Crunched",
+            "Cooked",
+            "Forged",
+            "Hammered",
+            "Stewed",
+            "Simmered",
+            "Worked",
+            "Reasoned",
+            "Drafted",
+        ];
+        for nanos in [0, 1, 7, 12, 100, 12_345_678, 999_999_999] {
+            let d = Duration::new(0, nanos);
+            assert!(known.contains(&pick_run_verb(d)), "nanos={nanos}");
+        }
     }
 
     #[test]
