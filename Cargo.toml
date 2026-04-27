@@ -87,6 +87,12 @@ url = "2"
 urlencoding = "2"
 scraper = "0.20"
 httpmock = "0.7"
+# chromiumoxide — optional CDP client used by `web_read`'s
+# `javascript: true` path. Pulled in only via the `headless`
+# feature flag on `anie-tools-web` so default builds stay
+# slim. Talks to a system Chrome/Chromium install; we don't
+# bundle the browser.
+chromiumoxide = { version = "0.9", default-features = false, features = ["bytes"] }
 
 # Internal
 anie-agent = { path = "crates/anie-agent" }

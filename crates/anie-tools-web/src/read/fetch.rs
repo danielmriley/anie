@@ -41,6 +41,11 @@ pub const DEFAULT_RATE_LIMIT_RPS: u32 = 1;
 /// the bucket holds 5 tokens before throttling.
 pub const DEFAULT_RATE_LIMIT_BURST: u32 = 5;
 
+/// Default timeout for the headless render path, in seconds.
+/// Generous enough for typical SPA hydration; bounded so a
+/// hanging page doesn't pin the agent indefinitely.
+pub const DEFAULT_HEADLESS_TIMEOUT_SECS: u64 = 30;
+
 // --------------------------------------------------------------
 // URL validation + SSRF guard.
 // --------------------------------------------------------------
@@ -280,6 +285,9 @@ pub struct FetchOptions {
     pub max_bytes: usize,
     pub max_redirects: usize,
     pub allow_private_ips: bool,
+    /// Total budget for `javascript: true` renders. Only used
+    /// when the crate is built with `--features headless`.
+    pub headless_timeout_secs: u64,
 }
 
 impl Default for FetchOptions {
@@ -290,6 +298,7 @@ impl Default for FetchOptions {
             max_bytes: DEFAULT_MAX_BYTES,
             max_redirects: DEFAULT_MAX_REDIRECTS,
             allow_private_ips: false,
+            headless_timeout_secs: DEFAULT_HEADLESS_TIMEOUT_SECS,
         }
     }
 }

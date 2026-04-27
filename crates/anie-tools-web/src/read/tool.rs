@@ -105,10 +105,22 @@ impl WebReadTool {
         }
 
         let html = if args.javascript {
-            return Err(WebToolError::HeadlessFailure(
-                "javascript=true requires building anie-tools-web with --features headless"
-                    .into(),
-            ));
+            #[cfg(feature = "headless")]
+            {
+                use std::time::Duration;
+                crate::read::headless::render_with_chrome(
+                    &url,
+                    Duration::from_secs(self.fetch_opts.headless_timeout_secs),
+                )
+                .await?
+            }
+            #[cfg(not(feature = "headless"))]
+            {
+                return Err(WebToolError::HeadlessFailure(
+                    "javascript=true requires building anie-tools-web with --features headless"
+                        .into(),
+                ));
+            }
         } else {
             fetch::fetch_html(&self.client, &url, &self.fetch_opts).await?
         };
@@ -375,6 +387,7 @@ mod tests {
         assert!(matches!(err, WebToolError::PrivateAddress(_)));
     }
 
+    #[cfg(not(feature = "headless"))]
     #[tokio::test]
     async fn web_read_rejects_javascript_without_headless_feature() {
         let tool = WebReadTool::with_runner(

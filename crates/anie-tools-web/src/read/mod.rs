@@ -3,6 +3,7 @@
 pub mod extract;
 pub mod fetch;
 pub mod frontmatter;
+pub mod headless;
 mod tool;
 
 pub use tool::WebReadTool;

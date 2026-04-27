@@ -22,7 +22,11 @@
 //!
 //! `web_read` with `javascript: true` additionally requires a
 //! Chrome / Chromium binary on the system. Build the crate
-//! with `--features headless` to enable that path.
+//! with `--features headless` to enable that path; the binary
+//! is located via `CHROME_PATH`, then `which`, then the macOS
+//! standard install path. Without the feature flag, requests
+//! with `javascript: true` are rejected up front with a clear
+//! error message.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 

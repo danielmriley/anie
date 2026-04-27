@@ -19,6 +19,10 @@ workspace = true
 # a lean build that doesn't need network reading.
 default = ["web"]
 web = ["dep:anie-tools-web"]
+# Opt into the headless Chrome render path used by
+# `web_read(javascript=true)`. Pulls in chromiumoxide; users
+# who don't need SPA support can stay on the default `web`.
+web-headless = ["web", "anie-tools-web/headless"]
 
 [dependencies]
 anyhow.workspace = true
