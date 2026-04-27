@@ -1438,37 +1438,69 @@ fn wrap_text(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
 
 fn wrap_plain_text(text: &str, width: u16) -> Vec<String> {
     let width = width.max(1) as usize;
-    let mut lines = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     for raw_line in text.split('\n') {
         if raw_line.is_empty() {
             lines.push(String::new());
             continue;
         }
-        // PR-D (Plan 04): walk the source once by char index,
-        // slicing at byte boundaries when the char counter hits
-        // `width`. The previous shape collected every char into
-        // a `Vec<char>` and rebuilt a `String` per chunk — O(n)
-        // allocations per wrapped input. New shape does O(lines)
-        // `String` allocations, matching the output size.
-        //
-        // Preserves char-count (USV) semantics per plan — this
-        // is not a display-width correctness change. Wide CJK
-        // and ZWJ sequences still wrap at `chars().count()`
-        // boundaries, identical to the previous behavior.
-        let mut char_in_line = 0usize;
-        let mut byte_start = 0usize;
-        for (byte_idx, _) in raw_line.char_indices() {
-            if char_in_line == width {
-                lines.push(raw_line[byte_start..byte_idx].to_string());
-                byte_start = byte_idx;
-                char_in_line = 0;
+        // Word-boundary wrap: track the byte/col of the current
+        // word's start; when the line overflows mid-word, retro-
+        // move the word's tail to a fresh line. Whitespace at a
+        // wrap boundary drops so wrapped lines don't lead with
+        // an orphan space. Words longer than `width` still
+        // hard-break — there's nowhere else to put them.
+        // Same algorithm as `InputPane::layout_lines_uncached`.
+        let mut line_buf = String::new();
+        let mut col = 0usize;
+        let mut word_byte_start: Option<usize> = None;
+        let mut word_col_start: Option<usize> = None;
+
+        for ch in raw_line.chars() {
+            let is_ws = ch == ' ' || ch == '\t';
+
+            if is_ws {
+                word_byte_start = None;
+                word_col_start = None;
+                if col >= width {
+                    lines.push(std::mem::take(&mut line_buf));
+                    col = 0;
+                    continue;
+                }
+                line_buf.push(ch);
+                col += 1;
+                continue;
             }
-            char_in_line += 1;
+
+            if col >= width {
+                if let (Some(anchor_byte), Some(anchor_col)) = (word_byte_start, word_col_start)
+                    && anchor_col > 0
+                {
+                    let tail = line_buf.split_off(anchor_byte);
+                    while line_buf.ends_with(' ') || line_buf.ends_with('\t') {
+                        line_buf.pop();
+                    }
+                    lines.push(std::mem::take(&mut line_buf));
+                    col = tail.chars().count();
+                    line_buf = tail;
+                    word_byte_start = Some(0);
+                    word_col_start = Some(0);
+                } else {
+                    lines.push(std::mem::take(&mut line_buf));
+                    col = 0;
+                    word_byte_start = Some(0);
+                    word_col_start = Some(0);
+                }
+            } else if word_byte_start.is_none() {
+                word_byte_start = Some(line_buf.len());
+                word_col_start = Some(col);
+            }
+
+            line_buf.push(ch);
+            col += 1;
         }
-        // Tail after the last boundary. Always non-empty for
-        // a non-empty raw_line (the loop pushes at boundaries
-        // and leaves the remainder for this step).
-        lines.push(raw_line[byte_start..].to_string());
+
+        lines.push(line_buf);
     }
     if lines.is_empty() {
         vec![String::new()]
@@ -1479,55 +1511,146 @@ fn wrap_plain_text(text: &str, width: u16) -> Vec<String> {
 
 fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut current_char_count = 0usize;
 
-    // PR-E (Plan 04): the previous shape flattened every input
-    // span into a `Vec<(char, Style)>` and then emitted one
-    // `Span` per char, rebuilding a `String` via `ch.to_string()`
-    // for every single character. A 5,000-char streaming response
-    // allocated 10,000+ Strings/frame that way.
+    // Word-boundary wrap. Tokenize the input span sequence into a
+    // flat stream of word and whitespace runs (style-preserving),
+    // then greedy-fill lines. A word that doesn't fit on the
+    // current line moves whole to the next; whitespace at a wrap
+    // boundary drops; words longer than `width` hard-break.
     //
-    // New shape walks each input span in place, tracking the
-    // running char count into the current line, and emits one
-    // `Span` per (style, byte-range) run. Output is identical at
-    // the rendered-cell level (ratatui draws each char with its
-    // style); same-style consecutive runs just fold into a
-    // single Span instead of N tiny ones. Char-count (USV) wrap
-    // boundaries are preserved.
+    // Replaces the earlier char-boundary wrap that split words
+    // mid-character at the right edge of the pane.
+    enum TokKind {
+        Word,
+        Whitespace,
+    }
+    struct Token {
+        kind: TokKind,
+        text: String,
+        style: Style,
+    }
+
+    let mut tokens: Vec<Token> = Vec::new();
     for span in spans {
         let style = span.style;
         let text = span.content.into_owned();
         if text.is_empty() {
             continue;
         }
-        let mut byte_start: usize = 0;
-        for (byte_idx, _ch) in text.char_indices() {
-            if current_char_count == width {
-                // Wrap boundary. Emit whatever portion of this
-                // span has accumulated up to byte_idx, then
-                // flush the line.
-                if byte_start < byte_idx {
-                    current_spans.push(Span::styled(text[byte_start..byte_idx].to_string(), style));
-                    byte_start = byte_idx;
-                }
-                lines.push(Line::from(std::mem::take(&mut current_spans)));
-                current_char_count = 0;
+        // Group adjacent chars by kind within the span so each
+        // token is either entirely word chars or entirely
+        // whitespace. Newlines are absorbed into word tokens
+        // here intentionally: callers pre-split on '\n' before
+        // invoking wrap_spans, so we don't expect them in the
+        // input. Anything that does sneak through gets treated
+        // like opaque text.
+        let mut run_start = 0usize;
+        let mut run_kind: Option<TokKind> = None;
+        for (byte_idx, ch) in text.char_indices() {
+            let kind = if ch == ' ' || ch == '\t' {
+                TokKind::Whitespace
+            } else {
+                TokKind::Word
+            };
+            let same = matches!(
+                (&run_kind, &kind),
+                (Some(TokKind::Word), TokKind::Word)
+                    | (Some(TokKind::Whitespace), TokKind::Whitespace)
+            );
+            if !same && let Some(prior_kind) = run_kind.take() {
+                tokens.push(Token {
+                    kind: prior_kind,
+                    text: text[run_start..byte_idx].to_string(),
+                    style,
+                });
+                run_start = byte_idx;
             }
-            current_char_count += 1;
+            if run_kind.is_none() {
+                run_kind = Some(kind);
+                run_start = byte_idx;
+            }
         }
-        if byte_start < text.len() {
-            current_spans.push(Span::styled(text[byte_start..].to_string(), style));
+        if let Some(kind) = run_kind.take() {
+            tokens.push(Token {
+                kind,
+                text: text[run_start..].to_string(),
+                style,
+            });
         }
     }
-    if !current_spans.is_empty() {
-        lines.push(Line::from(current_spans));
+
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+
+    for tok in tokens {
+        let token_chars = tok.text.chars().count();
+        match tok.kind {
+            TokKind::Whitespace => {
+                if col == 0 {
+                    // Drop leading whitespace at line start —
+                    // wrapped lines shouldn't lead with the
+                    // boundary space.
+                    continue;
+                }
+                if col + token_chars > width {
+                    // Whitespace lands past the right edge:
+                    // drop it and wrap.
+                    lines.push(std::mem::take(&mut current));
+                    col = 0;
+                } else {
+                    current.push(Span::styled(tok.text, tok.style));
+                    col += token_chars;
+                }
+            }
+            TokKind::Word => {
+                if col > 0 && col + token_chars > width {
+                    // Wrap before placing the word so the word
+                    // starts on a fresh line.
+                    lines.push(std::mem::take(&mut current));
+                    col = 0;
+                }
+                if token_chars <= width.saturating_sub(col) {
+                    current.push(Span::styled(tok.text, tok.style));
+                    col += token_chars;
+                } else {
+                    // Word is longer than the line — hard-break
+                    // it, char-by-char chunks.
+                    let mut remaining = tok.text.as_str();
+                    loop {
+                        let space_left = width.saturating_sub(col).max(1);
+                        let remaining_chars = remaining.chars().count();
+                        let take_chars = remaining_chars.min(space_left);
+                        if take_chars == 0 {
+                            break;
+                        }
+                        let take_byte = remaining
+                            .char_indices()
+                            .nth(take_chars)
+                            .map(|(b, _)| b)
+                            .unwrap_or(remaining.len());
+                        let chunk = &remaining[..take_byte];
+                        current.push(Span::styled(chunk.to_string(), tok.style));
+                        col += take_chars;
+                        remaining = &remaining[take_byte..];
+                        if remaining.is_empty() {
+                            break;
+                        }
+                        lines.push(std::mem::take(&mut current));
+                        col = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
     }
     if lines.is_empty() {
         vec![Line::default()]
     } else {
-        lines
+        lines.into_iter().map(Line::from).collect()
     }
 }
 
@@ -2355,6 +2478,86 @@ mod wrap_tests {
     #[test]
     fn wrap_plain_text_line_exactly_width_is_one_line() {
         assert_eq!(wrap_plain_text("abcdef", 6), vec!["abcdef"]);
+    }
+
+    /// Wrap on word boundary: "hello world" at effective width
+    /// 5 splits as "hello" / "world" rather than "hello" /
+    /// " worl" / "d".
+    #[test]
+    fn wrap_plain_text_breaks_on_word_boundary() {
+        assert_eq!(wrap_plain_text("hello world", 5), vec!["hello", "world"]);
+    }
+
+    /// Trailing whitespace before the word that gets retro-
+    /// moved is dropped, so the previous line doesn't end with
+    /// an awkward space when the word fits exactly.
+    #[test]
+    fn wrap_plain_text_trims_trailing_whitespace_after_retro_move() {
+        let lines = wrap_plain_text("ab cdef", 5);
+        // "ab cd" doesn't fit width 5 cleanly with a word break:
+        // "ab" goes on line 1, "cdef" wraps to line 2.
+        assert_eq!(lines, vec!["ab", "cdef"]);
+    }
+
+    /// A word longer than the line still hard-breaks — there's
+    /// nowhere else to put it.
+    #[test]
+    fn wrap_plain_text_hard_breaks_word_longer_than_width() {
+        assert_eq!(
+            wrap_plain_text("abcdefghij", 4),
+            vec!["abcd", "efgh", "ij"]
+        );
+    }
+
+    /// `wrap_spans` mirrors `wrap_plain_text` for the no-style
+    /// case: words break on word boundaries, not mid-character.
+    #[test]
+    fn wrap_spans_breaks_on_word_boundary() {
+        let spans = vec![Span::raw("hello world")];
+        let lines = wrap_spans(spans, 5);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    /// `wrap_spans` preserves styling across the wrap boundary:
+    /// the first part stays on line 1, the wrapped word inherits
+    /// the style of its source span.
+    #[test]
+    fn wrap_spans_preserves_styles_when_wrapping() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let spans = vec![
+            Span::styled("hello", bold),
+            Span::styled(" ", Style::default()),
+            Span::styled("world", italic),
+        ];
+        let lines = wrap_spans(spans, 5);
+        assert_eq!(lines.len(), 2);
+        // Line 0: "hello" carrying the bold style.
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content == "hello" && s.style.add_modifier.contains(Modifier::BOLD)));
+        // Line 1: "world" carrying the italic style.
+        assert!(lines[1]
+            .spans
+            .iter()
+            .any(|s| s.content == "world" && s.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    /// A word longer than the line hard-breaks across spans.
+    #[test]
+    fn wrap_spans_hard_breaks_word_longer_than_width() {
+        let spans = vec![Span::raw("abcdefghij")];
+        let lines = wrap_spans(spans, 4);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string()]);
     }
 
     /// PR 04 / F-9: bullet, verb, and the leading space between
