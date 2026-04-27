@@ -996,14 +996,35 @@ impl OutputPane {
     }
 
     fn find_tool_call_index(&self, call_id: &str) -> Option<usize> {
-        self.blocks.iter().position(|block| {
+        // Prefer the in-flight block when there are duplicates.
+        // Some providers (notably Ollama before its stream-nonce
+        // fix) regenerate the same synthesized call_id across
+        // model turns. A naive "first match" would point at the
+        // already-finalized block from the prior turn, causing
+        // the new turn's tool result to overwrite the old one
+        // and leaving the new block stuck `is_executing == true`.
+        // Searching for the executing block first sidesteps that
+        // class of bug regardless of the provider's ID strategy.
+        let by_executing = self.blocks.iter().position(|block| {
             matches!(
                 block,
                 RenderedBlock::ToolCall {
                     call_id: existing,
+                    is_executing: true,
                     ..
                 } if existing == call_id
             )
+        });
+        by_executing.or_else(|| {
+            self.blocks.iter().position(|block| {
+                matches!(
+                    block,
+                    RenderedBlock::ToolCall {
+                        call_id: existing,
+                        ..
+                    } if existing == call_id
+                )
+            })
         })
     }
 

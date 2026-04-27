@@ -33,10 +33,27 @@
 
 use serde::Deserialize;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anie_protocol::{AssistantMessage, ContentBlock, StopReason, ToolCall, Usage, now_millis};
 use anie_provider::{Model, ProviderError, ProviderEvent};
 
 use super::classify_ollama_error_body;
+
+/// Process-global stream nonce. Each `OllamaChatStreamState::new`
+/// claims the next value; the per-state counter then disambiguates
+/// tool calls *within* a single streamed response. Synthesized
+/// tool-call IDs are `ollama_tool_call_<nonce>_<counter>`.
+///
+/// The previous shape (`ollama_tool_call_<counter>`, with the
+/// counter scoped to a single stream) collided across model
+/// turns: Turn 1's first tool call and Turn 2's first tool call
+/// both got `ollama_tool_call_1`, which made the TUI stamp the
+/// new tool's result onto the old tool's block (linear-scan
+/// `find_tool_call_index` returns the first match) and leave the
+/// new tool's block stuck `is_executing == true`. That surfaces
+/// to the user as a tool-call spinner that never stops.
+static OLLAMA_STREAM_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) struct OllamaChatStreamState {
     model: Model,
@@ -44,6 +61,7 @@ pub(super) struct OllamaChatStreamState {
     text: String,
     tool_calls: Vec<ToolCall>,
     tool_call_counter: u64,
+    stream_nonce: u64,
     usage: Usage,
     done_reason: Option<String>,
     finished: bool,
@@ -57,6 +75,7 @@ impl OllamaChatStreamState {
             text: String::new(),
             tool_calls: Vec::new(),
             tool_call_counter: 0,
+            stream_nonce: OLLAMA_STREAM_NONCE.fetch_add(1, Ordering::Relaxed),
             usage: Usage::default(),
             done_reason: None,
             finished: false,
@@ -146,7 +165,13 @@ impl OllamaChatStreamState {
         tool_call: OllamaToolCall,
     ) -> Result<Vec<ProviderEvent>, ProviderError> {
         self.tool_call_counter += 1;
-        let id = format!("ollama_tool_call_{}", self.tool_call_counter);
+        // `stream_nonce` makes the ID unique across stream
+        // boundaries; `tool_call_counter` disambiguates within
+        // one stream. See the constant's doc comment for why.
+        let id = format!(
+            "ollama_tool_call_{}_{}",
+            self.stream_nonce, self.tool_call_counter
+        );
         let arguments = tool_call
             .function
             .arguments
@@ -421,6 +446,42 @@ mod tests {
         let Some(ProviderEvent::ToolCallStart(tool_call)) = events.first() else {
             panic!("expected tool call start");
         };
-        assert_eq!(tool_call.id, "ollama_tool_call_1");
+        // Format: `ollama_tool_call_<stream_nonce>_<counter>`.
+        // The stream_nonce is process-global and changes
+        // depending on test ordering, so assert the prefix +
+        // shape rather than the exact string. Counter is
+        // 1-based for the first tool call within the stream.
+        assert!(
+            tool_call.id.starts_with("ollama_tool_call_"),
+            "id should start with the synthesized prefix, got: {}",
+            tool_call.id
+        );
+        assert!(
+            tool_call.id.ends_with("_1"),
+            "first tool call within a stream should end with _1, got: {}",
+            tool_call.id
+        );
+    }
+
+    /// Regression: two streams in the same process must produce
+    /// distinct tool-call IDs even though each stream's
+    /// per-call counter starts at 1. The old shape returned the
+    /// same `ollama_tool_call_1` for the first tool of every
+    /// stream, which collided in the TUI's tool-call lookup and
+    /// stuck the spinner on the newer tool block.
+    #[test]
+    fn tool_call_ids_do_not_collide_across_streams() {
+        let mut a = OllamaChatStreamState::new(&sample_model());
+        let mut b = OllamaChatStreamState::new(&sample_model());
+        let line = r#"{"message":{"role":"assistant","tool_calls":[{"function":{"name":"read_file","arguments":{}}}]},"done":false}"#;
+        let id_a = match a.process_line(line).unwrap().into_iter().next() {
+            Some(ProviderEvent::ToolCallStart(tc)) => tc.id,
+            _ => panic!("expected ToolCallStart"),
+        };
+        let id_b = match b.process_line(line).unwrap().into_iter().next() {
+            Some(ProviderEvent::ToolCallStart(tc)) => tc.id,
+            _ => panic!("expected ToolCallStart"),
+        };
+        assert_ne!(id_a, id_b, "stream IDs must differ across streams");
     }
 }
