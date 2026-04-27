@@ -554,9 +554,16 @@ impl App {
             // `preferred_height` return value is the number of
             // *content* rows we want to show.
             BottomPane::Editor => {
+                // Floor of 1 so the input starts a single row
+                // tall and grows with content. PR 07 of
+                // `docs/tui_polish_2026-04-26/` lowered the
+                // floor in `InputPane::preferred_height`; this
+                // caller's clamp had to come down to match —
+                // otherwise the empty box still rendered
+                // 3 rows tall.
                 self.input_pane
                     .preferred_height(frame.area().width)
-                    .clamp(3, 8)
+                    .clamp(1, 8)
                     + 2
             }
             BottomPane::ModelPicker(session) => session
