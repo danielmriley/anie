@@ -15,8 +15,8 @@ Status key:
 | 04 — Web cancellation, budgets, and bounded side channels | ✅ | PR A `8b09c8f` (cancellation). PR B `a34ec65` (bounded side channels). PR C `8fbba97` (`[tools.web]` config + validation). PR D `500578a` (web_read emits coarse fetching/rendering/extracting phase pings via existing partial-update plumbing; best-effort try_send so a slow consumer can't backpressure the fetch). |
 | 05 — Streaming built-in read path | ✅ | PR A `360211f` (image metadata pre-check). PRs B + C bundled `32138ac` (streaming text read with bounded per-line buffer; LineEnd enum; updated footer wording — precise remaining-line count required full-file scan, dropped per plan). |
 | 06 — Ollama effective `num_ctx` error messaging | ✅ | Landed `13f2dda` (2026-04-27). One-line call-site fix in the give-up handler + targeted regression test. |
-| 07 — robots.txt and Defuddle extraction correctness | ⬜ | Standards/extraction polish. |
-| 08 — Atomic-write durability clarification | ⬜ | Low-risk durability/doc cleanup. |
+| 07 — robots.txt and Defuddle extraction correctness | ✅ | PR A `1792def` (origin-keyed cache; user-agent honored; raw bytes cached; malformed robots is permissive). PR B `861c02f` (document Defuddle 0.18's missing source-URL flag; trait/method/inline docs corrected; pulldown-cmark post-processor deferred). |
+| 08 — Atomic-write durability clarification | ✅ | PR A `856ed89` (Unix parent-dir fsync after rename; doc comment splits guarantees into atomic-replacement / file-body / dir-entry; warn-and-Ok semantics for rare dir-sync failure). |
 
 ## Global validation checklist
 
