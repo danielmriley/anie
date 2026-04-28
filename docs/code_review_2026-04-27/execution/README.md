@@ -9,8 +9,8 @@ Status key:
 
 | Plan | Status | Notes |
 |---|---:|---|
-| 01 — Repo formatting and CI hygiene | ⬜ | Format-only PR should land first. |
-| 02 — `[ui]` config loading | ⬜ | Needed for documented UI prefs and future web-budget config. |
+| 01 — Repo formatting and CI hygiene | ✅ | Landed `5cf01ff` (2026-04-27). 828 lines of mechanical diff across 18 files; gates green. |
+| 02 — `[ui]` config loading | ✅ | Landed `<TBD>` (2026-04-27). PR A only; PR B (template) and PR C (docs) deferred until needed. Three loader tests pin behavior. |
 | 03 — Web SSRF and redirect boundary | ⬜ | Security-critical web-tool hardening. |
 | 04 — Web cancellation, budgets, and bounded side channels | ⬜ | Keep timeout policy configurable/persistent-agent friendly. |
 | 05 — Streaming built-in read path | ⬜ | Memory/resource hardening for large text files. |

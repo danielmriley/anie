@@ -778,6 +778,18 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
     {
         config.ollama.default_max_num_ctx = Some(value);
     }
+
+    if let Some(ui) = partial.ui {
+        if let Some(slash_command_popup_enabled) = ui.slash_command_popup_enabled {
+            config.ui.slash_command_popup_enabled = slash_command_popup_enabled;
+        }
+        if let Some(markdown_enabled) = ui.markdown_enabled {
+            config.ui.markdown_enabled = markdown_enabled;
+        }
+        if let Some(tool_output_mode) = ui.tool_output_mode {
+            config.ui.tool_output_mode = tool_output_mode;
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -806,6 +818,20 @@ struct PartialAnieConfig {
     tools: Option<PartialToolsConfig>,
     #[serde(default)]
     ollama: Option<PartialOllamaConfig>,
+    #[serde(default)]
+    ui: Option<PartialUiConfig>,
+}
+
+/// Optional `[ui]` overrides loaded from `config.toml`. Each
+/// field is `Option<...>` so omitted keys preserve the
+/// `UiConfig::default()` values rather than zero-initializing.
+/// Mirrors the partial-config pattern used for `[compaction]`,
+/// `[context]`, etc. above.
+#[derive(Debug, Default, Deserialize)]
+struct PartialUiConfig {
+    slash_command_popup_enabled: Option<bool>,
+    markdown_enabled: Option<bool>,
+    tool_output_mode: Option<ToolOutputMode>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1175,6 +1201,85 @@ mod tests {
             template.contains("default_max_num_ctx"),
             "template must mention the field name so users can search"
         );
+    }
+
+    #[test]
+    fn ui_config_loads_from_real_config_path() {
+        // Regression for the bug where `[ui]` settings were
+        // silently ignored: `PartialAnieConfig` had no `ui`
+        // field, so `merge_partial_config` couldn't propagate
+        // the loaded values into `AnieConfig::ui`. This test
+        // pins the real loader path end-to-end so any future
+        // regression in the partial-config plumbing is caught.
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [ui]
+            slash_command_popup_enabled = false
+            markdown_enabled = false
+            tool_output_mode = "compact"
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert!(!config.ui.slash_command_popup_enabled);
+        assert!(!config.ui.markdown_enabled);
+        assert_eq!(config.ui.tool_output_mode, ToolOutputMode::Compact);
+    }
+
+    #[test]
+    fn ui_config_omitted_fields_keep_defaults() {
+        // Merging is field-level: a `[ui]` block that only sets
+        // one knob must leave the others at `UiConfig::default()`,
+        // not zero-initialize them.
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [ui]
+            markdown_enabled = false
+            "#,
+        )
+        .expect("write config");
+
+        let defaults = UiConfig::default();
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        // Only the explicitly-set field changed.
+        assert!(!config.ui.markdown_enabled);
+        // The other two retain their `UiConfig::default()` values.
+        assert_eq!(
+            config.ui.slash_command_popup_enabled,
+            defaults.slash_command_popup_enabled,
+        );
+        assert_eq!(config.ui.tool_output_mode, defaults.tool_output_mode);
+    }
+
+    #[test]
+    fn ui_config_absent_section_keeps_all_defaults() {
+        // No `[ui]` block at all → `AnieConfig::ui` is
+        // `UiConfig::default()` verbatim.
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [model]
+            provider = "ollama"
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+        assert_eq!(config.ui, UiConfig::default());
     }
 
     #[test]
