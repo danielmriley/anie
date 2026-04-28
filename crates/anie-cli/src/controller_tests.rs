@@ -416,6 +416,13 @@ fn state_summary_includes_compaction_counts_block() {
         summary.contains("overflow: 0"),
         "expected overflow count: {summary}",
     );
+    // Plan 06 PR B: counters are documented as
+    // this-process-lifetime to head off questions about why
+    // they zero on `--continue`.
+    assert!(
+        summary.contains("this process only"),
+        "expected process-lifetime note: {summary}",
+    );
 }
 
 #[tokio::test]

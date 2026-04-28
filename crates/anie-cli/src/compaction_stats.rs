@@ -43,6 +43,16 @@ impl CompactionStatsAtomic {
     }
 
     /// Plain-old-data snapshot for rendering / serialization.
+    ///
+    /// Tearing note: the three loads are independent, so a
+    /// reader concurrent with two emit sites can observe the
+    /// counters in a state that doesn't correspond to any
+    /// single moment in time (e.g. `pre_prompt = N+1` after a
+    /// `mid_turn` increment that the snapshot missed). That is
+    /// acceptable here — these counters are diagnostic
+    /// (`/state`, future telemetry), not load-bearing state.
+    /// Keeping three plain atomics avoids a mutex on the hot
+    /// emit path.
     pub(crate) fn snapshot(&self) -> CompactionStats {
         CompactionStats {
             pre_prompt: self.pre_prompt.load(Ordering::Acquire),

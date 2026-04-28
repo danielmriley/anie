@@ -36,21 +36,17 @@ pub struct ToolExecutionContext {
     pub context_window: u64,
 }
 
-impl ToolExecutionContext {
-    /// Default-constructor for tests and callers that don't
+impl Default for ToolExecutionContext {
+    /// Default constructor for tests and callers that don't
     /// participate in the agent loop's plumbing. The 200K
     /// value is intentionally large so it's effectively a
     /// no-op for any output budget that would otherwise
     /// shrink on smaller windows — existing tool behavior is
-    /// preserved.
-    pub const TEST_DEFAULT: Self = Self {
-        context_window: 200_000,
-    };
-}
-
-impl Default for ToolExecutionContext {
+    /// preserved when callers haven't wired in a real value.
     fn default() -> Self {
-        Self::TEST_DEFAULT
+        Self {
+            context_window: 200_000,
+        }
     }
 }
 

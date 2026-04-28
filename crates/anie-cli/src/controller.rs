@@ -1729,10 +1729,18 @@ fn format_state_summary(
     // Plan 06 PR B of `docs/midturn_compaction_2026-04-27/`.
     // Render the per-session compaction breakdown so users can
     // see how the three phases mixed without trawling logs.
+    // anie-specific deviation: counters are this-process-
+    // lifetime, not durable. Resuming a session via
+    // `--continue` starts the counters at zero — the persisted
+    // session log doesn't carry per-phase counts (mid-turn
+    // compactions intentionally don't persist; pre-prompt and
+    // reactive ones do but without a phase tag in the persisted
+    // entry). Backfilling stats from session-log replay is a
+    // future plan, tracked as deferred.
     let _ = writeln!(out, "Compactions this session");
     let _ = writeln!(
         out,
-        "  Total: {}  (pre-prompt: {}, mid-turn: {}, overflow: {})",
+        "  Total: {}  (pre-prompt: {}, mid-turn: {}, overflow: {}; this process only)",
         compaction_stats.total(),
         compaction_stats.pre_prompt,
         compaction_stats.mid_turn,

@@ -173,6 +173,20 @@ impl WebReadTool {
                 // non-headless `fetch_html` path. This call only
                 // covers the initial URL. PR 3.3 of
                 // `docs/code_review_2026-04-27/`.
+                //
+                // anie-specific deviation (Plan 05 PR D of
+                // `docs/midturn_compaction_2026-04-27/`):
+                // `effective_max_bytes` is computed for this
+                // call but only the non-headless branch below
+                // honors it. Chrome's render buffer is not
+                // capped from anie's side, so a headless render
+                // can still return a body larger than the
+                // per-call budget on a small-context model.
+                // Capping headless renders requires either a
+                // post-render trim or a `--virtual-time-budget`
+                // tweak; both are speculative and tracked as a
+                // deferred follow-up rather than blocking the
+                // mid-turn-compaction milestone.
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(WebToolError::Aborted),
                     r = fetch::validate_destination(
