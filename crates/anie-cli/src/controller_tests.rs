@@ -681,6 +681,51 @@ async fn queue_prompt_appends_to_fifo_queue_while_active() {
     assert!(acks[1].contains("#2"), "second ack: {}", acks[1]);
 }
 
+/// PR 2.3 of `docs/active_input_2026-04-27/`. When a
+/// `UiAction::QueuePrompt` arrives while a transient retry is
+/// armed, the controller cancels the retry and routes the
+/// prompt through `start_prompt_run`. Stale automatic retries
+/// must not hide fresh user input.
+#[tokio::test]
+async fn queue_prompt_cancels_pending_retry() {
+    use tokio::time::Instant as TokioInstant;
+
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Arm a retry. Deadline far enough out that
+    // `start_prompt_run`'s own logic doesn't race the timer.
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: TokioInstant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+    };
+
+    // No mock provider is registered for the model's API in
+    // this minimal harness, so `start_prompt_run` errors —
+    // but the retry must still have been cleared.
+    let _ = controller
+        .try_handle_action(UiAction::QueuePrompt("urgent".into()))
+        .await;
+
+    assert!(
+        matches!(controller.pending_retry, PendingRetry::Idle),
+        "pending retry must be cleared when QueuePrompt arrives during armed backoff",
+    );
+    let mut saw_cancel_message = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event
+            && text.contains("Cancelling pending retry")
+        {
+            saw_cancel_message = true;
+        }
+    }
+    assert!(
+        saw_cancel_message,
+        "user must see why the retry was dropped",
+    );
+}
+
 /// PR 2.2 of `docs/active_input_2026-04-27/`. When a queued
 /// prompt arrives while no run is active, it starts the prompt
 /// directly (matches `SubmitPrompt` shape — same end result for

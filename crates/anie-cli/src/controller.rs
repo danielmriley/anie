@@ -205,22 +205,40 @@ impl InteractiveController {
                                             }
                                         }
                                         RetryDecision::Retry { attempt, delay_ms } => {
-                                            // Emit RetryScheduled and arm the backoff state.
-                                            // The main loop's PendingRetry arm will fire
-                                            // the continuation when the deadline elapses.
-                                            self.state
-                                                .emit_retry_scheduled(
+                                            // PR 2.3 of `active_input_2026-04-27/`. If
+                                            // the user has queued follow-up prompts,
+                                            // their input is the freshest signal and
+                                            // should not wait behind a stale automatic
+                                            // retry. Finish the failed run, surface a
+                                            // short note, and let the run-completion
+                                            // drain start the queued prompt.
+                                            if !self.queued_prompts.is_empty() {
+                                                anie_agent::send_event(
                                                     &self.event_tx,
-                                                    error,
-                                                    attempt,
-                                                    delay_ms,
+                                                    AgentEvent::SystemMessage {
+                                                        text: "Skipping automatic retry because a follow-up is queued.".into(),
+                                                    },
                                                 )
-                                                .await?;
-                                            self.pending_retry = PendingRetry::Armed {
-                                                deadline: Instant::now() + Duration::from_millis(delay_ms),
-                                                attempt,
-                                                already_compacted,
-                                            };
+                                                .await;
+                                                self.state.finish_run(&result).await?;
+                                            } else {
+                                                // Emit RetryScheduled and arm the backoff state.
+                                                // The main loop's PendingRetry arm will fire
+                                                // the continuation when the deadline elapses.
+                                                self.state
+                                                    .emit_retry_scheduled(
+                                                        &self.event_tx,
+                                                        error,
+                                                        attempt,
+                                                        delay_ms,
+                                                    )
+                                                    .await?;
+                                                self.pending_retry = PendingRetry::Armed {
+                                                    deadline: Instant::now() + Duration::from_millis(delay_ms),
+                                                    attempt,
+                                                    already_compacted,
+                                                };
+                                            }
                                         }
                                         RetryDecision::GiveUp { reason } => {
                                             info!(?reason, retry_attempt, error = %error, "not retrying provider error");
@@ -381,7 +399,10 @@ impl InteractiveController {
                 // run completes. While idle, start the prompt
                 // immediately (matches the SubmitPrompt shape
                 // for callers that emit QueuePrompt
-                // unconditionally).
+                // unconditionally). PR 2.3 added the
+                // pending-retry override: a queued prompt is a
+                // fresh user signal, so a stale armed retry
+                // should yield to it.
                 if self.current_run.is_some() {
                     let preview: String =
                         text.lines().next().unwrap_or("").chars().take(80).collect();
@@ -395,6 +416,18 @@ impl InteractiveController {
                             ),
                         })
                         .await;
+                } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+                    // A retry was armed but the user typed a
+                    // new prompt — drop the retry and start
+                    // the prompt now.
+                    self.pending_retry = PendingRetry::Idle;
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::SystemMessage {
+                            text: "Cancelling pending retry to start your follow-up.".into(),
+                        })
+                        .await;
+                    self.start_prompt_run(text).await?;
                 } else {
                     self.start_prompt_run(text).await?;
                 }
