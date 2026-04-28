@@ -178,7 +178,17 @@ async fn read_tool_truncates_at_line_limit() {
         .expect("read succeeds");
 
     let text = text_content(&result);
-    assert!(text.contains("[remaining 100 lines not shown. Use offset to read more.]"));
+    // PR 5.2 of `docs/code_review_2026-04-27/`: the footer no
+    // longer carries an exact remaining-line count, since
+    // streaming reads stop as soon as the cap is hit and
+    // computing a precise count would re-scan the rest of
+    // the file.
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "got: {text}"
+    );
+    // 2000 lines == MAX_READ_LINES were shown.
+    assert_eq!(text.lines().count() - 1, 2000); // -1 for the footer line
 }
 
 #[tokio::test]
@@ -200,7 +210,11 @@ async fn read_tool_truncates_at_byte_limit() {
         .expect("read succeeds");
 
     let text = text_content(&result);
-    assert!(text.contains("[remaining 1 lines not shown. Use offset to read more.]"));
+    // Footer wording updated for PR 5.2 — see comment above.
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -227,6 +241,114 @@ async fn read_tool_detects_and_encodes_images() {
         result.content.first(),
         Some(ContentBlock::Image { media_type, .. }) if media_type == "image/png"
     ));
+}
+
+/// PR 5.2 of `docs/code_review_2026-04-27/`. Behavioral
+/// proxy for the streaming-read invariant: a huge file with a
+/// small `limit` returns bounded output without scanning the
+/// rest of the file. We can't directly assert "did not load
+/// the full body" without instrumenting the reader, but a
+/// 64 MiB sparse file finished within seconds (< 5s in CI)
+/// is a strong indication — the pre-streaming implementation
+/// allocated the full body and would either OOM or take much
+/// longer.
+#[tokio::test]
+async fn read_tool_does_not_load_entire_large_text_file_for_small_limit() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("huge.log");
+    // 64 MiB: large enough to dwarf the 50 KiB / 2000 line
+    // caps, small enough that creating it is fast on tmpfs.
+    // We write actual bytes (not sparse) so the streaming
+    // reader has real content to walk; sparse files would
+    // confuse line-counting heuristics on some filesystems.
+    let mut content = String::with_capacity(64 * 1024 * 1024);
+    for i in 0..(64 * 1024 / 8) {
+        // Each iteration writes ~8 bytes (a 5-digit index +
+        // newline). 8192 iterations → ~64 KiB; do 8192 *
+        // 1024 = 64 MiB total.
+        for j in 0..1024 {
+            content.push_str(&format!("{i:05}-{j:03}\n"));
+        }
+    }
+    tokio::fs::write(&path, &content)
+        .await
+        .expect("write huge file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let started = std::time::Instant::now();
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "huge.log", "limit": 20 }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("read succeeds");
+    let elapsed = started.elapsed();
+
+    let text = text_content(&result);
+    let line_count = text.lines().count();
+    assert_eq!(
+        line_count, 20,
+        "limit=20 must return exactly 20 lines, got {line_count}",
+    );
+    // 5 seconds is generous; the streaming reader should
+    // finish in < 100ms on tmpfs. The pre-streaming
+    // implementation walked all 8M lines to compute
+    // `total_lines`, which dominated the runtime.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "streaming read took {elapsed:?}; regression suggests full-file scan",
+    );
+}
+
+/// PR 5.2 of `docs/code_review_2026-04-27/`. A pathological
+/// newline-less file (or one with a single very long line)
+/// must NOT grow the per-line buffer to the file size. The
+/// `read_one_line` helper caps the buffer at
+/// `MAX_LINE_BUFFER_BYTES` (4× `MAX_READ_BYTES`); after that
+/// the read returns `LineEnd::Cap` and the streaming loop
+/// stops with `truncated = true`. Build a 1 MiB file of
+/// non-newline bytes and confirm the read completes quickly
+/// with bounded output — a regression that used unbounded
+/// `read_until` would still work for 1 MiB but would fail
+/// on a 1 GiB single-line file. We cap the test at 1 MiB to
+/// keep tmpfs usage modest while still being well above
+/// `MAX_LINE_BUFFER_BYTES = 200 KiB`.
+#[tokio::test]
+async fn read_tool_caps_line_buffer_for_newline_less_file() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("oneline.txt");
+    let content = "x".repeat(1024 * 1024);
+    tokio::fs::write(&path, &content).await.expect("write file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "oneline.txt" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("read succeeds");
+
+    let text = text_content(&result);
+    // The "line" gets trimmed at MAX_READ_BYTES = 50 KiB
+    // before display; with the truncation footer added the
+    // surfaced text should sit comfortably under 60 KiB —
+    // not anywhere near the source's 1 MiB.
+    assert!(
+        text.len() < 60 * 1024,
+        "surfaced text {} bytes; expected < 60 KiB. Regression suggests \
+         the line buffer ballooned to file size.",
+        text.len(),
+    );
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "got: {text}"
+    );
 }
 
 /// PR 5.1 of `docs/code_review_2026-04-27/`. The image cap
