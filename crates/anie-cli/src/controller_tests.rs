@@ -617,6 +617,62 @@ fn compaction_strategy_uses_effective_ollama_context_window() {
     assert_eq!(config.keep_recent_tokens, 2_000);
 }
 
+/// Regression for PR 1.3 of `docs/code_review_2026-04-27/`. The
+/// give-up handler in `run_prompt` must pass
+/// `effective_ollama_context_window()` (the value actually sent on
+/// the wire) into `render_user_facing_provider_error`, not the
+/// raw `model.context_window`. Otherwise a user with an active
+/// `/context-length` override sees the wrong values in the failure
+/// message.
+///
+/// Pinned at the helper boundary rather than driving a full run:
+/// the bug's blast radius is exactly the value passed at the call
+/// site, and the renderer's formula is already covered by
+/// `user_error::tests::*`. If a future change reverts the call
+/// site to `model.context_window`, this test catches it on the
+/// next compile because the assertion would fail (16384 vs 262144).
+#[test]
+fn give_up_handler_renders_with_effective_ollama_context_window() {
+    let mut runtime_state = RuntimeState::default();
+    runtime_state
+        .ollama_num_ctx_overrides
+        .insert("ollama:qwen3:32b".into(), 16_384);
+    let ollama_model = model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi);
+    let (controller, _event_rx, _tx) =
+        build_dispatch_controller_with_runtime_state(vec![ollama_model], 16, runtime_state);
+
+    let error = ProviderError::ModelLoadResources {
+        body: "model requires more system memory".into(),
+        suggested_num_ctx: 8_192,
+    };
+    let model = controller.state.config.current_model();
+    let requested_num_ctx = controller.state.config.effective_ollama_context_window();
+    let message = crate::user_error::render_user_facing_provider_error(
+        &error,
+        requested_num_ctx,
+        &model.provider,
+        &model.id,
+    )
+    .expect("ModelLoadResources should render a user-facing message");
+
+    // The override value (16384) must appear; the model's raw
+    // context_window (262144) must not.
+    assert!(
+        message.contains("num_ctx=16384"),
+        "message should report the override: {message}"
+    );
+    assert!(
+        !message.contains("num_ctx=262144"),
+        "message should NOT report the raw model.context_window: {message}"
+    );
+    // Halved attempt is 16384/2 = 8192 (the override's halve), not
+    // 262144/2 = 131072 (which would be wrong).
+    assert!(
+        message.contains("num_ctx=8192"),
+        "message should report the halved override: {message}"
+    );
+}
+
 #[test]
 fn status_event_uses_effective_ollama_context_window() {
     let mut runtime_state = RuntimeState::default();

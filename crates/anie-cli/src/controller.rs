@@ -205,10 +205,21 @@ impl InteractiveController {
                                             // is preserved to avoid scope creep.
                                             // See docs/ollama_load_failure_recovery
                                             // README PR 3.
+                                            // Use the *effective* num_ctx — the value
+                                            // actually sent to Ollama on the wire — so the
+                                            // user-facing message reports the failed attempt
+                                            // accurately when a runtime `/context-length`
+                                            // override is active. Without this, a user who
+                                            // ran `/context-length 65536` on a model with
+                                            // discovered context_window 262144 would see the
+                                            // message claim Ollama tried 262144 / 131072,
+                                            // when it actually tried 65536 / 32768.
                                             let model = self.state.config.current_model();
+                                            let requested_num_ctx =
+                                                self.state.config.effective_ollama_context_window();
                                             if let Some(message) = render_user_facing_provider_error(
                                                 error,
-                                                model.context_window,
+                                                requested_num_ctx,
                                                 &model.provider,
                                                 &model.id,
                                             ) {
