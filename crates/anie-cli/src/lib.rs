@@ -6,6 +6,7 @@ mod commands;
 mod compaction;
 mod compaction_gate;
 mod compaction_reserve;
+mod compaction_stats;
 mod controller;
 mod interactive_mode;
 mod login_command;

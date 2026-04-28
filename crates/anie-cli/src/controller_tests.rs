@@ -155,6 +155,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
             jitter: false,
         },
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -225,6 +226,7 @@ fn controller_with_runtime_state_path(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -373,6 +375,49 @@ async fn controller_compaction_retry_path() {
     );
 }
 
+/// Plan 06 PR B: `/state` should render a "Compactions this
+/// session" block showing the per-phase counts.
+#[test]
+fn state_summary_includes_compaction_counts_block() {
+    let stats = crate::compaction_stats::CompactionStats {
+        pre_prompt: 2,
+        mid_turn: 1,
+        reactive_overflow: 0,
+    };
+    let summary = format_state_summary(
+        &ollama_model(),
+        ThinkingLevel::Medium,
+        None,
+        None,
+        32_768,
+        "session-stats",
+        None,
+        None,
+        stats,
+    );
+
+    assert!(
+        summary.contains("Compactions this session"),
+        "missing compactions block: {summary}",
+    );
+    assert!(
+        summary.contains("Total: 3"),
+        "expected 'Total: 3': {summary}",
+    );
+    assert!(
+        summary.contains("pre-prompt: 2"),
+        "expected pre-prompt count: {summary}",
+    );
+    assert!(
+        summary.contains("mid-turn: 1"),
+        "expected mid-turn count: {summary}",
+    );
+    assert!(
+        summary.contains("overflow: 0"),
+        "expected overflow count: {summary}",
+    );
+}
+
 #[tokio::test]
 async fn controller_compaction_give_up_after_second_overflow() {
     let events = run_prompt_with_provider_scripts(vec![
@@ -512,6 +557,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -554,6 +600,7 @@ fn build_state_with_registry(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     }
 }
 
@@ -1181,6 +1228,7 @@ fn controller_for_context_length_test_with_cap(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1641,6 +1689,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry,
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1774,6 +1823,7 @@ fn spawn_live_controller(
         prompt_cache,
         retry_config,
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);
@@ -2200,6 +2250,7 @@ fn state_summary_for_ollama_with_runtime_override_shows_all_three_layers() {
         "session-abc",
         Some(std::path::PathBuf::from("/tmp/anie/config.toml")),
         Some(std::path::PathBuf::from("/tmp/anie/state.json")),
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("ollama:qwen3:32b"), "{summary}");
@@ -2232,6 +2283,7 @@ fn state_summary_for_ollama_without_override_marks_override_none() {
         "session-1",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(
@@ -2256,6 +2308,7 @@ fn state_summary_for_ollama_without_cap_marks_cap_none() {
         "session-1",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("Runtime override: (none)"), "{summary}");
@@ -2274,6 +2327,7 @@ fn state_summary_for_non_ollama_model_omits_layered_breakdown() {
         "session-x",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("openai:gpt-5"), "{summary}");
@@ -2304,6 +2358,7 @@ fn state_summary_includes_thinking_and_session_id() {
         "abc-123-def",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("Thinking: high"), "{summary}");
@@ -2321,6 +2376,7 @@ fn state_summary_lists_persistent_file_paths_when_available() {
         "s",
         Some(std::path::PathBuf::from("/home/u/.anie/config.toml")),
         Some(std::path::PathBuf::from("/home/u/.anie/state.json")),
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(
@@ -2345,6 +2401,7 @@ fn state_summary_omits_path_lines_when_path_helpers_return_none() {
         "s",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("Files"), "{summary}");

@@ -28,6 +28,7 @@ use anie_provider::{
 use anie_session::{CompactionConfig, SessionContext, SessionInfo};
 use anie_tui::UiAction;
 
+use crate::compaction_stats::{CompactionStats, CompactionStatsAtomic};
 use crate::retry_policy::GiveUpReason;
 use crate::{
     Cli,
@@ -182,6 +183,7 @@ impl InteractiveController {
             summarizer: Arc::new(strategy),
             budget: Arc::clone(&self.compactions_remaining_this_turn),
             event_tx: self.event_tx.clone(),
+            stats: Arc::clone(&self.state.compaction_stats),
         };
         Some(Arc::new(gate) as Arc<dyn anie_agent::CompactionGate>)
     }
@@ -996,6 +998,13 @@ pub(crate) struct ControllerState {
     /// `commands::builtin_commands()` at startup; extensions and
     /// prompt templates register additional entries here.
     pub(crate) command_registry: crate::commands::CommandRegistry,
+    /// Per-session running counts of compaction events by
+    /// phase. Surfaced in `/state`, reset on `/new` and
+    /// session switch. Shared via `Arc` with the mid-turn
+    /// `ControllerCompactionGate` so all paths increment the
+    /// same atomic. Plan 06 of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    pub(crate) compaction_stats: Arc<CompactionStatsAtomic>,
 }
 
 impl ControllerState {
@@ -1070,6 +1079,7 @@ impl ControllerState {
             self.session.id(),
             anie_config::global_config_path(),
             anie_config::anie_state_json_path(),
+            self.compaction_stats.snapshot(),
         )
     }
 
@@ -1212,7 +1222,13 @@ impl ControllerState {
             },
         )
         .await;
+        // Plan 06 PR B: bump the phase counter only after the
+        // event has been emitted, so the user-visible event
+        // ordering stays unchanged and `/state` reflects the
+        // same compactions the transcript shows.
+        self.compaction_stats.increment(phase);
     }
+
 
     /// Returns `Ok(true)` when a compaction successfully ran,
     /// `Ok(false)` when the threshold wasn't crossed or the
@@ -1304,6 +1320,10 @@ impl ControllerState {
 
     async fn new_session(&mut self) -> Result<()> {
         self.session.start_new()?;
+        // Plan 06 PR B: counters are session-scoped, so a fresh
+        // session zeroes them out alongside the rest of the
+        // session-bound state.
+        self.compaction_stats.reset();
         self.persist_runtime_state_logged("new_session");
         Ok(())
     }
@@ -1313,6 +1333,10 @@ impl ControllerState {
             .switch_to(session_id)
             .map_err(|_| UserCommandError::UnknownSession(session_id.to_string()))?;
         self.apply_session_overrides();
+        // Counters are session-scoped (plan 06 PR B). Switching
+        // away from the active session zeroes them out so the
+        // newly-active session starts with its own count.
+        self.compaction_stats.reset();
         self.persist_runtime_state_logged("switch_session");
         Ok(())
     }
@@ -1320,6 +1344,9 @@ impl ControllerState {
     async fn fork_session(&mut self) -> Result<String> {
         let child_id = self.session.fork()?;
         self.apply_session_overrides();
+        // Same rationale as `switch_session` — the fork is a
+        // distinct session and starts with fresh counters.
+        self.compaction_stats.reset();
         self.persist_runtime_state_logged("fork_session");
         Ok(child_id)
     }
@@ -1637,6 +1664,7 @@ fn format_state_summary(
     session_id: &str,
     config_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
+    compaction_stats: CompactionStats,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1697,6 +1725,20 @@ fn format_state_summary(
 
     let _ = writeln!(out, "Session");
     let _ = writeln!(out, "  Active: {session_id}");
+    let _ = writeln!(out);
+
+    // Plan 06 PR B of `docs/midturn_compaction_2026-04-27/`.
+    // Render the per-session compaction breakdown so users can
+    // see how the three phases mixed without trawling logs.
+    let _ = writeln!(out, "Compactions this session");
+    let _ = writeln!(
+        out,
+        "  Total: {}  (pre-prompt: {}, mid-turn: {}, overflow: {})",
+        compaction_stats.total(),
+        compaction_stats.pre_prompt,
+        compaction_stats.mid_turn,
+        compaction_stats.reactive_overflow,
+    );
     let _ = writeln!(out);
 
     let _ = writeln!(out, "Files");

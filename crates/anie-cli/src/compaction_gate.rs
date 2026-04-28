@@ -31,6 +31,8 @@ use anie_session::{
     CompactionConfig, MessageSummarizer, compact_messages_inline, estimate_message_tokens,
 };
 
+use crate::compaction_stats::CompactionStatsAtomic;
+
 /// Controller-side `CompactionGate`. Built per-turn from the
 /// controller's current model / config / shared budget atomic
 /// and installed on `AgentLoopConfig` via
@@ -52,6 +54,12 @@ pub(crate) struct ControllerCompactionGate {
     /// reactive / mid-turn paths is one counter (PR 8.2).
     pub budget: Arc<AtomicU32>,
     pub event_tx: mpsc::Sender<AgentEvent>,
+    /// Per-session compaction counters. Cloned from
+    /// `ControllerState::compaction_stats` so the mid-turn
+    /// path increments the same atomic the pre-prompt and
+    /// reactive paths use. Plan 06 of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    pub stats: Arc<CompactionStatsAtomic>,
 }
 
 #[async_trait]
@@ -116,6 +124,11 @@ impl CompactionGate for ControllerCompactionGate {
                     },
                 )
                 .await;
+                // Plan 06 PR B: bump the per-session counter
+                // after the user-visible event, mirroring
+                // `ControllerState::emit_compaction_end`'s
+                // ordering for the other two phases.
+                self.stats.increment(CompactionPhase::MidTurn);
                 Ok(CompactionGateOutcome::Compacted {
                     messages: inline.messages,
                 })
@@ -173,6 +186,7 @@ mod tests {
                 summarizer: Arc::new(StubSummarizer("test summary".into())),
                 budget: Arc::new(AtomicU32::new(budget_initial)),
                 event_tx: tx,
+                stats: Arc::new(CompactionStatsAtomic::default()),
             },
             rx,
         )
@@ -286,6 +300,23 @@ mod tests {
 
         // Budget decremented from 2 → 1.
         assert_eq!(gate.budget.load(Ordering::Acquire), 1);
+
+        // Plan 06 PR B: stats counter must record exactly one
+        // mid-turn compaction; the other phase counters stay
+        // at zero since the gate only emits MidTurn events.
+        let snapshot = gate.stats.snapshot();
+        assert_eq!(
+            snapshot.mid_turn, 1,
+            "expected one mid-turn count, got {snapshot:?}",
+        );
+        assert_eq!(
+            snapshot.pre_prompt, 0,
+            "gate must not bump pre-prompt counter, got {snapshot:?}",
+        );
+        assert_eq!(
+            snapshot.reactive_overflow, 0,
+            "gate must not bump reactive counter, got {snapshot:?}",
+        );
 
         // Drain emitted events; both Start and End should fire,
         // in that order.

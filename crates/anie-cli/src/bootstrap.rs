@@ -101,6 +101,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {
