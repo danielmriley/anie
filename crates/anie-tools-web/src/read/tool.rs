@@ -116,6 +116,7 @@ impl WebReadTool {
         &self,
         args: &WebReadArgs,
         cancel: &CancellationToken,
+        update_tx: Option<&mpsc::Sender<ToolResult>>,
     ) -> Result<String, WebToolError> {
         if cancel.is_cancelled() {
             return Err(WebToolError::Aborted);
@@ -139,6 +140,13 @@ impl WebReadTool {
             }
         }
 
+        // Coarse phase progress. PR 4.4 of
+        // `docs/code_review_2026-04-27/` — one update per
+        // phase, never high-frequency. The send is best-effort
+        // (drop on full / closed channel) so a slow consumer
+        // can't backpressure the fetch.
+        emit_phase(update_tx, &args.url, "fetching").await;
+
         let html = if args.javascript {
             #[cfg(feature = "headless")]
             {
@@ -160,6 +168,7 @@ impl WebReadTool {
                         self.fetch_opts.allow_private_ips,
                     ) => r?,
                 }
+                emit_phase(update_tx, &args.url, "rendering").await;
                 crate::read::headless::render_with_chrome(
                     &url,
                     Duration::from_secs(self.fetch_opts.headless_timeout_secs),
@@ -188,6 +197,7 @@ impl WebReadTool {
         };
         debug!(bytes = html.len(), "fetched html");
 
+        emit_phase(update_tx, &args.url, "extracting").await;
         let extracted = self.runner.run(&html, url.as_str(), cancel).await?;
         debug!(
             title = extracted.title.as_deref().unwrap_or(""),
@@ -198,6 +208,28 @@ impl WebReadTool {
         let yaml = frontmatter::build(&extracted, url.as_str());
         Ok(format!("{yaml}\n{}", extracted.markdown_body()))
     }
+}
+
+/// Best-effort phase update. Builds a `ToolResult` shaped like
+/// the bash tool's `partial: true` updates so the existing
+/// controller/UI plumbing renders it without further work, and
+/// uses `try_send` so a slow consumer can't backpressure the
+/// fetch — dropping a phase update is far less harmful than
+/// stalling the agent.
+async fn emit_phase(update_tx: Option<&mpsc::Sender<ToolResult>>, url: &str, phase: &str) {
+    let Some(tx) = update_tx else { return };
+    let result = ToolResult {
+        content: vec![ContentBlock::Text {
+            text: format!("web_read: {phase} {url}"),
+        }],
+        details: serde_json::json!({
+            "tool": "web_read",
+            "url": url,
+            "phase": phase,
+            "partial": true,
+        }),
+    };
+    let _ = tx.try_send(result);
 }
 
 #[async_trait]
@@ -231,14 +263,17 @@ impl Tool for WebReadTool {
         _call_id: &str,
         args: serde_json::Value,
         cancel: CancellationToken,
-        _update_tx: Option<mpsc::Sender<ToolResult>>,
+        update_tx: Option<mpsc::Sender<ToolResult>>,
     ) -> Result<ToolResult, ToolError> {
         let parsed: WebReadArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_read args: {e}")))?;
-        let body = self.run(&parsed, &cancel).await.map_err(|e| match e {
-            WebToolError::Aborted => ToolError::Aborted,
-            other => ToolError::ExecutionFailed(other.to_string()),
-        })?;
+        let body = self
+            .run(&parsed, &cancel, update_tx.as_ref())
+            .await
+            .map_err(|e| match e {
+                WebToolError::Aborted => ToolError::Aborted,
+                other => ToolError::ExecutionFailed(other.to_string()),
+            })?;
         Ok(ToolResult {
             content: vec![ContentBlock::Text { text: body }],
             details: serde_json::json!({
@@ -352,6 +387,7 @@ mod tests {
                     javascript: false,
                 },
                 &CancellationToken::new(),
+                None,
             )
             .await
             .expect("run ok");
@@ -396,6 +432,7 @@ mod tests {
                     javascript: false,
                 },
                 &CancellationToken::new(),
+                None,
             )
             .await
             .unwrap_err();
@@ -429,6 +466,7 @@ mod tests {
                     javascript: false,
                 },
                 &CancellationToken::new(),
+                None,
             )
             .await
             .unwrap_err();
@@ -455,6 +493,7 @@ mod tests {
                     javascript: false,
                 },
                 &CancellationToken::new(),
+                None,
             )
             .await
             .unwrap_err();
@@ -479,6 +518,7 @@ mod tests {
                     javascript: true,
                 },
                 &CancellationToken::new(),
+                None,
             )
             .await
             .unwrap_err();
@@ -509,6 +549,7 @@ mod tests {
                     javascript: false,
                 },
                 &cancel,
+                None,
             )
             .await
             .unwrap_err();
@@ -569,11 +610,83 @@ mod tests {
                     javascript: false,
                 },
                 &cancel,
+                None,
             )
             .await
             .unwrap_err();
         assert!(matches!(err, WebToolError::Aborted), "got: {err:?}");
         canceller.await.expect("canceller task");
+    }
+
+    /// PR 4.4 of `docs/code_review_2026-04-27/`. A coarse
+    /// `fetching` and `extracting` phase update flows through
+    /// the `update_tx` channel for the non-headless success
+    /// path. Verifies one update per phase (no high-frequency
+    /// progress) and that the partial-update marker is set so
+    /// the controller can distinguish phase pings from final
+    /// results.
+    #[tokio::test]
+    async fn web_read_emits_phase_progress_updates() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/page");
+                then.status(200)
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body("<html><body>ok</body></html>");
+            })
+            .await;
+
+        let tool = WebReadTool::with_runner(
+            opts(true),
+            Arc::new(StubRunner {
+                output: fixed_output(),
+            }),
+            false,
+        )
+        .expect("build tool");
+
+        let (tx, mut rx) = mpsc::channel::<ToolResult>(8);
+        let cancel = CancellationToken::new();
+        let url = format!("{}/page", server.base_url());
+        let _body = tool
+            .run(
+                &WebReadArgs {
+                    url: url.clone(),
+                    javascript: false,
+                },
+                &cancel,
+                Some(&tx),
+            )
+            .await
+            .expect("run ok");
+        // Drop tx so the receiver can drain to completion
+        // without hanging on a closed but empty channel.
+        drop(tx);
+
+        let mut phases: Vec<String> = Vec::new();
+        while let Some(result) = rx.recv().await {
+            let phase = result
+                .details
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            assert!(
+                result
+                    .details
+                    .get("partial")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                "phase update must be marked partial"
+            );
+            phases.push(phase);
+        }
+        assert_eq!(
+            phases,
+            vec!["fetching".to_string(), "extracting".to_string()],
+            "non-headless path emits exactly the two phases, in order"
+        );
     }
 
     /// PR 3.3 of `docs/code_review_2026-04-27/`. The headless
@@ -618,6 +731,7 @@ mod tests {
                     javascript: true,
                 },
                 &CancellationToken::new(),
+                None,
             )
             .await
             .unwrap_err();
