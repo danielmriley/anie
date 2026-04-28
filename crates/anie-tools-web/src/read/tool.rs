@@ -119,6 +119,21 @@ impl WebReadTool {
             #[cfg(feature = "headless")]
             {
                 use std::time::Duration;
+                // Headless path doesn't go through `fetch_html`,
+                // so the resolved-IP SSRF check has to happen
+                // here. Once Chrome is launched, redirects and
+                // subresources go through the browser's network
+                // stack — we don't intercept those today, so the
+                // headless boundary is strictly weaker than the
+                // non-headless `fetch_html` path. This call only
+                // covers the initial URL. PR 3.3 of
+                // `docs/code_review_2026-04-27/`.
+                fetch::validate_destination(
+                    &url,
+                    self.resolver.as_ref(),
+                    self.fetch_opts.allow_private_ips,
+                )
+                .await?;
                 crate::read::headless::render_with_chrome(
                     &url,
                     Duration::from_secs(self.fetch_opts.headless_timeout_secs),
@@ -133,6 +148,8 @@ impl WebReadTool {
                 ));
             }
         } else {
+            // `fetch_html` validates every URL in the chain
+            // (initial + redirects) against `allow_private_ips`.
             fetch::fetch_html(&self.client, self.resolver.as_ref(), &url, &self.fetch_opts).await?
         };
         debug!(bytes = html.len(), "fetched html");
@@ -154,7 +171,7 @@ impl Tool for WebReadTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "web_read".into(),
-            description: "Fetch a URL from the live web and return its main content as clean Markdown with YAML frontmatter metadata (title, author, date, source, etc.). Use this whenever you need information from a specific web page — articles, documentation, news stories, weather pages, blog posts, reference material, or any URL surfaced by web_search. Not just for coding research. Pass javascript=true for SPA / heavily JS-rendered pages — slower, requires Chrome/Chromium installed and the crate built with --features headless.".into(),
+            description: "Fetch a URL from the live web and return its main content as clean Markdown with YAML frontmatter metadata (title, author, date, source, etc.). Use this whenever you need information from a specific web page — articles, documentation, news stories, weather pages, blog posts, reference material, or any URL surfaced by web_search. Not just for coding research. Pass javascript=true for SPA / heavily JS-rendered pages — slower, requires Chrome/Chromium installed and the crate built with --features headless. Note: javascript=true relies on Chrome's network stack and does NOT carry the same private-network protection as the default fetch path; prefer the default unless the page genuinely needs JS.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -416,5 +433,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WebToolError::HeadlessFailure(_)));
+    }
+
+    /// PR 3.3 of `docs/code_review_2026-04-27/`. The headless
+    /// path is not SSRF-equivalent to the non-headless path,
+    /// but the *initial* navigation must still go through
+    /// `validate_destination` — otherwise a hostname like
+    /// `evil.example` resolving to `127.0.0.1` would slip past
+    /// the textual `validate_url` check (which only catches
+    /// known-private hostnames) and Chrome would happily fetch
+    /// the loopback resource. This test pins that the resolved-IP
+    /// guard fires before any Chrome launch attempt.
+    ///
+    /// Feature-gated because the production code path that
+    /// invokes `validate_destination` for `javascript=true` only
+    /// compiles with `--features headless`. The test asserts on
+    /// the validation error, so it does not need a real Chrome
+    /// install.
+    #[cfg(feature = "headless")]
+    #[tokio::test]
+    async fn web_read_javascript_path_rejects_hostname_resolving_to_private_ip() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use crate::read::fetch::StaticResolver;
+
+        let mut tool = WebReadTool::with_runner(
+            opts(false),
+            Arc::new(StubRunner {
+                output: fixed_output(),
+            }),
+            false,
+        )
+        .expect("build tool");
+        tool.set_resolver(Arc::new(StaticResolver::new(vec![(
+            "evil.example",
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        )])));
+
+        let err = tool
+            .run(&WebReadArgs {
+                url: "http://evil.example/page".into(),
+                javascript: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WebToolError::PrivateAddress(_)),
+            "got: {err:?}"
+        );
     }
 }
