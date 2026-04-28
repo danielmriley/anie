@@ -210,6 +210,66 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
+/// Outcome from a `CompactionGate::maybe_compact` call.
+///
+/// Plan `docs/midturn_compaction_2026-04-27/03_agent_loop_compaction_signal.md`.
+/// PR 8.3 — the trait and enum land default-off; plan 04 (PR
+/// 8.4) installs a real implementation in the controller.
+#[derive(Debug, Clone)]
+pub enum CompactionGateOutcome {
+    /// No compaction needed; the loop continues with the same
+    /// context.
+    Continue,
+    /// Compaction ran; replace the loop's context with `messages`.
+    /// The agent loop emits `AgentEvent::TranscriptReplace`
+    /// before the next sampling iteration so the UI re-renders
+    /// from the post-compaction transcript.
+    Compacted {
+        /// Replacement context. Must preserve any in-flight
+        /// tool-call correlation (the existing pre-prompt
+        /// compaction primitive `find_cut_point` is the model
+        /// for this).
+        messages: Vec<Message>,
+    },
+    /// Gate decided not to compact this time (typically because
+    /// the per-turn budget is exhausted, but the trait is
+    /// reason-agnostic). The loop emits a `SystemMessage` with
+    /// the supplied reason and continues; the next sampling
+    /// request may still overflow, in which case the reactive
+    /// retry path handles it.
+    Skipped {
+        /// Human-readable reason surfaced to the user / logs.
+        reason: String,
+    },
+}
+
+/// Hook invoked between agent-loop iterations to decide
+/// whether mid-turn compaction is warranted.
+///
+/// Called after each sampling response has been merged into
+/// the loop's context (assistant message + any tool results +
+/// any steering messages) and *before* the next sampling
+/// iteration's request is built. That timing matches codex's
+/// pattern (`codex-rs/core/src/codex.rs:6420-6468`) and gives
+/// the controller a chance to shrink context before the agent
+/// burns another sampling request on a too-large prompt.
+///
+/// **Default behavior:** `AgentLoopConfig::compaction_gate`
+/// defaults to `None`, in which case the loop never invokes
+/// this hook — no behavior change for callers that don't
+/// install one.
+///
+/// Plan `docs/midturn_compaction_2026-04-27/03_agent_loop_compaction_signal.md`.
+#[async_trait::async_trait]
+pub trait CompactionGate: Send + Sync {
+    /// Inspect `context` and decide whether to compact, leave
+    /// it unchanged, or explicitly skip with a reason.
+    async fn maybe_compact(
+        &self,
+        context: &[Message],
+    ) -> Result<CompactionGateOutcome, anyhow::Error>;
+}
+
 /// Immutable configuration for an agent loop instance.
 pub struct AgentLoopConfig {
     model: Model,
@@ -222,6 +282,12 @@ pub struct AgentLoopConfig {
     get_follow_up_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
     before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
     after_tool_call_hook: Option<Arc<dyn AfterToolCallHook>>,
+    /// Optional mid-turn compaction hook. Default `None`. Plan
+    /// 8.3 of `docs/midturn_compaction_2026-04-27/`. The
+    /// controller installs a real implementation in plan 8.4;
+    /// today's call sites all pass `None`, so this is a pure
+    /// plumbing change with zero behavioral effect.
+    compaction_gate: Option<Arc<dyn CompactionGate>>,
 }
 
 impl AgentLoopConfig {
@@ -245,7 +311,18 @@ impl AgentLoopConfig {
             get_follow_up_messages: None,
             before_tool_call_hook: None,
             after_tool_call_hook: None,
+            compaction_gate: None,
         }
+    }
+
+    /// Install a [`CompactionGate`] that the loop consults at
+    /// the bottom of each iteration (after the first).
+    /// Defaults to `None`. PR 8.3 of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    #[must_use]
+    pub fn with_compaction_gate(mut self, gate: Option<Arc<dyn CompactionGate>>) -> Self {
+        self.compaction_gate = gate;
+        self
     }
 
     /// Snapshot an Ollama native `num_ctx` override for provider
@@ -585,6 +662,49 @@ impl AgentLoop {
                     final_context: context,
                     terminal_error: None,
                 };
+            }
+
+            // Mid-turn compaction gate. PR 8.3 of
+            // `docs/midturn_compaction_2026-04-27/`. Fires AFTER
+            // tool results / steering messages have been merged
+            // into `context` and BEFORE the next sampling
+            // iteration starts. The first iteration is unaffected
+            // because we never reach this point without having
+            // completed at least one full sampling cycle. Default
+            // `None` makes this a single `Option::is_some` branch
+            // — zero cost for callers that don't install a gate.
+            if let Some(gate) = self.config.compaction_gate.as_ref() {
+                match gate.maybe_compact(&context).await {
+                    Ok(CompactionGateOutcome::Continue) => {}
+                    Ok(CompactionGateOutcome::Compacted { messages }) => {
+                        context = messages;
+                        send_event(
+                            event_tx,
+                            AgentEvent::TranscriptReplace {
+                                messages: context.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(CompactionGateOutcome::Skipped { reason }) => {
+                        send_event(
+                            event_tx,
+                            AgentEvent::SystemMessage {
+                                text: format!("Skipped mid-turn compaction: {reason}"),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        // A gate failure is non-fatal: the next
+                        // sampling request may still overflow, and
+                        // the reactive retry path will handle it.
+                        // Surfacing as a warn keeps the failure
+                        // observable without killing an in-flight
+                        // turn.
+                        warn!(?error, "compaction gate failed");
+                    }
+                }
             }
 
             send_event(event_tx, AgentEvent::TurnStart).await;

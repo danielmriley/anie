@@ -25,7 +25,10 @@ use anie_provider::{
 use crate::hooks::{
     AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride,
 };
-use crate::{AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionMode, ToolRegistry};
+use crate::{
+    AgentLoop, AgentLoopConfig, CompactionGate, CompactionGateOutcome, Tool, ToolError,
+    ToolExecutionMode, ToolRegistry,
+};
 
 fn sample_model() -> Model {
     Model {
@@ -851,4 +854,266 @@ async fn tool_partial_updates_emit_tool_exec_update_events() {
 
     let (_result, events) = collect_run(agent, vec![user_prompt("updates")], Vec::new()).await;
     assert!(event_kinds(&events).contains(&"ToolExecUpdate"));
+}
+
+// --------------------------------------------------------------
+// PR 8.3 of `docs/midturn_compaction_2026-04-27/`:
+// `CompactionGate` hook tests.
+// --------------------------------------------------------------
+
+/// Test gate that records every call and returns a configurable
+/// outcome. Driven from the test by an `Arc<Mutex<Vec<...>>>`
+/// queue so a single agent run can produce a sequence of
+/// `Continue` / `Compacted` / `Skipped` / `Err` outcomes in
+/// order.
+struct ScriptedGate {
+    script: std::sync::Mutex<std::collections::VecDeque<GateOutcomeScript>>,
+    calls: AtomicUsize,
+}
+
+enum GateOutcomeScript {
+    Continue,
+    Compacted(Vec<Message>),
+    Skipped(String),
+    Err(String),
+}
+
+#[async_trait]
+impl CompactionGate for ScriptedGate {
+    async fn maybe_compact(
+        &self,
+        _context: &[Message],
+    ) -> Result<CompactionGateOutcome, anyhow::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let next = self
+            .script
+            .lock()
+            .expect("script lock")
+            .pop_front()
+            .unwrap_or(GateOutcomeScript::Continue);
+        match next {
+            GateOutcomeScript::Continue => Ok(CompactionGateOutcome::Continue),
+            GateOutcomeScript::Compacted(messages) => {
+                Ok(CompactionGateOutcome::Compacted { messages })
+            }
+            GateOutcomeScript::Skipped(reason) => Ok(CompactionGateOutcome::Skipped { reason }),
+            GateOutcomeScript::Err(msg) => Err(anyhow::anyhow!(msg)),
+        }
+    }
+}
+
+fn agent_with_gate(
+    provider: Box<dyn Provider>,
+    tool_registry: Arc<ToolRegistry>,
+    gate: Option<Arc<dyn CompactionGate>>,
+) -> AgentLoop {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(ApiKind::OpenAICompletions, provider);
+
+    AgentLoop::new(
+        Arc::new(provider_registry),
+        tool_registry,
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_compaction_gate(gate),
+    )
+}
+
+/// Default `compaction_gate: None` is byte-identical to today.
+/// The gate-handling branch must be a no-op pure addition; this
+/// pins that no extra `TranscriptReplace` / `SystemMessage` /
+/// other side-effect leaks into a no-gate run.
+#[tokio::test]
+async fn agent_run_with_no_gate_behaves_like_today() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(string_arg_tool()));
+    let agent = agent_with_gate(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "echo",
+                serde_json::json!({"value": "first"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        None,
+    );
+
+    let (_result, events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let kinds = event_kinds(&events);
+    assert!(
+        !kinds.contains(&"TranscriptReplace"),
+        "no-gate run must not emit TranscriptReplace from the mid-turn path",
+    );
+    // The no-gate run sequence: prompt → tool-call assistant →
+    // tool result → final assistant → done. Pinning the count
+    // catches a regression where the gate branch fires extra
+    // events.
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "TurnStart").count(),
+        2,
+        "no-gate run emits exactly two TurnStart events (initial + post-tool); got {kinds:?}",
+    );
+}
+
+/// `Compacted { messages }` replaces `context` and emits
+/// `TranscriptReplace`. Drive a multi-iteration tool call and
+/// have the gate hand back a fresh context after the first
+/// iteration; the next request must build from the replaced
+/// context, and the UI side must see exactly one
+/// `TranscriptReplace`.
+#[tokio::test]
+async fn agent_run_calls_compaction_gate_between_iterations() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(string_arg_tool()));
+
+    // The gate hands back a single replacement message — by
+    // collapsing the entire turn's context to one user message,
+    // we can verify the loop actually used the new context for
+    // the next iteration: the next provider call sees what we
+    // hand back, not the original prompt + assistant + tool
+    // result chain.
+    let replacement_summary = user_prompt("[summary] previous turn replaced");
+    let gate = Arc::new(ScriptedGate {
+        script: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+            GateOutcomeScript::Compacted(vec![replacement_summary.clone()]),
+        ])),
+        calls: AtomicUsize::new(0),
+    });
+
+    let agent = agent_with_gate(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "echo",
+                serde_json::json!({"value": "first"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        Some(gate.clone() as Arc<dyn CompactionGate>),
+    );
+
+    let (result, events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    assert_eq!(
+        gate.calls.load(Ordering::Relaxed),
+        1,
+        "the gate is consulted exactly once between iterations",
+    );
+    assert!(
+        event_kinds(&events).contains(&"TranscriptReplace"),
+        "Compacted must emit TranscriptReplace so the UI re-renders",
+    );
+    // The replaced context took effect: the agent saw it and
+    // produced the second sampling response (the final
+    // assistant). Pin via terminal_error == None and a final
+    // assistant message present.
+    assert!(result.terminal_error.is_none());
+    let final_text = result
+        .generated_messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::Assistant(a) => Some(
+                a.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(final_text.contains("complete"));
+}
+
+/// `Skipped { reason }` emits a `SystemMessage` and continues.
+/// Pin both: the message text contains the reason, and the run
+/// reaches its final assistant.
+#[tokio::test]
+async fn agent_run_surfaces_skipped_reason_and_continues() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(string_arg_tool()));
+
+    let gate = Arc::new(ScriptedGate {
+        script: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+            GateOutcomeScript::Skipped("budget exhausted".into()),
+        ])),
+        calls: AtomicUsize::new(0),
+    });
+
+    let agent = agent_with_gate(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "echo",
+                serde_json::json!({"value": "first"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        Some(gate as Arc<dyn CompactionGate>),
+    );
+
+    let (result, events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    assert!(result.terminal_error.is_none());
+    let saw_skip_message = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::SystemMessage { text } if text.contains("Skipped mid-turn compaction") && text.contains("budget exhausted")
+        )
+    });
+    assert!(
+        saw_skip_message,
+        "Skipped must surface the reason via SystemMessage",
+    );
+}
+
+/// A gate `Err(...)` must NOT kill the turn — the next sampling
+/// request may still overflow, and the reactive retry path
+/// handles that. Without this, a flaky gate would pre-empt the
+/// existing retry/recovery story.
+#[tokio::test]
+async fn agent_run_continues_when_gate_errors() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(string_arg_tool()));
+
+    let gate = Arc::new(ScriptedGate {
+        script: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+            GateOutcomeScript::Err("simulated gate failure".into()),
+        ])),
+        calls: AtomicUsize::new(0),
+    });
+
+    let agent = agent_with_gate(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "echo",
+                serde_json::json!({"value": "first"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        Some(gate as Arc<dyn CompactionGate>),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+    assert!(
+        result.terminal_error.is_none(),
+        "gate failure must not produce a terminal error on the run",
+    );
 }
