@@ -210,6 +210,75 @@ fn status_bar_shows_elapsed_seconds_while_compacting() {
     );
 }
 
+/// Plan 06 PR C: the `MidTurn` phase puts a phase tag on the
+/// activity-row label so users can tell mid-turn compaction
+/// apart from a pre-prompt one without inspecting the
+/// transcript.
+#[test]
+fn activity_row_shows_midturn_label_for_midturn_phase() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    {
+        let status = app.status_bar_mut();
+        status.provider_name = "ollama".into();
+        status.model_name = "qwen3:32b".into();
+        status.thinking = "off".into();
+        status.estimated_context_tokens = 30_000;
+        status.context_window = 32_768;
+        status.cwd = "~/project".into();
+    }
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::MidTurn,
+    })
+    .expect("start");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert!(
+        screen.contains("compacting (mid-turn)"),
+        "mid-turn activity row should be tagged: {screen}",
+    );
+    assert!(
+        !screen.contains("compacting 0s"),
+        "mid-turn label should not collide with the pre-prompt label: {screen}",
+    );
+}
+
+/// Plan 06 PR C: reactive overflow recovery surfaces a
+/// distinct label so a "compacting after overflow" state is
+/// visually distinguishable from proactive compactions.
+#[test]
+fn activity_row_shows_overflow_label_for_reactive_phase() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    {
+        let status = app.status_bar_mut();
+        status.provider_name = "openai".into();
+        status.model_name = "gpt-5".into();
+        status.thinking = "medium".into();
+        status.estimated_context_tokens = 200_000;
+        status.context_window = 200_000;
+        status.cwd = "~/project".into();
+    }
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::ReactiveOverflow,
+    })
+    .expect("start");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert!(
+        screen.contains("compacting after overflow"),
+        "reactive overflow activity row should call out the trigger: {screen}",
+    );
+}
+
 #[test]
 fn shift_modified_characters_are_inserted() {
     use crate::InputPane;

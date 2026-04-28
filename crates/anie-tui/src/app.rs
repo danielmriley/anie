@@ -213,8 +213,14 @@ pub enum AgentUiState {
     ToolExecuting { tool_name: String },
     /// A context compaction is in flight — the LLM is
     /// summarizing the transcript. The wall-clock start is
-    /// tracked so the status bar can show elapsed seconds.
-    Compacting { started_at: std::time::Instant },
+    /// tracked so the status bar can show elapsed seconds;
+    /// the phase distinguishes pre-prompt / mid-turn /
+    /// reactive-overflow compactions in the activity row
+    /// (Plan 06 PR C of `docs/midturn_compaction_2026-04-27/`).
+    Compacting {
+        started_at: std::time::Instant,
+        phase: anie_protocol::CompactionPhase,
+    },
 }
 
 /// Actions emitted from the TUI to the controller layer.
@@ -880,17 +886,19 @@ impl App {
                 self.status_bar.cwd = cwd;
                 self.status_bar.last_known_input_tokens = None;
             }
-            AgentEvent::CompactionStart { phase: _ } => {
+            AgentEvent::CompactionStart { phase } => {
                 // Permanent record in the transcript + transition
                 // the agent state so the status bar shows the
                 // live elapsed counter while the summarization
-                // LLM call is in flight. PR C of plan 06 will
-                // surface `phase` in the activity-row label;
-                // PR A keeps the existing wording.
+                // LLM call is in flight. The transcript message
+                // stays phase-neutral; the activity-row label
+                // (`render_spinner_row`) carries the phase
+                // suffix (PR C of plan 06).
                 self.output_pane
                     .add_system_message("Compacting context…".to_string());
                 self.agent_state = AgentUiState::Compacting {
                     started_at: std::time::Instant::now(),
+                    phase,
                 };
             }
             AgentEvent::CompactionEnd {
@@ -2292,9 +2300,20 @@ fn render_spinner_row(
         AgentUiState::Idle => String::new(),
         AgentUiState::Streaming => "Responding".into(),
         AgentUiState::ToolExecuting { tool_name } => format!("Running {tool_name}"),
-        AgentUiState::Compacting { started_at } => {
+        AgentUiState::Compacting { started_at, phase } => {
+            // Plan 06 PR C: phase-specific suffix so users can
+            // distinguish proactive compactions from reactive
+            // overflow recovery without inspecting logs.
             let elapsed = started_at.elapsed().as_secs();
-            format!("compacting {elapsed}s")
+            match phase {
+                anie_protocol::CompactionPhase::PrePrompt => format!("compacting {elapsed}s"),
+                anie_protocol::CompactionPhase::MidTurn => {
+                    format!("compacting (mid-turn) {elapsed}s")
+                }
+                anie_protocol::CompactionPhase::ReactiveOverflow => {
+                    format!("compacting after overflow {elapsed}s")
+                }
+            }
         }
     };
     if label.is_empty() {

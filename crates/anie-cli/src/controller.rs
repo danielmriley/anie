@@ -1229,7 +1229,6 @@ impl ControllerState {
         self.compaction_stats.increment(phase);
     }
 
-
     /// Returns `Ok(true)` when a compaction successfully ran,
     /// `Ok(false)` when the threshold wasn't crossed or the
     /// session couldn't be reduced. The caller uses the bool
