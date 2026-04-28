@@ -14,7 +14,7 @@ use crate::error::WebToolError;
 use crate::read::extract::{DefuddleRunner, SubprocessDefuddleRunner};
 use crate::read::fetch::{
     self, DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, FetchOptions, HostRateLimiter,
-    RobotsCache,
+    Resolver, RobotsCache, system_resolver,
 };
 use crate::read::frontmatter;
 
@@ -29,6 +29,7 @@ pub struct WebReadTool {
     robots: RobotsCache,
     rate_limiter: Arc<HostRateLimiter>,
     runner: Arc<dyn DefuddleRunner>,
+    resolver: Arc<dyn Resolver>,
     respect_robots_txt: bool,
 }
 
@@ -47,6 +48,7 @@ impl WebReadTool {
                 DEFAULT_RATE_LIMIT_BURST,
             )),
             runner: Arc::new(SubprocessDefuddleRunner),
+            resolver: system_resolver(),
             respect_robots_txt: true,
         })
     }
@@ -62,6 +64,7 @@ impl WebReadTool {
             robots: RobotsCache::new(),
             rate_limiter,
             runner: Arc::new(SubprocessDefuddleRunner),
+            resolver: system_resolver(),
             respect_robots_txt: true,
         })
     }
@@ -84,8 +87,18 @@ impl WebReadTool {
                 DEFAULT_RATE_LIMIT_BURST,
             )),
             runner,
+            resolver: system_resolver(),
             respect_robots_txt,
         })
+    }
+
+    /// Replace the DNS resolver used by the SSRF guard. Tests
+    /// inject [`crate::read::fetch::StaticResolver`] here to
+    /// simulate hostname-to-private-IP mappings deterministically.
+    /// Production code should leave the default
+    /// [`crate::read::fetch::SystemResolver`] in place.
+    pub fn set_resolver(&mut self, resolver: Arc<dyn Resolver>) {
+        self.resolver = resolver;
     }
 
     async fn run(&self, args: &WebReadArgs) -> Result<String, WebToolError> {
@@ -120,7 +133,7 @@ impl WebReadTool {
                 ));
             }
         } else {
-            fetch::fetch_html(&self.client, &url, &self.fetch_opts).await?
+            fetch::fetch_html(&self.client, self.resolver.as_ref(), &url, &self.fetch_opts).await?
         };
         debug!(bytes = html.len(), "fetched html");
 

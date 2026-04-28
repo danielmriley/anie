@@ -13,6 +13,7 @@ use anie_protocol::{ContentBlock, ToolDef, ToolResult};
 use crate::error::WebToolError;
 use crate::read::fetch::{
     self, DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, FetchOptions, HostRateLimiter,
+    Resolver, system_resolver,
 };
 use crate::search::ddg;
 
@@ -33,6 +34,7 @@ pub struct WebSearchTool {
     client: reqwest::Client,
     fetch_opts: FetchOptions,
     rate_limiter: Arc<HostRateLimiter>,
+    resolver: Arc<dyn Resolver>,
     backend: SearchBackend,
 }
 
@@ -49,6 +51,7 @@ impl WebSearchTool {
                 DEFAULT_RATE_LIMIT_RPS,
                 DEFAULT_RATE_LIMIT_BURST,
             )),
+            resolver: system_resolver(),
             backend: SearchBackend::default(),
         })
     }
@@ -62,8 +65,15 @@ impl WebSearchTool {
             client,
             fetch_opts: opts,
             rate_limiter,
+            resolver: system_resolver(),
             backend: SearchBackend::default(),
         })
+    }
+
+    /// Replace the DNS resolver used by the SSRF guard. See
+    /// [`crate::WebReadTool::set_resolver`] for the rationale.
+    pub fn set_resolver(&mut self, resolver: Arc<dyn Resolver>) {
+        self.resolver = resolver;
     }
 
     async fn run(&self, args: &WebSearchArgs) -> Result<String, WebToolError> {
@@ -84,7 +94,14 @@ impl WebSearchTool {
 
         let hits = match self.backend {
             SearchBackend::DuckDuckGo => {
-                ddg::search(&self.client, &self.fetch_opts, &args.query, max as usize).await?
+                ddg::search(
+                    &self.client,
+                    self.resolver.as_ref(),
+                    &self.fetch_opts,
+                    &args.query,
+                    max as usize,
+                )
+                .await?
             }
         };
 

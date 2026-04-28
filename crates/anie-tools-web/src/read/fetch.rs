@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use texting_robots::Robot;
 use tokio::sync::RwLock;
@@ -97,7 +98,8 @@ fn host_str_is_private(host: &str) -> bool {
 
 /// Classify an IP address as "private" for SSRF purposes.
 /// Matches loopback, link-local, RFC 1918 ranges, IPv6 ULA,
-/// and IPv4 multicast / broadcast.
+/// IPv4 multicast / broadcast, and IPv4-mapped IPv6 addresses
+/// whose embedded IPv4 is private.
 pub fn ip_is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -107,10 +109,25 @@ pub fn ip_is_private(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_multicast()
                 || v4.is_unspecified()
-                // Carrier-grade NAT.
+                // Carrier-grade NAT (RFC 6598, 100.64.0.0/10).
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
+                // Class E reserved / future use (240.0.0.0/4).
+                // Not officially "private", but no legitimate
+                // public host is reachable here, so refusing is
+                // strictly safer than allowing.
+                || v4.octets()[0] >= 240
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 (::ffff:a.b.c.d). `is_loopback`
+            // and friends only check the canonical IPv6 ranges
+            // and miss e.g. ::ffff:127.0.0.1, so classify by the
+            // embedded IPv4 instead. Without this, an attacker
+            // who can spoof a `Location: http://[::ffff:127.0.0.1]`
+            // redirect would slip past the v6 checks below.
+            // PR 3.2 of `docs/code_review_2026-04-27/`.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_private(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -120,6 +137,105 @@ pub fn ip_is_private(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+// --------------------------------------------------------------
+// DNS resolver abstraction.
+// --------------------------------------------------------------
+
+/// DNS resolver abstraction used by the SSRF guard.
+///
+/// `validate_url()` covers IP literals and known private
+/// hostnames (`localhost`, `*.local`, `*.internal`, etc.) but
+/// does not catch arbitrary public-looking hostnames that
+/// resolve to private IPs (e.g. `evil.example` →
+/// `127.0.0.1`, or AWS metadata via a CNAME). The fetch path
+/// therefore resolves hostnames before issuing the request and
+/// rejects when any candidate IP is private.
+///
+/// A trait abstraction lets tests inject deterministic
+/// mappings without touching the system resolver. The default
+/// implementation is [`SystemResolver`], which delegates to
+/// `tokio::net::lookup_host`.
+#[async_trait]
+pub trait Resolver: Send + Sync {
+    /// Resolve `host:port` to its candidate IP addresses.
+    /// `port` is included so callers can use `(host, port)`
+    /// resolution APIs without constructing a `SocketAddr`.
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, WebToolError>;
+}
+
+/// Default resolver: delegates to `tokio::net::lookup_host`,
+/// which uses the platform-configured DNS.
+pub struct SystemResolver;
+
+#[async_trait]
+impl Resolver for SystemResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| WebToolError::Fetch(format!("dns lookup of {host} failed: {e}")))?;
+        let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+        Ok(ips)
+    }
+}
+
+/// Convenience constructor for the default system resolver as
+/// an `Arc<dyn Resolver>`. Production call sites pass this; tests
+/// substitute their own resolver via the same trait.
+pub fn system_resolver() -> Arc<dyn Resolver> {
+    Arc::new(SystemResolver)
+}
+
+/// Validate a URL's destination against the SSRF policy.
+///
+/// `validate_url` covers the textual host (literal IPs and
+/// known-private hostnames). This helper additionally resolves
+/// non-literal hostnames and rejects when any returned IP is
+/// classified as private by [`ip_is_private`]. The redirect
+/// loop in [`fetch_html`] calls this before sending each
+/// request so a 302 to a hostname that resolves to a private
+/// IP cannot bypass the guard.
+///
+/// anie-specific (vs. a connector-integrated resolver): there
+/// is a small TOCTOU between this validation and the request
+/// reqwest issues — DNS could in principle change between the
+/// two lookups. Pi has no equivalent guard at all, so this is a
+/// strict improvement; closing the TOCTOU requires a custom
+/// reqwest `Resolve` implementation and is tracked as a
+/// follow-up. PR 3.2 of `docs/code_review_2026-04-27/`.
+pub async fn validate_destination(
+    url: &Url,
+    resolver: &dyn Resolver,
+    allow_private_ips: bool,
+) -> Result<(), WebToolError> {
+    if allow_private_ips {
+        return Ok(());
+    }
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => {
+            // Literal IPs were already classified by
+            // `validate_url`. There is no DNS step to re-check.
+            return Ok(());
+        }
+        None => {
+            return Err(WebToolError::InvalidUrl("URL has no host".into()));
+        }
+    };
+    let port = url.port_or_known_default().unwrap_or(0);
+    let ips = resolver.resolve(&host, port).await?;
+    if ips.is_empty() {
+        return Err(WebToolError::Fetch(format!(
+            "dns lookup of {host} returned no addresses"
+        )));
+    }
+    for ip in &ips {
+        if ip_is_private(*ip) {
+            return Err(WebToolError::PrivateAddress(format!("{host} -> {ip}")));
+        }
+    }
+    Ok(())
 }
 
 // --------------------------------------------------------------
@@ -331,11 +447,24 @@ pub fn build_client(opts: &FetchOptions) -> Result<reqwest::Client, WebToolError
 /// 302 us into `http://127.0.0.1/admin` and `reqwest` would
 /// happily follow before anie's SSRF guard had a chance to
 /// run. PR 3.1 of `docs/code_review_2026-04-27/`.
+///
+/// SSRF DNS guard — every URL in the chain (initial and each
+/// redirect target) goes through [`validate_destination`],
+/// which resolves the hostname and rejects when any candidate
+/// IP is private. `validate_url` only classifies the textual
+/// host; without the DNS step, a public-looking hostname like
+/// `evil.example` could resolve to `127.0.0.1` and slip
+/// through. PR 3.2 of `docs/code_review_2026-04-27/`.
 pub async fn fetch_html(
     client: &reqwest::Client,
+    resolver: &dyn Resolver,
     url: &Url,
     opts: &FetchOptions,
 ) -> Result<String, WebToolError> {
+    // Initial DNS check. `validate_url` was called by the
+    // caller; we add the resolved-IP classification here.
+    validate_destination(url, resolver, opts.allow_private_ips).await?;
+
     let mut current = url.clone();
     let mut hops = 0usize;
     let response = loop {
@@ -385,6 +514,7 @@ pub async fn fetch_html(
         // destination.
         let _ = response;
         current = validate_url(next.as_str(), opts.allow_private_ips)?;
+        validate_destination(&current, resolver, opts.allow_private_ips).await?;
     };
 
     let status = response.status();
@@ -456,10 +586,59 @@ pub async fn fetch_html(
 // Tests
 // --------------------------------------------------------------
 
+// --------------------------------------------------------------
+// Test resolver. Public so integration tests in
+// `tests/fetch_basic.rs` (which see only the crate's public
+// surface) can model "hostname maps to private IP" — the
+// attack we're guarding against — without touching the system
+// DNS resolver.
+// --------------------------------------------------------------
+
+/// Static `Resolver` for tests and dev tooling: returns canned
+/// IPs per hostname. Doc-hidden because production code should
+/// always use [`SystemResolver`]; this exists so the SSRF guard
+/// can be exercised deterministically.
+#[doc(hidden)]
+pub struct StaticResolver {
+    map: HashMap<String, Vec<IpAddr>>,
+}
+
+impl StaticResolver {
+    /// Build a resolver from `(host, ips)` pairs.
+    pub fn new<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, Vec<IpAddr>)>,
+        S: Into<String>,
+    {
+        Self {
+            map: entries
+                .into_iter()
+                .map(|(h, ips)| (h.into(), ips))
+                .collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl Resolver for StaticResolver {
+    async fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+        match self.map.get(host) {
+            Some(ips) => Ok(ips.clone()),
+            None => Err(WebToolError::Fetch(format!(
+                "static resolver has no mapping for {host}"
+            ))),
+        }
+    }
+}
+
+// --------------------------------------------------------------
+// Tests
+// --------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn validate_url_accepts_https() {
@@ -538,8 +717,156 @@ mod tests {
         assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
         // CGNAT 100.64.0.0/10.
         assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        // EC2 metadata: link-local, must be private.
+        assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        // Class E reserved (240.0.0.0/4): no legitimate public
+        // host lives here, treat as private.
+        assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
         // Public IP example: not private.
         assert!(!ip_is_private(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    /// Regression for PR 3.2: without the IPv4-mapped path,
+    /// `Ipv6Addr::is_loopback` only matches `::1` and a server
+    /// could redirect to `[::ffff:127.0.0.1]` to reach the
+    /// loopback interface unflagged.
+    #[test]
+    fn ip_is_private_classifies_ipv4_mapped_ipv6_by_embedded_v4() {
+        // ::ffff:127.0.0.1 — IPv4-mapped loopback.
+        let mapped_loopback = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
+        assert!(ip_is_private(mapped_loopback));
+
+        // ::ffff:10.0.0.1 — IPv4-mapped RFC 1918.
+        let mapped_rfc1918 = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001));
+        assert!(ip_is_private(mapped_rfc1918));
+
+        // ::ffff:8.8.8.8 — IPv4-mapped public IP. Must NOT
+        // classify as private; the attack and its mitigation
+        // should be symmetric.
+        let mapped_public = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808));
+        assert!(!ip_is_private(mapped_public));
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_hostname_resolving_to_loopback() {
+        let resolver = StaticResolver::new(vec![(
+            "evil.example",
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        )]);
+        let url = Url::parse("http://evil.example/page").unwrap();
+        let err = validate_destination(&url, &resolver, false)
+            .await
+            .unwrap_err();
+        match err {
+            WebToolError::PrivateAddress(msg) => {
+                assert!(msg.contains("evil.example"), "got: {msg}");
+                assert!(msg.contains("127.0.0.1"), "got: {msg}");
+            }
+            other => panic!("expected PrivateAddress, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_hostname_resolving_to_link_local_metadata() {
+        // EC2/GCP metadata service IP. Hostname that resolves
+        // here is one of the most-commonly-cited SSRF targets.
+        let resolver = StaticResolver::new(vec![(
+            "metadata.example",
+            vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))],
+        )]);
+        let url = Url::parse("http://metadata.example/latest").unwrap();
+        let err = validate_destination(&url, &resolver, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::PrivateAddress(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_when_any_resolved_ip_is_private() {
+        // Hostnames returning a mix of public and private IPs
+        // (round-robin DNS, A+AAAA records pointing at
+        // different segments) must reject as a unit. Allowing
+        // through "if at least one IP is public" would race
+        // reqwest's connect order against the SSRF guard.
+        let resolver = StaticResolver::new(vec![(
+            "split.example",
+            vec![
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            ],
+        )]);
+        let url = Url::parse("http://split.example/").unwrap();
+        let err = validate_destination(&url, &resolver, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::PrivateAddress(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_destination_allows_public_resolution() {
+        let resolver = StaticResolver::new(vec![(
+            "good.example",
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+        )]);
+        let url = Url::parse("http://good.example/").unwrap();
+        validate_destination(&url, &resolver, false)
+            .await
+            .expect("public IP must pass");
+    }
+
+    #[tokio::test]
+    async fn validate_destination_skips_dns_when_private_explicitly_allowed() {
+        // `allow_private_ips = true` is the operator opt-in;
+        // the DNS check (and any resolver error) must not
+        // fire. Simulate by handing in a resolver that would
+        // panic if called — if the early-return path breaks,
+        // this test will surface it.
+        struct PanicResolver;
+        #[async_trait]
+        impl Resolver for PanicResolver {
+            async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+                panic!("resolver must not be called when allow_private_ips=true");
+            }
+        }
+        let url = Url::parse("http://good.example/").unwrap();
+        validate_destination(&url, &PanicResolver, true)
+            .await
+            .expect("allow_private_ips=true bypasses DNS");
+    }
+
+    #[tokio::test]
+    async fn validate_destination_skips_dns_for_ip_literals() {
+        // Literal IPs were already classified by `validate_url`.
+        // `validate_destination` must not re-resolve them
+        // through DNS — that would only invent a TOCTOU window
+        // for nothing. Same panic-resolver trick.
+        struct PanicResolver;
+        #[async_trait]
+        impl Resolver for PanicResolver {
+            async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+                panic!("resolver must not be called for IP literals");
+            }
+        }
+        let url = Url::parse("http://8.8.8.8/").unwrap();
+        validate_destination(&url, &PanicResolver, false)
+            .await
+            .expect("IP literal: no DNS step");
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_empty_resolution() {
+        struct EmptyResolver;
+        #[async_trait]
+        impl Resolver for EmptyResolver {
+            async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+                Ok(Vec::new())
+            }
+        }
+        let url = Url::parse("http://nx.example/").unwrap();
+        let err = validate_destination(&url, &EmptyResolver, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::Fetch(_)));
     }
 
     #[test]

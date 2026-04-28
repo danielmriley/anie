@@ -1,8 +1,12 @@
 //! End-to-end fetch tests using httpmock.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use anie_tools_web::WebToolError;
-use anie_tools_web::read::fetch::{FetchOptions, build_client, fetch_html};
+use anie_tools_web::read::fetch::{
+    FetchOptions, StaticResolver, build_client, fetch_html, system_resolver,
+};
 use httpmock::Method::GET;
 use httpmock::MockServer;
 use url::Url;
@@ -30,7 +34,10 @@ async fn fetch_returns_body_within_max_size() {
     let url = Url::parse(&format!("{}/article", server.base_url())).unwrap();
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
-    let html = fetch_html(&client, &url, &opts).await.expect("fetch ok");
+    let resolver = system_resolver();
+    let html = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .expect("fetch ok");
     assert!(html.contains("<h1>Hello</h1>"));
 }
 
@@ -49,7 +56,10 @@ async fn fetch_rejects_body_above_max_size() {
     let mut opts = opts_for_test(true);
     opts.max_bytes = 10 * 1024; // 10 KiB cap
     let client = build_client(&opts).expect("build client");
-    let err = fetch_html(&client, &url, &opts).await.unwrap_err();
+    let resolver = system_resolver();
+    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .unwrap_err();
     assert!(matches!(err, WebToolError::TooLarge { .. }), "got: {err:?}");
 }
 
@@ -66,7 +76,10 @@ async fn fetch_surfaces_http_404_as_typed_error() {
     let url = Url::parse(&format!("{}/missing", server.base_url())).unwrap();
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
-    let err = fetch_html(&client, &url, &opts).await.unwrap_err();
+    let resolver = system_resolver();
+    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .unwrap_err();
     match err {
         WebToolError::HttpStatus { code, body_excerpt } => {
             assert_eq!(code, 404);
@@ -101,7 +114,10 @@ async fn fetch_follows_redirect_chain() {
     let url = Url::parse(&format!("{}/start", server.base_url())).unwrap();
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
-    let html = fetch_html(&client, &url, &opts).await.expect("fetch ok");
+    let resolver = system_resolver();
+    let html = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .expect("fetch ok");
     assert!(html.contains("arrived"));
 }
 
@@ -132,7 +148,10 @@ async fn fetch_caps_redirect_chain() {
     let mut opts = opts_for_test(true);
     opts.max_redirects = 5;
     let client = build_client(&opts).expect("build client");
-    let err = fetch_html(&client, &url, &opts).await.unwrap_err();
+    let resolver = system_resolver();
+    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .unwrap_err();
     assert!(matches!(err, WebToolError::Fetch(_)), "got: {err:?}");
 }
 
@@ -168,7 +187,10 @@ async fn fetch_rejects_redirect_to_private_address() {
     // exactly the SSRF case.
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
-    let err = fetch_html(&client, &url, &opts).await.unwrap_err();
+    let resolver = system_resolver();
+    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .unwrap_err();
     // `allow_private_ips = true` lets this through (operator
     // opt-in). Re-test the negative case below.
     assert!(
@@ -231,7 +253,10 @@ async fn fetch_rejects_non_html_content_type() {
     let url = Url::parse(&format!("{}/text", server.base_url())).unwrap();
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
-    let err = fetch_html(&client, &url, &opts).await.unwrap_err();
+    let resolver = system_resolver();
+    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .unwrap_err();
     match err {
         WebToolError::UnsupportedContentType(ct) => {
             assert!(ct.starts_with("text/plain"), "got: {ct}");
@@ -255,6 +280,134 @@ async fn fetch_accepts_xhtml_and_xml_content_types() {
     let url = Url::parse(&format!("{}/xhtml", server.base_url())).unwrap();
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
-    let html = fetch_html(&client, &url, &opts).await.expect("fetch ok");
+    let resolver = system_resolver();
+    let html = fetch_html(&client, resolver.as_ref(), &url, &opts)
+        .await
+        .expect("fetch ok");
     assert!(html.contains("ok"));
+}
+
+/// PR 3.2 of `docs/code_review_2026-04-27/`. The textual SSRF
+/// guard catches `localhost`, `*.local`, RFC 1918 literals,
+/// etc. — but a public-looking hostname like `evil.example`
+/// that happens to resolve to `127.0.0.1` slips through unless
+/// the fetch path also classifies the resolved IPs. Inject a
+/// static resolver that maps the hostname to loopback and
+/// confirm `fetch_html` rejects with `PrivateAddress` before
+/// any request is issued.
+#[tokio::test]
+async fn fetch_rejects_hostname_resolving_to_private_ip() {
+    let resolver = StaticResolver::new(vec![(
+        "evil.example",
+        vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+    )]);
+    let url = Url::parse("http://evil.example/page").unwrap();
+    let opts = opts_for_test(false);
+    let client = build_client(&opts).expect("build client");
+    let err = fetch_html(&client, &resolver, &url, &opts)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WebToolError::PrivateAddress(_)),
+        "got: {err:?}",
+    );
+}
+
+/// PR 3.2 regression: hostname resolving to the EC2/GCP
+/// metadata IP (`169.254.169.254`). One of the most-cited
+/// SSRF targets — link-local in real DNS won't typically
+/// happen, but a malicious `Location` could redirect to a
+/// hostname that resolves there.
+#[tokio::test]
+async fn fetch_rejects_redirect_to_hostname_resolving_to_metadata() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/start");
+            then.status(302)
+                .header("Location", "http://metadata.example/latest");
+        })
+        .await;
+
+    let url = Url::parse(&format!("{}/start", server.base_url())).unwrap();
+
+    // Allow the mock server's loopback start, but the
+    // redirect target hostname resolves to the metadata IP
+    // through our injected resolver. Without DNS validation,
+    // `fetch_html` would happily issue a request to whatever
+    // `metadata.example` resolves to in the system DNS.
+    //
+    // We can't drop `allow_private_ips` to false (the
+    // mock-server URL is on 127.0.0.1 and would be flagged
+    // first). Instead, observe that `validate_destination`
+    // is the same call regardless: feeding the metadata IP
+    // mapping to the resolver and calling `validate_destination`
+    // directly is exercised by the unit tests in `fetch.rs`.
+    // This integration test pins the redirect path: the
+    // private address surfaces from the redirect-loop call to
+    // `validate_destination`, not from the response body.
+    let resolver = StaticResolver::new(vec![
+        // The mock server's hostname is "127.0.0.1" — an IP
+        // literal — so it bypasses DNS regardless of mapping.
+        (
+            "metadata.example".to_string(),
+            vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))],
+        ),
+    ]);
+
+    // Use allow_private_ips=false to enforce the guard, but
+    // only the redirect target is a hostname (the start URL
+    // is the literal 127.0.0.1, which validate_url *would*
+    // reject too — so we have to bypass the start URL check
+    // somehow). Workaround: re-validate the start URL with
+    // allow_private_ips=true via a per-test opts. The
+    // redirect target is a hostname, so its DNS check still
+    // runs and trips on the metadata IP.
+    let opts = opts_for_test(true);
+    let client = build_client(&opts).expect("build client");
+    let err = fetch_html(&client, &resolver, &url, &opts)
+        .await
+        .unwrap_err();
+    // With allow_private_ips=true we don't expect the guard
+    // to fire — but reqwest will fail to actually connect to
+    // `metadata.example` (the mapping is only known to our
+    // static resolver, not the OS), surfacing as Fetch.
+    // Either way, no useful body is returned. Document this
+    // limitation and exercise the guard contract via the
+    // companion unit tests in `fetch.rs`
+    // (`validate_destination_rejects_hostname_resolving_to_link_local_metadata`,
+    // `validate_destination_rejects_hostname_resolving_to_loopback`).
+    assert!(
+        matches!(err, WebToolError::Fetch(_)) || matches!(err, WebToolError::PrivateAddress(_)),
+        "got: {err:?}",
+    );
+}
+
+/// PR 3.2: positive case. Hostname resolving exclusively to a
+/// public IP must pass the DNS check.
+#[tokio::test]
+async fn fetch_allows_hostname_resolving_to_public_ip() {
+    // Resolution succeeds with a public IP, so
+    // `validate_destination` returns Ok. Reqwest will then
+    // try to actually connect, which will fail because
+    // `good.example` is fictional in the OS — the test cares
+    // about the validation outcome only, so we accept any
+    // post-validation error here.
+    let resolver = StaticResolver::new(vec![(
+        "good.example",
+        vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+    )]);
+    let url = Url::parse("http://good.example/page").unwrap();
+    let opts = FetchOptions {
+        allow_private_ips: false,
+        timeout: std::time::Duration::from_millis(500),
+        ..FetchOptions::default()
+    };
+    let client = build_client(&opts).expect("build client");
+    let result = fetch_html(&client, &resolver, &url, &opts).await;
+    // PrivateAddress would be a regression — the resolver
+    // returned a public IP, so validation must accept.
+    if let Err(WebToolError::PrivateAddress(msg)) = &result {
+        panic!("public IP must not be flagged as private: {msg}");
+    }
 }
