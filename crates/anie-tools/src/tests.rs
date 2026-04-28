@@ -742,6 +742,90 @@ async fn bash_tool_truncates_large_output() {
     assert!(text_content(&result).contains("[output truncated]"));
 }
 
+/// Plan 05 PR B: with an 8K-context model the byte budget
+/// floors at `MIN_TOOL_OUTPUT_BUDGET_BYTES` (1 KB), so
+/// bash output that would have fit on cloud models has to
+/// compress to ≤ ~1 KB plus a truncation marker.
+///
+/// `seq 1 1500` produces ~6.4 KB of stdout (1500 lines,
+/// under the `MAX_READ_LINES = 2000` cap so the byte
+/// budget is the only thing that can trip truncation) —
+/// well over the 1 KB floor — so we expect the truncation
+/// marker and a body bounded near the floor.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_tool_truncates_stdout_to_effective_budget_for_small_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::new(tempdir.path());
+    let small_ctx = ToolExecutionContext {
+        context_window: 8_192,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "seq 1 1500" }),
+            CancellationToken::new(),
+            None,
+            &small_ctx,
+        )
+        .await
+        .expect("command succeeds");
+
+    let body = text_content(&result);
+    assert!(
+        body.contains("[output truncated]"),
+        "small-context output must surface truncation; got {body:?}",
+    );
+    // Floor is 1024 bytes. The collector renders at most
+    // `byte_budget` bytes plus the truncation marker, so
+    // anything above ~2 KB is a regression — the budget
+    // didn't shrink with the window.
+    assert!(
+        body.len() <= 2_500,
+        "small-context output should fit ~1KB budget; got {} bytes",
+        body.len(),
+    );
+}
+
+/// Plan 05 PR B: regression guard against shrinking cloud
+/// behavior. A 200K-window model still uses an effective
+/// 20 KB byte budget (10 % of 200K, capped against the
+/// 50 KB `MAX_READ_BYTES` constant). `seq 1 1500` is
+/// ~6.4 KB and 1500 lines — well under both the byte
+/// budget and the 2000-line cap — so the cloud path must
+/// return the full output without a truncation marker.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_tool_keeps_larger_budget_for_cloud_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::new(tempdir.path());
+    let cloud_ctx = ToolExecutionContext {
+        context_window: 200_000,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "seq 1 1500" }),
+            CancellationToken::new(),
+            None,
+            &cloud_ctx,
+        )
+        .await
+        .expect("command succeeds");
+
+    let body = text_content(&result);
+    assert!(
+        !body.contains("[output truncated]"),
+        "cloud-context output should fit without truncation; got marker in body of {} bytes",
+        body.len(),
+    );
+    assert!(
+        body.len() > 5_000,
+        "cloud-context body should be much larger than the 1KB floor; got {} bytes",
+        body.len(),
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_tool_captures_stderr() {
