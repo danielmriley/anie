@@ -13,7 +13,7 @@ Status key:
 | 02 — `[ui]` config loading | ✅ | Landed `63f517b` (2026-04-27). PR A only; PR B (template) and PR C (docs) deferred until needed. Three loader tests pin behavior. |
 | 03 — Web SSRF and redirect boundary | ✅ | PR A `ea5dd9f` (manual redirect validation). PR B `40ef55a` (DNS resolver abstraction + resolved-IP guard, IPv4-mapped IPv6, Class E reserved). PR C `8f34d62` (conservative headless gate: pre-launch DNS validation, runtime warning, doc + tool-description SSRF caveat). Chrome request interception deferred. |
 | 04 — Web cancellation, budgets, and bounded side channels | ✅ | PR A `8b09c8f` (cancellation). PR B `a34ec65` (bounded side channels). PR C `8fbba97` (`[tools.web]` config + validation). PR D `500578a` (web_read emits coarse fetching/rendering/extracting phase pings via existing partial-update plumbing; best-effort try_send so a slow consumer can't backpressure the fetch). |
-| 05 — Streaming built-in read path | ⬜ | Memory/resource hardening for large text files. |
+| 05 — Streaming built-in read path | ✅ | PR A `360211f` (image metadata pre-check). PRs B + C bundled `32138ac` (streaming text read with bounded per-line buffer; LineEnd enum; updated footer wording — precise remaining-line count required full-file scan, dropped per plan). |
 | 06 — Ollama effective `num_ctx` error messaging | ✅ | Landed `13f2dda` (2026-04-27). One-line call-site fix in the give-up handler + targeted regression test. |
 | 07 — robots.txt and Defuddle extraction correctness | ⬜ | Standards/extraction polish. |
 | 08 — Atomic-write durability clarification | ⬜ | Low-risk durability/doc cleanup. |
