@@ -1,5 +1,30 @@
 use crate::{AssistantMessage, Message, StreamDelta, ToolResult, ToolResultMessage};
 
+/// Why a compaction fired. Attached to `CompactionStart` /
+/// `CompactionEnd` events so the UI and telemetry can
+/// distinguish proactive (pre-prompt, mid-turn) compactions
+/// from reactive overflow recovery without inspecting the
+/// emitting call site. Plan
+/// `docs/midturn_compaction_2026-04-27/06_compaction_telemetry.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionPhase {
+    /// Triggered before sending a new user prompt
+    /// (`InteractiveController::maybe_auto_compact`). Today's
+    /// default behavior; corresponds to the "compacting" badge
+    /// users have seen since pre-PR.
+    PrePrompt,
+    /// Triggered between sampling requests inside an active
+    /// agent loop (`ControllerCompactionGate`). New as of
+    /// PR 8.4 of the midturn-compaction plan.
+    MidTurn,
+    /// Triggered by `RetryDecision::Compact` after a provider
+    /// `ContextOverflow` error
+    /// (`InteractiveController::retry_after_overflow`). Always
+    /// reactive — the failed sampling request is already on
+    /// the wire.
+    ReactiveOverflow,
+}
+
 /// In-process events emitted by the agent loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
@@ -52,9 +77,18 @@ pub enum AgentEvent {
         session_id: String,
     },
     /// Context compaction has started.
-    CompactionStart,
+    CompactionStart {
+        /// Why this compaction is firing. Plan 06 of
+        /// `docs/midturn_compaction_2026-04-27/`.
+        phase: CompactionPhase,
+    },
     /// Context compaction completed successfully.
     CompactionEnd {
+        /// Why this compaction fired. Mirrors the
+        /// `CompactionStart::phase` value so consumers don't
+        /// have to remember the most recent start to label
+        /// the end.
+        phase: CompactionPhase,
         summary: String,
         tokens_before: u64,
         tokens_after: u64,

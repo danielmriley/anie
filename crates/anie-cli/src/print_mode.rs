@@ -107,7 +107,14 @@ async fn process_print_events(
             AgentEvent::SystemMessage { text } => {
                 writeln!(stderr, "\n{text}").context("failed to write stderr")?;
             }
-            AgentEvent::CompactionStart => {
+            AgentEvent::CompactionStart { phase: _ } => {
+                // Non-interactive print mode treats every
+                // compaction phase the same — the user is
+                // looking at stderr, not at a live activity
+                // row, so the marker just confirms a
+                // compaction is happening. PR C of plan 06
+                // surfaces the phase label in the TUI; print
+                // mode doesn't need it.
                 writeln!(stderr, "\n[compacting context]").context("failed to write stderr")?;
             }
             AgentEvent::CompactionEnd {

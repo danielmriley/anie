@@ -880,11 +880,13 @@ impl App {
                 self.status_bar.cwd = cwd;
                 self.status_bar.last_known_input_tokens = None;
             }
-            AgentEvent::CompactionStart => {
+            AgentEvent::CompactionStart { phase: _ } => {
                 // Permanent record in the transcript + transition
                 // the agent state so the status bar shows the
                 // live elapsed counter while the summarization
-                // LLM call is in flight.
+                // LLM call is in flight. PR C of plan 06 will
+                // surface `phase` in the activity-row label;
+                // PR A keeps the existing wording.
                 self.output_pane
                     .add_system_message("Compacting context…".to_string());
                 self.agent_state = AgentUiState::Compacting {
@@ -892,6 +894,7 @@ impl App {
                 };
             }
             AgentEvent::CompactionEnd {
+                phase: _,
                 summary,
                 tokens_before,
                 tokens_after,

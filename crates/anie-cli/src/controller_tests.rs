@@ -315,7 +315,7 @@ async fn controller_compaction_retry_path() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, AgentEvent::CompactionStart))
+            .filter(|event| matches!(event, AgentEvent::CompactionStart { .. }))
             .count(),
         1
     );
@@ -335,6 +335,42 @@ async fn controller_compaction_retry_path() {
         &events,
         "recovered after compaction"
     ));
+
+    // Plan 06 PR A regression guard: the reactive overflow
+    // path must tag its `CompactionStart` / `CompactionEnd`
+    // pair with `CompactionPhase::ReactiveOverflow`, never
+    // `PrePrompt`.
+    let reactive_starts = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::CompactionStart {
+                    phase: anie_protocol::CompactionPhase::ReactiveOverflow,
+                },
+            )
+        })
+        .count();
+    assert_eq!(
+        reactive_starts, 1,
+        "overflow path must emit exactly one ReactiveOverflow CompactionStart",
+    );
+    let reactive_ends = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::CompactionEnd {
+                    phase: anie_protocol::CompactionPhase::ReactiveOverflow,
+                    ..
+                },
+            )
+        })
+        .count();
+    assert_eq!(
+        reactive_ends, 1,
+        "overflow path must emit exactly one ReactiveOverflow CompactionEnd",
+    );
 }
 
 #[tokio::test]
@@ -351,7 +387,7 @@ async fn controller_compaction_give_up_after_second_overflow() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, AgentEvent::CompactionStart))
+            .filter(|event| matches!(event, AgentEvent::CompactionStart { .. }))
             .count(),
         1
     );

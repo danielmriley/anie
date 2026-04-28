@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use anie_agent::{CompactionGate, CompactionGateOutcome};
-use anie_protocol::{AgentEvent, Message};
+use anie_protocol::{AgentEvent, CompactionPhase, Message};
 use anie_session::{
     CompactionConfig, MessageSummarizer, compact_messages_inline, estimate_message_tokens,
 };
@@ -85,7 +85,13 @@ impl CompactionGate for ControllerCompactionGate {
             });
         }
 
-        anie_agent::send_event(&self.event_tx, AgentEvent::CompactionStart).await;
+        anie_agent::send_event(
+            &self.event_tx,
+            AgentEvent::CompactionStart {
+                phase: CompactionPhase::MidTurn,
+            },
+        )
+        .await;
         match compact_messages_inline(context, &self.config, self.summarizer.as_ref()).await? {
             Some(inline) => {
                 // Decrement the budget AFTER a successful
@@ -103,6 +109,7 @@ impl CompactionGate for ControllerCompactionGate {
                 anie_agent::send_event(
                     &self.event_tx,
                     AgentEvent::CompactionEnd {
+                        phase: CompactionPhase::MidTurn,
                         summary: inline.summary.clone(),
                         tokens_before: inline.tokens_before,
                         tokens_after: inline.tokens_after,
@@ -286,8 +293,20 @@ mod tests {
         let mut saw_end = false;
         while let Ok(event) = rx.try_recv() {
             match event {
-                AgentEvent::CompactionStart => saw_start = true,
-                AgentEvent::CompactionEnd { .. } => saw_end = true,
+                AgentEvent::CompactionStart { phase } => {
+                    assert!(
+                        matches!(phase, CompactionPhase::MidTurn),
+                        "mid-turn gate must tag the event with CompactionPhase::MidTurn",
+                    );
+                    saw_start = true;
+                }
+                AgentEvent::CompactionEnd { phase, .. } => {
+                    assert!(
+                        matches!(phase, CompactionPhase::MidTurn),
+                        "mid-turn gate must tag the end event with CompactionPhase::MidTurn",
+                    );
+                    saw_end = true;
+                }
                 _ => {}
             }
         }

@@ -387,7 +387,7 @@ fn event_kinds(events: &[AgentEvent]) -> Vec<&'static str> {
             AgentEvent::TranscriptReplace { .. } => "TranscriptReplace",
             AgentEvent::SystemMessage { .. } => "SystemMessage",
             AgentEvent::StatusUpdate { .. } => "StatusUpdate",
-            AgentEvent::CompactionStart => "CompactionStart",
+            AgentEvent::CompactionStart { .. } => "CompactionStart",
             AgentEvent::CompactionEnd { .. } => "CompactionEnd",
             AgentEvent::RetryScheduled { .. } => "RetryScheduled",
         })

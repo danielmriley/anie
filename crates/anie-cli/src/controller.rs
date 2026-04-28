@@ -1193,15 +1193,19 @@ impl ControllerState {
     /// Emit the `CompactionEnd` event for a successful compaction.
     /// Callers decide whether to follow with a status refresh or a
     /// transcript replacement, since the ordering matters visually.
+    /// `phase` should match the corresponding `CompactionStart`.
+    /// Plan 06 of `docs/midturn_compaction_2026-04-27/`.
     async fn emit_compaction_end(
         &self,
         event_tx: &mpsc::Sender<AgentEvent>,
         result: &anie_session::CompactionResult,
+        phase: anie_protocol::CompactionPhase,
     ) {
         let tokens_after = self.estimated_context_tokens();
         anie_agent::send_event(
             event_tx,
             AgentEvent::CompactionEnd {
+                phase,
                 summary: result.summary.clone(),
                 tokens_before: result.tokens_before,
                 tokens_after,
@@ -1234,7 +1238,13 @@ impl ControllerState {
             return Ok(false);
         }
 
-        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::CompactionStart {
+                phase: anie_protocol::CompactionPhase::PrePrompt,
+            },
+        )
+        .await;
 
         if let Some(result) = self
             .session
@@ -1242,7 +1252,8 @@ impl ControllerState {
             .auto_compact(&config, &strategy)
             .await?
         {
-            self.emit_compaction_end(event_tx, &result).await;
+            self.emit_compaction_end(event_tx, &result, anie_protocol::CompactionPhase::PrePrompt)
+                .await;
             anie_agent::send_event(event_tx, self.status_event()).await;
             Ok(true)
         } else {
@@ -1253,7 +1264,16 @@ impl ControllerState {
     async fn force_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
         let (config, strategy) =
             self.compaction_strategy(self.config.anie_config().compaction.keep_recent_tokens);
-        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+        // Manual `/compact` runs at the prompt boundary; classify
+        // it as `PrePrompt` so telemetry treats it the same as the
+        // automatic pre-prompt path.
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::CompactionStart {
+                phase: anie_protocol::CompactionPhase::PrePrompt,
+            },
+        )
+        .await;
         match self
             .session
             .inner_mut()
@@ -1261,7 +1281,12 @@ impl ControllerState {
             .await?
         {
             Some(result) => {
-                self.emit_compaction_end(event_tx, &result).await;
+                self.emit_compaction_end(
+                    event_tx,
+                    &result,
+                    anie_protocol::CompactionPhase::PrePrompt,
+                )
+                .await;
                 anie_agent::send_event(event_tx, self.status_event()).await;
             }
             None => {
@@ -1354,7 +1379,13 @@ impl ControllerState {
         // over the context window, so we need to discard more aggressively.
         let keep_recent = (self.config.anie_config().compaction.keep_recent_tokens / 2).max(1_000);
         let (config, strategy) = self.compaction_strategy(keep_recent);
-        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::CompactionStart {
+                phase: anie_protocol::CompactionPhase::ReactiveOverflow,
+            },
+        )
+        .await;
         match self
             .session
             .inner_mut()
@@ -1362,7 +1393,12 @@ impl ControllerState {
             .await?
         {
             Some(result) => {
-                self.emit_compaction_end(event_tx, &result).await;
+                self.emit_compaction_end(
+                    event_tx,
+                    &result,
+                    anie_protocol::CompactionPhase::ReactiveOverflow,
+                )
+                .await;
                 self.emit_transcript_replace_and_status(event_tx).await;
                 Ok(true)
             }

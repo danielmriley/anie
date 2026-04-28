@@ -4,7 +4,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 
 use anie_protocol::{
-    AgentEvent, AssistantMessage, ContentBlock, Message, StreamDelta, Usage, UserMessage,
+    AgentEvent, AssistantMessage, CompactionPhase, ContentBlock, Message, StreamDelta, Usage,
+    UserMessage,
 };
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat};
 
@@ -136,8 +137,10 @@ fn compaction_start_transitions_to_compacting_state() {
     let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
-    app.handle_agent_event(AgentEvent::CompactionStart)
-        .expect("handle");
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::PrePrompt,
+    })
+    .expect("handle");
 
     assert!(
         matches!(app.agent_state(), AgentUiState::Compacting { .. }),
@@ -158,9 +161,12 @@ fn compaction_end_transitions_back_to_idle() {
     let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
-    app.handle_agent_event(AgentEvent::CompactionStart)
-        .expect("start");
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::PrePrompt,
+    })
+    .expect("start");
     app.handle_agent_event(AgentEvent::CompactionEnd {
+        phase: CompactionPhase::PrePrompt,
         summary: "Prior conversation covered setup work.".into(),
         tokens_before: 150_000,
         tokens_after: 8_000,
@@ -184,8 +190,10 @@ fn status_bar_shows_elapsed_seconds_while_compacting() {
         status.context_window = 200_000;
         status.cwd = "~/project".into();
     }
-    app.handle_agent_event(AgentEvent::CompactionStart)
-        .expect("start");
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::PrePrompt,
+    })
+    .expect("start");
 
     let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
     terminal.draw(|frame| app.render(frame)).expect("draw");
