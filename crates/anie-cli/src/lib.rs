@@ -4,6 +4,7 @@
 mod bootstrap;
 mod commands;
 mod compaction;
+mod compaction_gate;
 mod compaction_reserve;
 mod controller;
 mod interactive_mode;

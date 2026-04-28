@@ -1057,7 +1057,7 @@ async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
         runtime_state,
         provider_registry,
     );
-    let agent = build_agent(&state);
+    let agent = build_agent(&state, None);
     let (event_tx, _event_rx) = mpsc::channel(16);
 
     let result = agent
@@ -1517,7 +1517,7 @@ async fn context_length_override_applies_to_next_request_without_reload() {
         .handle_action(UiAction::ContextLength(Some("16384".into())))
         .await
         .expect("set context length");
-    let agent = build_agent(&controller.state);
+    let agent = build_agent(&controller.state, None);
     let (event_tx, _event_rx) = mpsc::channel(16);
     let result = agent
         .run(

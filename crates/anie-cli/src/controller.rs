@@ -157,6 +157,35 @@ impl InteractiveController {
         self.compactions_remaining_this_turn.load(Ordering::Acquire)
     }
 
+    /// Build a `ControllerCompactionGate` snapshot for the
+    /// current turn, or `None` when compaction is disabled.
+    /// Each gate carries a per-turn snapshot of the
+    /// effective `CompactionConfig` and a freshly-built
+    /// summarizer; `Arc`-cloned with the controller's
+    /// per-turn budget atomic so the mid-turn path
+    /// decrements the same counter the pre-prompt and
+    /// reactive paths consume.
+    /// PR 8.4 PR B of `docs/midturn_compaction_2026-04-27/`.
+    fn build_compaction_gate(&self) -> Option<Arc<dyn anie_agent::CompactionGate>> {
+        if !self.state.config.anie_config().compaction.enabled {
+            return None;
+        }
+        let (config, strategy) = self.state.compaction_strategy(
+            self.state
+                .config
+                .anie_config()
+                .compaction
+                .keep_recent_tokens,
+        );
+        let gate = crate::compaction_gate::ControllerCompactionGate {
+            config,
+            summarizer: Arc::new(strategy),
+            budget: Arc::clone(&self.compactions_remaining_this_turn),
+            event_tx: self.event_tx.clone(),
+        };
+        Some(Arc::new(gate) as Arc<dyn anie_agent::CompactionGate>)
+    }
+
     /// Drain the next queued follow-up prompt, if any, and start
     /// it as a new run. Called at the run-completion boundary in
     /// the main loop after `finish_run` has persisted the just-
@@ -876,7 +905,7 @@ impl InteractiveController {
                 .ok();
         }
         let context = self.state.context_without_entry(Some(&prompt_entry_id));
-        let agent = build_agent(&self.state);
+        let agent = build_agent(&self.state, self.build_compaction_gate());
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -907,7 +936,7 @@ impl InteractiveController {
             .into_iter()
             .map(|message| message.message)
             .collect::<Vec<_>>();
-        let agent = build_agent(&self.state);
+        let agent = build_agent(&self.state, self.build_compaction_gate());
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -1443,7 +1472,10 @@ impl ControllerState {
     }
 }
 
-fn build_agent(state: &ControllerState) -> AgentLoop {
+fn build_agent(
+    state: &ControllerState,
+    compaction_gate: Option<Arc<dyn anie_agent::CompactionGate>>,
+) -> AgentLoop {
     AgentLoop::new(
         Arc::clone(&state.provider_registry),
         Arc::clone(&state.tool_registry),
@@ -1454,7 +1486,8 @@ fn build_agent(state: &ControllerState) -> AgentLoop {
             ToolExecutionMode::Parallel,
             Arc::clone(&state.request_options_resolver),
         )
-        .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override()),
+        .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
+        .with_compaction_gate(compaction_gate),
     )
 }
 
