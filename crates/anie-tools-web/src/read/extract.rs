@@ -122,10 +122,33 @@ impl DefuddleOutput {
 /// `cancel` is honored cooperatively. Production runners must
 /// kill the spawned subprocess on cancellation rather than
 /// letting it run to completion in the background.
+///
+/// **`source_url` semantics (PR 6.2 of
+/// `docs/code_review_2026-04-27/`).** Pre-PR-6.2 the trait
+/// docs claimed `source_url` was used for relative-link
+/// resolution. That was aspirational — Defuddle 0.18's CLI
+/// (`defuddle parse <source>`) has no `--source-url` /
+/// `--base-url` option, and we deliberately pass a tempfile
+/// rather than the URL so anie's SSRF guard, robots check,
+/// rate limit, and size cap stay in force. The result is
+/// that relative `<a href>` / `<img src>` references in the
+/// HTML come through as relative paths in the extracted
+/// Markdown — the agent gets no help resolving them against
+/// the original origin.
+///
+/// `source_url` therefore reaches this trait so callers /
+/// alternative runners can still record it (the
+/// `WebReadTool` frontmatter does), but the production
+/// `SubprocessDefuddleRunner` does not pass it to Defuddle
+/// itself. Promoting this to base-URL rewriting would
+/// require a Markdown-aware post-processor (pulldown-cmark)
+/// to avoid corrupting fenced code blocks and inline code
+/// spans, and is tracked as a follow-up.
 #[async_trait]
 pub trait DefuddleRunner: Send + Sync {
-    /// Run Defuddle against `html`, with `source_url` provided
-    /// for relative-link resolution and metadata. Returns
+    /// Run Defuddle against `html`. `source_url` is recorded
+    /// alongside the result for metadata; see the trait-level
+    /// doc for the relative-link-resolution caveat. Returns
     /// [`WebToolError::Aborted`] when `cancel` fires.
     async fn run(
         &self,
@@ -151,6 +174,16 @@ impl DefuddleRunner for SubprocessDefuddleRunner {
         if cancel.is_cancelled() {
             return Err(WebToolError::Aborted);
         }
+        // `_source_url` is intentionally unused: Defuddle 0.18's
+        // CLI does not accept a base / source URL flag, and we
+        // deliberately pass a tempfile rather than the original
+        // URL so anie's SSRF guard, robots check, rate limit,
+        // and size cap stay in force. The result is that
+        // relative `<a>` / `<img>` references in the HTML come
+        // through as relative paths in the extracted Markdown.
+        // See the trait-level doc for the follow-up plan.
+        // PR 6.2 of `docs/code_review_2026-04-27/`.
+
         // The Defuddle 0.18 CLI takes a file path or URL — no
         // stdin. We write the already-fetched HTML to a tempfile
         // so anie's SSRF guard, robots check, rate limit, and
