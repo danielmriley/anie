@@ -200,6 +200,7 @@ use crate::ToolRegistry;
 use crate::hooks::{
     AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride,
 };
+use crate::tool::ToolExecutionContext;
 
 /// Agent-loop execution mode for tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +209,66 @@ pub enum ToolExecutionMode {
     Sequential,
     /// Run all tool calls for the turn concurrently.
     Parallel,
+}
+
+/// Outcome from a `CompactionGate::maybe_compact` call.
+///
+/// Plan `docs/midturn_compaction_2026-04-27/03_agent_loop_compaction_signal.md`.
+/// PR 8.3 — the trait and enum land default-off; plan 04 (PR
+/// 8.4) installs a real implementation in the controller.
+#[derive(Debug, Clone)]
+pub enum CompactionGateOutcome {
+    /// No compaction needed; the loop continues with the same
+    /// context.
+    Continue,
+    /// Compaction ran; replace the loop's context with `messages`.
+    /// The agent loop emits `AgentEvent::TranscriptReplace`
+    /// before the next sampling iteration so the UI re-renders
+    /// from the post-compaction transcript.
+    Compacted {
+        /// Replacement context. Must preserve any in-flight
+        /// tool-call correlation (the existing pre-prompt
+        /// compaction primitive `find_cut_point` is the model
+        /// for this).
+        messages: Vec<Message>,
+    },
+    /// Gate decided not to compact this time (typically because
+    /// the per-turn budget is exhausted, but the trait is
+    /// reason-agnostic). The loop emits a `SystemMessage` with
+    /// the supplied reason and continues; the next sampling
+    /// request may still overflow, in which case the reactive
+    /// retry path handles it.
+    Skipped {
+        /// Human-readable reason surfaced to the user / logs.
+        reason: String,
+    },
+}
+
+/// Hook invoked between agent-loop iterations to decide
+/// whether mid-turn compaction is warranted.
+///
+/// Called after each sampling response has been merged into
+/// the loop's context (assistant message + any tool results +
+/// any steering messages) and *before* the next sampling
+/// iteration's request is built. That timing matches codex's
+/// pattern (`codex-rs/core/src/codex.rs:6420-6468`) and gives
+/// the controller a chance to shrink context before the agent
+/// burns another sampling request on a too-large prompt.
+///
+/// **Default behavior:** `AgentLoopConfig::compaction_gate`
+/// defaults to `None`, in which case the loop never invokes
+/// this hook — no behavior change for callers that don't
+/// install one.
+///
+/// Plan `docs/midturn_compaction_2026-04-27/03_agent_loop_compaction_signal.md`.
+#[async_trait::async_trait]
+pub trait CompactionGate: Send + Sync {
+    /// Inspect `context` and decide whether to compact, leave
+    /// it unchanged, or explicitly skip with a reason.
+    async fn maybe_compact(
+        &self,
+        context: &[Message],
+    ) -> Result<CompactionGateOutcome, anyhow::Error>;
 }
 
 /// Immutable configuration for an agent loop instance.
@@ -222,6 +283,12 @@ pub struct AgentLoopConfig {
     get_follow_up_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
     before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
     after_tool_call_hook: Option<Arc<dyn AfterToolCallHook>>,
+    /// Optional mid-turn compaction hook. Default `None`. Plan
+    /// 8.3 of `docs/midturn_compaction_2026-04-27/`. The
+    /// controller installs a real implementation in plan 8.4;
+    /// today's call sites all pass `None`, so this is a pure
+    /// plumbing change with zero behavioral effect.
+    compaction_gate: Option<Arc<dyn CompactionGate>>,
 }
 
 impl AgentLoopConfig {
@@ -245,7 +312,18 @@ impl AgentLoopConfig {
             get_follow_up_messages: None,
             before_tool_call_hook: None,
             after_tool_call_hook: None,
+            compaction_gate: None,
         }
+    }
+
+    /// Install a [`CompactionGate`] that the loop consults at
+    /// the bottom of each iteration (after the first).
+    /// Defaults to `None`. PR 8.3 of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    #[must_use]
+    pub fn with_compaction_gate(mut self, gate: Option<Arc<dyn CompactionGate>>) -> Self {
+        self.compaction_gate = gate;
+        self
     }
 
     /// Snapshot an Ollama native `num_ctx` override for provider
@@ -587,6 +665,49 @@ impl AgentLoop {
                 };
             }
 
+            // Mid-turn compaction gate. PR 8.3 of
+            // `docs/midturn_compaction_2026-04-27/`. Fires AFTER
+            // tool results / steering messages have been merged
+            // into `context` and BEFORE the next sampling
+            // iteration starts. The first iteration is unaffected
+            // because we never reach this point without having
+            // completed at least one full sampling cycle. Default
+            // `None` makes this a single `Option::is_some` branch
+            // — zero cost for callers that don't install a gate.
+            if let Some(gate) = self.config.compaction_gate.as_ref() {
+                match gate.maybe_compact(&context).await {
+                    Ok(CompactionGateOutcome::Continue) => {}
+                    Ok(CompactionGateOutcome::Compacted { messages }) => {
+                        context = messages;
+                        send_event(
+                            event_tx,
+                            AgentEvent::TranscriptReplace {
+                                messages: context.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(CompactionGateOutcome::Skipped { reason }) => {
+                        send_event(
+                            event_tx,
+                            AgentEvent::SystemMessage {
+                                text: format!("Skipped mid-turn compaction: {reason}"),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        // A gate failure is non-fatal: the next
+                        // sampling request may still overflow, and
+                        // the reactive retry path will handle it.
+                        // Surfacing as a warn keeps the failure
+                        // observable without killing an in-flight
+                        // turn.
+                        warn!(?error, "compaction gate failed");
+                    }
+                }
+            }
+
             send_event(event_tx, AgentEvent::TurnStart).await;
         }
     }
@@ -889,12 +1010,14 @@ impl AgentLoop {
             }
         });
 
+        let tool_ctx = self.tool_execution_context();
         let execution = tool
             .execute(
                 &tool_call.id,
                 tool_call.arguments.clone(),
                 cancel.child_token(),
                 Some(update_tx),
+                &tool_ctx,
             )
             .await;
         let _ = update_forwarder.await;
@@ -924,6 +1047,20 @@ impl AgentLoop {
         .await;
 
         tool_result_message(&tool_call, result, is_error)
+    }
+
+    /// Build the per-execution tool context for this run.
+    ///
+    /// `context_window` honors a runtime `num_ctx` override
+    /// (set by `/context-length` for Ollama models) and falls
+    /// back to the catalog `Model::context_window`. Plan 05 of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    fn tool_execution_context(&self) -> ToolExecutionContext {
+        let context_window = self
+            .config
+            .ollama_num_ctx_override
+            .unwrap_or(self.config.model.context_window);
+        ToolExecutionContext { context_window }
     }
 
     fn error_assistant_message(
@@ -1362,15 +1499,15 @@ mod tests {
         AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
     };
     use anie_provider::{
-        CostPerMillion, Model, ModelCompat, ProviderError, RequestOptionsResolver,
-        ResolvedRequestOptions,
+        CostPerMillion, Model, ModelCompat, ProviderError, ProviderRegistry,
+        RequestOptionsResolver, ResolvedRequestOptions,
     };
     use async_trait::async_trait;
     use serde_json::json;
 
     use super::{
-        AgentLoopConfig, ToolExecutionMode, sanitize_assistant_for_request,
-        sanitize_context_for_request,
+        AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry,
+        sanitize_assistant_for_request, sanitize_context_for_request,
     };
 
     struct StaticResolver;
@@ -1429,6 +1566,33 @@ mod tests {
 
         assert_eq!(options.api_key.as_deref(), Some("key"));
         assert_eq!(options.num_ctx_override, Some(16_384));
+    }
+
+    /// Plan 05 PR A: with no override, the tool execution
+    /// context inherits the catalog `context_window`. The
+    /// override is the runtime knob (`/context-length`); it
+    /// wins when set so tools see the same effective window
+    /// as the provider.
+    #[test]
+    fn tool_execution_context_uses_model_context_window_without_override() {
+        let config = sample_agent_loop_config();
+        let agent_loop = AgentLoop::new(
+            Arc::new(ProviderRegistry::default()),
+            Arc::new(ToolRegistry::new()),
+            config,
+        );
+        assert_eq!(agent_loop.tool_execution_context().context_window, 32_768);
+    }
+
+    #[test]
+    fn tool_execution_context_uses_runtime_override_when_present() {
+        let config = sample_agent_loop_config().with_ollama_num_ctx_override(Some(8_192));
+        let agent_loop = AgentLoop::new(
+            Arc::new(ProviderRegistry::default()),
+            Arc::new(ToolRegistry::new()),
+            config,
+        );
+        assert_eq!(agent_loop.tool_execution_context().context_window, 8_192);
     }
 
     fn user_message(text: &str, timestamp: u64) -> Message {

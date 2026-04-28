@@ -83,6 +83,13 @@ pub(crate) enum GiveUpReason {
     AlreadyCompacted,
     /// The configured retry limit has been exhausted.
     AttemptsExhausted,
+    /// Context overflow arrived after the per-turn compaction
+    /// budget was exhausted. Surfaces an actionable message
+    /// (smaller prompt / larger window / raise
+    /// `[compaction] max_per_turn`) rather than letting the
+    /// turn loop on serial overflow→compact→overflow grinds.
+    /// PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+    CompactionBudgetExhausted,
 }
 
 /// Pure retry-decision helper.
@@ -92,19 +99,30 @@ pub(crate) struct RetryPolicy<'a> {
 
 impl<'a> RetryPolicy<'a> {
     /// Decide what to do after `attempt` transient retries have
-    /// already happened. `already_compacted` indicates whether this
-    /// run has already been through the overflow-compaction path.
+    /// already happened. `already_compacted` indicates whether
+    /// this run has already been through the overflow-compaction
+    /// path. `compaction_budget_remaining` is the number of
+    /// compactions still allowed in the current user turn — when
+    /// zero, a fresh `ContextOverflow` gives up with
+    /// `GiveUpReason::CompactionBudgetExhausted` rather than
+    /// triggering yet another compact-and-retry cycle. Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
     pub(crate) fn decide(
         &self,
         error: &ProviderError,
         attempt: u32,
         already_compacted: bool,
+        compaction_budget_remaining: u32,
     ) -> RetryDecision {
         match error {
             ProviderError::ContextOverflow(_) => {
                 if already_compacted {
                     RetryDecision::GiveUp {
                         reason: GiveUpReason::AlreadyCompacted,
+                    }
+                } else if compaction_budget_remaining == 0 {
+                    RetryDecision::GiveUp {
+                        reason: GiveUpReason::CompactionBudgetExhausted,
                     }
                 } else {
                     RetryDecision::Compact
@@ -279,6 +297,14 @@ pub(crate) fn retry_delay_ms(
 mod tests {
     use super::*;
 
+    /// Default per-turn compaction-budget value used by the
+    /// existing tests: high enough that no test triggers the
+    /// `CompactionBudgetExhausted` give-up path. PR 8.2 of
+    /// `docs/midturn_compaction_2026-04-27/` introduced the
+    /// fourth `decide` argument; tests that exercise the
+    /// budget path itself pass `0` explicitly.
+    const NOT_EXHAUSTED: u32 = u32::MAX;
+
     fn deterministic_policy(config: RetryConfig) -> RetryPolicy<'static> {
         let config = Box::leak(Box::new(config));
         RetryPolicy { config }
@@ -295,7 +321,12 @@ mod tests {
     fn auth_error_gives_up_immediately() {
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
-            policy.decide(&ProviderError::Auth("bad key".into()), 0, false),
+            policy.decide(
+                &ProviderError::Auth("bad key".into()),
+                0,
+                false,
+                NOT_EXHAUSTED
+            ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }
@@ -313,6 +344,7 @@ mod tests {
                 },
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
@@ -324,7 +356,12 @@ mod tests {
     fn feature_unsupported_gives_up_immediately() {
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
-            policy.decide(&ProviderError::FeatureUnsupported("x".into()), 0, false,),
+            policy.decide(
+                &ProviderError::FeatureUnsupported("x".into()),
+                0,
+                false,
+                NOT_EXHAUSTED
+            ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }
@@ -339,6 +376,7 @@ mod tests {
                 &ProviderError::UnsupportedStreamFeature("server_tool_use".into()),
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
@@ -356,6 +394,7 @@ mod tests {
                 },
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::Retry {
                 attempt: 1,
@@ -378,6 +417,7 @@ mod tests {
                 },
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::Retry {
                 attempt: 1,
@@ -396,6 +436,7 @@ mod tests {
                 },
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::Retry {
                 attempt: 1,
@@ -417,6 +458,7 @@ mod tests {
                 },
                 MAX_RATE_LIMIT_RETRIES,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::AttemptsExhausted,
@@ -431,9 +473,76 @@ mod tests {
             policy.decide(
                 &ProviderError::ContextOverflow("too many tokens".into()),
                 0,
-                false
+                false,
+                NOT_EXHAUSTED
             ),
             RetryDecision::Compact
+        );
+    }
+
+    /// PR 8.2 of `docs/midturn_compaction_2026-04-27/`. When
+    /// the per-turn compaction budget is exhausted (zero
+    /// remaining) and a fresh `ContextOverflow` arrives, the
+    /// retry policy gives up with
+    /// `CompactionBudgetExhausted` rather than triggering yet
+    /// another compact-and-retry cycle. This is the
+    /// safety-net that breaks compaction storms on small
+    /// local-model windows.
+    #[test]
+    fn retry_policy_gives_up_when_budget_exhausted() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::ContextOverflow("budget exhausted".into()),
+                0,
+                false, // not yet compacted in this turn
+                0,     // but the per-turn budget is gone
+            ),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::CompactionBudgetExhausted,
+            },
+            "with budget=0, ContextOverflow must surface as CompactionBudgetExhausted",
+        );
+    }
+
+    /// PR 8.2: the budget gate only fires when both
+    /// conditions hold (`already_compacted == false` AND
+    /// `budget_remaining == 0`). With at least one slot
+    /// remaining we still take the Compact path — i.e. the
+    /// budget is a ceiling, not a precondition.
+    #[test]
+    fn retry_policy_still_compacts_when_budget_remains() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::ContextOverflow("first time".into()),
+                0,
+                false,
+                1, // one slot still available
+            ),
+            RetryDecision::Compact,
+        );
+    }
+
+    /// PR 8.2: `already_compacted=true` takes precedence over
+    /// the budget check (gives up with `AlreadyCompacted`,
+    /// not `CompactionBudgetExhausted`). This pins the
+    /// existing precedence rule — the per-run already-compacted
+    /// guard is still authoritative for retry continuations
+    /// against a transient error after a reactive compact.
+    #[test]
+    fn retry_policy_already_compacted_outranks_budget_exhausted() {
+        let policy = deterministic_policy(deterministic_config());
+        assert_eq!(
+            policy.decide(
+                &ProviderError::ContextOverflow("post-compact still over".into()),
+                0,
+                true, // run already compacted
+                0,    // budget also exhausted, but that's fine
+            ),
+            RetryDecision::GiveUp {
+                reason: GiveUpReason::AlreadyCompacted,
+            },
         );
     }
 
@@ -444,7 +553,8 @@ mod tests {
             policy.decide(
                 &ProviderError::ContextOverflow("still too many tokens".into()),
                 0,
-                true
+                true,
+                NOT_EXHAUSTED
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::AlreadyCompacted,
@@ -463,6 +573,7 @@ mod tests {
                 },
                 1,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::Retry {
                 attempt: 2,
@@ -477,6 +588,7 @@ mod tests {
                 },
                 3,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::AttemptsExhausted,
@@ -495,6 +607,7 @@ mod tests {
                 },
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
@@ -506,7 +619,7 @@ mod tests {
     fn response_truncated_gives_up_immediately() {
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
-            policy.decide(&ProviderError::ResponseTruncated, 0, false),
+            policy.decide(&ProviderError::ResponseTruncated, 0, false, NOT_EXHAUSTED),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }
@@ -524,7 +637,12 @@ mod tests {
         // this as terminal so the failure is reported once.
         let policy = deterministic_policy(deterministic_config());
         assert_eq!(
-            policy.decide(&ProviderError::EmptyAssistantResponse, 0, false),
+            policy.decide(
+                &ProviderError::EmptyAssistantResponse,
+                0,
+                false,
+                NOT_EXHAUSTED
+            ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }
@@ -532,7 +650,12 @@ mod tests {
         // Still terminal even after partial retries, in case the
         // classification was reached via a non-empty path first.
         assert_eq!(
-            policy.decide(&ProviderError::EmptyAssistantResponse, 2, false),
+            policy.decide(
+                &ProviderError::EmptyAssistantResponse,
+                2,
+                false,
+                NOT_EXHAUSTED
+            ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
             }
@@ -546,7 +669,8 @@ mod tests {
             policy.decide(
                 &ProviderError::MalformedStreamEvent("socket dropped".into()),
                 2,
-                false
+                false,
+                NOT_EXHAUSTED
             ),
             RetryDecision::Retry {
                 attempt: 3,
@@ -557,7 +681,8 @@ mod tests {
             policy.decide(
                 &ProviderError::MalformedStreamEvent("socket dropped".into()),
                 3,
-                false
+                false,
+                NOT_EXHAUSTED
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::AttemptsExhausted,
@@ -572,7 +697,8 @@ mod tests {
             policy.decide(
                 &ProviderError::ToolCallMalformed("bad json".into()),
                 0,
-                false
+                false,
+                NOT_EXHAUSTED
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
@@ -588,6 +714,7 @@ mod tests {
                 &ProviderError::NativeReasoningUnsupported("unsupported".into()),
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
@@ -612,6 +739,7 @@ mod tests {
                 },
                 0,
                 false,
+                NOT_EXHAUSTED,
             ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::Terminal,
@@ -630,12 +758,12 @@ mod tests {
         );
         // Attempt 0 → retry.
         assert!(matches!(
-            policy.decide(&error, 0, false),
+            policy.decide(&error, 0, false, NOT_EXHAUSTED),
             RetryDecision::Retry { attempt: 1, .. }
         ));
         // Attempt 1 → retry (still under MAX_MODEL_OUTPUT_MALFORMED_RETRIES = 2).
         assert!(matches!(
-            policy.decide(&error, 1, false),
+            policy.decide(&error, 1, false, NOT_EXHAUSTED),
             RetryDecision::Retry { attempt: 2, .. }
         ));
     }
@@ -648,7 +776,12 @@ mod tests {
         let policy = deterministic_policy(deterministic_config());
         let error = ProviderError::ModelOutputMalformed("xml: unexpected eof".into());
         assert_eq!(
-            policy.decide(&error, MAX_MODEL_OUTPUT_MALFORMED_RETRIES, false),
+            policy.decide(
+                &error,
+                MAX_MODEL_OUTPUT_MALFORMED_RETRIES,
+                false,
+                NOT_EXHAUSTED
+            ),
             RetryDecision::GiveUp {
                 reason: GiveUpReason::AttemptsExhausted,
             }

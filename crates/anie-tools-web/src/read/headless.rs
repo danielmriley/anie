@@ -76,13 +76,45 @@ pub fn locate_chrome() -> Result<PathBuf, WebToolError> {
 /// Available only with `--features headless`. The matching
 /// stub on the no-feature path lives in `tool.rs`, where
 /// `javascript: true` is rejected up front with a build hint.
+///
+/// **SSRF posture (PR 3.3 of
+/// `docs/code_review_2026-04-27/`).** This function is **not**
+/// SSRF-equivalent to [`crate::read::fetch::fetch_html`]. The
+/// caller is expected to have run
+/// [`crate::read::fetch::validate_destination`] on `url` before
+/// invoking this function — that covers the initial navigation.
+/// Once Chrome is running, however, it follows redirects and
+/// loads subresources (CSS, images, XHR) through its own
+/// network stack. anie does not currently install a CDP
+/// request-interception handler, so a malicious page can
+/// trigger requests to `127.0.0.1` or RFC 1918 hosts that the
+/// non-headless path would have refused.
+///
+/// Operators enabling `--features headless` and exposing
+/// `javascript=true` to the agent should treat this as an
+/// explicit escape hatch: the safety guarantees of the
+/// non-headless `web_read` do not transfer.
 #[cfg(feature = "headless")]
 pub async fn render_with_chrome(
     url: &url::Url,
     timeout: std::time::Duration,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<String, WebToolError> {
     use chromiumoxide::browser::{Browser, BrowserConfig};
     use futures::StreamExt;
+
+    if cancel.is_cancelled() {
+        return Err(WebToolError::Aborted);
+    }
+
+    // Per the doc comment above: the headless path is not SSRF
+    // equivalent to the non-headless path. Log this loudly so
+    // operators see it whenever `javascript=true` actually
+    // launches Chrome, not just buried in docs.
+    tracing::warn!(
+        target = %url,
+        "headless render: subresources/redirects loaded by Chrome are NOT guarded against private destinations; see render_with_chrome docs"
+    );
 
     let chrome_path = locate_chrome()?;
 
@@ -152,11 +184,27 @@ pub async fn render_with_chrome(
         result
     };
 
-    match tokio::time::timeout(timeout, render).await {
-        Ok(res) => res,
-        Err(_) => Err(WebToolError::Timeout {
-            seconds: timeout.as_secs(),
-        }),
+    // Race timeout, cancellation, and the render. The render
+    // closure handles browser cleanup on its own success and
+    // internal-error paths via `browser.close().await`. If
+    // either timeout *or* cancellation wins here, the render
+    // future is dropped before `browser.close()` can run, and
+    // chromiumoxide does NOT tear down Chrome on `Browser`
+    // drop — so the spawned process is leaked until anie's
+    // own exit reaps it. The same leak existed for the
+    // timeout path before this PR; cancellation just adds a
+    // second trigger. Closing this requires a top-level
+    // `Browser` handle so we can call `.kill()` from outside
+    // the inner future, plus rolling our own select against
+    // an explicit timer rather than `tokio::time::timeout`.
+    // Tracked as follow-up to PR 4.1.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(WebToolError::Aborted),
+        result = tokio::time::timeout(timeout, render) => match result {
+            Ok(res) => res,
+            Err(_) => Err(WebToolError::Timeout { seconds: timeout.as_secs() }),
+        }
     }
 }
 

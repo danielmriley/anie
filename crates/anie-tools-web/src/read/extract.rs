@@ -27,6 +27,7 @@ use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::WebToolError;
 
@@ -40,6 +41,20 @@ use crate::error::WebToolError;
 /// `defuddle` package. Earlier `0.6.x` pins targeted the old
 /// stdin-pipe CLI shape and no longer work.
 pub const DEFUDDLE_VERSION: &str = "0.18.x";
+
+/// Maximum bytes captured from Defuddle's stdout. Cleaned
+/// markdown output for a typical article fits in tens of KiB;
+/// 1 MiB leaves headroom for unusually long documents while
+/// keeping a runaway / malicious page from filling memory via
+/// the subprocess pipe. PR 4.2 of `docs/code_review_2026-04-27/`.
+pub const DEFAULT_MAX_DEFUDDLE_STDOUT_BYTES: usize = 1024 * 1024;
+
+/// Maximum bytes captured from Defuddle's stderr. Stderr is
+/// only used for the exit-code error message; if Defuddle is
+/// flooding stderr it's misbehaving and we want a typed error
+/// rather than an OOM. 256 KiB is generous for any sensible
+/// stderr payload.
+pub const DEFAULT_MAX_DEFUDDLE_STDERR_BYTES: usize = 256 * 1024;
 
 /// Defuddle's JSON output. Optional fields use
 /// `#[serde(default)]` so a Defuddle release that adds or
@@ -103,11 +118,44 @@ impl DefuddleOutput {
 
 /// Trait abstracting the Defuddle invocation so tests can
 /// substitute a deterministic implementation.
+///
+/// `cancel` is honored cooperatively. Production runners must
+/// kill the spawned subprocess on cancellation rather than
+/// letting it run to completion in the background.
+///
+/// **`source_url` semantics (PR 6.2 of
+/// `docs/code_review_2026-04-27/`).** Pre-PR-6.2 the trait
+/// docs claimed `source_url` was used for relative-link
+/// resolution. That was aspirational — Defuddle 0.18's CLI
+/// (`defuddle parse <source>`) has no `--source-url` /
+/// `--base-url` option, and we deliberately pass a tempfile
+/// rather than the URL so anie's SSRF guard, robots check,
+/// rate limit, and size cap stay in force. The result is
+/// that relative `<a href>` / `<img src>` references in the
+/// HTML come through as relative paths in the extracted
+/// Markdown — the agent gets no help resolving them against
+/// the original origin.
+///
+/// `source_url` therefore reaches this trait so callers /
+/// alternative runners can still record it (the
+/// `WebReadTool` frontmatter does), but the production
+/// `SubprocessDefuddleRunner` does not pass it to Defuddle
+/// itself. Promoting this to base-URL rewriting would
+/// require a Markdown-aware post-processor (pulldown-cmark)
+/// to avoid corrupting fenced code blocks and inline code
+/// spans, and is tracked as a follow-up.
 #[async_trait]
 pub trait DefuddleRunner: Send + Sync {
-    /// Run Defuddle against `html`, with `source_url` provided
-    /// for relative-link resolution and metadata.
-    async fn run(&self, html: &str, source_url: &str) -> Result<DefuddleOutput, WebToolError>;
+    /// Run Defuddle against `html`. `source_url` is recorded
+    /// alongside the result for metadata; see the trait-level
+    /// doc for the relative-link-resolution caveat. Returns
+    /// [`WebToolError::Aborted`] when `cancel` fires.
+    async fn run(
+        &self,
+        html: &str,
+        source_url: &str,
+        cancel: &CancellationToken,
+    ) -> Result<DefuddleOutput, WebToolError>;
 }
 
 /// Production implementation: spawns the `defuddle` CLI as a
@@ -117,7 +165,25 @@ pub struct SubprocessDefuddleRunner;
 
 #[async_trait]
 impl DefuddleRunner for SubprocessDefuddleRunner {
-    async fn run(&self, html: &str, _source_url: &str) -> Result<DefuddleOutput, WebToolError> {
+    async fn run(
+        &self,
+        html: &str,
+        _source_url: &str,
+        cancel: &CancellationToken,
+    ) -> Result<DefuddleOutput, WebToolError> {
+        if cancel.is_cancelled() {
+            return Err(WebToolError::Aborted);
+        }
+        // `_source_url` is intentionally unused: Defuddle 0.18's
+        // CLI does not accept a base / source URL flag, and we
+        // deliberately pass a tempfile rather than the original
+        // URL so anie's SSRF guard, robots check, rate limit,
+        // and size cap stay in force. The result is that
+        // relative `<a>` / `<img>` references in the HTML come
+        // through as relative paths in the extracted Markdown.
+        // See the trait-level doc for the follow-up plan.
+        // PR 6.2 of `docs/code_review_2026-04-27/`.
+
         // The Defuddle 0.18 CLI takes a file path or URL — no
         // stdin. We write the already-fetched HTML to a tempfile
         // so anie's SSRF guard, robots check, rate limit, and
@@ -149,22 +215,119 @@ impl DefuddleRunner for SubprocessDefuddleRunner {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| WebToolError::DefuddleSpawn(e.to_string()))?;
 
-        let output = child.wait_with_output().await?;
+        // Cancellation: take stdout/stderr into separate read
+        // tasks so we can `child.wait()` cooperatively. On
+        // cancel, kill the child and abort the readers — the
+        // alternative (`wait_with_output()`) consumes `child`
+        // and gives us no kill handle. PR 4.1 of
+        // `docs/code_review_2026-04-27/`.
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| WebToolError::DefuddleSpawn("missing stdout pipe".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| WebToolError::DefuddleSpawn("missing stderr pipe".into()))?;
+
+        let stdout_task = tokio::spawn(async move {
+            let mut reader = stdout;
+            read_to_end_bounded(&mut reader, DEFAULT_MAX_DEFUDDLE_STDOUT_BYTES).await
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = stderr;
+            read_to_end_bounded(&mut reader, DEFAULT_MAX_DEFUDDLE_STDERR_BYTES).await
+        });
+
+        let status = tokio::select! {
+            _ = cancel.cancelled() => {
+                // start_kill is non-blocking; wait reaps the
+                // process so we don't leave a zombie.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                drop(tmp);
+                return Err(WebToolError::Aborted);
+            }
+            res = child.wait() => res?,
+        };
+
+        let (stdout_buf, stdout_overflowed) = stdout_task
+            .await
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stdout reader join: {e}")))?
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stdout read: {e}")))?;
+        let (stderr_buf, stderr_overflowed) = stderr_task
+            .await
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stderr reader join: {e}")))?
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stderr read: {e}")))?;
+
         // Keep `tmp` alive until after the child has read it.
         drop(tmp);
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !status.success() {
+            let mut stderr_text = String::from_utf8_lossy(&stderr_buf).to_string();
+            if stderr_overflowed {
+                stderr_text.push_str("\n…[truncated]");
+            }
             return Err(WebToolError::DefuddleFailed {
-                exit_code: output.status.code(),
-                stderr,
+                exit_code: status.code(),
+                stderr: stderr_text,
             });
         }
-        parse_defuddle_output(&output.stdout)
+
+        // PR 4.2 of `docs/code_review_2026-04-27/`: a
+        // success exit with overflowed stdout means we
+        // truncated valid JSON. The truncated bytes will not
+        // round-trip through `parse_defuddle_output`, but
+        // surface a typed error explaining *why* parsing
+        // would fail rather than letting the agent see a
+        // confusing "expected `,` or `}`" deserializer
+        // message.
+        if stdout_overflowed {
+            return Err(WebToolError::DefuddleFailed {
+                exit_code: status.code(),
+                stderr: format!(
+                    "defuddle stdout exceeded {DEFAULT_MAX_DEFUDDLE_STDOUT_BYTES} bytes; output truncated and unparseable"
+                ),
+            });
+        }
+        parse_defuddle_output(&stdout_buf)
+    }
+}
+
+/// Read `reader` to EOF, accumulating up to `cap` bytes and
+/// silently discarding any beyond. Returns `(buf, overflowed)`.
+/// Drains the underlying pipe even after the cap is hit so the
+/// child process can finish writing without backpressure
+/// stalling its exit. PR 4.2 of `docs/code_review_2026-04-27/`.
+async fn read_to_end_bounded<R>(reader: &mut R, cap: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok((buf, overflowed));
+        }
+        let remaining = cap.saturating_sub(buf.len());
+        if n > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            overflowed = true;
+        } else if !overflowed {
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        // After overflow, we keep reading but drop bytes — the
+        // pipe must continue draining or the child blocks on
+        // write and never exits.
     }
 }
 
@@ -290,5 +453,30 @@ mod tests {
             ..DefuddleOutput::default()
         };
         assert_eq!(out.markdown_body(), "# Heading\n\nBody.");
+    }
+
+    /// PR 4.2 of `docs/code_review_2026-04-27/`. The bounded
+    /// reader keeps at most `cap` bytes in memory and reports
+    /// `overflowed = true` when the source produced more,
+    /// while still draining the rest of the source so the
+    /// underlying pipe doesn't backpressure the writer.
+    #[tokio::test]
+    async fn read_to_end_bounded_caps_at_size() {
+        // 8 KiB source, 4 KiB cap.
+        let source: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
+        let mut reader = std::io::Cursor::new(source.clone());
+        let (buf, overflowed) = read_to_end_bounded(&mut reader, 4 * 1024).await.unwrap();
+        assert_eq!(buf.len(), 4 * 1024);
+        assert!(overflowed);
+        assert_eq!(&buf[..], &source[..4 * 1024]);
+    }
+
+    #[tokio::test]
+    async fn read_to_end_bounded_returns_full_buffer_when_under_cap() {
+        let source = b"short payload".to_vec();
+        let mut reader = std::io::Cursor::new(source.clone());
+        let (buf, overflowed) = read_to_end_bounded(&mut reader, 1024).await.unwrap();
+        assert_eq!(buf, source);
+        assert!(!overflowed);
     }
 }

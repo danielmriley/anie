@@ -11,7 +11,7 @@ Status key:
 |---|---:|---|
 | 01 — Editable active draft | ✅ | Landed `<TBD>` (2026-04-27). PR A only; PR B (border styling cleanup) deferred. Four tests pin the behavior. |
 | 02 — Queued follow-up prompts | ✅ | Plan landed across four PRs (2.1–2.4) on 2026-04-27. Visibility messages emit on queue + drain; queue overrides stale retries. Persistence to disk explicitly deferred per plan. |
-| 03 — Interrupt-and-send affordance | ⬜ | Explicit abort + send drafted correction. |
+| 03 — Interrupt-and-send affordance | ✅ | PR A `cb788f6` (controller `AbortAndQueuePrompt`: front-queue + cancel for active runs; clear-retry-and-start for pending; start for idle). PR B `c827fb7` (Ctrl+Enter binding; empty-draft no-op; Ctrl+C unchanged). PR C landed (`/help` Keys section). |
 
 ## Validation checklist
 

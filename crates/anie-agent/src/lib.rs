@@ -5,8 +5,14 @@ mod agent_loop;
 mod hooks;
 mod tool;
 
-pub use agent_loop::{AgentLoop, AgentLoopConfig, AgentRunResult, ToolExecutionMode, send_event};
-pub use tool::{Tool, ToolError, ToolRegistry};
+pub use agent_loop::{
+    AgentLoop, AgentLoopConfig, AgentRunResult, CompactionGate, CompactionGateOutcome,
+    ToolExecutionMode, send_event,
+};
+pub use tool::{
+    MIN_TOOL_OUTPUT_BUDGET_BYTES, Tool, ToolError, ToolExecutionContext, ToolRegistry,
+    effective_tool_output_budget,
+};
 
 #[cfg(test)]
 mod tests;

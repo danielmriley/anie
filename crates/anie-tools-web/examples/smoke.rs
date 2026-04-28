@@ -12,7 +12,7 @@
 //! we run by hand to verify behavior end-to-end against real
 //! services (DuckDuckGo, Defuddle subprocess, Chrome).
 
-use anie_agent::Tool;
+use anie_agent::{Tool, ToolExecutionContext};
 use anie_tools_web::{WebReadTool, WebSearchTool};
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +28,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tool = WebSearchTool::new()?;
             let payload = serde_json::json!({ "query": query, "max_results": 5 });
             let result = tool
-                .execute("smoke", payload, CancellationToken::new(), None)
+                .execute(
+                    "smoke",
+                    payload,
+                    CancellationToken::new(),
+                    None,
+                    &ToolExecutionContext::default(),
+                )
                 .await?;
             print_result(&result);
         }
@@ -37,7 +43,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tool = WebReadTool::new()?;
             let payload = serde_json::json!({ "url": url });
             let result = tool
-                .execute("smoke", payload, CancellationToken::new(), None)
+                .execute(
+                    "smoke",
+                    payload,
+                    CancellationToken::new(),
+                    None,
+                    &ToolExecutionContext::default(),
+                )
                 .await?;
             print_result(&result);
         }
@@ -46,7 +58,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tool = WebReadTool::new()?;
             let payload = serde_json::json!({ "url": url, "javascript": true });
             let result = tool
-                .execute("smoke", payload, CancellationToken::new(), None)
+                .execute(
+                    "smoke",
+                    payload,
+                    CancellationToken::new(),
+                    None,
+                    &ToolExecutionContext::default(),
+                )
                 .await?;
             print_result(&result);
         }
@@ -54,9 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "render" => {
             let url_str = target.ok_or("usage: smoke render <url>")?;
             let url = url::Url::parse(&url_str)?;
+            let cancel = CancellationToken::new();
             let html = anie_tools_web::read::headless::render_with_chrome(
                 &url,
                 std::time::Duration::from_secs(30),
+                &cancel,
             )
             .await?;
             // Print the full HTML so it can be redirected.

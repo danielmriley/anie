@@ -5,7 +5,7 @@ use tokio::{
     sync::mpsc,
 };
 
-use anie_protocol::{AgentEvent, Message, StreamDelta};
+use anie_protocol::{AgentEvent, CompactionPhase, Message, StreamDelta};
 use anie_tui::UiAction;
 
 use crate::{Cli, bootstrap::prepare_controller_state, controller::InteractiveController};
@@ -117,6 +117,28 @@ enum RpcCommand {
     SetThinking { level: String },
 }
 
+/// Wire-format mirror of `anie_protocol::CompactionPhase`,
+/// kept separate so the snake-case JSON variants stay stable
+/// even if the in-process enum is renamed. Plan 06 of
+/// `docs/midturn_compaction_2026-04-27/`.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RpcCompactionPhase {
+    PrePrompt,
+    MidTurn,
+    ReactiveOverflow,
+}
+
+impl From<CompactionPhase> for RpcCompactionPhase {
+    fn from(value: CompactionPhase) -> Self {
+        match value {
+            CompactionPhase::PrePrompt => Self::PrePrompt,
+            CompactionPhase::MidTurn => Self::MidTurn,
+            CompactionPhase::ReactiveOverflow => Self::ReactiveOverflow,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum RpcEvent {
@@ -150,9 +172,15 @@ enum RpcEvent {
         session_id: String,
     },
     #[serde(rename = "compaction_start")]
-    CompactionStart,
+    CompactionStart {
+        /// One of `pre_prompt`, `mid_turn`, `reactive_overflow`
+        /// per `CompactionPhase`. Plan 06 of
+        /// `docs/midturn_compaction_2026-04-27/`.
+        phase: RpcCompactionPhase,
+    },
     #[serde(rename = "compaction_end")]
     CompactionEnd {
+        phase: RpcCompactionPhase,
         summary: String,
         tokens_before: u64,
         tokens_after: u64,
@@ -212,12 +240,16 @@ impl From<AgentEvent> for RpcEvent {
                 cwd,
                 session_id,
             },
-            AgentEvent::CompactionStart => Self::CompactionStart,
+            AgentEvent::CompactionStart { phase } => Self::CompactionStart {
+                phase: phase.into(),
+            },
             AgentEvent::CompactionEnd {
+                phase,
                 summary,
                 tokens_before,
                 tokens_after,
             } => Self::CompactionEnd {
+                phase: phase.into(),
                 summary,
                 tokens_before,
                 tokens_after,

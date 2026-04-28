@@ -53,6 +53,18 @@ pub use search::WebSearchTool;
 /// Both tools share a per-host rate limiter so a search-then-read
 /// chain doesn't double-spend the budget for a single host.
 pub fn web_tools() -> Result<Vec<Arc<dyn Tool>>, WebToolError> {
+    web_tools_with_options(read::fetch::FetchOptions::default())
+}
+
+/// Build the web tools using a caller-supplied
+/// [`read::fetch::FetchOptions`]. The bootstrap converts
+/// `[tools.web]` config into `FetchOptions` and passes it
+/// here, so operator-tunable timeouts / byte caps / private-IP
+/// policy take effect at startup. PR 4.3 of
+/// `docs/code_review_2026-04-27/`.
+pub fn web_tools_with_options(
+    opts: read::fetch::FetchOptions,
+) -> Result<Vec<Arc<dyn Tool>>, WebToolError> {
     use read::fetch::{DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, HostRateLimiter};
 
     let limiter = Arc::new(HostRateLimiter::new(
@@ -60,7 +72,7 @@ pub fn web_tools() -> Result<Vec<Arc<dyn Tool>>, WebToolError> {
         DEFAULT_RATE_LIMIT_BURST,
     ));
     Ok(vec![
-        Arc::new(WebReadTool::with_rate_limiter(limiter.clone())?),
-        Arc::new(WebSearchTool::with_rate_limiter(limiter)?),
+        Arc::new(WebReadTool::with_options(opts.clone(), limiter.clone())?),
+        Arc::new(WebSearchTool::with_options(opts, limiter)?),
     ])
 }

@@ -3,9 +3,11 @@
 
 use std::{collections::HashMap, net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use texting_robots::Robot;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::error::WebToolError;
@@ -39,6 +41,23 @@ pub const DEFAULT_RATE_LIMIT_BURST: u32 = 5;
 /// Generous enough for typical SPA hydration; bounded so a
 /// hanging page doesn't pin the agent indefinitely.
 pub const DEFAULT_HEADLESS_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum bytes captured from a non-2xx response body before
+/// truncation. The body is only used for the agent-visible
+/// excerpt in [`WebToolError::HttpStatus`], so capping at
+/// 256 KiB still gives any reasonable error page room while
+/// keeping a misbehaving server from streaming megabytes into
+/// memory just because it returned a 500. PR 4.2 of
+/// `docs/code_review_2026-04-27/`.
+pub const DEFAULT_MAX_ERROR_BODY_BYTES: usize = 256 * 1024;
+
+/// Maximum bytes consumed from a `robots.txt` response. RFC
+/// 9309 Section 2.5 suggests 500 KiB as a parser limit; we go
+/// slightly higher (512 KiB) to match. A robots.txt larger
+/// than this is treated as unavailable rather than parsed —
+/// almost certainly the server returning an HTML error page
+/// or a malicious endpoint trying to OOM us.
+pub const DEFAULT_MAX_ROBOTS_BYTES: usize = 512 * 1024;
 
 // --------------------------------------------------------------
 // URL validation + SSRF guard.
@@ -97,7 +116,8 @@ fn host_str_is_private(host: &str) -> bool {
 
 /// Classify an IP address as "private" for SSRF purposes.
 /// Matches loopback, link-local, RFC 1918 ranges, IPv6 ULA,
-/// and IPv4 multicast / broadcast.
+/// IPv4 multicast / broadcast, and IPv4-mapped IPv6 addresses
+/// whose embedded IPv4 is private.
 pub fn ip_is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -107,10 +127,25 @@ pub fn ip_is_private(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_multicast()
                 || v4.is_unspecified()
-                // Carrier-grade NAT.
+                // Carrier-grade NAT (RFC 6598, 100.64.0.0/10).
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
+                // Class E reserved / future use (240.0.0.0/4).
+                // Not officially "private", but no legitimate
+                // public host is reachable here, so refusing is
+                // strictly safer than allowing.
+                || v4.octets()[0] >= 240
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 (::ffff:a.b.c.d). `is_loopback`
+            // and friends only check the canonical IPv6 ranges
+            // and miss e.g. ::ffff:127.0.0.1, so classify by the
+            // embedded IPv4 instead. Without this, an attacker
+            // who can spoof a `Location: http://[::ffff:127.0.0.1]`
+            // redirect would slip past the v6 checks below.
+            // PR 3.2 of `docs/code_review_2026-04-27/`.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_private(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -120,6 +155,105 @@ pub fn ip_is_private(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+// --------------------------------------------------------------
+// DNS resolver abstraction.
+// --------------------------------------------------------------
+
+/// DNS resolver abstraction used by the SSRF guard.
+///
+/// `validate_url()` covers IP literals and known private
+/// hostnames (`localhost`, `*.local`, `*.internal`, etc.) but
+/// does not catch arbitrary public-looking hostnames that
+/// resolve to private IPs (e.g. `evil.example` →
+/// `127.0.0.1`, or AWS metadata via a CNAME). The fetch path
+/// therefore resolves hostnames before issuing the request and
+/// rejects when any candidate IP is private.
+///
+/// A trait abstraction lets tests inject deterministic
+/// mappings without touching the system resolver. The default
+/// implementation is [`SystemResolver`], which delegates to
+/// `tokio::net::lookup_host`.
+#[async_trait]
+pub trait Resolver: Send + Sync {
+    /// Resolve `host:port` to its candidate IP addresses.
+    /// `port` is included so callers can use `(host, port)`
+    /// resolution APIs without constructing a `SocketAddr`.
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, WebToolError>;
+}
+
+/// Default resolver: delegates to `tokio::net::lookup_host`,
+/// which uses the platform-configured DNS.
+pub struct SystemResolver;
+
+#[async_trait]
+impl Resolver for SystemResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| WebToolError::Fetch(format!("dns lookup of {host} failed: {e}")))?;
+        let ips: Vec<IpAddr> = addrs.map(|sa| sa.ip()).collect();
+        Ok(ips)
+    }
+}
+
+/// Convenience constructor for the default system resolver as
+/// an `Arc<dyn Resolver>`. Production call sites pass this; tests
+/// substitute their own resolver via the same trait.
+pub fn system_resolver() -> Arc<dyn Resolver> {
+    Arc::new(SystemResolver)
+}
+
+/// Validate a URL's destination against the SSRF policy.
+///
+/// `validate_url` covers the textual host (literal IPs and
+/// known-private hostnames). This helper additionally resolves
+/// non-literal hostnames and rejects when any returned IP is
+/// classified as private by [`ip_is_private`]. The redirect
+/// loop in [`fetch_html`] calls this before sending each
+/// request so a 302 to a hostname that resolves to a private
+/// IP cannot bypass the guard.
+///
+/// anie-specific (vs. a connector-integrated resolver): there
+/// is a small TOCTOU between this validation and the request
+/// reqwest issues — DNS could in principle change between the
+/// two lookups. Pi has no equivalent guard at all, so this is a
+/// strict improvement; closing the TOCTOU requires a custom
+/// reqwest `Resolve` implementation and is tracked as a
+/// follow-up. PR 3.2 of `docs/code_review_2026-04-27/`.
+pub async fn validate_destination(
+    url: &Url,
+    resolver: &dyn Resolver,
+    allow_private_ips: bool,
+) -> Result<(), WebToolError> {
+    if allow_private_ips {
+        return Ok(());
+    }
+    let host = match url.host() {
+        Some(url::Host::Domain(d)) => d.to_string(),
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => {
+            // Literal IPs were already classified by
+            // `validate_url`. There is no DNS step to re-check.
+            return Ok(());
+        }
+        None => {
+            return Err(WebToolError::InvalidUrl("URL has no host".into()));
+        }
+    };
+    let port = url.port_or_known_default().unwrap_or(0);
+    let ips = resolver.resolve(&host, port).await?;
+    if ips.is_empty() {
+        return Err(WebToolError::Fetch(format!(
+            "dns lookup of {host} returned no addresses"
+        )));
+    }
+    for ip in &ips {
+        if ip_is_private(*ip) {
+            return Err(WebToolError::PrivateAddress(format!("{host} -> {ip}")));
+        }
+    }
+    Ok(())
 }
 
 // --------------------------------------------------------------
@@ -133,9 +267,52 @@ pub fn ip_is_private(ip: IpAddr) -> bool {
 /// A long-running anie session that hits the same hosts many
 /// times benefits; one-shot CLI invocations re-fetch each
 /// time, which is fine.
+/// Origin key for the robots cache: `(scheme, host, port)`.
+/// Keying by origin (RFC 6454) rather than just host means
+/// `https://example.com:8443/` and `http://example.com/` get
+/// separate cached policies — same host, different origins,
+/// different operators in practice. Pre-PR-6.1 the cache was
+/// keyed by host string alone, so a previously-fetched
+/// `http://example.com/robots.txt` would shadow an HTTPS
+/// fetch on the same host. PR 6.1 of `docs/code_review_2026-04-27/`.
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+struct RobotsOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl RobotsOrigin {
+    fn from_url(url: &Url) -> Result<Self, WebToolError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| WebToolError::InvalidUrl("URL has no host".into()))?
+            .to_ascii_lowercase();
+        // `port_or_known_default` returns 80 / 443 for http / https
+        // when no explicit port is set, so the cache key for
+        // `http://example.com/` and `http://example.com:80/` lines
+        // up.
+        let port = url.port_or_known_default().ok_or_else(|| {
+            WebToolError::InvalidUrl("URL has unsupported scheme for port resolution".into())
+        })?;
+        Ok(Self {
+            scheme: url.scheme().to_string(),
+            host,
+            port,
+        })
+    }
+}
+
+/// In-memory robots.txt cache, keyed by origin. Stores the raw
+/// `robots.txt` body so [`Robot`] can be re-instantiated against
+/// the requested user-agent on each evaluation — `texting_robots`
+/// bakes the agent into the parsed `Robot` and re-parsing on
+/// every call would lose the cache benefit, while caching one
+/// `Robot` per `(origin, user_agent)` would refetch when the
+/// agent changes. PR 6.1 of `docs/code_review_2026-04-27/`.
 #[derive(Clone, Default)]
 pub struct RobotsCache {
-    inner: Arc<RwLock<HashMap<String, Option<Robot>>>>,
+    inner: Arc<RwLock<HashMap<RobotsOrigin, Option<Vec<u8>>>>>,
 }
 
 impl RobotsCache {
@@ -147,59 +324,80 @@ impl RobotsCache {
     /// Check whether `url` may be fetched under `user_agent`.
     /// Returns `Ok(())` if allowed (or robots.txt unavailable);
     /// `Err(WebToolError::Forbidden)` if explicitly disallowed.
+    /// Honors `cancel` for the robots.txt fetch on the slow
+    /// path; the in-memory cache lookup is uncancellable but
+    /// effectively instantaneous.
     pub async fn check(
         &self,
         url: &Url,
         user_agent: &str,
         client: &reqwest::Client,
+        cancel: &CancellationToken,
     ) -> Result<(), WebToolError> {
-        let host = url
-            .host_str()
-            .ok_or_else(|| WebToolError::InvalidUrl("URL has no host".into()))?
-            .to_string();
+        let origin = RobotsOrigin::from_url(url)?;
 
-        // Fast path: cached.
-        {
+        // Fast path: cached body (or the cached "no robots
+        // available" None marker).
+        let cached = {
             let cache = self.inner.read().await;
-            if let Some(slot) = cache.get(&host) {
-                return self.evaluate(slot.as_ref(), url, user_agent);
+            cache.get(&origin).cloned()
+        };
+        let body = match cached {
+            Some(body) => body,
+            None => {
+                let fetched = tokio::select! {
+                    _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+                    r = fetch_robots_for(client, url) => r,
+                };
+                let mut cache = self.inner.write().await;
+                cache.entry(origin).or_insert(fetched.clone());
+                fetched
             }
-        }
-
-        // Slow path: fetch robots.txt for this host.
-        let robots = fetch_robots_for(client, url).await;
-        let mut cache = self.inner.write().await;
-        let slot = cache.entry(host).or_insert(robots);
-        self.evaluate(slot.as_ref(), url, user_agent)
+        };
+        self.evaluate(body.as_deref(), url, user_agent)
     }
 
+    /// Parse the cached robots body against the requested
+    /// user-agent and consult the rules. `texting_robots` baked
+    /// the agent in at parse time, so we instantiate per-call;
+    /// the parse cost is small relative to the fetch cost the
+    /// cache already saved us.
     fn evaluate(
         &self,
-        robot: Option<&Robot>,
+        body: Option<&[u8]>,
         url: &Url,
-        _user_agent: &str,
+        user_agent: &str,
     ) -> Result<(), WebToolError> {
-        match robot {
-            None => Ok(()), // No robots.txt → permissive.
-            Some(robot) => {
-                if robot.allowed(url.as_str()) {
-                    Ok(())
-                } else {
-                    Err(WebToolError::Forbidden(url.to_string()))
-                }
-            }
+        let Some(body) = body else {
+            return Ok(()); // No robots.txt → permissive.
+        };
+        // Malformed robots.txt → permissive. Failing closed
+        // here would let one malformed robots.txt deny the
+        // whole origin even when the operator's intent was
+        // clearly to allow.
+        let Ok(robot) = Robot::new(user_agent, body) else {
+            return Ok(());
+        };
+        if robot.allowed(url.as_str()) {
+            Ok(())
+        } else {
+            Err(WebToolError::Forbidden(url.to_string()))
         }
     }
 
-    /// Test-only insert.
+    /// Test-only insert. Stores the raw robots body keyed by
+    /// origin; `None` means "no robots.txt available" and
+    /// suppresses a network round-trip on the next check.
     #[cfg(test)]
-    pub async fn insert(&self, host: &str, robot: Option<Robot>) {
+    pub async fn insert_for(&self, url: &Url, body: Option<Vec<u8>>) {
         let mut cache = self.inner.write().await;
-        cache.insert(host.to_string(), robot);
+        if let Ok(origin) = RobotsOrigin::from_url(url) {
+            cache.insert(origin, body);
+        }
     }
 }
 
-async fn fetch_robots_for(client: &reqwest::Client, url: &Url) -> Option<Robot> {
+async fn fetch_robots_for(client: &reqwest::Client, url: &Url) -> Option<Vec<u8>> {
     let mut robots_url = url.clone();
     robots_url.set_path("/robots.txt");
     robots_url.set_query(None);
@@ -214,8 +412,96 @@ async fn fetch_robots_for(client: &reqwest::Client, url: &Url) -> Option<Robot> 
     if !response.status().is_success() {
         return None;
     }
-    let body = response.bytes().await.ok()?;
-    Robot::new("*", &body).ok()
+    // Bound the read. A robots.txt larger than the cap is
+    // treated as unavailable rather than truncated-and-parsed
+    // — silently parsing a partial file could miss a
+    // `Disallow:` directive at the bottom and we'd let the
+    // crawl through a path the operator forbade. Better to
+    // fail closed (no robots data → permissive evaluation
+    // already in `RobotsCache::evaluate`) than partially
+    // open. PR 4.2 of `docs/code_review_2026-04-27/`.
+    let (body, overflowed) = collect_bounded_body(response, DEFAULT_MAX_ROBOTS_BYTES)
+        .await
+        .ok()?;
+    if overflowed {
+        tracing::warn!(
+            url = %robots_url,
+            cap = DEFAULT_MAX_ROBOTS_BYTES,
+            "robots.txt exceeds cap; treating as unavailable"
+        );
+        return None;
+    }
+    Some(body)
+}
+
+/// Drain a non-2xx response body into a UTF-8 string, capped
+/// at [`DEFAULT_MAX_ERROR_BODY_BYTES`]. Honors `cancel` between
+/// chunks. Used by `fetch_html` to build the excerpt carried in
+/// [`WebToolError::HttpStatus`] without giving a misbehaving
+/// server an OOM vector via the error path.
+async fn bounded_text_for_error(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+) -> Result<String, WebToolError> {
+    use futures::stream::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut stream = response.bytes_stream();
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            n = stream.next() => n,
+        };
+        let Some(chunk) = next else { break };
+        // Drain failures here are best-effort: the response is
+        // already a non-success and we just want an excerpt.
+        // Treat a stream error as end-of-body rather than a
+        // hard fetch error.
+        let Ok(chunk) = chunk else { break };
+        let remaining = DEFAULT_MAX_ERROR_BODY_BYTES.saturating_sub(buf.len());
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            overflowed = true;
+        } else if !overflowed {
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if overflowed {
+        text.push_str("\n…[truncated]");
+    }
+    Ok(text)
+}
+
+/// Stream a response body into a `Vec<u8>`, capped at `cap`
+/// bytes. Returns `(body, overflowed)` — `overflowed == true`
+/// means the source produced more bytes than `cap` and only
+/// the first `cap` bytes were kept. The underlying stream is
+/// drained to completion either way, so the connection is
+/// returned to the pool cleanly. PR 4.2 of
+/// `docs/code_review_2026-04-27/`.
+async fn collect_bounded_body(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<(Vec<u8>, bool), WebToolError> {
+    use futures::stream::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| WebToolError::Fetch(e.to_string()))?;
+        let remaining = cap.saturating_sub(buf.len());
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            overflowed = true;
+            // Keep draining so the pipe doesn't backpressure
+            // a server that's still streaming. Subsequent
+            // chunks are dropped.
+        } else if !overflowed {
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    Ok((buf, overflowed))
 }
 
 // --------------------------------------------------------------
@@ -331,19 +617,39 @@ pub fn build_client(opts: &FetchOptions) -> Result<reqwest::Client, WebToolError
 /// 302 us into `http://127.0.0.1/admin` and `reqwest` would
 /// happily follow before anie's SSRF guard had a chance to
 /// run. PR 3.1 of `docs/code_review_2026-04-27/`.
+///
+/// SSRF DNS guard — every URL in the chain (initial and each
+/// redirect target) goes through [`validate_destination`],
+/// which resolves the hostname and rejects when any candidate
+/// IP is private. `validate_url` only classifies the textual
+/// host; without the DNS step, a public-looking hostname like
+/// `evil.example` could resolve to `127.0.0.1` and slip
+/// through. PR 3.2 of `docs/code_review_2026-04-27/`.
 pub async fn fetch_html(
     client: &reqwest::Client,
+    resolver: &dyn Resolver,
+    cancel: &CancellationToken,
     url: &Url,
     opts: &FetchOptions,
 ) -> Result<String, WebToolError> {
+    if cancel.is_cancelled() {
+        return Err(WebToolError::Aborted);
+    }
+    // Initial DNS check. `validate_url` was called by the
+    // caller; we add the resolved-IP classification here.
+    tokio::select! {
+        _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+        r = validate_destination(url, resolver, opts.allow_private_ips) => r?,
+    }
+
     let mut current = url.clone();
     let mut hops = 0usize;
     let response = loop {
-        let response = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(|e| WebToolError::Fetch(e.to_string()))?;
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            r = client.get(current.clone()).send() => r
+                .map_err(|e| WebToolError::Fetch(e.to_string()))?,
+        };
 
         let status = response.status();
         if !status.is_redirection() {
@@ -365,8 +671,9 @@ pub async fn fetch_html(
         else {
             // 3xx without Location is malformed — surface as
             // an HTTP error like any other unsuccessful
-            // status. Drain the body for the excerpt.
-            let body = response.text().await.unwrap_or_default();
+            // status. Drain a bounded excerpt of the body for
+            // the agent.
+            let body = bounded_text_for_error(response, cancel).await?;
             return Err(WebToolError::HttpStatus {
                 code: status.as_u16(),
                 body_excerpt: WebToolError::truncate_excerpt(&body),
@@ -385,12 +692,20 @@ pub async fn fetch_html(
         // destination.
         let _ = response;
         current = validate_url(next.as_str(), opts.allow_private_ips)?;
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            r = validate_destination(&current, resolver, opts.allow_private_ips) => r?,
+        }
     };
 
     let status = response.status();
     if !status.is_success() {
         // Try to capture a body excerpt for the agent to see.
-        let body = response.text().await.unwrap_or_default();
+        // Bounded so a hostile server returning a 500 + 50 MiB
+        // body can't OOM us via the error path. The displayed
+        // excerpt is then further trimmed by `truncate_excerpt`
+        // for the agent.
+        let body = bounded_text_for_error(response, cancel).await?;
         return Err(WebToolError::HttpStatus {
             code: status.as_u16(),
             body_excerpt: WebToolError::truncate_excerpt(&body),
@@ -430,10 +745,18 @@ pub async fn fetch_html(
     }
 
     // Stream the body, enforcing the size cap as we go.
+    // The chunk-level cancellation check matters: a slow
+    // server feeding us bytes drip-by-drip would otherwise
+    // pin the agent until the timeout fires.
     use futures::stream::StreamExt;
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            n = stream.next() => n,
+        };
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| WebToolError::Fetch(e.to_string()))?;
         if buf.len() + chunk.len() > opts.max_bytes {
             return Err(WebToolError::TooLarge {
@@ -456,10 +779,59 @@ pub async fn fetch_html(
 // Tests
 // --------------------------------------------------------------
 
+// --------------------------------------------------------------
+// Test resolver. Public so integration tests in
+// `tests/fetch_basic.rs` (which see only the crate's public
+// surface) can model "hostname maps to private IP" — the
+// attack we're guarding against — without touching the system
+// DNS resolver.
+// --------------------------------------------------------------
+
+/// Static `Resolver` for tests and dev tooling: returns canned
+/// IPs per hostname. Doc-hidden because production code should
+/// always use [`SystemResolver`]; this exists so the SSRF guard
+/// can be exercised deterministically.
+#[doc(hidden)]
+pub struct StaticResolver {
+    map: HashMap<String, Vec<IpAddr>>,
+}
+
+impl StaticResolver {
+    /// Build a resolver from `(host, ips)` pairs.
+    pub fn new<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, Vec<IpAddr>)>,
+        S: Into<String>,
+    {
+        Self {
+            map: entries
+                .into_iter()
+                .map(|(h, ips)| (h.into(), ips))
+                .collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl Resolver for StaticResolver {
+    async fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+        match self.map.get(host) {
+            Some(ips) => Ok(ips.clone()),
+            None => Err(WebToolError::Fetch(format!(
+                "static resolver has no mapping for {host}"
+            ))),
+        }
+    }
+}
+
+// --------------------------------------------------------------
+// Tests
+// --------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn validate_url_accepts_https() {
@@ -538,8 +910,182 @@ mod tests {
         assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
         // CGNAT 100.64.0.0/10.
         assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        // EC2 metadata: link-local, must be private.
+        assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        // Class E reserved (240.0.0.0/4): no legitimate public
+        // host lives here, treat as private.
+        assert!(ip_is_private(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
         // Public IP example: not private.
         assert!(!ip_is_private(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    /// Regression for PR 3.2: without the IPv4-mapped path,
+    /// `Ipv6Addr::is_loopback` only matches `::1` and a server
+    /// could redirect to `[::ffff:127.0.0.1]` to reach the
+    /// loopback interface unflagged.
+    #[test]
+    fn ip_is_private_classifies_ipv4_mapped_ipv6_by_embedded_v4() {
+        // ::ffff:127.0.0.1 — IPv4-mapped loopback.
+        let mapped_loopback = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
+        assert!(ip_is_private(mapped_loopback));
+
+        // ::ffff:10.0.0.1 — IPv4-mapped RFC 1918.
+        let mapped_rfc1918 = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001));
+        assert!(ip_is_private(mapped_rfc1918));
+
+        // ::ffff:8.8.8.8 — IPv4-mapped public IP. Must NOT
+        // classify as private; the attack and its mitigation
+        // should be symmetric.
+        let mapped_public = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808));
+        assert!(!ip_is_private(mapped_public));
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_hostname_resolving_to_loopback() {
+        let resolver = StaticResolver::new(vec![(
+            "evil.example",
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        )]);
+        let url = Url::parse("http://evil.example/page").unwrap();
+        let err = validate_destination(&url, &resolver, false)
+            .await
+            .unwrap_err();
+        match err {
+            WebToolError::PrivateAddress(msg) => {
+                assert!(msg.contains("evil.example"), "got: {msg}");
+                assert!(msg.contains("127.0.0.1"), "got: {msg}");
+            }
+            other => panic!("expected PrivateAddress, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_hostname_resolving_to_link_local_metadata() {
+        // EC2/GCP metadata service IP. Hostname that resolves
+        // here is one of the most-commonly-cited SSRF targets.
+        let resolver = StaticResolver::new(vec![(
+            "metadata.example",
+            vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))],
+        )]);
+        let url = Url::parse("http://metadata.example/latest").unwrap();
+        let err = validate_destination(&url, &resolver, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::PrivateAddress(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_when_any_resolved_ip_is_private() {
+        // Hostnames returning a mix of public and private IPs
+        // (round-robin DNS, A+AAAA records pointing at
+        // different segments) must reject as a unit. Allowing
+        // through "if at least one IP is public" would race
+        // reqwest's connect order against the SSRF guard.
+        let resolver = StaticResolver::new(vec![(
+            "split.example",
+            vec![
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            ],
+        )]);
+        let url = Url::parse("http://split.example/").unwrap();
+        let err = validate_destination(&url, &resolver, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::PrivateAddress(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_destination_allows_public_resolution() {
+        let resolver = StaticResolver::new(vec![(
+            "good.example",
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))],
+        )]);
+        let url = Url::parse("http://good.example/").unwrap();
+        validate_destination(&url, &resolver, false)
+            .await
+            .expect("public IP must pass");
+    }
+
+    #[tokio::test]
+    async fn validate_destination_skips_dns_when_private_explicitly_allowed() {
+        // `allow_private_ips = true` is the operator opt-in;
+        // the DNS check (and any resolver error) must not
+        // fire. Simulate by handing in a resolver that would
+        // panic if called — if the early-return path breaks,
+        // this test will surface it.
+        struct PanicResolver;
+        #[async_trait]
+        impl Resolver for PanicResolver {
+            async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+                panic!("resolver must not be called when allow_private_ips=true");
+            }
+        }
+        let url = Url::parse("http://good.example/").unwrap();
+        validate_destination(&url, &PanicResolver, true)
+            .await
+            .expect("allow_private_ips=true bypasses DNS");
+    }
+
+    #[tokio::test]
+    async fn validate_destination_skips_dns_for_ip_literals() {
+        // Literal IPs were already classified by `validate_url`.
+        // `validate_destination` must not re-resolve them
+        // through DNS — that would only invent a TOCTOU window
+        // for nothing. Same panic-resolver trick.
+        struct PanicResolver;
+        #[async_trait]
+        impl Resolver for PanicResolver {
+            async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+                panic!("resolver must not be called for IP literals");
+            }
+        }
+        let url = Url::parse("http://8.8.8.8/").unwrap();
+        validate_destination(&url, &PanicResolver, false)
+            .await
+            .expect("IP literal: no DNS step");
+    }
+
+    /// PR 4.2 of `docs/code_review_2026-04-27/`. A
+    /// `bytes_stream` consumer must keep memory bounded even
+    /// when the response is many times larger than the cap.
+    #[tokio::test]
+    async fn collect_bounded_body_caps_at_size() {
+        // Build a fake server returning a 4 MiB body.
+        use httpmock::Method::GET;
+        use httpmock::MockServer;
+
+        let server = MockServer::start_async().await;
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/big");
+                then.status(200).body(big);
+            })
+            .await;
+
+        let response = reqwest::get(format!("{}/big", server.base_url()))
+            .await
+            .expect("get");
+        let (buf, overflowed) = collect_bounded_body(response, 64 * 1024).await.expect("ok");
+        assert_eq!(buf.len(), 64 * 1024);
+        assert!(overflowed);
+    }
+
+    #[tokio::test]
+    async fn validate_destination_rejects_empty_resolution() {
+        struct EmptyResolver;
+        #[async_trait]
+        impl Resolver for EmptyResolver {
+            async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, WebToolError> {
+                Ok(Vec::new())
+            }
+        }
+        let url = Url::parse("http://nx.example/").unwrap();
+        let err = validate_destination(&url, &EmptyResolver, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::Fetch(_)));
     }
 
     #[test]
@@ -577,31 +1123,125 @@ mod tests {
     #[tokio::test]
     async fn robots_cache_returns_ok_when_no_robots_txt() {
         let cache = RobotsCache::new();
-        cache.insert("example.com", None).await;
         let url = Url::parse("https://example.com/page").unwrap();
+        cache.insert_for(&url, None).await;
         let client = reqwest::Client::new();
-        assert!(cache.check(&url, "anie/test", &client).await.is_ok());
+        assert!(
+            cache
+                .check(&url, "anie/test", &client, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn robots_cache_disallows_when_robot_says_so() {
-        let robot = Robot::new("anie/test", b"User-agent: *\nDisallow: /private/").unwrap();
         let cache = RobotsCache::new();
-        cache.insert("example.com", Some(robot)).await;
         let url = Url::parse("https://example.com/private/secret").unwrap();
+        cache
+            .insert_for(&url, Some(b"User-agent: *\nDisallow: /private/".to_vec()))
+            .await;
         let client = reqwest::Client::new();
-        let err = cache.check(&url, "anie/test", &client).await.unwrap_err();
+        let err = cache
+            .check(&url, "anie/test", &client, &CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, WebToolError::Forbidden(_)));
     }
 
     #[tokio::test]
     async fn robots_cache_allows_unrestricted_paths() {
-        let robot = Robot::new("anie/test", b"User-agent: *\nDisallow: /private/").unwrap();
         let cache = RobotsCache::new();
-        cache.insert("example.com", Some(robot)).await;
         let url = Url::parse("https://example.com/public/article").unwrap();
+        cache
+            .insert_for(&url, Some(b"User-agent: *\nDisallow: /private/".to_vec()))
+            .await;
         let client = reqwest::Client::new();
-        assert!(cache.check(&url, "anie/test", &client).await.is_ok());
+        assert!(
+            cache
+                .check(&url, "anie/test", &client, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// PR 6.1 of `docs/code_review_2026-04-27/`. A robots.txt
+    /// with an `anie`-specific group must override the
+    /// wildcard rules. Pre-PR-6.1 the cache passed `"*"` to
+    /// `Robot::new`, so anie-specific directives were never
+    /// consulted.
+    #[tokio::test]
+    async fn robots_cache_honors_anie_specific_user_agent() {
+        let cache = RobotsCache::new();
+        let url = Url::parse("https://example.com/secret").unwrap();
+        let body = b"\
+User-agent: *\n\
+Disallow:\n\
+\n\
+User-agent: anie\n\
+Disallow: /secret\n\
+"
+        .to_vec();
+        cache.insert_for(&url, Some(body)).await;
+        let client = reqwest::Client::new();
+        let err = cache
+            .check(&url, "anie", &client, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::Forbidden(_)), "got: {err:?}");
+
+        // Same robots body, different agent → wildcard
+        // group's empty Disallow applies, fetch is permitted.
+        let other_url = Url::parse("https://example.com/secret").unwrap();
+        let cache2 = RobotsCache::new();
+        cache2
+            .insert_for(
+                &other_url,
+                Some(b"User-agent: *\nDisallow:\n\nUser-agent: anie\nDisallow: /secret\n".to_vec()),
+            )
+            .await;
+        assert!(
+            cache2
+                .check(&other_url, "GoogleBot", &client, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// PR 6.1: same host, different ports get separate
+    /// cached policies. Pre-PR-6.1 the cache key was the host
+    /// string alone, so a `Disallow:/admin` policy fetched
+    /// from `:80` would also block fetches on `:8080` even
+    /// when those operators have different rules.
+    #[tokio::test]
+    async fn robots_cache_keys_by_origin_not_just_host() {
+        let cache = RobotsCache::new();
+        let url_8080 = Url::parse("http://example.com:8080/admin").unwrap();
+        let url_80 = Url::parse("http://example.com/admin").unwrap();
+
+        // Set a `Disallow: /admin` policy on :8080 only.
+        cache
+            .insert_for(
+                &url_8080,
+                Some(b"User-agent: *\nDisallow: /admin\n".to_vec()),
+            )
+            .await;
+        // :80 has its own (permissive) policy.
+        cache
+            .insert_for(&url_80, Some(b"User-agent: *\nDisallow:\n".to_vec()))
+            .await;
+
+        let client = reqwest::Client::new();
+        let cancel = CancellationToken::new();
+
+        assert!(matches!(
+            cache
+                .check(&url_8080, "anie", &client, &cancel)
+                .await
+                .unwrap_err(),
+            WebToolError::Forbidden(_),
+        ));
+        assert!(cache.check(&url_80, "anie", &client, &cancel).await.is_ok());
     }
 
     #[test]

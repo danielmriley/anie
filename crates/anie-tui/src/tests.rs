@@ -4,7 +4,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 
 use anie_protocol::{
-    AgentEvent, AssistantMessage, ContentBlock, Message, StreamDelta, Usage, UserMessage,
+    AgentEvent, AssistantMessage, CompactionPhase, ContentBlock, Message, StreamDelta, Usage,
+    UserMessage,
 };
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat};
 
@@ -136,8 +137,10 @@ fn compaction_start_transitions_to_compacting_state() {
     let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
-    app.handle_agent_event(AgentEvent::CompactionStart)
-        .expect("handle");
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::PrePrompt,
+    })
+    .expect("handle");
 
     assert!(
         matches!(app.agent_state(), AgentUiState::Compacting { .. }),
@@ -158,9 +161,12 @@ fn compaction_end_transitions_back_to_idle() {
     let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
 
-    app.handle_agent_event(AgentEvent::CompactionStart)
-        .expect("start");
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::PrePrompt,
+    })
+    .expect("start");
     app.handle_agent_event(AgentEvent::CompactionEnd {
+        phase: CompactionPhase::PrePrompt,
         summary: "Prior conversation covered setup work.".into(),
         tokens_before: 150_000,
         tokens_after: 8_000,
@@ -184,8 +190,10 @@ fn status_bar_shows_elapsed_seconds_while_compacting() {
         status.context_window = 200_000;
         status.cwd = "~/project".into();
     }
-    app.handle_agent_event(AgentEvent::CompactionStart)
-        .expect("start");
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::PrePrompt,
+    })
+    .expect("start");
 
     let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
     terminal.draw(|frame| app.render(frame)).expect("draw");
@@ -199,6 +207,75 @@ fn status_bar_shows_elapsed_seconds_while_compacting() {
     assert!(
         screen.contains("compacting 0s"),
         "expected '0s' suffix: {screen}"
+    );
+}
+
+/// Plan 06 PR C: the `MidTurn` phase puts a phase tag on the
+/// activity-row label so users can tell mid-turn compaction
+/// apart from a pre-prompt one without inspecting the
+/// transcript.
+#[test]
+fn activity_row_shows_midturn_label_for_midturn_phase() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    {
+        let status = app.status_bar_mut();
+        status.provider_name = "ollama".into();
+        status.model_name = "qwen3:32b".into();
+        status.thinking = "off".into();
+        status.estimated_context_tokens = 30_000;
+        status.context_window = 32_768;
+        status.cwd = "~/project".into();
+    }
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::MidTurn,
+    })
+    .expect("start");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert!(
+        screen.contains("compacting (mid-turn)"),
+        "mid-turn activity row should be tagged: {screen}",
+    );
+    assert!(
+        !screen.contains("compacting 0s"),
+        "mid-turn label should not collide with the pre-prompt label: {screen}",
+    );
+}
+
+/// Plan 06 PR C: reactive overflow recovery surfaces a
+/// distinct label so a "compacting after overflow" state is
+/// visually distinguishable from proactive compactions.
+#[test]
+fn activity_row_shows_overflow_label_for_reactive_phase() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    {
+        let status = app.status_bar_mut();
+        status.provider_name = "openai".into();
+        status.model_name = "gpt-5".into();
+        status.thinking = "medium".into();
+        status.estimated_context_tokens = 200_000;
+        status.context_window = 200_000;
+        status.cwd = "~/project".into();
+    }
+    app.handle_agent_event(AgentEvent::CompactionStart {
+        phase: CompactionPhase::ReactiveOverflow,
+    })
+    .expect("start");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let screen = render_to_string(terminal.backend());
+
+    assert!(
+        screen.contains("compacting after overflow"),
+        "reactive overflow activity row should call out the trigger: {screen}",
     );
 }
 
@@ -640,6 +717,89 @@ fn enter_while_streaming_sends_queue_prompt_and_clears_draft() {
         }
     }
     assert!(saw_queue, "expected a UiAction::QueuePrompt to be emitted");
+}
+
+/// PR 7.2 of `docs/active_input_2026-04-27/`. Ctrl+Enter
+/// while the agent is active emits
+/// `UiAction::AbortAndQueuePrompt(text)` and clears the draft.
+/// Companion to `enter_while_streaming_sends_queue_prompt_…`:
+/// plain Enter queues for after the run, Ctrl+Enter aborts
+/// the run and front-queues this draft instead.
+#[test]
+fn ctrl_enter_while_streaming_sends_abort_and_queue_and_clears_draft() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    for ch in "wrong path".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("char");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL,
+    )))
+    .expect("ctrl-enter");
+
+    assert_eq!(
+        app.input_pane_contents(),
+        "",
+        "Ctrl+Enter must clear the draft after sending interrupt",
+    );
+    let mut saw_interrupt = false;
+    while let Ok(action) = action_rx.try_recv() {
+        match action {
+            crate::UiAction::AbortAndQueuePrompt(text) => {
+                assert_eq!(text, "wrong path");
+                saw_interrupt = true;
+            }
+            crate::UiAction::QueuePrompt(_) => {
+                panic!(
+                    "Ctrl+Enter must not emit QueuePrompt; AbortAndQueuePrompt is the right action"
+                )
+            }
+            crate::UiAction::Abort => {
+                panic!(
+                    "Ctrl+Enter must not emit a bare Abort; AbortAndQueuePrompt is the right action"
+                )
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_interrupt,
+        "expected a UiAction::AbortAndQueuePrompt to be emitted",
+    );
+}
+
+/// PR 7.2: Ctrl+Enter on an empty draft must NOT abort. The
+/// user pressing the chord without any text in the box hasn't
+/// expressed an interrupt-and-send intent; turning that into a
+/// bare abort would be a footgun. Ctrl+C remains the way to
+/// abort without queueing.
+#[test]
+fn ctrl_enter_with_empty_draft_does_not_abort() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL,
+    )))
+    .expect("ctrl-enter");
+
+    assert!(
+        action_rx.try_recv().is_err(),
+        "empty Ctrl+Enter must not emit any UiAction",
+    );
 }
 
 /// Active Enter on an empty draft is a no-op — no queue

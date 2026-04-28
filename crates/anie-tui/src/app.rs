@@ -213,8 +213,14 @@ pub enum AgentUiState {
     ToolExecuting { tool_name: String },
     /// A context compaction is in flight — the LLM is
     /// summarizing the transcript. The wall-clock start is
-    /// tracked so the status bar can show elapsed seconds.
-    Compacting { started_at: std::time::Instant },
+    /// tracked so the status bar can show elapsed seconds;
+    /// the phase distinguishes pre-prompt / mid-turn /
+    /// reactive-overflow compactions in the activity row
+    /// (Plan 06 PR C of `docs/midturn_compaction_2026-04-27/`).
+    Compacting {
+        started_at: std::time::Instant,
+        phase: anie_protocol::CompactionPhase,
+    },
 }
 
 /// Actions emitted from the TUI to the controller layer.
@@ -230,6 +236,15 @@ pub enum UiAction {
     /// run-boundary instead of racing the active run. Plan 02
     /// of `docs/active_input_2026-04-27/`.
     QueuePrompt(String),
+    /// Cancel the active run *and* front-queue this prompt so
+    /// it starts the moment the abort completes. The user is
+    /// telling anie "I see you going the wrong way, here's the
+    /// correction" — single-run discipline is preserved (we
+    /// don't inject into a live provider stream), but the next
+    /// thing to run is the user's correction rather than
+    /// whatever else might already be queued. Plan 03 of
+    /// `docs/active_input_2026-04-27/`.
+    AbortAndQueuePrompt(String),
     /// Abort the active run.
     Abort,
     /// Quit the app.
@@ -871,18 +886,23 @@ impl App {
                 self.status_bar.cwd = cwd;
                 self.status_bar.last_known_input_tokens = None;
             }
-            AgentEvent::CompactionStart => {
+            AgentEvent::CompactionStart { phase } => {
                 // Permanent record in the transcript + transition
                 // the agent state so the status bar shows the
                 // live elapsed counter while the summarization
-                // LLM call is in flight.
+                // LLM call is in flight. The transcript message
+                // stays phase-neutral; the activity-row label
+                // (`render_spinner_row`) carries the phase
+                // suffix (PR C of plan 06).
                 self.output_pane
                     .add_system_message("Compacting context…".to_string());
                 self.agent_state = AgentUiState::Compacting {
                     started_at: std::time::Instant::now(),
+                    phase,
                 };
             }
             AgentEvent::CompactionEnd {
+                phase: _,
                 summary,
                 tokens_before,
                 tokens_after,
@@ -1084,6 +1104,40 @@ impl App {
             (KeyModifiers::NONE, KeyCode::End) if self.input_pane.content().is_empty() => {
                 self.output_pane.scroll_to_bottom();
                 RenderDirty::full()
+            }
+            // Ctrl+Enter while active: abort the current run
+            // and front-queue this draft so it sends as soon
+            // as the abort completes. PR 7.2 of
+            // `docs/active_input_2026-04-27/`. Terminal support
+            // for Ctrl+Enter varies (Kitty / WezTerm / iTerm2
+            // 3.5 with CSI-u report it; some legacy terminals
+            // do not), but every terminal that does report it
+            // sends a CONTROL+Enter key event under crossterm —
+            // so this binding is safe-by-default and a no-op on
+            // terminals that don't surface the chord. The
+            // companion command-driven fallback for those
+            // terminals lands in PR 7.3 if needed.
+            //
+            // Empty draft is a deliberate no-op rather than a
+            // bare abort: the user pressing Ctrl+Enter without
+            // text in the box hasn't actually expressed an
+            // interrupt-and-send intent, so falling through to
+            // a bare abort would surprise them. Ctrl+C remains
+            // the way to abort without queueing.
+            (KeyModifiers::CONTROL, KeyCode::Enter) => {
+                let draft = self.input_pane.content().to_string();
+                if draft.is_empty() {
+                    RenderDirty::none()
+                } else if self
+                    .action_tx
+                    .send(UiAction::AbortAndQueuePrompt(draft))
+                    .is_ok()
+                {
+                    self.input_pane.clear();
+                    RenderDirty::composer()
+                } else {
+                    RenderDirty::none()
+                }
             }
             // Enter while active: queue the draft for FIFO
             // execution after the current run completes. The
@@ -2246,9 +2300,20 @@ fn render_spinner_row(
         AgentUiState::Idle => String::new(),
         AgentUiState::Streaming => "Responding".into(),
         AgentUiState::ToolExecuting { tool_name } => format!("Running {tool_name}"),
-        AgentUiState::Compacting { started_at } => {
+        AgentUiState::Compacting { started_at, phase } => {
+            // Plan 06 PR C: phase-specific suffix so users can
+            // distinguish proactive compactions from reactive
+            // overflow recovery without inspecting logs.
             let elapsed = started_at.elapsed().as_secs();
-            format!("compacting {elapsed}s")
+            match phase {
+                anie_protocol::CompactionPhase::PrePrompt => format!("compacting {elapsed}s"),
+                anie_protocol::CompactionPhase::MidTurn => {
+                    format!("compacting (mid-turn) {elapsed}s")
+                }
+                anie_protocol::CompactionPhase::ReactiveOverflow => {
+                    format!("compacting after overflow {elapsed}s")
+                }
+            }
         }
     };
     if label.is_empty() {

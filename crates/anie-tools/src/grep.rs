@@ -25,7 +25,7 @@ use ignore::{WalkBuilder, types::TypesBuilder};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::ToolDef;
 
 use crate::shared::{resolve_path, text_result};
@@ -115,6 +115,7 @@ impl Tool for GrepTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let options = GrepOptions::from_args(&args)?;
         let search_root = self.resolve_path(options.path.as_deref());
@@ -505,8 +506,14 @@ mod tests {
         args: serde_json::Value,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let tool = GrepTool::new(cwd);
-        tool.execute("call", args, CancellationToken::new(), None)
-            .await
+        tool.execute(
+            "call",
+            args,
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
     }
 
     fn text_body(result: &anie_protocol::ToolResult) -> String {

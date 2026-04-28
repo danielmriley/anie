@@ -8,7 +8,10 @@ use tempfile::tempdir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionMode, ToolRegistry};
+use anie_agent::{
+    AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionContext, ToolExecutionMode,
+    ToolRegistry,
+};
 use anie_protocol::{
     AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
 };
@@ -127,6 +130,7 @@ async fn read_tool_reads_small_text_file() {
             serde_json::json!({ "path": "hello.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -149,6 +153,7 @@ async fn read_tool_supports_offset_and_limit() {
             serde_json::json!({ "path": "numbers.txt", "offset": 2, "limit": 2 }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -173,12 +178,23 @@ async fn read_tool_truncates_at_line_limit() {
             serde_json::json!({ "path": "many_lines.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
 
     let text = text_content(&result);
-    assert!(text.contains("[remaining 100 lines not shown. Use offset to read more.]"));
+    // PR 5.2 of `docs/code_review_2026-04-27/`: the footer no
+    // longer carries an exact remaining-line count, since
+    // streaming reads stop as soon as the cap is hit and
+    // computing a precise count would re-scan the rest of
+    // the file.
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "got: {text}"
+    );
+    // 2000 lines == MAX_READ_LINES were shown.
+    assert_eq!(text.lines().count() - 1, 2000); // -1 for the footer line
 }
 
 #[tokio::test]
@@ -195,12 +211,101 @@ async fn read_tool_truncates_at_byte_limit() {
             serde_json::json!({ "path": "wide.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
 
     let text = text_content(&result);
-    assert!(text.contains("[remaining 1 lines not shown. Use offset to read more.]"));
+    // Footer wording updated for PR 5.2 — see comment above.
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "got: {text}"
+    );
+}
+
+/// Plan 05 PR C: small-context model gets a 1 KB byte
+/// budget for read tool output. A 10 KB file (well over
+/// the floor and under `MAX_READ_LINES`) must come back
+/// truncated to ~1 KB plus the truncation footer, proving
+/// the per-call budget shrunk with the context window.
+#[tokio::test]
+async fn read_tool_truncates_to_effective_budget_for_small_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("wide.txt");
+    // 10 KB on a single line so the line-cap path doesn't
+    // mask the byte-budget path.
+    let contents = "x".repeat(10 * 1024);
+    tokio::fs::write(&path, contents).await.expect("write file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let small_ctx = ToolExecutionContext {
+        context_window: 8_192,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "wide.txt" }),
+            CancellationToken::new(),
+            None,
+            &small_ctx,
+        )
+        .await
+        .expect("read succeeds");
+
+    let text = text_content(&result);
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "small-window read should surface truncation; got: {text}",
+    );
+    // The body before the footer must be ~1 KB (the floor),
+    // not 10 KB. A length above 2 KB means the budget
+    // didn't shrink with the window.
+    assert!(
+        text.len() <= 2_048,
+        "small-window read body should fit ~1KB budget; got {} bytes",
+        text.len(),
+    );
+}
+
+/// Plan 05 PR C: regression guard. A 200K-window model
+/// gets a 20 KB effective budget (10 % of 200K, capped by
+/// the 50 KB `MAX_READ_BYTES`). A 10 KB file fits without
+/// truncation — proves the cloud path is not collapsing
+/// to the small-window floor.
+#[tokio::test]
+async fn read_tool_keeps_full_output_for_cloud_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("medium.txt");
+    let contents = "x".repeat(10 * 1024);
+    tokio::fs::write(&path, contents).await.expect("write file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let cloud_ctx = ToolExecutionContext {
+        context_window: 200_000,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "medium.txt" }),
+            CancellationToken::new(),
+            None,
+            &cloud_ctx,
+        )
+        .await
+        .expect("read succeeds");
+
+    let text = text_content(&result);
+    assert!(
+        !text.contains("[output truncated. Use offset to read more.]"),
+        "cloud-window read should fit without truncation; got: body of {} bytes",
+        text.len(),
+    );
+    assert!(
+        text.len() >= 10 * 1024,
+        "cloud-window read should return the whole 10 KB file; got {} bytes",
+        text.len(),
+    );
 }
 
 #[tokio::test]
@@ -219,6 +324,7 @@ async fn read_tool_detects_and_encodes_images() {
             serde_json::json!({ "path": "image.png" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("image read succeeds");
@@ -227,6 +333,153 @@ async fn read_tool_detects_and_encodes_images() {
         result.content.first(),
         Some(ContentBlock::Image { media_type, .. }) if media_type == "image/png"
     ));
+}
+
+/// PR 5.2 of `docs/code_review_2026-04-27/`. Behavioral
+/// proxy for the streaming-read invariant: a huge file with a
+/// small `limit` returns bounded output without scanning the
+/// rest of the file. We can't directly assert "did not load
+/// the full body" without instrumenting the reader, but a
+/// 64 MiB sparse file finished within seconds (< 5s in CI)
+/// is a strong indication — the pre-streaming implementation
+/// allocated the full body and would either OOM or take much
+/// longer.
+#[tokio::test]
+async fn read_tool_does_not_load_entire_large_text_file_for_small_limit() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("huge.log");
+    // 64 MiB: large enough to dwarf the 50 KiB / 2000 line
+    // caps, small enough that creating it is fast on tmpfs.
+    // We write actual bytes (not sparse) so the streaming
+    // reader has real content to walk; sparse files would
+    // confuse line-counting heuristics on some filesystems.
+    let mut content = String::with_capacity(64 * 1024 * 1024);
+    for i in 0..(64 * 1024 / 8) {
+        // Each iteration writes ~8 bytes (a 5-digit index +
+        // newline). 8192 iterations → ~64 KiB; do 8192 *
+        // 1024 = 64 MiB total.
+        for j in 0..1024 {
+            content.push_str(&format!("{i:05}-{j:03}\n"));
+        }
+    }
+    tokio::fs::write(&path, &content)
+        .await
+        .expect("write huge file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let started = std::time::Instant::now();
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "huge.log", "limit": 20 }),
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect("read succeeds");
+    let elapsed = started.elapsed();
+
+    let text = text_content(&result);
+    let line_count = text.lines().count();
+    assert_eq!(
+        line_count, 20,
+        "limit=20 must return exactly 20 lines, got {line_count}",
+    );
+    // 5 seconds is generous; the streaming reader should
+    // finish in < 100ms on tmpfs. The pre-streaming
+    // implementation walked all 8M lines to compute
+    // `total_lines`, which dominated the runtime.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "streaming read took {elapsed:?}; regression suggests full-file scan",
+    );
+}
+
+/// PR 5.2 of `docs/code_review_2026-04-27/`. A pathological
+/// newline-less file (or one with a single very long line)
+/// must NOT grow the per-line buffer to the file size. The
+/// `read_one_line` helper caps the buffer at
+/// `MAX_LINE_BUFFER_BYTES` (4× `MAX_READ_BYTES`); after that
+/// the read returns `LineEnd::Cap` and the streaming loop
+/// stops with `truncated = true`. Build a 1 MiB file of
+/// non-newline bytes and confirm the read completes quickly
+/// with bounded output — a regression that used unbounded
+/// `read_until` would still work for 1 MiB but would fail
+/// on a 1 GiB single-line file. We cap the test at 1 MiB to
+/// keep tmpfs usage modest while still being well above
+/// `MAX_LINE_BUFFER_BYTES = 200 KiB`.
+#[tokio::test]
+async fn read_tool_caps_line_buffer_for_newline_less_file() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("oneline.txt");
+    let content = "x".repeat(1024 * 1024);
+    tokio::fs::write(&path, &content).await.expect("write file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "oneline.txt" }),
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect("read succeeds");
+
+    let text = text_content(&result);
+    // The "line" gets trimmed at MAX_READ_BYTES = 50 KiB
+    // before display; with the truncation footer added the
+    // surfaced text should sit comfortably under 60 KiB —
+    // not anywhere near the source's 1 MiB.
+    assert!(
+        text.len() < 60 * 1024,
+        "surfaced text {} bytes; expected < 60 KiB. Regression suggests \
+         the line buffer ballooned to file size.",
+        text.len(),
+    );
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "got: {text}"
+    );
+}
+
+/// PR 5.1 of `docs/code_review_2026-04-27/`. The image cap
+/// must be enforced from `metadata.len()` BEFORE the file
+/// body lands in memory. Use `set_len` to grow a sparse file
+/// to 11 MiB without writing 11 MiB of bytes to disk —
+/// `metadata.len()` reports the logical size, so the pre-read
+/// check rejects, while a regression that called
+/// `tokio::fs::read` first would allocate 11 MiB before the
+/// cap fired.
+#[tokio::test]
+async fn read_tool_rejects_oversized_image_via_metadata() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("huge.png");
+    let file = std::fs::File::create(&path).expect("create image");
+    // 11 MiB is just over MAX_IMAGE_BYTES (10 MiB).
+    file.set_len(11 * 1024 * 1024).expect("set_len");
+    drop(file);
+
+    let tool = ReadTool::new(tempdir.path());
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "huge.png" }),
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect_err("oversized image should reject");
+    match error {
+        anie_agent::ToolError::ExecutionFailed(msg) => {
+            assert!(msg.contains("too large"), "got: {msg}");
+            assert!(msg.contains("huge.png"), "got: {msg}");
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -239,6 +492,7 @@ async fn read_tool_returns_error_for_missing_file() {
             serde_json::json!({ "path": "missing.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("missing file should error");
@@ -257,6 +511,7 @@ async fn write_tool_creates_new_file() {
         serde_json::json!({ "path": "new.txt", "content": "hello" }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("write succeeds");
@@ -279,6 +534,7 @@ async fn write_tool_overwrites_existing_file() {
         serde_json::json!({ "path": "existing.txt", "content": "new" }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("write succeeds");
@@ -298,6 +554,7 @@ async fn write_tool_creates_parent_directories() {
         serde_json::json!({ "path": "nested/dir/file.txt", "content": "hello" }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("write succeeds");
@@ -321,6 +578,7 @@ async fn write_tool_honors_cancellation_before_write() {
             serde_json::json!({ "path": "cancelled.txt", "content": "hello" }),
             cancel,
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("cancelled write should fail");
@@ -370,6 +628,7 @@ async fn bash_tool_runs_simple_command() {
             serde_json::json!({ "command": "echo hello" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("command succeeds");
@@ -395,6 +654,7 @@ async fn bash_policy_blocks_denied_command_before_spawn() {
             serde_json::json!({ "command": "touch blocked.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("policy should block");
@@ -423,6 +683,7 @@ async fn bash_policy_blocks_denied_command_basename() {
             serde_json::json!({ "command": "/usr/bin/touch blocked.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("policy should block");
@@ -451,6 +712,7 @@ async fn bash_policy_blocks_denied_regex_pattern() {
             serde_json::json!({ "command": "git push --force origin main" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("policy should block");
@@ -478,6 +740,7 @@ async fn bash_policy_disabled_does_not_block() {
             serde_json::json!({ "command": "echo allowed" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("disabled policy should not block");
@@ -496,6 +759,7 @@ async fn bash_tool_captures_multiline_output() {
             serde_json::json!({ "command": "printf 'a\\nb\\n'" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("command succeeds");
@@ -514,6 +778,7 @@ async fn bash_tool_propagates_exit_code_failures() {
             serde_json::json!({ "command": "echo fail && exit 7" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("command should fail");
@@ -534,6 +799,7 @@ async fn bash_tool_enforces_timeout() {
             serde_json::json!({ "command": "sleep 2", "timeout": 1 }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("command should time out");
@@ -552,11 +818,96 @@ async fn bash_tool_truncates_large_output() {
             serde_json::json!({ "command": "seq 1 3000" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("command succeeds");
 
     assert!(text_content(&result).contains("[output truncated]"));
+}
+
+/// Plan 05 PR B: with an 8K-context model the byte budget
+/// floors at `MIN_TOOL_OUTPUT_BUDGET_BYTES` (1 KB), so
+/// bash output that would have fit on cloud models has to
+/// compress to ≤ ~1 KB plus a truncation marker.
+///
+/// `seq 1 1500` produces ~6.4 KB of stdout (1500 lines,
+/// under the `MAX_READ_LINES = 2000` cap so the byte
+/// budget is the only thing that can trip truncation) —
+/// well over the 1 KB floor — so we expect the truncation
+/// marker and a body bounded near the floor.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_tool_truncates_stdout_to_effective_budget_for_small_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::new(tempdir.path());
+    let small_ctx = ToolExecutionContext {
+        context_window: 8_192,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "seq 1 1500" }),
+            CancellationToken::new(),
+            None,
+            &small_ctx,
+        )
+        .await
+        .expect("command succeeds");
+
+    let body = text_content(&result);
+    assert!(
+        body.contains("[output truncated]"),
+        "small-context output must surface truncation; got {body:?}",
+    );
+    // Floor is 1024 bytes. The collector renders at most
+    // `byte_budget` bytes plus the truncation marker, so
+    // anything above ~2 KB is a regression — the budget
+    // didn't shrink with the window.
+    assert!(
+        body.len() <= 2_500,
+        "small-context output should fit ~1KB budget; got {} bytes",
+        body.len(),
+    );
+}
+
+/// Plan 05 PR B: regression guard against shrinking cloud
+/// behavior. A 200K-window model still uses an effective
+/// 20 KB byte budget (10 % of 200K, capped against the
+/// 50 KB `MAX_READ_BYTES` constant). `seq 1 1500` is
+/// ~6.4 KB and 1500 lines — well under both the byte
+/// budget and the 2000-line cap — so the cloud path must
+/// return the full output without a truncation marker.
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_tool_keeps_larger_budget_for_cloud_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let tool = BashTool::new(tempdir.path());
+    let cloud_ctx = ToolExecutionContext {
+        context_window: 200_000,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "command": "seq 1 1500" }),
+            CancellationToken::new(),
+            None,
+            &cloud_ctx,
+        )
+        .await
+        .expect("command succeeds");
+
+    let body = text_content(&result);
+    assert!(
+        !body.contains("[output truncated]"),
+        "cloud-context output should fit without truncation; got marker in body of {} bytes",
+        body.len(),
+    );
+    assert!(
+        body.len() > 5_000,
+        "cloud-context body should be much larger than the 1KB floor; got {} bytes",
+        body.len(),
+    );
 }
 
 #[cfg(unix)]
@@ -570,6 +921,7 @@ async fn bash_tool_captures_stderr() {
             serde_json::json!({ "command": "echo err >&2 && exit 3" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("command should fail");
@@ -593,6 +945,7 @@ async fn bash_tool_honors_cancellation() {
             serde_json::json!({ "command": "sleep 10" }),
             cancel_clone,
             None,
+            &ToolExecutionContext::default(),
         )
         .await
     });
@@ -701,6 +1054,7 @@ async fn edit_tool_applies_exact_replacements_and_returns_diff() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("edit succeeds");
@@ -735,6 +1089,7 @@ async fn edit_tool_detects_duplicate_matches() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("duplicate match should fail");
@@ -764,6 +1119,7 @@ async fn edit_tool_detects_overlapping_replacements() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("overlap should fail");
@@ -795,6 +1151,7 @@ async fn edit_tool_rejects_too_many_edits_before_reading_file() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("too many edits should fail before reading");
@@ -823,6 +1180,7 @@ async fn edit_tool_rejects_oversized_old_text_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized oldText should fail before matching");
@@ -851,6 +1209,7 @@ async fn edit_tool_rejects_oversized_new_text_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized newText should fail before matching");
@@ -885,6 +1244,7 @@ async fn edit_tool_rejects_combined_argument_budget_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("combined edit budget should fail before matching");
@@ -917,6 +1277,7 @@ async fn edit_tool_rejects_oversized_input_file_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized input file should fail");
@@ -953,6 +1314,7 @@ async fn edit_tool_rejects_oversized_output_and_preserves_original_file() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized output should fail");
@@ -991,6 +1353,7 @@ async fn edit_tool_preserves_bom_and_crlf() {
         }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("edit succeeds");
@@ -1023,6 +1386,7 @@ async fn edit_tool_can_fuzzily_match_whitespace_runs() {
         }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("fuzzy edit succeeds");

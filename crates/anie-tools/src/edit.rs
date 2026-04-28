@@ -5,7 +5,7 @@ use similar::{ChangeTag, TextDiff};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::ToolDef;
 
 use crate::{
@@ -87,6 +87,7 @@ impl Tool for EditTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let path = required_string_arg(&args, "path")?;
         let edits = parse_edits(&args)?;

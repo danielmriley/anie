@@ -79,6 +79,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         &cwd,
         cli.no_tools,
         bash_policy_from_config(&config.tools.bash.policy),
+        config.tools.web.clone(),
     );
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
@@ -100,6 +101,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {
@@ -110,13 +112,19 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
 
 #[cfg(test)]
 pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistry> {
-    build_tool_registry_with_policy(cwd, no_tools, BashPolicy::default())
+    build_tool_registry_with_policy(
+        cwd,
+        no_tools,
+        BashPolicy::default(),
+        anie_config::WebToolConfig::default(),
+    )
 }
 
 fn build_tool_registry_with_policy(
     cwd: &Path,
     no_tools: bool,
     bash_policy: BashPolicy,
+    web_config: anie_config::WebToolConfig,
 ) -> Arc<ToolRegistry> {
     let mut tools = ToolRegistry::new();
     if no_tools {
@@ -143,22 +151,45 @@ fn build_tool_registry_with_policy(
 
     // Web tools — optional via the `web` cargo feature so
     // lean builds can compile them out entirely. The
-    // `web_tools()` factory may fail if the reqwest client
-    // can't be built (e.g., no TLS roots); we log and
-    // continue without web tools rather than refuse to start.
+    // `web_tools_with_options()` factory may fail if the
+    // reqwest client can't be built (e.g., no TLS roots); we
+    // log and continue without web tools rather than refuse
+    // to start. The `[tools.web]` config supplied by the
+    // operator is converted to `FetchOptions` here. PR 4.3 of
+    // `docs/code_review_2026-04-27/`.
     #[cfg(feature = "web")]
-    match anie_tools_web::web_tools() {
-        Ok(web) => {
-            for tool in web {
-                tools.register(tool);
+    {
+        let opts = web_fetch_options_from_config(&web_config);
+        match anie_tools_web::web_tools_with_options(opts) {
+            Ok(web) => {
+                for tool in web {
+                    tools.register(tool);
+                }
+            }
+            Err(error) => {
+                warn!(%error, "failed to initialize web tools; continuing without them");
             }
         }
-        Err(error) => {
-            warn!(%error, "failed to initialize web tools; continuing without them");
-        }
     }
+    #[cfg(not(feature = "web"))]
+    let _ = web_config;
 
     Arc::new(tools)
+}
+
+#[cfg(feature = "web")]
+fn web_fetch_options_from_config(
+    web_config: &anie_config::WebToolConfig,
+) -> anie_tools_web::read::fetch::FetchOptions {
+    use std::time::Duration;
+    anie_tools_web::read::fetch::FetchOptions {
+        timeout: Duration::from_secs(web_config.request_timeout_secs),
+        user_agent: anie_tools_web::read::fetch::DEFAULT_USER_AGENT.into(),
+        max_bytes: web_config.max_page_bytes,
+        max_redirects: web_config.max_redirects,
+        allow_private_ips: web_config.allow_private_ips,
+        headless_timeout_secs: web_config.headless_timeout_secs,
+    }
 }
 
 fn bash_policy_from_config(config: &anie_config::BashPolicyConfig) -> BashPolicy {

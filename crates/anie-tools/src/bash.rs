@@ -10,7 +10,7 @@ use regex::Regex;
 use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext, effective_tool_output_budget};
 use anie_protocol::ToolDef;
 
 use crate::shared::{
@@ -93,6 +93,7 @@ impl Tool for BashTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
+        ctx: &ToolExecutionContext,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let command = required_string_arg(&args, "command")?;
         self.policy.check(command)?;
@@ -131,7 +132,18 @@ impl Tool for BashTool {
         }
         drop(chunk_tx);
 
-        let mut collector = OutputCollector::new();
+        // Plan 05 PR B: cap stdout/stderr at the smaller of
+        // `MAX_READ_BYTES` and ~10 % of the model's context
+        // window so a single bash result can't consume the
+        // bulk of a small-context model's input. Cloud models
+        // (200K+) still hit `MAX_READ_BYTES` first and behave
+        // exactly as before below 500K-context.
+        let byte_budget = usize::try_from(effective_tool_output_budget(
+            ctx.context_window,
+            MAX_READ_BYTES as u64,
+        ))
+        .unwrap_or(MAX_READ_BYTES);
+        let mut collector = OutputCollector::new(byte_budget);
         let mut timeout_sleep =
             timeout.map(|spec| Box::pin(tokio::time::sleep(spec.as_duration())));
         let mut exit_status = None;
@@ -358,15 +370,22 @@ struct OutputCollector {
     total_lines: usize,
     tail: String,
     truncated: bool,
+    /// Per-call byte budget for what the agent ultimately
+    /// sees. Set by the caller from
+    /// `effective_tool_output_budget(ctx.context_window,
+    /// MAX_READ_BYTES)`. Plan 05 PR B of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    byte_budget: usize,
 }
 
 impl OutputCollector {
-    fn new() -> Self {
+    fn new(byte_budget: usize) -> Self {
         Self {
             total_bytes: 0,
             total_lines: 0,
             tail: String::new(),
             truncated: false,
+            byte_budget,
         }
     }
 
@@ -374,8 +393,8 @@ impl OutputCollector {
         self.total_bytes += chunk.len();
         self.total_lines += chunk.lines().count();
         self.tail.push_str(chunk);
-        if self.tail.len() > MAX_READ_BYTES * 4 {
-            let keep_from = self.tail.len().saturating_sub(MAX_READ_BYTES * 2);
+        if self.tail.len() > self.byte_budget * 4 {
+            let keep_from = self.tail.len().saturating_sub(self.byte_budget * 2);
             let mut boundary = keep_from;
             while boundary < self.tail.len() && !self.tail.is_char_boundary(boundary) {
                 boundary += 1;
@@ -390,10 +409,9 @@ impl OutputCollector {
         // without cloning the full tail string first. The
         // final `lines[start..].join("\n")` still allocates
         // the output, but we save the intermediate tail-clone
-        // which was up to 2×MAX_READ_BYTES (100 KB) on busy
-        // shells.
-        let tail_slice: &str = if self.tail.len() > MAX_READ_BYTES {
-            let keep_from = self.tail.len() - MAX_READ_BYTES;
+        // which was up to 2×byte_budget on busy shells.
+        let tail_slice: &str = if self.tail.len() > self.byte_budget {
+            let keep_from = self.tail.len() - self.byte_budget;
             let mut boundary = keep_from;
             while boundary < self.tail.len() && !self.tail.is_char_boundary(boundary) {
                 boundary += 1;
@@ -416,6 +434,6 @@ impl OutputCollector {
     }
 
     fn was_truncated(&self) -> bool {
-        self.truncated || self.total_bytes > MAX_READ_BYTES || self.total_lines > MAX_READ_LINES
+        self.truncated || self.total_bytes > self.byte_budget || self.total_lines > MAX_READ_LINES
     }
 }

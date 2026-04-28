@@ -20,6 +20,90 @@ pub enum ValidatorState {
     Invalid(String),
 }
 
+/// Per-execution context handed to every `Tool::execute` call.
+/// Carries metadata the agent loop knows about the current
+/// invocation; tools ignore fields they don't care about.
+///
+/// Plan `docs/midturn_compaction_2026-04-27/05_tool_output_caps_scale_with_context.md`
+/// PR A: introduce the struct and thread it through. Output-
+/// scaling logic that consumes `context_window` lands in PR B+.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolExecutionContext {
+    /// Effective context window for the current model
+    /// (post-`/context-length`-override). Tools use this to
+    /// scale output budgets via
+    /// `effective_tool_output_budget`.
+    pub context_window: u64,
+}
+
+impl Default for ToolExecutionContext {
+    /// Default constructor for tests and callers that don't
+    /// participate in the agent loop's plumbing. The 200K
+    /// value is intentionally large so it's effectively a
+    /// no-op for any output budget that would otherwise
+    /// shrink on smaller windows — existing tool behavior is
+    /// preserved when callers haven't wired in a real value.
+    fn default() -> Self {
+        Self {
+            context_window: 200_000,
+        }
+    }
+}
+
+/// Floor on the per-tool output budget. A pathologically
+/// small context window must not push the budget below a
+/// handful of useful lines; otherwise tools return only an
+/// elision marker and the agent has nothing to act on.
+/// Same shape as `compaction_reserve::DEFAULT_MIN_RESERVE_TOKENS`
+/// over in `anie-cli`: a hard floor that keeps very small
+/// windows usable.
+pub const MIN_TOOL_OUTPUT_BUDGET_BYTES: u64 = 1_024;
+
+/// Numerator/denominator of the share of the context window
+/// any single tool result is allowed to occupy. With a 10 %
+/// share, a single tool result claiming more than 30 % of the
+/// model's context is mechanically impossible — and 30 % is
+/// already the upper end of what's tolerable. This factor is
+/// not yet user-configurable; if real workloads ask for a
+/// different ratio, expose it via `[tools]` config (see plan
+/// 05's deferred items).
+const CONTEXT_SHARE_NUMERATOR: u64 = 1;
+const CONTEXT_SHARE_DENOMINATOR: u64 = 10;
+
+/// Compute the effective output budget for a single tool
+/// result given the model's context window and the tool's
+/// hard-coded `base_default` cap.
+///
+/// Three rules apply, in order:
+///
+/// 1. Take ~10 % of `context_window` as the context-share
+///    budget.
+/// 2. Cap that share by `base_default` so we never *grow* the
+///    budget for cloud-window models — the existing constant
+///    remains the upper bound.
+/// 3. Floor at [`MIN_TOOL_OUTPUT_BUDGET_BYTES`] so that
+///    pathologically small windows don't return an empty
+///    result. (Even a 4K-window model can usefully ingest
+///    1 KB of stdout.)
+///
+/// Examples (`base_default = 50 KiB`):
+///
+/// | window  | share  | clamped to base | floored | result   |
+/// |---------|--------|-----------------|---------|----------|
+/// | 200,000 | 20,000 | 20,000          | 20,000  | 20,000   |
+/// | 65,536  |  6,553 |  6,553          |  6,553  |  6,553   |
+/// | 16,384  |  1,638 |  1,638          |  1,638  |  1,638   |
+/// |  8,192  |    819 |    819          |  1,024  |  1,024   |
+/// |  4,096  |    409 |    409          |  1,024  |  1,024   |
+///
+/// Plan 05 of `docs/midturn_compaction_2026-04-27/`.
+#[must_use]
+pub fn effective_tool_output_budget(context_window: u64, base_default: u64) -> u64 {
+    let share = context_window.saturating_mul(CONTEXT_SHARE_NUMERATOR) / CONTEXT_SHARE_DENOMINATOR;
+    let capped = share.min(base_default);
+    capped.max(MIN_TOOL_OUTPUT_BUDGET_BYTES)
+}
+
 /// Trait implemented by every tool.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -33,6 +117,7 @@ pub trait Tool: Send + Sync {
         args: serde_json::Value,
         cancel: CancellationToken,
         update_tx: Option<mpsc::Sender<ToolResult>>,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError>;
 }
 
@@ -162,6 +247,7 @@ mod tests {
             _args: serde_json::Value,
             _cancel: CancellationToken,
             _update_tx: Option<mpsc::Sender<ToolResult>>,
+            _ctx: &ToolExecutionContext,
         ) -> Result<ToolResult, ToolError> {
             unreachable!("tests do not exercise execution")
         }
@@ -256,6 +342,54 @@ mod tests {
             Some(ValidatorState::Invalid(msg)) => panic!("expected Ready, got Invalid({msg})"),
             None => panic!("expected Ready, got missing validator"),
         }
+    }
+
+    /// Plan 05 PR B: the effective output budget must:
+    ///
+    /// 1. Stay below the configured `base_default` for cloud
+    ///    windows (a 200K window's 10 % share is 20K, well
+    ///    under the 50K bash cap).
+    /// 2. Shrink linearly for medium windows.
+    /// 3. Floor at `MIN_TOOL_OUTPUT_BUDGET_BYTES` for very
+    ///    small windows so tools return *something* useful
+    ///    rather than an empty result.
+    #[test]
+    fn effective_tool_output_budget_clamps_to_context_share_for_large_windows() {
+        // 200K context, 50K base: 10% share = 20K, picks share.
+        assert_eq!(effective_tool_output_budget(200_000, 50_000), 20_000);
+        // 65K context, 50K base: share = 6553, picks share.
+        assert_eq!(effective_tool_output_budget(65_536, 50_000), 6_553);
+    }
+
+    #[test]
+    fn effective_tool_output_budget_floors_at_min_budget_for_small_windows() {
+        // 8K window: share = 819, floored to 1024.
+        assert_eq!(
+            effective_tool_output_budget(8_192, 50_000),
+            MIN_TOOL_OUTPUT_BUDGET_BYTES
+        );
+        // 4K window: share = 409, floored to 1024.
+        assert_eq!(
+            effective_tool_output_budget(4_096, 50_000),
+            MIN_TOOL_OUTPUT_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn effective_tool_output_budget_never_exceeds_base_default() {
+        // Even a huge window cannot grow the budget above the
+        // tool's own configured cap.
+        assert_eq!(effective_tool_output_budget(2_000_000, 50_000), 50_000);
+    }
+
+    #[test]
+    fn effective_tool_output_budget_handles_zero_window_with_floor() {
+        // Degenerate config (window 0) should not crash and
+        // should produce the floor.
+        assert_eq!(
+            effective_tool_output_budget(0, 50_000),
+            MIN_TOOL_OUTPUT_BUDGET_BYTES
+        );
     }
 
     /// An invalid schema is stored as `Invalid(msg)` so the

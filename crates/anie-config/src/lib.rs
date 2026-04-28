@@ -99,6 +99,51 @@ pub struct ToolsConfig {
     /// Bash tool settings.
     #[serde(default)]
     pub bash: BashToolConfig,
+    /// Web tool settings (`web_read`, `web_search`).
+    #[serde(default)]
+    pub web: WebToolConfig,
+}
+
+/// Configuration for the built-in `web_read` and `web_search`
+/// tools. Defaults reflect the existing built-in behavior.
+/// Persistent-agent deployments may want to relax the
+/// wall-clock timeouts (set higher) or tighten the byte caps
+/// to suit their environment. PR 4.3 of
+/// `docs/code_review_2026-04-27/`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebToolConfig {
+    /// Per-fetch HTTP request timeout, in seconds. Applies to
+    /// the entire request including header receive. Must be
+    /// > 0.
+    pub request_timeout_secs: u64,
+    /// Total budget for `javascript=true` headless renders,
+    /// in seconds. Only meaningful when the crate is built
+    /// with `--features headless`. Must be > 0.
+    pub headless_timeout_secs: u64,
+    /// Maximum bytes accepted from a 2xx response body before
+    /// returning a typed `TooLarge` error. Hard memory cap.
+    pub max_page_bytes: usize,
+    /// Maximum number of HTTP redirects followed before the
+    /// fetch returns an error. `0` disables redirect
+    /// following entirely.
+    pub max_redirects: usize,
+    /// Allow the tool to fetch URLs that resolve to private
+    /// or loopback addresses. Disabled by default; operators
+    /// must opt in explicitly to disable the SSRF guard for
+    /// trusted internal endpoints.
+    pub allow_private_ips: bool,
+}
+
+impl Default for WebToolConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: 30,
+            headless_timeout_secs: 30,
+            max_page_bytes: 10 * 1024 * 1024,
+            max_redirects: 10,
+            allow_private_ips: false,
+        }
+    }
 }
 
 /// Bash tool settings.
@@ -290,6 +335,19 @@ pub struct CompactionConfig {
     /// Recent-token budget to keep verbatim past the compaction
     /// boundary (the tail of the transcript isn't summarized).
     pub keep_recent_tokens: u64,
+    /// Maximum number of compactions allowed during a single
+    /// user turn. The counter resets on every `start_prompt_run`
+    /// and decrements on every successful compaction; if a
+    /// `ContextOverflow` arrives after the counter hits zero,
+    /// the retry policy gives up with
+    /// `GiveUpReason::CompactionBudgetExhausted` rather than
+    /// looping. Default 2 covers the realistic
+    /// "compact-pre-prompt + compact-once-mid-turn" or
+    /// "compact-pre-prompt + reactive-overflow-retry" shapes.
+    /// Range 1..=8 — anything higher is almost certainly a
+    /// model-fit problem the user should know about. Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
+    pub max_per_turn: u32,
 }
 
 impl Default for CompactionConfig {
@@ -298,6 +356,7 @@ impl Default for CompactionConfig {
             enabled: true,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
+            max_per_turn: 2,
         }
     }
 }
@@ -357,15 +416,42 @@ pub fn anie_dir() -> Option<PathBuf> {
 
 /// Atomically write `contents` to `path`.
 ///
-/// The write goes to a same-directory temp file
-/// (`.{name}.tmp.{pid}.{counter}`), fsyncs, then renames over the destination. On POSIX the
-/// rename is atomic for same-filesystem moves, so a crash during
-/// the write leaves the original `path` intact.
+/// Three guarantees, in order of strength:
+///
+/// 1. **Atomic replacement.** The write goes to a
+///    same-directory temp file (`.{name}.tmp.{pid}.{counter}`)
+///    and is renamed over the destination. On POSIX the
+///    rename is atomic for same-filesystem moves, so a crash
+///    during the write leaves the original `path` intact —
+///    readers see either the old contents or the new
+///    contents, never a half-written file.
+///
+/// 2. **File-body durability.** Before rename, the temp
+///    file's body is synced via `File::sync_all`, so the
+///    bytes themselves are on disk before the directory
+///    entry flips.
+///
+/// 3. **Directory-entry durability** (PR 6.3 of
+///    `docs/code_review_2026-04-27/`). On Unix, after
+///    rename succeeds, the parent directory itself is
+///    synced via `File::sync_all` on the directory handle.
+///    Without this, a crash immediately after rename could
+///    lose the directory-entry update on filesystems /
+///    mount options that buffer metadata writes, even
+///    though the file body was already on disk.
+///
+///    A directory-sync failure is logged via `tracing::warn`
+///    but does not surface as an `Err` from this function:
+///    by then the rename has already succeeded and the new
+///    contents are at `path`. Callers receive `Ok(())` so
+///    they don't double-clean a file that's actually in
+///    place; durability is best-effort beyond the log.
 ///
 /// Use this for any user-facing persistent file (config, auth,
-/// runtime state). On failure the temp file is best-effort
-/// removed and the previous contents of `path` are preserved —
-/// callers should treat `Err` as "nothing happened."
+/// runtime state). On the *write* / *rename* error paths the
+/// temp file is best-effort removed and the previous contents
+/// of `path` are preserved — callers should treat `Err` as
+/// "nothing happened."
 ///
 /// # Errors
 ///
@@ -405,12 +491,46 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 
     match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // PR 6.3: fsync the parent directory so the rename
+            // is durable, not just the file body. See guarantee
+            // 3 in the doc comment above for why this lands in
+            // the success arm specifically and why a sync
+            // failure here does not become an `Err` return.
+            if let Err(err) = sync_parent_dir(parent) {
+                tracing::warn!(
+                    parent = %parent.display(),
+                    %err,
+                    "atomic_write: parent directory fsync failed; data is written but durability is best-effort"
+                );
+            }
+            Ok(())
+        }
         Err(err) => {
             let _ = fs::remove_file(&tmp);
             Err(err)
         }
     }
+}
+
+/// Sync the directory at `parent` so a directory-entry update
+/// (e.g. the rename inside `atomic_write`) is flushed to
+/// stable storage. POSIX-only — `File::sync_all` on a
+/// directory handle is the portable Unix way to fsync a
+/// directory.
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
+    let dir = fs::File::open(parent)?;
+    dir.sync_all()
+}
+
+/// Non-Unix stub. Today this only matters on macOS / Linux
+/// because the crate is Windows-gated; if a non-Unix POSIX
+/// target ever lands, this stub is a deliberate "skip" rather
+/// than silent forgetting.
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn atomic_write_temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
@@ -507,6 +627,8 @@ pub fn load_config_with_paths(
     apply_cli_overrides(&mut config, cli_overrides);
     warn_legacy_ollama_openai_api(&config);
     validate_ollama_config(&config.ollama)?;
+    validate_web_tool_config(&config.tools.web)?;
+    validate_compaction_config(&config.compaction)?;
     Ok(config)
 }
 
@@ -527,6 +649,62 @@ fn validate_ollama_config(ollama: &OllamaConfig) -> Result<()> {
         return Err(anyhow::anyhow!(
             "[ollama] default_max_num_ctx = {value} is below the minimum {OLLAMA_DEFAULT_MAX_NUM_CTX_MIN} \
              (the /context-length slash command also rejects values below this threshold)"
+        ));
+    }
+    Ok(())
+}
+
+/// Range bounds for `[compaction] max_per_turn`. Anything
+/// below 1 disables the safety net entirely; anything above
+/// 8 in a single user turn is overwhelmingly a sign the model
+/// can't cope with the workload, in which case failing loudly
+/// is better than grinding. PR 8.2 of
+/// `docs/midturn_compaction_2026-04-27/`.
+const COMPACTION_MAX_PER_TURN_MIN: u32 = 1;
+const COMPACTION_MAX_PER_TURN_MAX: u32 = 8;
+
+/// Validate `[compaction]` config values at load time.
+fn validate_compaction_config(compaction: &CompactionConfig) -> Result<()> {
+    if !(COMPACTION_MAX_PER_TURN_MIN..=COMPACTION_MAX_PER_TURN_MAX)
+        .contains(&compaction.max_per_turn)
+    {
+        return Err(anyhow::anyhow!(
+            "[compaction] max_per_turn = {} is outside the allowed range {}..={}",
+            compaction.max_per_turn,
+            COMPACTION_MAX_PER_TURN_MIN,
+            COMPACTION_MAX_PER_TURN_MAX,
+        ));
+    }
+    Ok(())
+}
+
+/// Smallest acceptable value for `max_page_bytes`. A 1 KiB
+/// floor lets debug overrides shrink the cap without it
+/// silently rejecting every non-empty page (smaller than this
+/// and any HTML doctype + body would already trip the cap).
+const WEB_TOOL_MIN_PAGE_BYTES: usize = 1024;
+
+/// Validate `[tools.web]` config values at load time.
+/// Catches operator typos that would otherwise be silently
+/// applied (e.g. `request_timeout_secs = 0` would disable
+/// the request entirely). PR 4.3 of
+/// `docs/code_review_2026-04-27/`.
+fn validate_web_tool_config(web: &WebToolConfig) -> Result<()> {
+    if web.request_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "[tools.web] request_timeout_secs must be > 0 (set a generous value like 300 \
+             for persistent-agent deployments rather than 0)"
+        ));
+    }
+    if web.headless_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "[tools.web] headless_timeout_secs must be > 0"
+        ));
+    }
+    if web.max_page_bytes < WEB_TOOL_MIN_PAGE_BYTES {
+        return Err(anyhow::anyhow!(
+            "[tools.web] max_page_bytes = {} is below the minimum {WEB_TOOL_MIN_PAGE_BYTES}",
+            web.max_page_bytes
         ));
     }
     Ok(())
@@ -744,6 +922,9 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
         if let Some(keep_recent_tokens) = compaction.keep_recent_tokens {
             config.compaction.keep_recent_tokens = keep_recent_tokens;
         }
+        if let Some(max_per_turn) = compaction.max_per_turn {
+            config.compaction.max_per_turn = max_per_turn;
+        }
     }
 
     if let Some(context) = partial.context {
@@ -758,18 +939,36 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
         }
     }
 
-    if let Some(tools) = partial.tools
-        && let Some(bash) = tools.bash
-        && let Some(policy) = bash.policy
-    {
-        if let Some(enabled) = policy.enabled {
-            config.tools.bash.policy.enabled = enabled;
+    if let Some(tools) = partial.tools {
+        if let Some(bash) = tools.bash
+            && let Some(policy) = bash.policy
+        {
+            if let Some(enabled) = policy.enabled {
+                config.tools.bash.policy.enabled = enabled;
+            }
+            if let Some(deny_commands) = policy.deny_commands {
+                config.tools.bash.policy.deny_commands = deny_commands;
+            }
+            if let Some(deny_patterns) = policy.deny_patterns {
+                config.tools.bash.policy.deny_patterns = deny_patterns;
+            }
         }
-        if let Some(deny_commands) = policy.deny_commands {
-            config.tools.bash.policy.deny_commands = deny_commands;
-        }
-        if let Some(deny_patterns) = policy.deny_patterns {
-            config.tools.bash.policy.deny_patterns = deny_patterns;
+        if let Some(web) = tools.web {
+            if let Some(value) = web.request_timeout_secs {
+                config.tools.web.request_timeout_secs = value;
+            }
+            if let Some(value) = web.headless_timeout_secs {
+                config.tools.web.headless_timeout_secs = value;
+            }
+            if let Some(value) = web.max_page_bytes {
+                config.tools.web.max_page_bytes = value;
+            }
+            if let Some(value) = web.max_redirects {
+                config.tools.web.max_redirects = value;
+            }
+            if let Some(value) = web.allow_private_ips {
+                config.tools.web.allow_private_ips = value;
+            }
         }
     }
 
@@ -859,6 +1058,7 @@ struct PartialCompactionConfig {
     enabled: Option<bool>,
     reserve_tokens: Option<u64>,
     keep_recent_tokens: Option<u64>,
+    max_per_turn: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -871,6 +1071,7 @@ struct PartialContextConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialToolsConfig {
     bash: Option<PartialBashToolConfig>,
+    web: Option<PartialWebToolConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -883,6 +1084,18 @@ struct PartialBashPolicyConfig {
     enabled: Option<bool>,
     deny_commands: Option<Vec<String>>,
     deny_patterns: Option<Vec<String>>,
+}
+
+/// Optional `[tools.web]` overrides loaded from `config.toml`.
+/// Each field is `Option<...>` so omitted keys preserve the
+/// `WebToolConfig::default()` values rather than zero-init.
+#[derive(Debug, Default, Deserialize)]
+struct PartialWebToolConfig {
+    request_timeout_secs: Option<u64>,
+    headless_timeout_secs: Option<u64>,
+    max_page_bytes: Option<usize>,
+    max_redirects: Option<usize>,
+    allow_private_ips: Option<bool>,
 }
 
 #[cfg(test)]
@@ -944,6 +1157,27 @@ mod tests {
         let target = dir.path().join("config.toml");
         atomic_write(&target, b"hello").expect("write ok");
         assert_eq!(fs::read(&target).expect("read target"), b"hello");
+    }
+
+    /// PR 6.3 of `docs/code_review_2026-04-27/`. The success
+    /// path now fsyncs the parent directory after rename. We
+    /// can't directly verify "directory entry was synced to
+    /// stable storage" without a power-cycle test rig, but we
+    /// can pin that a successful write through a tempdir's
+    /// real parent-directory file descriptor doesn't trip
+    /// either the rename or the new fsync — i.e. the new code
+    /// path runs cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_succeeds_with_parent_directory_sync() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("durable.toml");
+        atomic_write(&target, b"persisted").expect("write ok");
+        assert_eq!(fs::read(&target).expect("read target"), b"persisted");
+
+        // Replacement still atomic across a second write.
+        atomic_write(&target, b"persisted-v2").expect("write v2");
+        assert_eq!(fs::read(&target).expect("read v2"), b"persisted-v2");
     }
 
     #[test]
@@ -1260,6 +1494,190 @@ mod tests {
             defaults.slash_command_popup_enabled,
         );
         assert_eq!(config.ui.tool_output_mode, defaults.tool_output_mode);
+    }
+
+    /// PR 4.3 of `docs/code_review_2026-04-27/`. Confirms
+    /// `[tools.web]` values reach `AnieConfig.tools.web`
+    /// through the real loader path.
+    #[test]
+    fn web_tool_config_loads_from_real_config_path() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            request_timeout_secs = 120
+            headless_timeout_secs = 60
+            max_page_bytes = 5242880
+            max_redirects = 3
+            allow_private_ips = true
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert_eq!(config.tools.web.request_timeout_secs, 120);
+        assert_eq!(config.tools.web.headless_timeout_secs, 60);
+        assert_eq!(config.tools.web.max_page_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.tools.web.max_redirects, 3);
+        assert!(config.tools.web.allow_private_ips);
+    }
+
+    /// PR 4.3: omitted fields keep `WebToolConfig::default()`
+    /// values rather than zero-initializing.
+    #[test]
+    fn web_tool_config_omitted_fields_keep_defaults() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            request_timeout_secs = 120
+            "#,
+        )
+        .expect("write config");
+
+        let defaults = WebToolConfig::default();
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert_eq!(config.tools.web.request_timeout_secs, 120);
+        assert_eq!(
+            config.tools.web.headless_timeout_secs,
+            defaults.headless_timeout_secs
+        );
+        assert_eq!(config.tools.web.max_page_bytes, defaults.max_page_bytes);
+        assert_eq!(config.tools.web.max_redirects, defaults.max_redirects);
+        assert_eq!(
+            config.tools.web.allow_private_ips,
+            defaults.allow_private_ips
+        );
+    }
+
+    /// PR 4.3: a config file with no `[tools.web]` section at
+    /// all leaves the defaults intact.
+    #[test]
+    fn web_tool_config_absent_section_keeps_all_defaults() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [model]
+            provider = "ollama"
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+        assert_eq!(config.tools.web, WebToolConfig::default());
+    }
+
+    /// PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+    /// `[compaction] max_per_turn` round-trips through the
+    /// loader and slots into the rest of `CompactionConfig`
+    /// without disturbing existing fields.
+    #[test]
+    fn compaction_config_loads_max_per_turn() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [compaction]
+            max_per_turn = 4
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+        assert_eq!(config.compaction.max_per_turn, 4);
+        // Other compaction fields keep defaults.
+        assert!(config.compaction.enabled);
+    }
+
+    /// PR 8.2: out-of-range `max_per_turn` is rejected at
+    /// load time so a user typing `9999` doesn't quietly let
+    /// the budget become useless.
+    #[test]
+    fn compaction_config_max_per_turn_out_of_range_is_rejected() {
+        for bad in [0_u32, 9_u32, 100_u32] {
+            let tempdir = tempdir().expect("tempdir");
+            let config_path = tempdir.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+                    [compaction]
+                    max_per_turn = {bad}
+                    "#,
+                ),
+            )
+            .expect("write config");
+
+            let err = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+                .expect_err("out-of-range max_per_turn should reject");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("max_per_turn"),
+                "error must mention the field for bad={bad}: {msg}",
+            );
+        }
+    }
+
+    /// PR 4.3: validation catches operator typos at load time
+    /// rather than letting `request_timeout_secs = 0` silently
+    /// disable the request entirely.
+    #[test]
+    fn web_tool_config_zero_timeout_is_rejected() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            request_timeout_secs = 0
+            "#,
+        )
+        .expect("write config");
+
+        let err = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect_err("zero timeout should reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("request_timeout_secs"),
+            "error must mention the field: {msg}"
+        );
+    }
+
+    /// PR 4.3: tiny `max_page_bytes` is rejected so a typo
+    /// like `max_page_bytes = 100` doesn't break every fetch.
+    #[test]
+    fn web_tool_config_tiny_max_page_bytes_is_rejected() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            max_page_bytes = 100
+            "#,
+        )
+        .expect("write config");
+
+        let err = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect_err("tiny page cap should reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_page_bytes"),
+            "error must mention the field: {msg}"
+        );
     }
 
     #[test]

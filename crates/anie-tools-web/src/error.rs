@@ -59,6 +59,13 @@ pub enum WebToolError {
         seconds: u64,
     },
 
+    /// Operation was cancelled by the caller (Ctrl+C, agent
+    /// abort, etc.). Mapped to [`anie_agent::ToolError::Aborted`]
+    /// at the tool boundary so the agent loop sees an abort
+    /// rather than a generic execution failure.
+    #[error("aborted")]
+    Aborted,
+
     /// Headless Chrome render failed (only when `javascript=true`).
     #[error("headless render failed: {0}")]
     HeadlessFailure(String),

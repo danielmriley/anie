@@ -155,6 +155,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
             jitter: false,
         },
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -225,6 +226,7 @@ fn controller_with_runtime_state_path(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -315,7 +317,7 @@ async fn controller_compaction_retry_path() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, AgentEvent::CompactionStart))
+            .filter(|event| matches!(event, AgentEvent::CompactionStart { .. }))
             .count(),
         1
     );
@@ -335,6 +337,92 @@ async fn controller_compaction_retry_path() {
         &events,
         "recovered after compaction"
     ));
+
+    // Plan 06 PR A regression guard: the reactive overflow
+    // path must tag its `CompactionStart` / `CompactionEnd`
+    // pair with `CompactionPhase::ReactiveOverflow`, never
+    // `PrePrompt`.
+    let reactive_starts = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::CompactionStart {
+                    phase: anie_protocol::CompactionPhase::ReactiveOverflow,
+                },
+            )
+        })
+        .count();
+    assert_eq!(
+        reactive_starts, 1,
+        "overflow path must emit exactly one ReactiveOverflow CompactionStart",
+    );
+    let reactive_ends = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::CompactionEnd {
+                    phase: anie_protocol::CompactionPhase::ReactiveOverflow,
+                    ..
+                },
+            )
+        })
+        .count();
+    assert_eq!(
+        reactive_ends, 1,
+        "overflow path must emit exactly one ReactiveOverflow CompactionEnd",
+    );
+}
+
+/// Plan 06 PR B: `/state` should render a "Compactions this
+/// session" block showing the per-phase counts.
+#[test]
+fn state_summary_includes_compaction_counts_block() {
+    let stats = crate::compaction_stats::CompactionStats {
+        pre_prompt: 2,
+        mid_turn: 1,
+        reactive_overflow: 0,
+    };
+    let summary = format_state_summary(
+        &ollama_model(),
+        ThinkingLevel::Medium,
+        None,
+        None,
+        32_768,
+        "session-stats",
+        None,
+        None,
+        stats,
+    );
+
+    assert!(
+        summary.contains("Compactions this session"),
+        "missing compactions block: {summary}",
+    );
+    assert!(
+        summary.contains("Total: 3"),
+        "expected 'Total: 3': {summary}",
+    );
+    assert!(
+        summary.contains("pre-prompt: 2"),
+        "expected pre-prompt count: {summary}",
+    );
+    assert!(
+        summary.contains("mid-turn: 1"),
+        "expected mid-turn count: {summary}",
+    );
+    assert!(
+        summary.contains("overflow: 0"),
+        "expected overflow count: {summary}",
+    );
+    // Plan 06 PR B: counters are documented as
+    // this-process-lifetime to head off questions about why
+    // they zero on `--continue`.
+    assert!(
+        summary.contains("this process only"),
+        "expected process-lifetime note: {summary}",
+    );
 }
 
 #[tokio::test]
@@ -351,7 +439,7 @@ async fn controller_compaction_give_up_after_second_overflow() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, AgentEvent::CompactionStart))
+            .filter(|event| matches!(event, AgentEvent::CompactionStart { .. }))
             .count(),
         1
     );
@@ -476,6 +564,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -518,6 +607,7 @@ fn build_state_with_registry(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     }
 }
 
@@ -762,6 +852,179 @@ async fn queue_prompt_cancels_pending_retry() {
     );
 }
 
+/// PR 8.2 of `docs/midturn_compaction_2026-04-27/`. Every
+/// `start_prompt_run` resets the per-turn compaction budget
+/// to the configured `max_per_turn`. Without this, a previous
+/// turn that consumed budget would silently constrain the
+/// next turn — undermining the semantic that each user turn
+/// gets its own allowance.
+#[tokio::test]
+async fn controller_compaction_budget_resets_to_max_per_turn_on_run_prompt() {
+    use std::sync::atomic::Ordering;
+
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Drain the budget to zero, simulating a prior turn that
+    // exhausted its compactions.
+    controller
+        .compactions_remaining_this_turn
+        .store(0, Ordering::Release);
+
+    // No mock provider for this model's API in the harness, so
+    // `start_prompt_run` errors after the reset path runs —
+    // but the reset happens before that error, so the value
+    // we assert below is the post-reset state regardless.
+    let _ = controller.start_prompt_run("hello".into()).await;
+
+    // Default `max_per_turn` is 2 (see anie_config::CompactionConfig).
+    assert_eq!(
+        controller
+            .compactions_remaining_this_turn
+            .load(Ordering::Acquire),
+        2,
+        "fresh user turn must restore the configured per-turn allowance",
+    );
+}
+
+/// PR 7.1 of `docs/active_input_2026-04-27/`. While a run is
+/// active, `AbortAndQueuePrompt(text)` must:
+///  - push `text` to the **front** of `queued_prompts` so it
+///    runs ahead of any FIFO follow-ups already queued;
+///  - cancel the in-flight run via `CurrentRun::cancel`;
+///  - emit a system message announcing the abort + queued
+///    draft so the user has a clear log of what happened.
+#[tokio::test]
+async fn abort_and_queue_during_active_run_front_queues_and_cancels() {
+    use anie_agent::AgentRunResult;
+    use tokio_util::sync::CancellationToken;
+
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Pre-seed a stale FIFO queue entry so we can prove the new
+    // interrupt arrives at the front, not the back.
+    controller
+        .queued_prompts
+        .push_back("stale follow-up".into());
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async {
+        AgentRunResult {
+            generated_messages: Vec::new(),
+            final_context: Vec::new(),
+            terminal_error: None,
+        }
+    });
+    controller.current_run = Some(CurrentRun {
+        handle,
+        cancel,
+        already_compacted: false,
+        retry_attempt: 0,
+    });
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::AbortAndQueuePrompt("interrupt me".into()))
+            .await
+            .is_ok()
+    );
+
+    let queued: Vec<_> = controller.queued_prompts.iter().cloned().collect();
+    assert_eq!(
+        queued,
+        vec!["interrupt me".to_string(), "stale follow-up".to_string()],
+        "interrupt must front-queue ahead of any existing follow-ups",
+    );
+    assert!(
+        cancel_clone.is_cancelled(),
+        "abort-and-queue must cancel the current run",
+    );
+
+    let mut saw_message = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event
+            && text.starts_with("Aborting current run")
+        {
+            assert!(text.contains("interrupt me"), "got: {text}");
+            saw_message = true;
+        }
+    }
+    assert!(saw_message, "user must see why the run is aborting");
+}
+
+/// PR 7.1 of `docs/active_input_2026-04-27/`. When the
+/// transient-error retry timer is armed, an interrupt-and-send
+/// must clear the retry and start the new prompt immediately —
+/// same precedence rule the FIFO `QueuePrompt` already
+/// enforces (a fresh user signal beats a stale automatic
+/// retry).
+#[tokio::test]
+async fn abort_and_queue_during_pending_retry_clears_retry() {
+    use tokio::time::Instant as TokioInstant;
+
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: TokioInstant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+    };
+
+    // No mock provider is registered for the model's API in
+    // this minimal harness, so `start_prompt_run` errors out —
+    // but the retry must still have been cleared.
+    let _ = controller
+        .try_handle_action(UiAction::AbortAndQueuePrompt("interrupt".into()))
+        .await;
+
+    assert!(
+        matches!(controller.pending_retry, PendingRetry::Idle),
+        "pending retry must be cleared when AbortAndQueuePrompt arrives during armed backoff",
+    );
+    let mut saw_cancel_message = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event
+            && text.contains("Cancelling pending retry")
+        {
+            saw_cancel_message = true;
+        }
+    }
+    assert!(
+        saw_cancel_message,
+        "user must see why the retry was dropped",
+    );
+}
+
+/// PR 7.1 of `docs/active_input_2026-04-27/`. With nothing
+/// active, `AbortAndQueuePrompt` is equivalent to a direct
+/// submit — there's no run to abort, so we just start the
+/// prompt. Pinning this avoids a regression where the action
+/// silently no-ops on an empty controller (the user's draft
+/// would vanish).
+#[tokio::test]
+async fn abort_and_queue_when_idle_starts_immediately() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    assert!(controller.current_run.is_none());
+
+    // No mock provider is registered, so `start_prompt_run`
+    // returns an error — but it WILL be invoked, which is
+    // what we're testing. The queue must remain empty either
+    // way; we don't queue against ourselves.
+    let _ = controller
+        .try_handle_action(UiAction::AbortAndQueuePrompt("interrupt".into()))
+        .await;
+
+    assert!(
+        controller.queued_prompts.is_empty(),
+        "idle AbortAndQueuePrompt must not enqueue; it should start the run directly",
+    );
+}
+
 /// PR 2.2 of `docs/active_input_2026-04-27/`. When a queued
 /// prompt arrives while no run is active, it starts the prompt
 /// directly (matches `SubmitPrompt` shape — same end result for
@@ -884,7 +1147,7 @@ async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
         runtime_state,
         provider_registry,
     );
-    let agent = build_agent(&state);
+    let agent = build_agent(&state, None);
     let (event_tx, _event_rx) = mpsc::channel(16);
 
     let result = agent
@@ -972,6 +1235,7 @@ fn controller_for_context_length_test_with_cap(
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1344,7 +1608,7 @@ async fn context_length_override_applies_to_next_request_without_reload() {
         .handle_action(UiAction::ContextLength(Some("16384".into())))
         .await
         .expect("set context length");
-    let agent = build_agent(&controller.state);
+    let agent = build_agent(&controller.state, None);
     let (event_tx, _event_rx) = mpsc::channel(16);
     let result = agent
         .run(
@@ -1432,6 +1696,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         prompt_cache,
         retry_config: RetryConfig::default(),
         command_registry,
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1565,6 +1830,7 @@ fn spawn_live_controller(
         prompt_cache,
         retry_config,
         command_registry: crate::commands::CommandRegistry::with_builtins(),
+        compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);
@@ -1991,6 +2257,7 @@ fn state_summary_for_ollama_with_runtime_override_shows_all_three_layers() {
         "session-abc",
         Some(std::path::PathBuf::from("/tmp/anie/config.toml")),
         Some(std::path::PathBuf::from("/tmp/anie/state.json")),
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("ollama:qwen3:32b"), "{summary}");
@@ -2023,6 +2290,7 @@ fn state_summary_for_ollama_without_override_marks_override_none() {
         "session-1",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(
@@ -2047,6 +2315,7 @@ fn state_summary_for_ollama_without_cap_marks_cap_none() {
         "session-1",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("Runtime override: (none)"), "{summary}");
@@ -2065,6 +2334,7 @@ fn state_summary_for_non_ollama_model_omits_layered_breakdown() {
         "session-x",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("openai:gpt-5"), "{summary}");
@@ -2095,6 +2365,7 @@ fn state_summary_includes_thinking_and_session_id() {
         "abc-123-def",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("Thinking: high"), "{summary}");
@@ -2112,6 +2383,7 @@ fn state_summary_lists_persistent_file_paths_when_available() {
         "s",
         Some(std::path::PathBuf::from("/home/u/.anie/config.toml")),
         Some(std::path::PathBuf::from("/home/u/.anie/state.json")),
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(
@@ -2136,6 +2408,7 @@ fn state_summary_omits_path_lines_when_path_helpers_return_none() {
         "s",
         None,
         None,
+        crate::compaction_stats::CompactionStats::default(),
     );
 
     assert!(summary.contains("Files"), "{summary}");

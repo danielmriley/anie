@@ -11,17 +11,21 @@
 //! change.
 
 use scraper::{Html, Selector};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::error::WebToolError;
-use crate::read::fetch::{FetchOptions, fetch_html};
+use crate::read::fetch::{FetchOptions, Resolver, fetch_html};
 use crate::search::SearchHit;
 
 const DDG_HTML_BASE: &str = "https://duckduckgo.com/html/";
 
 /// Run a DuckDuckGo HTML search. Returns up to `max` hits.
+/// Honors `cancel` cooperatively via `fetch_html`.
 pub async fn search(
     client: &reqwest::Client,
+    resolver: &dyn Resolver,
+    cancel: &CancellationToken,
     fetch_opts: &FetchOptions,
     query: &str,
     max: usize,
@@ -29,7 +33,7 @@ pub async fn search(
     let url = Url::parse(&format!("{DDG_HTML_BASE}?q={}", urlencoding::encode(query),))
         .map_err(|e| WebToolError::SearchBackend(e.to_string()))?;
 
-    let html = fetch_html(client, &url, fetch_opts).await?;
+    let html = fetch_html(client, resolver, cancel, &url, fetch_opts).await?;
     parse_ddg_html(&html, max)
 }
 

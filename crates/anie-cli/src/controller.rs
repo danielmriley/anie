@@ -1,7 +1,10 @@
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,6 +28,8 @@ use anie_provider::{
 use anie_session::{CompactionConfig, SessionContext, SessionInfo};
 use anie_tui::UiAction;
 
+use crate::compaction_stats::{CompactionStats, CompactionStatsAtomic};
+use crate::retry_policy::GiveUpReason;
 use crate::{
     Cli,
     compaction::CompactionStrategy,
@@ -72,6 +77,17 @@ pub(crate) struct InteractiveController {
     /// — if anie crashes mid-queue the unstarted prompts are
     /// lost; that's the documented trade-off in the plan.
     queued_prompts: VecDeque<String>,
+    /// Compactions still allowed in the current user turn.
+    /// Reset to `[compaction] max_per_turn` at the top of every
+    /// `start_prompt_run`; decremented in `emit_compaction_end`
+    /// after every successful compaction (pre-prompt and
+    /// reactive paths). Read-only consumers
+    /// (`compaction_budget_remaining`) use `Acquire` loads;
+    /// writers use `Release` stores. The `Arc` shape is
+    /// chosen so plan 04's mid-turn gate can clone the handle
+    /// into a spawned task without moving it. Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
+    compactions_remaining_this_turn: Arc<AtomicU32>,
 }
 
 struct CurrentRun {
@@ -120,6 +136,7 @@ impl InteractiveController {
         event_tx: mpsc::Sender<AgentEvent>,
         exit_after_run: bool,
     ) -> Self {
+        let max_per_turn = state.config.anie_config().compaction.max_per_turn;
         Self {
             state,
             ui_action_rx,
@@ -129,7 +146,46 @@ impl InteractiveController {
             quitting: false,
             exit_after_run,
             queued_prompts: VecDeque::new(),
+            compactions_remaining_this_turn: Arc::new(AtomicU32::new(max_per_turn)),
         }
+    }
+
+    /// Read-only accessor for the per-turn compaction budget.
+    /// Used by the reactive retry path (`RetryPolicy::decide`)
+    /// and — once plan 04 lands — the mid-turn gate's pre-check.
+    /// PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+    fn compaction_budget_remaining(&self) -> u32 {
+        self.compactions_remaining_this_turn.load(Ordering::Acquire)
+    }
+
+    /// Build a `ControllerCompactionGate` snapshot for the
+    /// current turn, or `None` when compaction is disabled.
+    /// Each gate carries a per-turn snapshot of the
+    /// effective `CompactionConfig` and a freshly-built
+    /// summarizer; `Arc`-cloned with the controller's
+    /// per-turn budget atomic so the mid-turn path
+    /// decrements the same counter the pre-prompt and
+    /// reactive paths consume.
+    /// PR 8.4 PR B of `docs/midturn_compaction_2026-04-27/`.
+    fn build_compaction_gate(&self) -> Option<Arc<dyn anie_agent::CompactionGate>> {
+        if !self.state.config.anie_config().compaction.enabled {
+            return None;
+        }
+        let (config, strategy) = self.state.compaction_strategy(
+            self.state
+                .config
+                .anie_config()
+                .compaction
+                .keep_recent_tokens,
+        );
+        let gate = crate::compaction_gate::ControllerCompactionGate {
+            config,
+            summarizer: Arc::new(strategy),
+            budget: Arc::clone(&self.compactions_remaining_this_turn),
+            event_tx: self.event_tx.clone(),
+            stats: Arc::clone(&self.state.compaction_stats),
+        };
+        Some(Arc::new(gate) as Arc<dyn anie_agent::CompactionGate>)
     }
 
     /// Drain the next queued follow-up prompt, if any, and start
@@ -187,10 +243,26 @@ impl InteractiveController {
                                     let policy = RetryPolicy {
                                         config: &self.state.retry_config,
                                     };
-                                    match policy.decide(error, retry_attempt, already_compacted) {
+                                    let budget_remaining = self.compaction_budget_remaining();
+                                    match policy.decide(
+                                        error,
+                                        retry_attempt,
+                                        already_compacted,
+                                        budget_remaining,
+                                    ) {
                                         RetryDecision::Compact => {
                                             match self.state.retry_after_overflow(&self.event_tx).await {
                                                 Ok(true) => {
+                                                    // Successful reactive compaction
+                                                    // consumes a budget slot. PR 8.2 of
+                                                    // `docs/midturn_compaction_2026-04-27/`.
+                                                    self.compactions_remaining_this_turn
+                                                        .fetch_update(
+                                                            Ordering::Release,
+                                                            Ordering::Acquire,
+                                                            |n| Some(n.saturating_sub(1)),
+                                                        )
+                                                        .ok();
                                                     self.start_continuation_run(true, retry_attempt).await?;
                                                 }
                                                 Ok(false) => {
@@ -261,20 +333,53 @@ impl InteractiveController {
                                             // discovered context_window 262144 would see the
                                             // message claim Ollama tried 262144 / 131072,
                                             // when it actually tried 65536 / 32768.
-                                            let model = self.state.config.current_model();
-                                            let requested_num_ctx =
-                                                self.state.config.effective_ollama_context_window();
-                                            if let Some(message) = render_user_facing_provider_error(
-                                                error,
-                                                requested_num_ctx,
-                                                &model.provider,
-                                                &model.id,
+                                            // PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+                                            // `CompactionBudgetExhausted` carries no
+                                            // model-load-resources detail, so render an
+                                            // actionable message here rather than relying on
+                                            // `render_user_facing_provider_error` (which keys
+                                            // off the underlying ProviderError, not the
+                                            // give-up reason).
+                                            if matches!(
+                                                reason,
+                                                GiveUpReason::CompactionBudgetExhausted
                                             ) {
+                                                let max_per_turn = self
+                                                    .state
+                                                    .config
+                                                    .anie_config()
+                                                    .compaction
+                                                    .max_per_turn;
                                                 anie_agent::send_event(
                                                     &self.event_tx,
-                                                    AgentEvent::SystemMessage { text: message },
+                                                    AgentEvent::SystemMessage {
+                                                        text: format!(
+                                                            "Context overflow; the per-turn compaction budget ({max_per_turn}) is already used. \
+                                                             Try a smaller prompt, raise /context-length, or set [compaction] max_per_turn higher."
+                                                        ),
+                                                    },
                                                 )
                                                 .await;
+                                            } else {
+                                                let model = self.state.config.current_model();
+                                                let requested_num_ctx =
+                                                    self.state.config.effective_ollama_context_window();
+                                                if let Some(message) =
+                                                    render_user_facing_provider_error(
+                                                        error,
+                                                        requested_num_ctx,
+                                                        &model.provider,
+                                                        &model.id,
+                                                    )
+                                                {
+                                                    anie_agent::send_event(
+                                                        &self.event_tx,
+                                                        AgentEvent::SystemMessage {
+                                                            text: message,
+                                                        },
+                                                    )
+                                                    .await;
+                                                }
                                             }
                                             self.state.finish_run(&result).await?;
                                         }
@@ -425,6 +530,45 @@ impl InteractiveController {
                         .event_tx
                         .send(AgentEvent::SystemMessage {
                             text: "Cancelling pending retry to start your follow-up.".into(),
+                        })
+                        .await;
+                    self.start_prompt_run(text).await?;
+                } else {
+                    self.start_prompt_run(text).await?;
+                }
+            }
+            UiAction::AbortAndQueuePrompt(text) => {
+                // Plan 03 of `docs/active_input_2026-04-27/`.
+                // The user has a draft they want to send *now*.
+                // Three cases:
+                //   - active run: front-queue the draft and
+                //     cancel the run. The post-run drain will
+                //     pick the front-queued prompt up before any
+                //     stale FIFO-queued follow-ups.
+                //   - pending retry armed: clear the retry and
+                //     start the prompt immediately (matches
+                //     `QueuePrompt` semantics; the user's fresh
+                //     signal beats a transient-error retry).
+                //   - idle: start the prompt immediately.
+                if let Some(current_run) = &self.current_run {
+                    let preview: String =
+                        text.lines().next().unwrap_or("").chars().take(80).collect();
+                    self.queued_prompts.push_front(text);
+                    current_run.cancel.cancel();
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::SystemMessage {
+                            text: format!(
+                                "Aborting current run; queued draft will send next: {preview}",
+                            ),
+                        })
+                        .await;
+                } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+                    self.pending_retry = PendingRetry::Idle;
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::SystemMessage {
+                            text: "Cancelling pending retry to start your interrupt.".into(),
                         })
                         .await;
                     self.start_prompt_run(text).await?;
@@ -732,6 +876,13 @@ impl InteractiveController {
             info!("cancelling pending retry in favor of new prompt");
             self.pending_retry = PendingRetry::Idle;
         }
+        // Reset the per-turn compaction budget. Each fresh user
+        // prompt earns the configured allowance — the budget only
+        // protects against compaction storms *within* a single
+        // turn. PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+        let max_per_turn = self.state.config.anie_config().compaction.max_per_turn;
+        self.compactions_remaining_this_turn
+            .store(max_per_turn, Ordering::Release);
         self.state.refresh_system_prompt_if_needed();
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],
@@ -743,11 +894,20 @@ impl InteractiveController {
             .session
             .inner_mut()
             .append_message(&prompt_message)?;
-        if self.state.config.anie_config().compaction.enabled {
-            self.state.maybe_auto_compact(&self.event_tx).await?;
+        if self.state.config.anie_config().compaction.enabled
+            && self.state.maybe_auto_compact(&self.event_tx).await?
+        {
+            // Successful pre-prompt compaction consumes one of
+            // this turn's budget slots. PR 8.2 of
+            // `docs/midturn_compaction_2026-04-27/`.
+            self.compactions_remaining_this_turn
+                .fetch_update(Ordering::Release, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
         }
         let context = self.state.context_without_entry(Some(&prompt_entry_id));
-        let agent = build_agent(&self.state);
+        let agent = build_agent(&self.state, self.build_compaction_gate());
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -778,7 +938,7 @@ impl InteractiveController {
             .into_iter()
             .map(|message| message.message)
             .collect::<Vec<_>>();
-        let agent = build_agent(&self.state);
+        let agent = build_agent(&self.state, self.build_compaction_gate());
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -838,6 +998,13 @@ pub(crate) struct ControllerState {
     /// `commands::builtin_commands()` at startup; extensions and
     /// prompt templates register additional entries here.
     pub(crate) command_registry: crate::commands::CommandRegistry,
+    /// Per-session running counts of compaction events by
+    /// phase. Surfaced in `/state`, reset on `/new` and
+    /// session switch. Shared via `Arc` with the mid-turn
+    /// `ControllerCompactionGate` so all paths increment the
+    /// same atomic. Plan 06 of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    pub(crate) compaction_stats: Arc<CompactionStatsAtomic>,
 }
 
 impl ControllerState {
@@ -912,6 +1079,7 @@ impl ControllerState {
             self.session.id(),
             anie_config::global_config_path(),
             anie_config::anie_state_json_path(),
+            self.compaction_stats.snapshot(),
         )
     }
 
@@ -998,13 +1166,29 @@ impl ControllerState {
 
     /// Build the compaction config + summarizer for the current
     /// session state. Used by every compaction call site.
+    ///
+    /// PR 8.1 of `docs/midturn_compaction_2026-04-27/`. The
+    /// stored `reserve_tokens` is clamped to a window-relative
+    /// fraction here so the resulting threshold lives at
+    /// roughly 75% of the window regardless of size. Without
+    /// this, a 16K Ollama window minus the default 16K reserve
+    /// saturated to threshold 0, and the controller compacted
+    /// every turn unconditionally. `anie-session` stays
+    /// unaware of windows; the clamp lives at the call site
+    /// that builds `CompactionConfig`.
     fn compaction_strategy(
         &self,
         keep_recent_tokens: u64,
     ) -> (CompactionConfig, CompactionStrategy) {
+        let context_window = self.config.effective_ollama_context_window();
+        let reserve_tokens = crate::compaction_reserve::effective_reserve(
+            context_window,
+            self.config.anie_config().compaction.reserve_tokens,
+            crate::compaction_reserve::DEFAULT_MIN_RESERVE_TOKENS,
+        );
         let config = CompactionConfig {
-            context_window: self.config.effective_ollama_context_window(),
-            reserve_tokens: self.config.anie_config().compaction.reserve_tokens,
+            context_window,
+            reserve_tokens,
             keep_recent_tokens,
         };
         let strategy = CompactionStrategy::new(
@@ -1019,24 +1203,39 @@ impl ControllerState {
     /// Emit the `CompactionEnd` event for a successful compaction.
     /// Callers decide whether to follow with a status refresh or a
     /// transcript replacement, since the ordering matters visually.
+    /// `phase` should match the corresponding `CompactionStart`.
+    /// Plan 06 of `docs/midturn_compaction_2026-04-27/`.
     async fn emit_compaction_end(
         &self,
         event_tx: &mpsc::Sender<AgentEvent>,
         result: &anie_session::CompactionResult,
+        phase: anie_protocol::CompactionPhase,
     ) {
         let tokens_after = self.estimated_context_tokens();
         anie_agent::send_event(
             event_tx,
             AgentEvent::CompactionEnd {
+                phase,
                 summary: result.summary.clone(),
                 tokens_before: result.tokens_before,
                 tokens_after,
             },
         )
         .await;
+        // Plan 06 PR B: bump the phase counter only after the
+        // event has been emitted, so the user-visible event
+        // ordering stays unchanged and `/state` reflects the
+        // same compactions the transcript shows.
+        self.compaction_stats.increment(phase);
     }
 
-    async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
+    /// Returns `Ok(true)` when a compaction successfully ran,
+    /// `Ok(false)` when the threshold wasn't crossed or the
+    /// session couldn't be reduced. The caller uses the bool
+    /// to decrement the per-turn compaction budget tracked on
+    /// `InteractiveController`. Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
+    async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<bool> {
         let (config, strategy) =
             self.compaction_strategy(self.config.anie_config().compaction.keep_recent_tokens);
 
@@ -1051,10 +1250,16 @@ impl ControllerState {
         let tokens_before = self.session.inner().estimate_context_tokens();
         let threshold = config.context_window.saturating_sub(config.reserve_tokens);
         if tokens_before <= threshold {
-            return Ok(());
+            return Ok(false);
         }
 
-        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::CompactionStart {
+                phase: anie_protocol::CompactionPhase::PrePrompt,
+            },
+        )
+        .await;
 
         if let Some(result) = self
             .session
@@ -1062,16 +1267,28 @@ impl ControllerState {
             .auto_compact(&config, &strategy)
             .await?
         {
-            self.emit_compaction_end(event_tx, &result).await;
+            self.emit_compaction_end(event_tx, &result, anie_protocol::CompactionPhase::PrePrompt)
+                .await;
             anie_agent::send_event(event_tx, self.status_event()).await;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     async fn force_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
         let (config, strategy) =
             self.compaction_strategy(self.config.anie_config().compaction.keep_recent_tokens);
-        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+        // Manual `/compact` runs at the prompt boundary; classify
+        // it as `PrePrompt` so telemetry treats it the same as the
+        // automatic pre-prompt path.
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::CompactionStart {
+                phase: anie_protocol::CompactionPhase::PrePrompt,
+            },
+        )
+        .await;
         match self
             .session
             .inner_mut()
@@ -1079,7 +1296,12 @@ impl ControllerState {
             .await?
         {
             Some(result) => {
-                self.emit_compaction_end(event_tx, &result).await;
+                self.emit_compaction_end(
+                    event_tx,
+                    &result,
+                    anie_protocol::CompactionPhase::PrePrompt,
+                )
+                .await;
                 anie_agent::send_event(event_tx, self.status_event()).await;
             }
             None => {
@@ -1097,6 +1319,10 @@ impl ControllerState {
 
     async fn new_session(&mut self) -> Result<()> {
         self.session.start_new()?;
+        // Plan 06 PR B: counters are session-scoped, so a fresh
+        // session zeroes them out alongside the rest of the
+        // session-bound state.
+        self.compaction_stats.reset();
         self.persist_runtime_state_logged("new_session");
         Ok(())
     }
@@ -1106,6 +1332,10 @@ impl ControllerState {
             .switch_to(session_id)
             .map_err(|_| UserCommandError::UnknownSession(session_id.to_string()))?;
         self.apply_session_overrides();
+        // Counters are session-scoped (plan 06 PR B). Switching
+        // away from the active session zeroes them out so the
+        // newly-active session starts with its own count.
+        self.compaction_stats.reset();
         self.persist_runtime_state_logged("switch_session");
         Ok(())
     }
@@ -1113,6 +1343,9 @@ impl ControllerState {
     async fn fork_session(&mut self) -> Result<String> {
         let child_id = self.session.fork()?;
         self.apply_session_overrides();
+        // Same rationale as `switch_session` — the fork is a
+        // distinct session and starts with fresh counters.
+        self.compaction_stats.reset();
         self.persist_runtime_state_logged("fork_session");
         Ok(child_id)
     }
@@ -1172,7 +1405,13 @@ impl ControllerState {
         // over the context window, so we need to discard more aggressively.
         let keep_recent = (self.config.anie_config().compaction.keep_recent_tokens / 2).max(1_000);
         let (config, strategy) = self.compaction_strategy(keep_recent);
-        anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
+        anie_agent::send_event(
+            event_tx,
+            AgentEvent::CompactionStart {
+                phase: anie_protocol::CompactionPhase::ReactiveOverflow,
+            },
+        )
+        .await;
         match self
             .session
             .inner_mut()
@@ -1180,7 +1419,12 @@ impl ControllerState {
             .await?
         {
             Some(result) => {
-                self.emit_compaction_end(event_tx, &result).await;
+                self.emit_compaction_end(
+                    event_tx,
+                    &result,
+                    anie_protocol::CompactionPhase::ReactiveOverflow,
+                )
+                .await;
                 self.emit_transcript_replace_and_status(event_tx).await;
                 Ok(true)
             }
@@ -1290,7 +1534,10 @@ impl ControllerState {
     }
 }
 
-fn build_agent(state: &ControllerState) -> AgentLoop {
+fn build_agent(
+    state: &ControllerState,
+    compaction_gate: Option<Arc<dyn anie_agent::CompactionGate>>,
+) -> AgentLoop {
     AgentLoop::new(
         Arc::clone(&state.provider_registry),
         Arc::clone(&state.tool_registry),
@@ -1301,7 +1548,8 @@ fn build_agent(state: &ControllerState) -> AgentLoop {
             ToolExecutionMode::Parallel,
             Arc::clone(&state.request_options_resolver),
         )
-        .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override()),
+        .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
+        .with_compaction_gate(compaction_gate),
     )
 }
 
@@ -1415,6 +1663,7 @@ fn format_state_summary(
     session_id: &str,
     config_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
+    compaction_stats: CompactionStats,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1475,6 +1724,28 @@ fn format_state_summary(
 
     let _ = writeln!(out, "Session");
     let _ = writeln!(out, "  Active: {session_id}");
+    let _ = writeln!(out);
+
+    // Plan 06 PR B of `docs/midturn_compaction_2026-04-27/`.
+    // Render the per-session compaction breakdown so users can
+    // see how the three phases mixed without trawling logs.
+    // anie-specific deviation: counters are this-process-
+    // lifetime, not durable. Resuming a session via
+    // `--continue` starts the counters at zero — the persisted
+    // session log doesn't carry per-phase counts (mid-turn
+    // compactions intentionally don't persist; pre-prompt and
+    // reactive ones do but without a phase tag in the persisted
+    // entry). Backfilling stats from session-log replay is a
+    // future plan, tracked as deferred.
+    let _ = writeln!(out, "Compactions this session");
+    let _ = writeln!(
+        out,
+        "  Total: {}  (pre-prompt: {}, mid-turn: {}, overflow: {}; this process only)",
+        compaction_stats.total(),
+        compaction_stats.pre_prompt,
+        compaction_stats.mid_turn,
+        compaction_stats.reactive_overflow,
+    );
     let _ = writeln!(out);
 
     let _ = writeln!(out, "Files");
