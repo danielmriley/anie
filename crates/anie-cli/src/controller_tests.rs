@@ -825,6 +825,9 @@ async fn queue_prompt_cancels_pending_retry() {
         deadline: TokioInstant::now() + Duration::from_secs(60),
         attempt: 1,
         already_compacted: false,
+        error: ProviderError::Transport("test transient".into()),
+        provider: "test-provider".into(),
+        model: "test-model".into(),
     };
 
     // No mock provider is registered for the model's API in
@@ -849,6 +852,215 @@ async fn queue_prompt_cancels_pending_retry() {
     assert!(
         saw_cancel_message,
         "user must see why the retry was dropped",
+    );
+}
+
+/// Plan `docs/run_abort_breadcrumb_2026-04-28/`: count
+/// assistant messages persisted to the session log whose body
+/// matches the canceled retry's error string. Used by every
+/// breadcrumb test.
+fn count_error_assistant_breadcrumbs(controller: &InteractiveController, needle: &str) -> usize {
+    controller
+        .state
+        .session
+        .inner()
+        .entries()
+        .iter()
+        .filter(|entry| match entry {
+            anie_session::SessionEntry::Message {
+                message: anie_protocol::Message::Assistant(assistant),
+                ..
+            } => {
+                assistant
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|m| m.contains(needle))
+                    && matches!(assistant.stop_reason, anie_protocol::StopReason::Error)
+            }
+            _ => false,
+        })
+        .count()
+}
+
+/// Plan `docs/run_abort_breadcrumb_2026-04-28/`: a fresh prompt
+/// arriving while a retry is armed must finalize the failed
+/// turn with an error-assistant breadcrumb in the session log
+/// — preventing back-to-back user messages.
+#[tokio::test]
+async fn pending_retry_canceled_by_new_prompt_writes_error_assistant_breadcrumb() {
+    use tokio::time::Instant as TokioInstant;
+
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: TokioInstant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+        error: ProviderError::RateLimited {
+            retry_after_ms: None,
+        },
+        provider: "openrouter".into(),
+        model: "minimax/minimax-m2.5:free".into(),
+    };
+
+    let _ = controller
+        .try_handle_action(UiAction::QueuePrompt("hello".into()))
+        .await;
+
+    assert!(
+        matches!(controller.pending_retry, PendingRetry::Idle),
+        "retry must be cleared",
+    );
+    assert_eq!(
+        count_error_assistant_breadcrumbs(&controller, "Rate limited"),
+        1,
+        "breadcrumb must be persisted to the session for the canceled retry",
+    );
+}
+
+/// Plan `docs/run_abort_breadcrumb_2026-04-28/`: explicit user
+/// abort writes the breadcrumb just like a new prompt does.
+#[tokio::test]
+async fn pending_retry_canceled_by_abort_writes_error_assistant_breadcrumb() {
+    use tokio::time::Instant as TokioInstant;
+
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: TokioInstant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+        error: ProviderError::Transport("dns".into()),
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+    };
+
+    controller.try_handle_action(UiAction::Abort).await.ok();
+
+    assert!(matches!(controller.pending_retry, PendingRetry::Idle));
+    assert_eq!(
+        count_error_assistant_breadcrumbs(&controller, "Transport error"),
+        1,
+        "abort must persist a breadcrumb for the canceled retry",
+    );
+}
+
+/// Plan `docs/run_abort_breadcrumb_2026-04-28/`: quit during a
+/// pending retry still writes the breadcrumb so the partially-
+/// finished session is well-formed on next resume.
+#[tokio::test]
+async fn pending_retry_canceled_by_quit_writes_error_assistant_breadcrumb() {
+    use tokio::time::Instant as TokioInstant;
+
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: TokioInstant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+        error: ProviderError::Transport("hangup".into()),
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+    };
+
+    controller.try_handle_action(UiAction::Quit).await.ok();
+
+    assert!(matches!(controller.pending_retry, PendingRetry::Idle));
+    assert_eq!(
+        count_error_assistant_breadcrumbs(&controller, "Transport error"),
+        1,
+        "quit must persist a breadcrumb for the canceled retry",
+    );
+}
+
+/// Plan `docs/run_abort_breadcrumb_2026-04-28/`: a model switch
+/// (or any run-affecting config change) cancels the pending
+/// retry. The breadcrumb must be attributed to the *original*
+/// failed run's provider/model, not the freshly-selected one.
+#[tokio::test]
+async fn pending_retry_canceled_by_model_switch_writes_breadcrumb_with_original_model() {
+    use tokio::time::Instant as TokioInstant;
+
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(
+        vec![
+            model("gpt-4o", "openai"),
+            model("claude-sonnet-4.6", "anthropic"),
+        ],
+        16,
+    );
+
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: TokioInstant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+        error: ProviderError::Transport("timeout".into()),
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+    };
+
+    controller
+        .cancel_pending_retry_for_run_affecting_change()
+        .await
+        .expect("cancel ok");
+
+    assert!(matches!(controller.pending_retry, PendingRetry::Idle));
+    let entries = controller.state.session.inner().entries();
+    let breadcrumb = entries.iter().find_map(|entry| match entry {
+        anie_session::SessionEntry::Message { message, .. } => match message {
+            anie_protocol::Message::Assistant(assistant)
+                if matches!(assistant.stop_reason, anie_protocol::StopReason::Error) =>
+            {
+                Some(assistant)
+            }
+            _ => None,
+        },
+        _ => None,
+    });
+    let breadcrumb = breadcrumb.expect("breadcrumb persisted");
+    assert_eq!(
+        breadcrumb.provider, "openai",
+        "breadcrumb provider must match the failed run, not the freshly-selected one",
+    );
+    assert_eq!(breadcrumb.model, "gpt-4o");
+}
+
+/// Plan `docs/run_abort_breadcrumb_2026-04-28/`: when the
+/// retry state is already `Idle`, calling the helper must be
+/// a no-op and not write a spurious assistant message.
+#[tokio::test]
+async fn abort_pending_retry_is_noop_when_idle() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    assert!(matches!(controller.pending_retry, PendingRetry::Idle));
+
+    controller
+        .abort_pending_retry()
+        .await
+        .expect("idle helper succeeds");
+
+    let assistant_count = controller
+        .state
+        .session
+        .inner()
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                anie_session::SessionEntry::Message {
+                    message: anie_protocol::Message::Assistant(_),
+                    ..
+                },
+            )
+        })
+        .count();
+    assert_eq!(
+        assistant_count, 0,
+        "no-op helper must not synthesize a breadcrumb",
     );
 }
 
@@ -971,6 +1183,9 @@ async fn abort_and_queue_during_pending_retry_clears_retry() {
         deadline: TokioInstant::now() + Duration::from_secs(60),
         attempt: 1,
         already_compacted: false,
+        error: ProviderError::Transport("test transient".into()),
+        provider: "test-provider".into(),
+        model: "test-model".into(),
     };
 
     // No mock provider is registered for the model's API in
@@ -1379,6 +1594,9 @@ async fn context_length_set_rejected_while_retry_pending() {
         deadline: Instant::now() + Duration::from_secs(60),
         attempt: 1,
         already_compacted: false,
+        error: ProviderError::Transport("test transient".into()),
+        provider: "test-provider".into(),
+        model: "test-model".into(),
     };
 
     controller
