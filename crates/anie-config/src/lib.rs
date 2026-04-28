@@ -99,6 +99,51 @@ pub struct ToolsConfig {
     /// Bash tool settings.
     #[serde(default)]
     pub bash: BashToolConfig,
+    /// Web tool settings (`web_read`, `web_search`).
+    #[serde(default)]
+    pub web: WebToolConfig,
+}
+
+/// Configuration for the built-in `web_read` and `web_search`
+/// tools. Defaults reflect the existing built-in behavior.
+/// Persistent-agent deployments may want to relax the
+/// wall-clock timeouts (set higher) or tighten the byte caps
+/// to suit their environment. PR 4.3 of
+/// `docs/code_review_2026-04-27/`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebToolConfig {
+    /// Per-fetch HTTP request timeout, in seconds. Applies to
+    /// the entire request including header receive. Must be
+    /// > 0.
+    pub request_timeout_secs: u64,
+    /// Total budget for `javascript=true` headless renders,
+    /// in seconds. Only meaningful when the crate is built
+    /// with `--features headless`. Must be > 0.
+    pub headless_timeout_secs: u64,
+    /// Maximum bytes accepted from a 2xx response body before
+    /// returning a typed `TooLarge` error. Hard memory cap.
+    pub max_page_bytes: usize,
+    /// Maximum number of HTTP redirects followed before the
+    /// fetch returns an error. `0` disables redirect
+    /// following entirely.
+    pub max_redirects: usize,
+    /// Allow the tool to fetch URLs that resolve to private
+    /// or loopback addresses. Disabled by default; operators
+    /// must opt in explicitly to disable the SSRF guard for
+    /// trusted internal endpoints.
+    pub allow_private_ips: bool,
+}
+
+impl Default for WebToolConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: 30,
+            headless_timeout_secs: 30,
+            max_page_bytes: 10 * 1024 * 1024,
+            max_redirects: 10,
+            allow_private_ips: false,
+        }
+    }
 }
 
 /// Bash tool settings.
@@ -507,6 +552,7 @@ pub fn load_config_with_paths(
     apply_cli_overrides(&mut config, cli_overrides);
     warn_legacy_ollama_openai_api(&config);
     validate_ollama_config(&config.ollama)?;
+    validate_web_tool_config(&config.tools.web)?;
     Ok(config)
 }
 
@@ -527,6 +573,38 @@ fn validate_ollama_config(ollama: &OllamaConfig) -> Result<()> {
         return Err(anyhow::anyhow!(
             "[ollama] default_max_num_ctx = {value} is below the minimum {OLLAMA_DEFAULT_MAX_NUM_CTX_MIN} \
              (the /context-length slash command also rejects values below this threshold)"
+        ));
+    }
+    Ok(())
+}
+
+/// Smallest acceptable value for `max_page_bytes`. A 1 KiB
+/// floor lets debug overrides shrink the cap without it
+/// silently rejecting every non-empty page (smaller than this
+/// and any HTML doctype + body would already trip the cap).
+const WEB_TOOL_MIN_PAGE_BYTES: usize = 1024;
+
+/// Validate `[tools.web]` config values at load time.
+/// Catches operator typos that would otherwise be silently
+/// applied (e.g. `request_timeout_secs = 0` would disable
+/// the request entirely). PR 4.3 of
+/// `docs/code_review_2026-04-27/`.
+fn validate_web_tool_config(web: &WebToolConfig) -> Result<()> {
+    if web.request_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "[tools.web] request_timeout_secs must be > 0 (set a generous value like 300 \
+             for persistent-agent deployments rather than 0)"
+        ));
+    }
+    if web.headless_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "[tools.web] headless_timeout_secs must be > 0"
+        ));
+    }
+    if web.max_page_bytes < WEB_TOOL_MIN_PAGE_BYTES {
+        return Err(anyhow::anyhow!(
+            "[tools.web] max_page_bytes = {} is below the minimum {WEB_TOOL_MIN_PAGE_BYTES}",
+            web.max_page_bytes
         ));
     }
     Ok(())
@@ -758,18 +836,36 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
         }
     }
 
-    if let Some(tools) = partial.tools
-        && let Some(bash) = tools.bash
-        && let Some(policy) = bash.policy
-    {
-        if let Some(enabled) = policy.enabled {
-            config.tools.bash.policy.enabled = enabled;
+    if let Some(tools) = partial.tools {
+        if let Some(bash) = tools.bash
+            && let Some(policy) = bash.policy
+        {
+            if let Some(enabled) = policy.enabled {
+                config.tools.bash.policy.enabled = enabled;
+            }
+            if let Some(deny_commands) = policy.deny_commands {
+                config.tools.bash.policy.deny_commands = deny_commands;
+            }
+            if let Some(deny_patterns) = policy.deny_patterns {
+                config.tools.bash.policy.deny_patterns = deny_patterns;
+            }
         }
-        if let Some(deny_commands) = policy.deny_commands {
-            config.tools.bash.policy.deny_commands = deny_commands;
-        }
-        if let Some(deny_patterns) = policy.deny_patterns {
-            config.tools.bash.policy.deny_patterns = deny_patterns;
+        if let Some(web) = tools.web {
+            if let Some(value) = web.request_timeout_secs {
+                config.tools.web.request_timeout_secs = value;
+            }
+            if let Some(value) = web.headless_timeout_secs {
+                config.tools.web.headless_timeout_secs = value;
+            }
+            if let Some(value) = web.max_page_bytes {
+                config.tools.web.max_page_bytes = value;
+            }
+            if let Some(value) = web.max_redirects {
+                config.tools.web.max_redirects = value;
+            }
+            if let Some(value) = web.allow_private_ips {
+                config.tools.web.allow_private_ips = value;
+            }
         }
     }
 
@@ -871,6 +967,7 @@ struct PartialContextConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialToolsConfig {
     bash: Option<PartialBashToolConfig>,
+    web: Option<PartialWebToolConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -883,6 +980,18 @@ struct PartialBashPolicyConfig {
     enabled: Option<bool>,
     deny_commands: Option<Vec<String>>,
     deny_patterns: Option<Vec<String>>,
+}
+
+/// Optional `[tools.web]` overrides loaded from `config.toml`.
+/// Each field is `Option<...>` so omitted keys preserve the
+/// `WebToolConfig::default()` values rather than zero-init.
+#[derive(Debug, Default, Deserialize)]
+struct PartialWebToolConfig {
+    request_timeout_secs: Option<u64>,
+    headless_timeout_secs: Option<u64>,
+    max_page_bytes: Option<usize>,
+    max_redirects: Option<usize>,
+    allow_private_ips: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1260,6 +1369,137 @@ mod tests {
             defaults.slash_command_popup_enabled,
         );
         assert_eq!(config.ui.tool_output_mode, defaults.tool_output_mode);
+    }
+
+    /// PR 4.3 of `docs/code_review_2026-04-27/`. Confirms
+    /// `[tools.web]` values reach `AnieConfig.tools.web`
+    /// through the real loader path.
+    #[test]
+    fn web_tool_config_loads_from_real_config_path() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            request_timeout_secs = 120
+            headless_timeout_secs = 60
+            max_page_bytes = 5242880
+            max_redirects = 3
+            allow_private_ips = true
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert_eq!(config.tools.web.request_timeout_secs, 120);
+        assert_eq!(config.tools.web.headless_timeout_secs, 60);
+        assert_eq!(config.tools.web.max_page_bytes, 5 * 1024 * 1024);
+        assert_eq!(config.tools.web.max_redirects, 3);
+        assert!(config.tools.web.allow_private_ips);
+    }
+
+    /// PR 4.3: omitted fields keep `WebToolConfig::default()`
+    /// values rather than zero-initializing.
+    #[test]
+    fn web_tool_config_omitted_fields_keep_defaults() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            request_timeout_secs = 120
+            "#,
+        )
+        .expect("write config");
+
+        let defaults = WebToolConfig::default();
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+
+        assert_eq!(config.tools.web.request_timeout_secs, 120);
+        assert_eq!(
+            config.tools.web.headless_timeout_secs,
+            defaults.headless_timeout_secs
+        );
+        assert_eq!(config.tools.web.max_page_bytes, defaults.max_page_bytes);
+        assert_eq!(config.tools.web.max_redirects, defaults.max_redirects);
+        assert_eq!(
+            config.tools.web.allow_private_ips,
+            defaults.allow_private_ips
+        );
+    }
+
+    /// PR 4.3: a config file with no `[tools.web]` section at
+    /// all leaves the defaults intact.
+    #[test]
+    fn web_tool_config_absent_section_keeps_all_defaults() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [model]
+            provider = "ollama"
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+        assert_eq!(config.tools.web, WebToolConfig::default());
+    }
+
+    /// PR 4.3: validation catches operator typos at load time
+    /// rather than letting `request_timeout_secs = 0` silently
+    /// disable the request entirely.
+    #[test]
+    fn web_tool_config_zero_timeout_is_rejected() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            request_timeout_secs = 0
+            "#,
+        )
+        .expect("write config");
+
+        let err = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect_err("zero timeout should reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("request_timeout_secs"),
+            "error must mention the field: {msg}"
+        );
+    }
+
+    /// PR 4.3: tiny `max_page_bytes` is rejected so a typo
+    /// like `max_page_bytes = 100` doesn't break every fetch.
+    #[test]
+    fn web_tool_config_tiny_max_page_bytes_is_rejected() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [tools.web]
+            max_page_bytes = 100
+            "#,
+        )
+        .expect("write config");
+
+        let err = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect_err("tiny page cap should reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_page_bytes"),
+            "error must mention the field: {msg}"
+        );
     }
 
     #[test]

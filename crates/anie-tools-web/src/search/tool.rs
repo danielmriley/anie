@@ -59,7 +59,16 @@ impl WebSearchTool {
     /// Build with a shared rate limiter (so `web_read` and
     /// `web_search` share per-host bucket state).
     pub fn with_rate_limiter(rate_limiter: Arc<HostRateLimiter>) -> Result<Self, WebToolError> {
-        let opts = FetchOptions::default();
+        Self::with_options(FetchOptions::default(), rate_limiter)
+    }
+
+    /// Build with operator-supplied [`FetchOptions`] and a
+    /// shared rate limiter. PR 4.3 of
+    /// `docs/code_review_2026-04-27/`.
+    pub fn with_options(
+        opts: FetchOptions,
+        rate_limiter: Arc<HostRateLimiter>,
+    ) -> Result<Self, WebToolError> {
         let client = fetch::build_client(&opts)?;
         Ok(Self {
             client,
