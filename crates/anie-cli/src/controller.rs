@@ -1037,13 +1037,29 @@ impl ControllerState {
 
     /// Build the compaction config + summarizer for the current
     /// session state. Used by every compaction call site.
+    ///
+    /// PR 8.1 of `docs/midturn_compaction_2026-04-27/`. The
+    /// stored `reserve_tokens` is clamped to a window-relative
+    /// fraction here so the resulting threshold lives at
+    /// roughly 75% of the window regardless of size. Without
+    /// this, a 16K Ollama window minus the default 16K reserve
+    /// saturated to threshold 0, and the controller compacted
+    /// every turn unconditionally. `anie-session` stays
+    /// unaware of windows; the clamp lives at the call site
+    /// that builds `CompactionConfig`.
     fn compaction_strategy(
         &self,
         keep_recent_tokens: u64,
     ) -> (CompactionConfig, CompactionStrategy) {
+        let context_window = self.config.effective_ollama_context_window();
+        let reserve_tokens = crate::compaction_reserve::effective_reserve(
+            context_window,
+            self.config.anie_config().compaction.reserve_tokens,
+            crate::compaction_reserve::DEFAULT_MIN_RESERVE_TOKENS,
+        );
         let config = CompactionConfig {
-            context_window: self.config.effective_ollama_context_window(),
-            reserve_tokens: self.config.anie_config().compaction.reserve_tokens,
+            context_window,
+            reserve_tokens,
             keep_recent_tokens,
         };
         let strategy = CompactionStrategy::new(
