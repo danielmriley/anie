@@ -1668,8 +1668,7 @@ mod tests {
         // Two-column table at natural widths 30+10. Viewport 40
         // (budget 30 after borders). Proportional split: 30 →
         // ~23, 10 → ~7, sum 30.
-        let widths =
-            compute_column_widths(&[30, 10], &[MIN_COL_WIDTH; 2], 40).expect("fits");
+        let widths = compute_column_widths(&[30, 10], &[MIN_COL_WIDTH; 2], 40).expect("fits");
         assert!(widths.iter().all(|w| *w >= MIN_COL_WIDTH));
         let overhead = 2 * 2 + (2 + 1);
         assert!(

@@ -54,9 +54,7 @@ pub fn locate_chrome() -> Result<PathBuf, WebToolError> {
         }
     }
 
-    let mac_default = PathBuf::from(
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    );
+    let mac_default = PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
     if mac_default.exists() {
         return Ok(mac_default);
     }
@@ -206,9 +204,8 @@ mod tests {
         // macOS default path; that's a real install and a
         // legitimate "found" result. Skip the assertion in that
         // case rather than fail.
-        let mac_default = PathBuf::from(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        );
+        let mac_default =
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
         if mac_default.exists() {
             return;
         }

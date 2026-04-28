@@ -1123,7 +1123,8 @@ impl OnboardingScreen {
                     .map(|model| model.base_url.clone())
                     .unwrap_or_else(|| normalize_openai_base_url(&server.base_url));
                 let api = discovery_model_api(&server.name, api, &base_url);
-                let mut model = model_info.to_model(api, &discovery_model_base_url(api, &base_url), None);
+                let mut model =
+                    model_info.to_model(api, &discovery_model_base_url(api, &base_url), None);
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {
                     model,
@@ -1147,7 +1148,8 @@ impl OnboardingScreen {
                 ..
             } => {
                 let api = discovery_model_api(provider_name, ApiKind::OpenAICompletions, base_url);
-                let mut model = model_info.to_model(api, &discovery_model_base_url(api, base_url), None);
+                let mut model =
+                    model_info.to_model(api, &discovery_model_base_url(api, base_url), None);
                 model.provider = provider_name.clone();
                 anie_providers_builtin::apply_openrouter_capabilities(&mut model);
                 ConfiguredProvider {

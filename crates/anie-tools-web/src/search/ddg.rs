@@ -26,11 +26,8 @@ pub async fn search(
     query: &str,
     max: usize,
 ) -> Result<Vec<SearchHit>, WebToolError> {
-    let url = Url::parse(&format!(
-        "{DDG_HTML_BASE}?q={}",
-        urlencoding::encode(query),
-    ))
-    .map_err(|e| WebToolError::SearchBackend(e.to_string()))?;
+    let url = Url::parse(&format!("{DDG_HTML_BASE}?q={}", urlencoding::encode(query),))
+        .map_err(|e| WebToolError::SearchBackend(e.to_string()))?;
 
     let html = fetch_html(client, &url, fetch_opts).await?;
     parse_ddg_html(&html, max)
@@ -100,9 +97,8 @@ pub fn decode_ddg_redirect(raw: &str) -> Result<Url, WebToolError> {
     let parsed = Url::parse(&absolute_form)
         .map_err(|e| WebToolError::SearchBackend(format!("bad redirect URL: {e}")))?;
     if let Some((_, value)) = parsed.query_pairs().find(|(k, _)| k == "uddg") {
-        return Url::parse(&value).map_err(|e| {
-            WebToolError::SearchBackend(format!("bad uddg target: {e}"))
-        });
+        return Url::parse(&value)
+            .map_err(|e| WebToolError::SearchBackend(format!("bad uddg target: {e}")));
     }
     Ok(parsed)
 }
@@ -189,10 +185,8 @@ mod tests {
 
     #[test]
     fn decode_ddg_redirect_extracts_uddg_target() {
-        let url = decode_ddg_redirect(
-            "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath",
-        )
-        .expect("decode");
+        let url = decode_ddg_redirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath")
+            .expect("decode");
         assert_eq!(url.as_str(), "https://example.com/path");
     }
 

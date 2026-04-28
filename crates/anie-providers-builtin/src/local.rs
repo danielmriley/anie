@@ -157,9 +157,7 @@ pub fn default_local_reasoning_capabilities(
 /// (TLS roots unavailable, etc.) — discovery is a best-effort
 /// feature and should never prevent startup. A warning is logged so
 /// the failure is visible.
-pub async fn detect_local_servers(
-    ollama_default_max_num_ctx: Option<u64>,
-) -> Vec<LocalServer> {
+pub async fn detect_local_servers(ollama_default_max_num_ctx: Option<u64>) -> Vec<LocalServer> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
@@ -408,9 +406,10 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
-            .await
-            .expect("detected local server");
+        let detected =
+            probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
+                .await
+                .expect("detected local server");
 
         assert_eq!(detected.name, "ollama");
         assert_eq!(detected.base_url, format!("http://{address}"));
@@ -459,9 +458,10 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "lmstudio", &format!("http://{address}"), None)
-            .await
-            .expect("detected local server");
+        let detected =
+            probe_openai_compatible(&client, "lmstudio", &format!("http://{address}"), None)
+                .await
+                .expect("detected local server");
 
         assert_eq!(detected.models[0].api, ApiKind::OpenAICompletions);
         assert_eq!(detected.models[0].base_url, format!("http://{address}/v1"));
@@ -650,9 +650,10 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
-            .await
-            .expect("detected local server");
+        let detected =
+            probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
+                .await
+                .expect("detected local server");
 
         assert_eq!(detected.models.len(), 2);
         let qwen = detected
@@ -742,9 +743,10 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
-            .await
-            .expect("detected local server");
+        let detected =
+            probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
+                .await
+                .expect("detected local server");
 
         let qwen = detected
             .models
@@ -804,9 +806,10 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .expect("client");
-        let detected = probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
-            .await
-            .expect("detected local server");
+        let detected =
+            probe_openai_compatible(&client, "ollama", &format!("http://{address}"), None)
+                .await
+                .expect("detected local server");
 
         let qwen = detected
             .models
@@ -960,7 +963,8 @@ mod tests {
             .build()
             .expect("client");
         let started = std::time::Instant::now();
-        let detected = probe_openai_compatible(&client, "missing", "http://127.0.0.1:9", None).await;
+        let detected =
+            probe_openai_compatible(&client, "missing", "http://127.0.0.1:9", None).await;
         assert!(detected.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }

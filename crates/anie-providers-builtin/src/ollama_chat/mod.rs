@@ -109,13 +109,8 @@ impl OllamaChatProvider {
                 let mut retry_options = options.clone();
                 retry_options.num_ctx_override = Some(suggested_num_ctx);
                 let retry_body = build_request_body(model, context, &retry_options);
-                Self::send_request_with_reasoning_retry(
-                    client,
-                    url,
-                    retry_body,
-                    &retry_options,
-                )
-                .await
+                Self::send_request_with_reasoning_retry(client, url, retry_body, &retry_options)
+                    .await
             }
             other => other,
         }
@@ -556,8 +551,7 @@ mod tests {
         // (`util.rs:20-32`), which fires only on HTTP 400 with a
         // body containing "context" or "token". A 500 with the
         // load-failure body must never reach that detector.
-        let load_failure_body =
-            r#"{"error":"model requires more system memory (56.0 GiB) than is available (50.3 GiB)"}"#;
+        let load_failure_body = r#"{"error":"model requires more system memory (56.0 GiB) than is available (50.3 GiB)"}"#;
         let error = classify_ollama_error_body(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             load_failure_body,
@@ -582,14 +576,9 @@ mod tests {
     /// is what's wrong, not the request.
     #[test]
     fn classify_ollama_error_body_routes_xml_syntax_to_model_output_malformed() {
-        let body =
-            r#"{"error":"xml syntax error on line 5: unexpected EOF"}"#;
-        let error = classify_ollama_error_body(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-            Some(65_536),
-        );
+        let body = r#"{"error":"xml syntax error on line 5: unexpected EOF"}"#;
+        let error =
+            classify_ollama_error_body(reqwest::StatusCode::BAD_REQUEST, body, None, Some(65_536));
         assert!(
             matches!(error, ProviderError::ModelOutputMalformed(_)),
             "expected ModelOutputMalformed, got: {error:?}",
@@ -602,12 +591,7 @@ mod tests {
     #[test]
     fn classify_ollama_error_body_routes_json_parse_to_model_output_malformed() {
         let body = r#"{"error":"json: cannot unmarshal string into Go struct field"}"#;
-        let error = classify_ollama_error_body(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-            None,
-        );
+        let error = classify_ollama_error_body(reqwest::StatusCode::BAD_REQUEST, body, None, None);
         assert!(
             matches!(error, ProviderError::ModelOutputMalformed(_)),
             "expected ModelOutputMalformed, got: {error:?}",
@@ -621,12 +605,7 @@ mod tests {
     #[test]
     fn classify_ollama_error_body_does_not_misclassify_invalid_model_as_output_malformed() {
         let body = r#"{"error":"invalid model name"}"#;
-        let error = classify_ollama_error_body(
-            reqwest::StatusCode::BAD_REQUEST,
-            body,
-            None,
-            None,
-        );
+        let error = classify_ollama_error_body(reqwest::StatusCode::BAD_REQUEST, body, None, None);
         // "invalid" is in the body, so this routes to the
         // unsupported/feature path, not to ModelOutputMalformed.
         assert!(
@@ -963,7 +942,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(requests.len(), 2, "no third attempt — one halved retry only");
+        assert_eq!(
+            requests.len(),
+            2,
+            "no third attempt — one halved retry only"
+        );
         let error = result.expect_err("second failure must surface as Err");
         match error {
             ProviderError::ModelLoadResources {

@@ -82,15 +82,13 @@ async fn fetch_follows_redirect_chain() {
     server
         .mock_async(|when, then| {
             when.method(GET).path("/start");
-            then.status(302)
-                .header("Location", "/middle");
+            then.status(302).header("Location", "/middle");
         })
         .await;
     server
         .mock_async(|when, then| {
             when.method(GET).path("/middle");
-            then.status(302)
-                .header("Location", "/final");
+            then.status(302).header("Location", "/final");
         })
         .await;
     server

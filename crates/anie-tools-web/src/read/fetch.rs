@@ -1,13 +1,7 @@
 //! HTTP fetch path: URL validation, SSRF guard, robots.txt
 //! caching, per-host rate limiting, bounded HTTP fetching.
 
-use std::{
-    collections::HashMap,
-    net::IpAddr,
-    num::NonZeroU32,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use texting_robots::Robot;

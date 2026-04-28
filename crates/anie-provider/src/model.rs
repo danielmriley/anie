@@ -497,7 +497,11 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: None,
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1", None);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://openrouter.ai/api/v1",
+            None,
+        );
         assert_eq!(model.max_tokens, 262_144);
         assert_eq!(model.context_window, 262_144);
     }
@@ -525,7 +529,11 @@ mod tests {
                 "thinking".into(),
             ]),
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "http://localhost:11434/v1",
+            None,
+        );
         assert_eq!(
             model.reasoning_capabilities,
             Some(ReasoningCapabilities {
@@ -556,7 +564,11 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: Some(vec!["completion".into()]),
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "http://localhost:11434/v1",
+            None,
+        );
         assert_eq!(model.reasoning_capabilities, None);
     }
 
@@ -578,7 +590,11 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: Some(vec!["completion".into(), "tools".into()]),
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "http://localhost:11434/v1",
+            None,
+        );
         assert_eq!(model.context_window, 32_768);
     }
 
@@ -619,7 +635,11 @@ mod tests {
     fn to_model_clamps_ollama_context_window_when_cap_is_set() {
         // Cap below discovered → clamped to cap.
         let info = ollama_info_with_context(262_144);
-        let model = info.to_model(ApiKind::OllamaChatApi, "http://localhost:11434", Some(32_768));
+        let model = info.to_model(
+            ApiKind::OllamaChatApi,
+            "http://localhost:11434",
+            Some(32_768),
+        );
         assert_eq!(
             model.context_window, 32_768,
             "discovered=262144, cap=32768 → context_window=32768"
@@ -720,7 +740,11 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: None,
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "https://openrouter.ai/api/v1", None);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://openrouter.ai/api/v1",
+            None,
+        );
         assert_eq!(model.context_window, 200_000);
     }
 
@@ -742,7 +766,11 @@ mod tests {
             supported_parameters: None,
             provider_capabilities: None,
         };
-        let model = info.to_model(ApiKind::OpenAICompletions, "https://api.openai.com/v1", None);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "https://api.openai.com/v1",
+            None,
+        );
         assert_eq!(model.max_tokens, 8_192);
     }
 
@@ -761,7 +789,11 @@ mod tests {
             provider_capabilities: None,
         };
 
-        let model = info.to_model(ApiKind::OpenAICompletions, "http://localhost:11434/v1", None);
+        let model = info.to_model(
+            ApiKind::OpenAICompletions,
+            "http://localhost:11434/v1",
+            None,
+        );
         assert_eq!(model.id, "qwen3:32b");
         assert_eq!(model.name, "Qwen 3 32B");
         assert_eq!(model.provider, "ollama");

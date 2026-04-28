@@ -53,9 +53,7 @@ pub async fn run_models_command(provider_filter: Option<&str>, refresh: bool) ->
                     && config.ollama.default_max_num_ctx.is_some();
                 for model in models.iter() {
                     let mut model = model.clone();
-                    if apply_cap
-                        && let Some(discovered) = model.context_length
-                    {
+                    if apply_cap && let Some(discovered) = model.context_length {
                         model.context_length = Some(anie_provider::clamp_ollama_context_window(
                             discovered,
                             config.ollama.default_max_num_ctx,

@@ -127,9 +127,8 @@ impl Tool for WebSearchTool {
         _cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<ToolResult>>,
     ) -> Result<ToolResult, ToolError> {
-        let parsed: WebSearchArgs = serde_json::from_value(args).map_err(|e| {
-            ToolError::ExecutionFailed(format!("invalid web_search args: {e}"))
-        })?;
+        let parsed: WebSearchArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_search args: {e}")))?;
         let body = self
             .run(&parsed)
             .await

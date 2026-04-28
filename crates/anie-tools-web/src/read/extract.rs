@@ -107,11 +107,7 @@ impl DefuddleOutput {
 pub trait DefuddleRunner: Send + Sync {
     /// Run Defuddle against `html`, with `source_url` provided
     /// for relative-link resolution and metadata.
-    async fn run(
-        &self,
-        html: &str,
-        source_url: &str,
-    ) -> Result<DefuddleOutput, WebToolError>;
+    async fn run(&self, html: &str, source_url: &str) -> Result<DefuddleOutput, WebToolError>;
 }
 
 /// Production implementation: spawns the `defuddle` CLI as a
@@ -121,11 +117,7 @@ pub struct SubprocessDefuddleRunner;
 
 #[async_trait]
 impl DefuddleRunner for SubprocessDefuddleRunner {
-    async fn run(
-        &self,
-        html: &str,
-        _source_url: &str,
-    ) -> Result<DefuddleOutput, WebToolError> {
+    async fn run(&self, html: &str, _source_url: &str) -> Result<DefuddleOutput, WebToolError> {
         // The Defuddle 0.18 CLI takes a file path or URL — no
         // stdin. We write the already-fetched HTML to a tempfile
         // so anie's SSRF guard, robots check, rate limit, and
@@ -201,10 +193,7 @@ fn locate_defuddle() -> Result<DefuddleCmd, WebToolError> {
     if let Ok(npx) = which::which("npx") {
         return Ok(DefuddleCmd {
             binary: npx,
-            args: vec![
-                "--yes".into(),
-                format!("defuddle@{DEFUDDLE_VERSION}"),
-            ],
+            args: vec!["--yes".into(), format!("defuddle@{DEFUDDLE_VERSION}")],
         });
     }
     Err(WebToolError::DefuddleNotFound)
@@ -243,7 +232,13 @@ mod tests {
         assert_eq!(parsed.author.as_deref(), Some("Jane Doe"));
         assert_eq!(parsed.domain.as_deref(), Some("example.com"));
         assert_eq!(parsed.word_count, Some(1234));
-        assert!(parsed.content_markdown.as_deref().unwrap().contains("# Hello"));
+        assert!(
+            parsed
+                .content_markdown
+                .as_deref()
+                .unwrap()
+                .contains("# Hello")
+        );
     }
 
     #[test]

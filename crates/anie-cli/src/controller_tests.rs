@@ -1004,10 +1004,7 @@ async fn context_length_set_above_cap_emits_warning_but_applies_override() {
     // The override still applies to the controller's effective
     // value — the warning is informational, not blocking.
     assert_eq!(
-        controller
-            .state
-            .config
-            .active_ollama_num_ctx_override(),
+        controller.state.config.active_ollama_num_ctx_override(),
         Some(65_536)
     );
 }

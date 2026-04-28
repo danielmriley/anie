@@ -321,9 +321,7 @@ impl InputPane {
         let border_style = if input_locked {
             Style::default().add_modifier(Modifier::DIM)
         } else {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::DIM)
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
         };
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
@@ -375,14 +373,13 @@ impl InputPane {
         // After the populate above, cached_layout is always
         // `Some`; `get_or_insert_with` lets the borrow checker
         // see that without a panic-on-None unwrap.
-        self.cached_layout
-            .get_or_insert_with(|| CachedLayout {
-                width,
-                cursor: self.cursor,
-                content: self.content.clone(),
-                lines: Vec::new(),
-                cursor_visual: (0, 0),
-            })
+        self.cached_layout.get_or_insert_with(|| CachedLayout {
+            width,
+            cursor: self.cursor,
+            content: self.content.clone(),
+            lines: Vec::new(),
+            cursor_visual: (0, 0),
+        })
     }
 
     fn submit(&mut self) -> InputAction {
@@ -654,8 +651,7 @@ impl InputPane {
                 // Wrap point. If we're inside a word that
                 // started after column 0, retro-move the word
                 // tail to a fresh line.
-                if let (Some(anchor_col), Some(anchor_byte)) =
-                    (word_anchor_col, word_byte_start)
+                if let (Some(anchor_col), Some(anchor_byte)) = (word_anchor_col, word_byte_start)
                     && anchor_col > 0
                 {
                     let line_str = &mut lines[row];
@@ -663,8 +659,7 @@ impl InputPane {
                     // already-pushed chars from `anchor_byte`
                     // onward. Strip them off and stash for the
                     // new line.
-                    let split_pos = line_str.len()
-                        - self.content[anchor_byte..idx].len();
+                    let split_pos = line_str.len() - self.content[anchor_byte..idx].len();
                     let tail = line_str.split_off(split_pos);
                     let tail_chars = tail.chars().count();
                     lines.push(tail);
@@ -673,15 +668,10 @@ impl InputPane {
                     word_anchor_col = Some(0);
                     // Adjust cursor if it landed inside the
                     // moved tail.
-                    if cursor_set
-                        && self.cursor > anchor_byte
-                        && self.cursor <= idx
-                    {
-                        let chars_into_tail = self.content[anchor_byte..self.cursor]
-                            .chars()
-                            .count();
-                        cursor_visual =
-                            ((prefix_offset(row) + chars_into_tail) as u16, row as u16);
+                    if cursor_set && self.cursor > anchor_byte && self.cursor <= idx {
+                        let chars_into_tail =
+                            self.content[anchor_byte..self.cursor].chars().count();
+                        cursor_visual = ((prefix_offset(row) + chars_into_tail) as u16, row as u16);
                     }
                 } else {
                     // Hard break: word longer than line width

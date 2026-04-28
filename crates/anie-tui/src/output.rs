@@ -756,7 +756,10 @@ impl OutputPane {
     fn has_animated_blocks(&self) -> bool {
         debug_assert_eq!(
             self.animated_block_count,
-            self.blocks.iter().filter(|b| block_has_animated_content(b)).count(),
+            self.blocks
+                .iter()
+                .filter(|b| block_has_animated_content(b))
+                .count(),
             "animated_block_count drifted from the actual block state",
         );
         self.animated_block_count > 0
@@ -773,10 +776,7 @@ impl OutputPane {
         // flat_lines holds Arc<Line> after PR 06 — deep-clone
         // here is a test convenience; production paths borrow
         // via `set_line(line.as_ref(), ...)` instead.
-        self.flat_lines
-            .iter()
-            .map(|arc| (**arc).clone())
-            .collect()
+        self.flat_lines.iter().map(|arc| (**arc).clone()).collect()
     }
 
     /// Fast-path the flat cache when nothing has changed.
@@ -911,8 +911,7 @@ impl OutputPane {
             // Wrap each line in its own `Arc` so the cache slot
             // and the flat output share the same allocation. The
             // cache hit path then refcount-bumps; no deep clone.
-            let lines_arcs: Vec<Arc<Line<'static>>> =
-                computed.into_iter().map(Arc::new).collect();
+            let lines_arcs: Vec<Arc<Line<'static>>> = computed.into_iter().map(Arc::new).collect();
             if hits_cache && let Some(slot) = self.caches.get_mut(index) {
                 let entry = CachedAtWidth {
                     width,
@@ -2373,10 +2372,7 @@ mod streaming_markdown_tests {
             !text.contains("[docs]"),
             "literal markdown link leaked: {text}",
         );
-        assert!(
-            text.contains("https://example.com"),
-            "URL missing: {text}",
-        );
+        assert!(text.contains("https://example.com"), "URL missing: {text}",);
     }
 
     /// Cache: identical render at the same text_len/width/theme
@@ -2503,10 +2499,7 @@ mod wrap_tests {
     /// nowhere else to put it.
     #[test]
     fn wrap_plain_text_hard_breaks_word_longer_than_width() {
-        assert_eq!(
-            wrap_plain_text("abcdefghij", 4),
-            vec!["abcd", "efgh", "ij"]
-        );
+        assert_eq!(wrap_plain_text("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
     }
 
     /// `wrap_spans` mirrors `wrap_plain_text` for the no-style
@@ -2537,15 +2530,19 @@ mod wrap_tests {
         let lines = wrap_spans(spans, 5);
         assert_eq!(lines.len(), 2);
         // Line 0: "hello" carrying the bold style.
-        assert!(lines[0]
-            .spans
-            .iter()
-            .any(|s| s.content == "hello" && s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.content == "hello" && s.style.add_modifier.contains(Modifier::BOLD))
+        );
         // Line 1: "world" carrying the italic style.
-        assert!(lines[1]
-            .spans
-            .iter()
-            .any(|s| s.content == "world" && s.style.add_modifier.contains(Modifier::ITALIC)));
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|s| s.content == "world" && s.style.add_modifier.contains(Modifier::ITALIC))
+        );
     }
 
     /// A word longer than the line hard-breaks across spans.
@@ -2557,7 +2554,10 @@ mod wrap_tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert_eq!(texts, vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string()]);
+        assert_eq!(
+            texts,
+            vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string()]
+        );
     }
 
     /// PR 04 / F-9: bullet, verb, and the leading space between
@@ -2572,15 +2572,23 @@ mod wrap_tests {
         // Non-executing path: bullet "• " is borrowed.
         let spans = format_tool_header_spans("bash", "ls /tmp", false, false, ".");
         // [bullet, verb, " ", args]
-        assert!(matches!(spans[0].content, std::borrow::Cow::Borrowed(_)),
-            "bullet should be Cow::Borrowed");
-        assert!(matches!(spans[1].content, std::borrow::Cow::Borrowed(_)),
-            "verb should be Cow::Borrowed");
-        assert!(matches!(spans[2].content, std::borrow::Cow::Borrowed(_)),
-            "space separator should be Cow::Borrowed");
+        assert!(
+            matches!(spans[0].content, std::borrow::Cow::Borrowed(_)),
+            "bullet should be Cow::Borrowed"
+        );
+        assert!(
+            matches!(spans[1].content, std::borrow::Cow::Borrowed(_)),
+            "verb should be Cow::Borrowed"
+        );
+        assert!(
+            matches!(spans[2].content, std::borrow::Cow::Borrowed(_)),
+            "space separator should be Cow::Borrowed"
+        );
         // args is per-call &str → unavoidable owned String.
-        assert!(matches!(spans[3].content, std::borrow::Cow::Owned(_)),
-            "args span owns its String (input is &str, not 'static)");
+        assert!(
+            matches!(spans[3].content, std::borrow::Cow::Owned(_)),
+            "args span owns its String (input is &str, not 'static)"
+        );
     }
 
     /// PR 04 of `docs/tui_polish_2026-04-26/`. User messages
@@ -2597,11 +2605,7 @@ mod wrap_tests {
         //   [user lines, blank separator, ...]
         let user_line = lines
             .iter()
-            .find(|line| {
-                line.spans
-                    .iter()
-                    .any(|s| s.content.contains('›'))
-            })
+            .find(|line| line.spans.iter().any(|s| s.content.contains('›')))
             .expect("user-message line missing");
         // Every span on the line must carry a non-default bg.
         for (idx, span) in user_line.spans.iter().enumerate() {

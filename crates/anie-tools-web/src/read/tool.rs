@@ -53,9 +53,7 @@ impl WebReadTool {
 
     /// Build with a shared rate limiter (so `web_read` and
     /// `web_search` share per-host bucket state).
-    pub fn with_rate_limiter(
-        rate_limiter: Arc<HostRateLimiter>,
-    ) -> Result<Self, WebToolError> {
+    pub fn with_rate_limiter(rate_limiter: Arc<HostRateLimiter>) -> Result<Self, WebToolError> {
         let opts = FetchOptions::default();
         let client = fetch::build_client(&opts)?;
         Ok(Self {
@@ -171,9 +169,8 @@ impl Tool for WebReadTool {
         _cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<ToolResult>>,
     ) -> Result<ToolResult, ToolError> {
-        let parsed: WebReadArgs = serde_json::from_value(args).map_err(|e| {
-            ToolError::ExecutionFailed(format!("invalid web_read args: {e}"))
-        })?;
+        let parsed: WebReadArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_read args: {e}")))?;
         let body = self
             .run(&parsed)
             .await

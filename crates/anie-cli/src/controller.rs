@@ -100,7 +100,9 @@ enum ContextLengthMutation {
     /// workspace-wide `[ollama] default_max_num_ctx` cap; the
     /// caller emits it as a separate system message so the
     /// user sees both the success and the conflict.
-    Set { above_cap_warning: Option<String> },
+    Set {
+        above_cap_warning: Option<String>,
+    },
     Reset,
 }
 
@@ -877,9 +879,7 @@ impl ControllerState {
             });
 
         self.config.set_ollama_num_ctx_override(value);
-        Ok(ContextLengthMutation::Set {
-            above_cap_warning,
-        })
+        Ok(ContextLengthMutation::Set { above_cap_warning })
     }
 
     /// Build the compaction config + summarizer for the current
@@ -1306,11 +1306,7 @@ fn format_state_summary(
     let mut out = String::new();
 
     let _ = writeln!(out, "Current model");
-    let _ = writeln!(
-        out,
-        "  {}:{} · {:?}",
-        model.provider, model.id, model.api,
-    );
+    let _ = writeln!(out, "  {}:{} · {:?}", model.provider, model.id, model.api,);
     let _ = writeln!(out, "  Thinking: {}", format_thinking(thinking));
     let _ = writeln!(out);
 

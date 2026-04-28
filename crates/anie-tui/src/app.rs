@@ -598,15 +598,9 @@ impl App {
             .last_streaming_delta_at
             .map(|t| t.elapsed())
             .filter(|d| {
-                matches!(self.agent_state, AgentUiState::Streaming)
-                    && *d >= Duration::from_secs(3)
+                matches!(self.agent_state, AgentUiState::Streaming) && *d >= Duration::from_secs(3)
             });
-        render_spinner_row(
-            &self.agent_state,
-            silence,
-            spinner_area,
-            frame.buffer_mut(),
-        );
+        render_spinner_row(&self.agent_state, silence, spinner_area, frame.buffer_mut());
 
         let input_locked = !matches!(self.agent_state, AgentUiState::Idle);
         let cursor = match &mut self.bottom_pane {
@@ -2283,18 +2277,8 @@ fn format_turn_duration(d: Duration) -> String {
 /// that suit an agent harness.
 fn pick_run_verb(elapsed: Duration) -> &'static str {
     const VERBS: &[&str] = &[
-        "Brewed",
-        "Pondered",
-        "Mulled",
-        "Crunched",
-        "Cooked",
-        "Forged",
-        "Hammered",
-        "Stewed",
-        "Simmered",
-        "Worked",
-        "Reasoned",
-        "Drafted",
+        "Brewed", "Pondered", "Mulled", "Crunched", "Cooked", "Forged", "Hammered", "Stewed",
+        "Simmered", "Worked", "Reasoned", "Drafted",
     ];
     let idx = elapsed.subsec_nanos() as usize % VERBS.len();
     VERBS[idx]
@@ -2585,18 +2569,8 @@ mod tests {
         // nanos values that are co-prime with 12 will hit every
         // index over time — but here we just check membership.
         let known: &[&str] = &[
-            "Brewed",
-            "Pondered",
-            "Mulled",
-            "Crunched",
-            "Cooked",
-            "Forged",
-            "Hammered",
-            "Stewed",
-            "Simmered",
-            "Worked",
-            "Reasoned",
-            "Drafted",
+            "Brewed", "Pondered", "Mulled", "Crunched", "Cooked", "Forged", "Hammered", "Stewed",
+            "Simmered", "Worked", "Reasoned", "Drafted",
         ];
         for nanos in [0, 1, 7, 12, 100, 12_345_678, 999_999_999] {
             let d = Duration::new(0, nanos);
