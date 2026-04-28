@@ -20,8 +20,8 @@ this tracker owns landing status.
 | 02 | Per-turn compaction budget | Done (PRs A + B) | `1b16ffe` (counter + max_per_turn config + GiveUpReason::CompactionBudgetExhausted). PR C (mid-turn budget consultation) folded into 04 PR B. |
 | 03 | Agent-loop compaction signal | Done | `65248c1` (CompactionGate trait + AgentLoopConfig::with_compaction_gate; default off). |
 | 04 | Mid-turn compaction execution | Done (PRs A + B) | `a000ba4` (compact_messages_inline + estimate_message_tokens). `31adf29` (ControllerCompactionGate + build_agent integration). PR C (manual smoke + docs) deferred. |
-| 05 | Tool output caps scale with context | Pending | Workspace-wide trait change (Tool::execute signature + 9 tool impls); deferred to a fresh session. |
-| 06 | Compaction telemetry and visibility | Pending | Schema change to AgentEvent::CompactionStart/End ripples through TUI/log; deferred to a fresh session. |
+| 05 | Tool output caps scale with context | Done (PRs A–D) | `8f03142` (PR A: ToolExecutionContext through Tool::execute), `5a79ec6` (PR B: bash effective_tool_output_budget), `5fcbb53` (PR C: read), `4237baa` (PR D: web_read). The `[tools] context_share_for_output` config knob is deferred — share is hardcoded at 10 % for now; revisit if real workloads need a different ratio. |
+| 06 | Compaction telemetry and visibility | Done (PRs A–C) | `33f5116` (PR A: CompactionPhase enum + event plumbing), `16a8e1b` (PR B: CompactionStats counters + `/state` rendering), `31158e6` (PR C: TUI activity-row phase labels). PR D (`/compaction-stats` slash command) deferred — `/state` already surfaces the same data. Skipped-budget-exhausted SystemMessage breadcrumbs (plan §"Surfacing skipped compactions") covered by the existing reactive-budget message and the gate's `Skipped { reason }` pathway. |
 
 ## PR ordering
 
@@ -67,11 +67,11 @@ Targeted gates by plan:
 
 ## Milestone exit
 
-- [ ] Effective reserve scales for small windows.
-- [ ] Per-turn compaction budget enforced across all three trigger paths.
-- [ ] Agent-loop hook installed; mid-turn compaction fires when warranted.
-- [ ] Tool outputs shrink for small context windows.
-- [ ] Telemetry distinguishes pre-prompt / mid-turn / reactive.
+- [x] Effective reserve scales for small windows. (Plan 01 PR A)
+- [x] Per-turn compaction budget enforced across all three trigger paths. (Plan 02 PRs A + B; mid-turn budget consult folded into 04 PR B)
+- [x] Agent-loop hook installed; mid-turn compaction fires when warranted. (Plan 03; Plan 04 PRs A + B)
+- [x] Tool outputs shrink for small context windows. (Plan 05 PRs A–D, covers bash, read, web_read; other tools inherit via `ToolExecutionContext` and can opt in incrementally)
+- [x] Telemetry distinguishes pre-prompt / mid-turn / reactive. (Plan 06 PRs A–C)
 - [ ] Manual smoke of small-context Ollama coding task completes
-      with at least one mid-turn compaction observed.
-- [ ] No regression for cloud-model golden tests.
+      with at least one mid-turn compaction observed. (Deferred to next live-session smoke pass — code paths exercised by unit + integration tests across the workspace.)
+- [x] No regression for cloud-model golden tests. (Validated via `cargo test --workspace` + the `bash_tool_keeps_larger_budget_for_cloud_window` and `read_tool_keeps_full_output_for_cloud_window` regression guards.)
