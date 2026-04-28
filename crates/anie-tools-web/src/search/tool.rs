@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::{ContentBlock, ToolDef, ToolResult};
 
 use crate::error::WebToolError;
@@ -163,6 +163,7 @@ impl Tool for WebSearchTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<ToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let parsed: WebSearchArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_search args: {e}")))?;

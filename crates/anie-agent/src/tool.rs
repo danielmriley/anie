@@ -20,6 +20,40 @@ pub enum ValidatorState {
     Invalid(String),
 }
 
+/// Per-execution context handed to every `Tool::execute` call.
+/// Carries metadata the agent loop knows about the current
+/// invocation; tools ignore fields they don't care about.
+///
+/// Plan `docs/midturn_compaction_2026-04-27/05_tool_output_caps_scale_with_context.md`
+/// PR A: introduce the struct and thread it through. Output-
+/// scaling logic that consumes `context_window` lands in PR B+.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolExecutionContext {
+    /// Effective context window for the current model
+    /// (post-`/context-length`-override). Tools use this to
+    /// scale output budgets via
+    /// `effective_tool_output_budget`.
+    pub context_window: u64,
+}
+
+impl ToolExecutionContext {
+    /// Default-constructor for tests and callers that don't
+    /// participate in the agent loop's plumbing. The 200K
+    /// value is intentionally large so it's effectively a
+    /// no-op for any output budget that would otherwise
+    /// shrink on smaller windows — existing tool behavior is
+    /// preserved.
+    pub const TEST_DEFAULT: Self = Self {
+        context_window: 200_000,
+    };
+}
+
+impl Default for ToolExecutionContext {
+    fn default() -> Self {
+        Self::TEST_DEFAULT
+    }
+}
+
 /// Trait implemented by every tool.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -33,6 +67,7 @@ pub trait Tool: Send + Sync {
         args: serde_json::Value,
         cancel: CancellationToken,
         update_tx: Option<mpsc::Sender<ToolResult>>,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError>;
 }
 
@@ -162,6 +197,7 @@ mod tests {
             _args: serde_json::Value,
             _cancel: CancellationToken,
             _update_tx: Option<mpsc::Sender<ToolResult>>,
+            _ctx: &ToolExecutionContext,
         ) -> Result<ToolResult, ToolError> {
             unreachable!("tests do not exercise execution")
         }

@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::ToolDef;
 
 use crate::shared::{
@@ -62,6 +62,7 @@ impl Tool for ReadTool {
         args: serde_json::Value,
         _cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let path = required_string_arg(&args, "path")?;
         let offset = parse_optional_usize_arg(&args, "offset")?.unwrap_or(1);

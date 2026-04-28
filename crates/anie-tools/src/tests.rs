@@ -8,7 +8,10 @@ use tempfile::tempdir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionMode, ToolRegistry};
+use anie_agent::{
+    AgentLoop, AgentLoopConfig, Tool, ToolError, ToolExecutionContext, ToolExecutionMode,
+    ToolRegistry,
+};
 use anie_protocol::{
     AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
 };
@@ -127,6 +130,7 @@ async fn read_tool_reads_small_text_file() {
             serde_json::json!({ "path": "hello.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -149,6 +153,7 @@ async fn read_tool_supports_offset_and_limit() {
             serde_json::json!({ "path": "numbers.txt", "offset": 2, "limit": 2 }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -173,6 +178,7 @@ async fn read_tool_truncates_at_line_limit() {
             serde_json::json!({ "path": "many_lines.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -205,6 +211,7 @@ async fn read_tool_truncates_at_byte_limit() {
             serde_json::json!({ "path": "wide.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -233,6 +240,7 @@ async fn read_tool_detects_and_encodes_images() {
             serde_json::json!({ "path": "image.png" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("image read succeeds");
@@ -282,6 +290,7 @@ async fn read_tool_does_not_load_entire_large_text_file_for_small_limit() {
             serde_json::json!({ "path": "huge.log", "limit": 20 }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -330,6 +339,7 @@ async fn read_tool_caps_line_buffer_for_newline_less_file() {
             serde_json::json!({ "path": "oneline.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("read succeeds");
@@ -375,6 +385,7 @@ async fn read_tool_rejects_oversized_image_via_metadata() {
             serde_json::json!({ "path": "huge.png" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized image should reject");
@@ -397,6 +408,7 @@ async fn read_tool_returns_error_for_missing_file() {
             serde_json::json!({ "path": "missing.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("missing file should error");
@@ -415,6 +427,7 @@ async fn write_tool_creates_new_file() {
         serde_json::json!({ "path": "new.txt", "content": "hello" }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("write succeeds");
@@ -437,6 +450,7 @@ async fn write_tool_overwrites_existing_file() {
         serde_json::json!({ "path": "existing.txt", "content": "new" }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("write succeeds");
@@ -456,6 +470,7 @@ async fn write_tool_creates_parent_directories() {
         serde_json::json!({ "path": "nested/dir/file.txt", "content": "hello" }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("write succeeds");
@@ -479,6 +494,7 @@ async fn write_tool_honors_cancellation_before_write() {
             serde_json::json!({ "path": "cancelled.txt", "content": "hello" }),
             cancel,
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("cancelled write should fail");
@@ -528,6 +544,7 @@ async fn bash_tool_runs_simple_command() {
             serde_json::json!({ "command": "echo hello" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("command succeeds");
@@ -553,6 +570,7 @@ async fn bash_policy_blocks_denied_command_before_spawn() {
             serde_json::json!({ "command": "touch blocked.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("policy should block");
@@ -581,6 +599,7 @@ async fn bash_policy_blocks_denied_command_basename() {
             serde_json::json!({ "command": "/usr/bin/touch blocked.txt" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("policy should block");
@@ -609,6 +628,7 @@ async fn bash_policy_blocks_denied_regex_pattern() {
             serde_json::json!({ "command": "git push --force origin main" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("policy should block");
@@ -636,6 +656,7 @@ async fn bash_policy_disabled_does_not_block() {
             serde_json::json!({ "command": "echo allowed" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("disabled policy should not block");
@@ -654,6 +675,7 @@ async fn bash_tool_captures_multiline_output() {
             serde_json::json!({ "command": "printf 'a\\nb\\n'" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("command succeeds");
@@ -672,6 +694,7 @@ async fn bash_tool_propagates_exit_code_failures() {
             serde_json::json!({ "command": "echo fail && exit 7" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("command should fail");
@@ -692,6 +715,7 @@ async fn bash_tool_enforces_timeout() {
             serde_json::json!({ "command": "sleep 2", "timeout": 1 }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("command should time out");
@@ -710,6 +734,7 @@ async fn bash_tool_truncates_large_output() {
             serde_json::json!({ "command": "seq 1 3000" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("command succeeds");
@@ -728,6 +753,7 @@ async fn bash_tool_captures_stderr() {
             serde_json::json!({ "command": "echo err >&2 && exit 3" }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("command should fail");
@@ -751,6 +777,7 @@ async fn bash_tool_honors_cancellation() {
             serde_json::json!({ "command": "sleep 10" }),
             cancel_clone,
             None,
+            &ToolExecutionContext::default(),
         )
         .await
     });
@@ -859,6 +886,7 @@ async fn edit_tool_applies_exact_replacements_and_returns_diff() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect("edit succeeds");
@@ -893,6 +921,7 @@ async fn edit_tool_detects_duplicate_matches() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("duplicate match should fail");
@@ -922,6 +951,7 @@ async fn edit_tool_detects_overlapping_replacements() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("overlap should fail");
@@ -953,6 +983,7 @@ async fn edit_tool_rejects_too_many_edits_before_reading_file() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("too many edits should fail before reading");
@@ -981,6 +1012,7 @@ async fn edit_tool_rejects_oversized_old_text_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized oldText should fail before matching");
@@ -1009,6 +1041,7 @@ async fn edit_tool_rejects_oversized_new_text_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized newText should fail before matching");
@@ -1043,6 +1076,7 @@ async fn edit_tool_rejects_combined_argument_budget_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("combined edit budget should fail before matching");
@@ -1075,6 +1109,7 @@ async fn edit_tool_rejects_oversized_input_file_before_matching() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized input file should fail");
@@ -1111,6 +1146,7 @@ async fn edit_tool_rejects_oversized_output_and_preserves_original_file() {
             }),
             CancellationToken::new(),
             None,
+            &ToolExecutionContext::default(),
         )
         .await
         .expect_err("oversized output should fail");
@@ -1149,6 +1185,7 @@ async fn edit_tool_preserves_bom_and_crlf() {
         }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("edit succeeds");
@@ -1181,6 +1218,7 @@ async fn edit_tool_can_fuzzily_match_whitespace_runs() {
         }),
         CancellationToken::new(),
         None,
+        &ToolExecutionContext::default(),
     )
     .await
     .expect("fuzzy edit succeeds");

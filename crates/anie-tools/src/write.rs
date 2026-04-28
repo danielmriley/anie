@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::ToolDef;
 
 use crate::{
@@ -65,6 +65,7 @@ impl Tool for WriteTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let path = required_string_arg(&args, "path")?;
         let content = required_string_arg(&args, "content")?;

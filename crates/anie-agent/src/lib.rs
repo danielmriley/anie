@@ -9,7 +9,7 @@ pub use agent_loop::{
     AgentLoop, AgentLoopConfig, AgentRunResult, CompactionGate, CompactionGateOutcome,
     ToolExecutionMode, send_event,
 };
-pub use tool::{Tool, ToolError, ToolRegistry};
+pub use tool::{Tool, ToolError, ToolExecutionContext, ToolRegistry};
 
 #[cfg(test)]
 mod tests;

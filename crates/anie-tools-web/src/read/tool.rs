@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::{ContentBlock, ToolDef, ToolResult};
 
 use crate::error::WebToolError;
@@ -264,6 +264,7 @@ impl Tool for WebReadTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         update_tx: Option<mpsc::Sender<ToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let parsed: WebReadArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_read args: {e}")))?;

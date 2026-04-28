@@ -27,7 +27,7 @@ use crate::hooks::{
 };
 use crate::{
     AgentLoop, AgentLoopConfig, CompactionGate, CompactionGateOutcome, Tool, ToolError,
-    ToolExecutionMode, ToolRegistry,
+    ToolExecutionContext, ToolExecutionMode, ToolRegistry,
 };
 
 fn sample_model() -> Model {
@@ -201,6 +201,7 @@ impl Tool for TestTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         update_tx: Option<mpsc::Sender<ProtocolToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<ProtocolToolResult, ToolError> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         let _guard = ConcurrencyGuard::new(

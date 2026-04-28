@@ -200,6 +200,7 @@ use crate::ToolRegistry;
 use crate::hooks::{
     AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride,
 };
+use crate::tool::ToolExecutionContext;
 
 /// Agent-loop execution mode for tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1009,12 +1010,14 @@ impl AgentLoop {
             }
         });
 
+        let tool_ctx = self.tool_execution_context();
         let execution = tool
             .execute(
                 &tool_call.id,
                 tool_call.arguments.clone(),
                 cancel.child_token(),
                 Some(update_tx),
+                &tool_ctx,
             )
             .await;
         let _ = update_forwarder.await;
@@ -1044,6 +1047,20 @@ impl AgentLoop {
         .await;
 
         tool_result_message(&tool_call, result, is_error)
+    }
+
+    /// Build the per-execution tool context for this run.
+    ///
+    /// `context_window` honors a runtime `num_ctx` override
+    /// (set by `/context-length` for Ollama models) and falls
+    /// back to the catalog `Model::context_window`. Plan 05 of
+    /// `docs/midturn_compaction_2026-04-27/`.
+    fn tool_execution_context(&self) -> ToolExecutionContext {
+        let context_window = self
+            .config
+            .ollama_num_ctx_override
+            .unwrap_or(self.config.model.context_window);
+        ToolExecutionContext { context_window }
     }
 
     fn error_assistant_message(
@@ -1482,15 +1499,15 @@ mod tests {
         AssistantMessage, ContentBlock, Message, StopReason, ToolCall, Usage, UserMessage,
     };
     use anie_provider::{
-        CostPerMillion, Model, ModelCompat, ProviderError, RequestOptionsResolver,
-        ResolvedRequestOptions,
+        CostPerMillion, Model, ModelCompat, ProviderError, ProviderRegistry,
+        RequestOptionsResolver, ResolvedRequestOptions,
     };
     use async_trait::async_trait;
     use serde_json::json;
 
     use super::{
-        AgentLoopConfig, ToolExecutionMode, sanitize_assistant_for_request,
-        sanitize_context_for_request,
+        AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry,
+        sanitize_assistant_for_request, sanitize_context_for_request,
     };
 
     struct StaticResolver;
@@ -1549,6 +1566,33 @@ mod tests {
 
         assert_eq!(options.api_key.as_deref(), Some("key"));
         assert_eq!(options.num_ctx_override, Some(16_384));
+    }
+
+    /// Plan 05 PR A: with no override, the tool execution
+    /// context inherits the catalog `context_window`. The
+    /// override is the runtime knob (`/context-length`); it
+    /// wins when set so tools see the same effective window
+    /// as the provider.
+    #[test]
+    fn tool_execution_context_uses_model_context_window_without_override() {
+        let config = sample_agent_loop_config();
+        let agent_loop = AgentLoop::new(
+            Arc::new(ProviderRegistry::default()),
+            Arc::new(ToolRegistry::new()),
+            config,
+        );
+        assert_eq!(agent_loop.tool_execution_context().context_window, 32_768);
+    }
+
+    #[test]
+    fn tool_execution_context_uses_runtime_override_when_present() {
+        let config = sample_agent_loop_config().with_ollama_num_ctx_override(Some(8_192));
+        let agent_loop = AgentLoop::new(
+            Arc::new(ProviderRegistry::default()),
+            Arc::new(ToolRegistry::new()),
+            config,
+        );
+        assert_eq!(agent_loop.tool_execution_context().context_window, 8_192);
     }
 
     fn user_message(text: &str, timestamp: u64) -> Message {

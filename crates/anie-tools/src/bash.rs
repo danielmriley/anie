@@ -10,7 +10,7 @@ use regex::Regex;
 use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{Tool, ToolError};
+use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::ToolDef;
 
 use crate::shared::{
@@ -93,6 +93,7 @@ impl Tool for BashTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
+        _ctx: &ToolExecutionContext,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let command = required_string_arg(&args, "command")?;
         self.policy.check(command)?;
