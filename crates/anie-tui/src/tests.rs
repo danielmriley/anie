@@ -542,6 +542,136 @@ fn second_ctrl_c_while_active_quits() {
     ));
 }
 
+/// PR 1.2 of the active-input plan set. While the agent is
+/// streaming, ordinary printable keys must reach the input
+/// pane so the user can draft a follow-up. No `SubmitPrompt`
+/// is emitted yet — that's PR 2.1's queue work.
+#[test]
+fn active_streaming_accepts_text_input_without_submitting() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    for ch in "hello".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("char");
+    }
+
+    assert_eq!(app.input_pane_contents(), "hello");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "no UiAction should be emitted while drafting an active-state follow-up",
+    );
+}
+
+/// Same shape during tool execution.
+#[test]
+fn active_tool_execution_accepts_text_input_without_submitting() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+    app.handle_agent_event(AgentEvent::ToolExecStart {
+        call_id: "call-1".into(),
+        tool_name: "bash".into(),
+        args: serde_json::Value::Null,
+    })
+    .expect("tool start");
+
+    for ch in "draft".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("char");
+    }
+
+    assert_eq!(app.input_pane_contents(), "draft");
+    assert!(action_rx.try_recv().is_err());
+}
+
+/// Enter while active must not clear the draft and must not
+/// emit a `SubmitPrompt`. Plan 02 will turn this into a
+/// `QueuePrompt` action; until then, the draft is preserved
+/// and a system message explains the state.
+#[test]
+fn enter_while_active_preserves_draft_until_queue_feature_lands() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    for ch in "queued".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("char");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("enter");
+
+    assert_eq!(
+        app.input_pane_contents(),
+        "queued",
+        "active Enter must not clear the draft",
+    );
+    // No `SubmitPrompt` should leak out.
+    while let Ok(action) = action_rx.try_recv() {
+        assert!(
+            !matches!(action, crate::UiAction::SubmitPrompt(_)),
+            "active Enter must not emit SubmitPrompt before plan 02",
+        );
+    }
+}
+
+/// `Home`/`End` follow the idle rule: navigate within the
+/// draft when it has content, scroll the transcript when
+/// empty. Mirrors `handle_idle_key`.
+#[test]
+fn home_and_end_preserve_input_editing_when_active_draft_is_present() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    for ch in "world".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("char");
+    }
+    // Press Home — should move cursor to start of draft, not
+    // scroll the transcript.
+    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+        .expect("home");
+    // Insert a char at the new position; if Home navigated
+    // to col 0, the inserted char prepends.
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('!'),
+        KeyModifiers::NONE,
+    )))
+    .expect("char");
+
+    assert_eq!(
+        app.input_pane_contents(),
+        "!world",
+        "Home should have moved to the start of the draft, not scrolled the transcript",
+    );
+}
+
 #[test]
 fn ctrl_c_while_idle_quits_immediately() {
     let (_event_tx, event_rx) = mpsc::channel(8);

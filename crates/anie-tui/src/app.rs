@@ -1066,18 +1066,38 @@ impl App {
                 let _ = self.action_tx.send(UiAction::Quit);
                 RenderDirty::none()
             }
-            // Active state: Home/End scroll unconditionally —
-            // the editor is locked while the agent is running,
-            // so input-line navigation is irrelevant.
-            (KeyModifiers::NONE, KeyCode::Home) => {
+            // Home/End: same "empty draft scrolls; non-empty
+            // navigates" rule as idle so the user's mental
+            // model is consistent across states.
+            (KeyModifiers::NONE, KeyCode::Home) if self.input_pane.content().is_empty() => {
                 self.output_pane.scroll_to_top();
                 RenderDirty::full()
             }
-            (KeyModifiers::NONE, KeyCode::End) => {
+            (KeyModifiers::NONE, KeyCode::End) if self.input_pane.content().is_empty() => {
                 self.output_pane.scroll_to_bottom();
                 RenderDirty::full()
             }
-            _ => RenderDirty::none(),
+            // Enter while active: must NOT submit. Plan 02 of
+            // `docs/active_input_2026-04-27/` will introduce a
+            // queued-prompt action; until then, intercepting
+            // Enter here keeps `InputPane::submit()` from
+            // clearing the draft (it does that unconditionally
+            // when invoked).
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                if !self.input_pane.content().is_empty() {
+                    self.output_pane.add_system_message(
+                        "Agent is still working. Your draft is preserved; wait for the run to \
+                         finish or press Ctrl+C to abort."
+                            .to_string(),
+                    );
+                }
+                RenderDirty::full()
+            }
+            // Everything else routes through the editor so the
+            // user can draft a follow-up while the agent runs.
+            // `handle_editor_key` returns `InputAction::Submit`
+            // only on Enter, which we already intercepted above.
+            _ => self.handle_editor_key(key),
         }
     }
 

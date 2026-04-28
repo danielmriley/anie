@@ -9,7 +9,7 @@ Status key:
 
 | Plan | Status | Notes |
 |---|---:|---|
-| 01 — Editable active draft | ⬜ | TUI-only minimum fix; lets users type while the agent runs. |
+| 01 — Editable active draft | ✅ | Landed `<TBD>` (2026-04-27). PR A only; PR B (border styling cleanup) deferred. Four tests pin the behavior. |
 | 02 — Queued follow-up prompts | ⬜ | Enter while active queues FIFO prompts after current run. |
 | 03 — Interrupt-and-send affordance | ⬜ | Explicit abort + send drafted correction. |
 
