@@ -14,7 +14,7 @@ Status key:
 | 03 — Web SSRF and redirect boundary | ⬜ | Security-critical web-tool hardening. |
 | 04 — Web cancellation, budgets, and bounded side channels | ⬜ | Keep timeout policy configurable/persistent-agent friendly. |
 | 05 — Streaming built-in read path | ⬜ | Memory/resource hardening for large text files. |
-| 06 — Ollama effective `num_ctx` error messaging | ✅ | Landed `<TBD>` (2026-04-27). One-line call-site fix in the give-up handler + targeted regression test. |
+| 06 — Ollama effective `num_ctx` error messaging | ✅ | Landed `13f2dda` (2026-04-27). One-line call-site fix in the give-up handler + targeted regression test. |
 | 07 — robots.txt and Defuddle extraction correctness | ⬜ | Standards/extraction polish. |
 | 08 — Atomic-write durability clarification | ⬜ | Low-risk durability/doc cleanup. |
 
