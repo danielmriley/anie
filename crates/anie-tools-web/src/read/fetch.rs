@@ -299,11 +299,20 @@ impl Default for FetchOptions {
 
 /// Build a `reqwest::Client` with sane defaults for the web
 /// tools. Reused across calls for connection pooling.
+///
+/// Redirects are disabled at the reqwest layer
+/// (`Policy::none()`) so `fetch_html` can validate every
+/// redirect target against `validate_url` before issuing the
+/// next request. `Policy::limited` would let `reqwest` follow
+/// a 302 to `http://127.0.0.1` before anie ever saw the
+/// `Location` header — exactly the SSRF bypass the manual
+/// redirect loop in `fetch_html` is designed to prevent.
+/// PR 3.1 of `docs/code_review_2026-04-27/`.
 pub fn build_client(opts: &FetchOptions) -> Result<reqwest::Client, WebToolError> {
     reqwest::Client::builder()
         .timeout(opts.timeout)
         .user_agent(&opts.user_agent)
-        .redirect(reqwest::redirect::Policy::limited(opts.max_redirects))
+        .redirect(reqwest::redirect::Policy::none())
         .gzip(true)
         .brotli(true)
         .build()
@@ -314,16 +323,69 @@ pub fn build_client(opts: &FetchOptions) -> Result<reqwest::Client, WebToolError
 /// Streams the response and bails the moment the byte counter
 /// exceeds the cap, so a hostile server claiming a small
 /// `Content-Length` then streaming gigabytes can't OOM us.
+///
+/// Manual redirect handling — `build_client` disables
+/// `reqwest`'s automatic redirects so this function can call
+/// `validate_url` on every `Location` target before sending
+/// the next request. Without manual handling, a server could
+/// 302 us into `http://127.0.0.1/admin` and `reqwest` would
+/// happily follow before anie's SSRF guard had a chance to
+/// run. PR 3.1 of `docs/code_review_2026-04-27/`.
 pub async fn fetch_html(
     client: &reqwest::Client,
     url: &Url,
     opts: &FetchOptions,
 ) -> Result<String, WebToolError> {
-    let response = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|e| WebToolError::Fetch(e.to_string()))?;
+    let mut current = url.clone();
+    let mut hops = 0usize;
+    let response = loop {
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| WebToolError::Fetch(e.to_string()))?;
+
+        let status = response.status();
+        if !status.is_redirection() {
+            break response;
+        }
+
+        if hops >= opts.max_redirects {
+            return Err(WebToolError::Fetch(format!(
+                "exceeded max_redirects ({}) following {url}",
+                opts.max_redirects,
+            )));
+        }
+        hops += 1;
+
+        let Some(location) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            // 3xx without Location is malformed — surface as
+            // an HTTP error like any other unsuccessful
+            // status. Drain the body for the excerpt.
+            let body = response.text().await.unwrap_or_default();
+            return Err(WebToolError::HttpStatus {
+                code: status.as_u16(),
+                body_excerpt: WebToolError::truncate_excerpt(&body),
+            });
+        };
+
+        // Resolve relative redirects against the current URL.
+        let next = current
+            .join(location)
+            .map_err(|e| WebToolError::Fetch(format!("redirect target invalid: {e}")))?;
+
+        // Validate the next target with the same SSRF rules
+        // as the initial URL. The body of the redirect
+        // response is intentionally dropped — its content
+        // doesn't matter once we've classified the
+        // destination.
+        let _ = response;
+        current = validate_url(next.as_str(), opts.allow_private_ips)?;
+    };
 
     let status = response.status();
     if !status.is_success() {
@@ -335,8 +397,10 @@ pub async fn fetch_html(
         });
     }
 
-    // Re-check host privacy after redirects: if the server
-    // redirected to a private host, refuse.
+    // Defense in depth: even though every URL in the chain
+    // was validated against `allow_private_ips`, double-check
+    // the final response's host. Catches any future regression
+    // where the redirect loop accepts a target it shouldn't.
     if !opts.allow_private_ips
         && let Some(final_host) = response.url().host_str()
         && host_str_is_private(final_host)
