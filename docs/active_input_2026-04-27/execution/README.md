@@ -10,7 +10,7 @@ Status key:
 | Plan | Status | Notes |
 |---|---:|---|
 | 01 — Editable active draft | ✅ | Landed `<TBD>` (2026-04-27). PR A only; PR B (border styling cleanup) deferred. Four tests pin the behavior. |
-| 02 — Queued follow-up prompts | ⬜ | Enter while active queues FIFO prompts after current run. |
+| 02 — Queued follow-up prompts | ✅ | Plan landed across four PRs (2.1–2.4) on 2026-04-27. Visibility messages emit on queue + drain; queue overrides stale retries. Persistence to disk explicitly deferred per plan. |
 | 03 — Interrupt-and-send affordance | ⬜ | Explicit abort + send drafted correction. |
 
 ## Validation checklist

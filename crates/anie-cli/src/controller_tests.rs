@@ -681,6 +681,42 @@ async fn queue_prompt_appends_to_fifo_queue_while_active() {
     assert!(acks[1].contains("#2"), "second ack: {}", acks[1]);
 }
 
+/// PR 2.4 of `docs/active_input_2026-04-27/`. The
+/// run-completion drain emits "Starting queued follow-up: …"
+/// before invoking `start_prompt_run`, so users can tell when
+/// the next queued prompt is actually beginning rather than
+/// guessing from a fresh prompt prefix in the transcript.
+#[tokio::test]
+async fn drain_queued_prompt_emits_starting_system_message() {
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Pre-load the queue. `try_drain_queued_prompt` will pop
+    // the front entry and call `start_prompt_run`, which fails
+    // in this minimal harness (no provider registered) — but
+    // the system message must have already been emitted before
+    // the failed start, so the assertion still holds.
+    controller
+        .queued_prompts
+        .push_back("explain the architecture".into());
+
+    let _ = controller.try_drain_queued_prompt().await;
+
+    let mut saw_starting_message = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event
+            && text.starts_with("Starting queued follow-up:")
+        {
+            assert!(text.contains("explain the architecture"));
+            saw_starting_message = true;
+        }
+    }
+    assert!(
+        saw_starting_message,
+        "drain must surface a 'Starting queued follow-up' system message",
+    );
+}
+
 /// PR 2.3 of `docs/active_input_2026-04-27/`. When a
 /// `UiAction::QueuePrompt` arrives while a transient retry is
 /// armed, the controller cancels the retry and routes the
