@@ -42,6 +42,23 @@ pub const DEFAULT_RATE_LIMIT_BURST: u32 = 5;
 /// hanging page doesn't pin the agent indefinitely.
 pub const DEFAULT_HEADLESS_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum bytes captured from a non-2xx response body before
+/// truncation. The body is only used for the agent-visible
+/// excerpt in [`WebToolError::HttpStatus`], so capping at
+/// 256 KiB still gives any reasonable error page room while
+/// keeping a misbehaving server from streaming megabytes into
+/// memory just because it returned a 500. PR 4.2 of
+/// `docs/code_review_2026-04-27/`.
+pub const DEFAULT_MAX_ERROR_BODY_BYTES: usize = 256 * 1024;
+
+/// Maximum bytes consumed from a `robots.txt` response. RFC
+/// 9309 Section 2.5 suggests 500 KiB as a parser limit; we go
+/// slightly higher (512 KiB) to match. A robots.txt larger
+/// than this is treated as unavailable rather than parsed —
+/// almost certainly the server returning an HTML error page
+/// or a malicious endpoint trying to OOM us.
+pub const DEFAULT_MAX_ROBOTS_BYTES: usize = 512 * 1024;
+
 // --------------------------------------------------------------
 // URL validation + SSRF guard.
 // --------------------------------------------------------------
@@ -338,8 +355,96 @@ async fn fetch_robots_for(client: &reqwest::Client, url: &Url) -> Option<Robot> 
     if !response.status().is_success() {
         return None;
     }
-    let body = response.bytes().await.ok()?;
+    // Bound the read. A robots.txt larger than the cap is
+    // treated as unavailable rather than truncated-and-parsed
+    // — silently parsing a partial file could miss a
+    // `Disallow:` directive at the bottom and we'd let the
+    // crawl through a path the operator forbade. Better to
+    // fail closed (no robots data → permissive evaluation
+    // already in `RobotsCache::evaluate`) than partially
+    // open. PR 4.2 of `docs/code_review_2026-04-27/`.
+    let (body, overflowed) = collect_bounded_body(response, DEFAULT_MAX_ROBOTS_BYTES)
+        .await
+        .ok()?;
+    if overflowed {
+        tracing::warn!(
+            url = %robots_url,
+            cap = DEFAULT_MAX_ROBOTS_BYTES,
+            "robots.txt exceeds cap; treating as unavailable"
+        );
+        return None;
+    }
     Robot::new("*", &body).ok()
+}
+
+/// Drain a non-2xx response body into a UTF-8 string, capped
+/// at [`DEFAULT_MAX_ERROR_BODY_BYTES`]. Honors `cancel` between
+/// chunks. Used by `fetch_html` to build the excerpt carried in
+/// [`WebToolError::HttpStatus`] without giving a misbehaving
+/// server an OOM vector via the error path.
+async fn bounded_text_for_error(
+    response: reqwest::Response,
+    cancel: &CancellationToken,
+) -> Result<String, WebToolError> {
+    use futures::stream::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut stream = response.bytes_stream();
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            n = stream.next() => n,
+        };
+        let Some(chunk) = next else { break };
+        // Drain failures here are best-effort: the response is
+        // already a non-success and we just want an excerpt.
+        // Treat a stream error as end-of-body rather than a
+        // hard fetch error.
+        let Ok(chunk) = chunk else { break };
+        let remaining = DEFAULT_MAX_ERROR_BODY_BYTES.saturating_sub(buf.len());
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            overflowed = true;
+        } else if !overflowed {
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if overflowed {
+        text.push_str("\n…[truncated]");
+    }
+    Ok(text)
+}
+
+/// Stream a response body into a `Vec<u8>`, capped at `cap`
+/// bytes. Returns `(body, overflowed)` — `overflowed == true`
+/// means the source produced more bytes than `cap` and only
+/// the first `cap` bytes were kept. The underlying stream is
+/// drained to completion either way, so the connection is
+/// returned to the pool cleanly. PR 4.2 of
+/// `docs/code_review_2026-04-27/`.
+async fn collect_bounded_body(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<(Vec<u8>, bool), WebToolError> {
+    use futures::stream::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| WebToolError::Fetch(e.to_string()))?;
+        let remaining = cap.saturating_sub(buf.len());
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            overflowed = true;
+            // Keep draining so the pipe doesn't backpressure
+            // a server that's still streaming. Subsequent
+            // chunks are dropped.
+        } else if !overflowed {
+            buf.extend_from_slice(&chunk);
+        }
+    }
+    Ok((buf, overflowed))
 }
 
 // --------------------------------------------------------------
@@ -509,8 +614,9 @@ pub async fn fetch_html(
         else {
             // 3xx without Location is malformed — surface as
             // an HTTP error like any other unsuccessful
-            // status. Drain the body for the excerpt.
-            let body = response.text().await.unwrap_or_default();
+            // status. Drain a bounded excerpt of the body for
+            // the agent.
+            let body = bounded_text_for_error(response, cancel).await?;
             return Err(WebToolError::HttpStatus {
                 code: status.as_u16(),
                 body_excerpt: WebToolError::truncate_excerpt(&body),
@@ -538,10 +644,11 @@ pub async fn fetch_html(
     let status = response.status();
     if !status.is_success() {
         // Try to capture a body excerpt for the agent to see.
-        let body = tokio::select! {
-            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
-            r = response.text() => r.unwrap_or_default(),
-        };
+        // Bounded so a hostile server returning a 500 + 50 MiB
+        // body can't OOM us via the error path. The displayed
+        // excerpt is then further trimmed by `truncate_excerpt`
+        // for the agent.
+        let body = bounded_text_for_error(response, cancel).await?;
         return Err(WebToolError::HttpStatus {
             code: status.as_u16(),
             body_excerpt: WebToolError::truncate_excerpt(&body),
@@ -880,6 +987,32 @@ mod tests {
         validate_destination(&url, &PanicResolver, false)
             .await
             .expect("IP literal: no DNS step");
+    }
+
+    /// PR 4.2 of `docs/code_review_2026-04-27/`. A
+    /// `bytes_stream` consumer must keep memory bounded even
+    /// when the response is many times larger than the cap.
+    #[tokio::test]
+    async fn collect_bounded_body_caps_at_size() {
+        // Build a fake server returning a 4 MiB body.
+        use httpmock::Method::GET;
+        use httpmock::MockServer;
+
+        let server = MockServer::start_async().await;
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/big");
+                then.status(200).body(big);
+            })
+            .await;
+
+        let response = reqwest::get(format!("{}/big", server.base_url()))
+            .await
+            .expect("get");
+        let (buf, overflowed) = collect_bounded_body(response, 64 * 1024).await.expect("ok");
+        assert_eq!(buf.len(), 64 * 1024);
+        assert!(overflowed);
     }
 
     #[tokio::test]

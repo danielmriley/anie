@@ -460,3 +460,48 @@ async fn fetch_allows_hostname_resolving_to_public_ip() {
         panic!("public IP must not be flagged as private: {msg}");
     }
 }
+
+/// PR 4.2 of `docs/code_review_2026-04-27/`. A non-2xx
+/// response with a multi-megabyte body must not allocate the
+/// entire body into memory just to derive a small excerpt.
+/// `bounded_text_for_error` caps captured bytes at
+/// `DEFAULT_MAX_ERROR_BODY_BYTES` (256 KiB); this test pins
+/// that the surfaced `HttpStatus` excerpt is bounded — a
+/// marker placed at the very end of a 4 MiB body must NOT
+/// appear, proving the body wasn't drained wholesale.
+#[tokio::test]
+async fn fetch_caps_huge_error_body() {
+    let server = MockServer::start_async().await;
+    let mut big = "x".repeat(4 * 1024 * 1024);
+    big.push_str("END_OF_BODY_MARKER");
+    server
+        .mock_async(|when, then| {
+            when.method(GET).path("/oops");
+            then.status(500).body(big);
+        })
+        .await;
+
+    let url = Url::parse(&format!("{}/oops", server.base_url())).unwrap();
+    let opts = opts_for_test(true);
+    let client = build_client(&opts).expect("build client");
+    let resolver = system_resolver();
+    let err = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        WebToolError::HttpStatus { code, body_excerpt } => {
+            assert_eq!(code, 500);
+            assert!(
+                !body_excerpt.contains("END_OF_BODY_MARKER"),
+                "marker at the end of a 4 MiB body must not appear in the bounded excerpt"
+            );
+        }
+        other => panic!("expected HttpStatus, got: {other:?}"),
+    }
+}

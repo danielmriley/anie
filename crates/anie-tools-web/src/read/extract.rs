@@ -42,6 +42,20 @@ use crate::error::WebToolError;
 /// stdin-pipe CLI shape and no longer work.
 pub const DEFUDDLE_VERSION: &str = "0.18.x";
 
+/// Maximum bytes captured from Defuddle's stdout. Cleaned
+/// markdown output for a typical article fits in tens of KiB;
+/// 1 MiB leaves headroom for unusually long documents while
+/// keeping a runaway / malicious page from filling memory via
+/// the subprocess pipe. PR 4.2 of `docs/code_review_2026-04-27/`.
+pub const DEFAULT_MAX_DEFUDDLE_STDOUT_BYTES: usize = 1024 * 1024;
+
+/// Maximum bytes captured from Defuddle's stderr. Stderr is
+/// only used for the exit-code error message; if Defuddle is
+/// flooding stderr it's misbehaving and we want a typed error
+/// rather than an OOM. 256 KiB is generous for any sensible
+/// stderr payload.
+pub const DEFAULT_MAX_DEFUDDLE_STDERR_BYTES: usize = 256 * 1024;
+
 /// Defuddle's JSON output. Optional fields use
 /// `#[serde(default)]` so a Defuddle release that adds or
 /// drops a field doesn't break parsing. Field names follow
@@ -188,16 +202,12 @@ impl DefuddleRunner for SubprocessDefuddleRunner {
             .ok_or_else(|| WebToolError::DefuddleSpawn("missing stderr pipe".into()))?;
 
         let stdout_task = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
             let mut reader = stdout;
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.map(|_| buf)
+            read_to_end_bounded(&mut reader, DEFAULT_MAX_DEFUDDLE_STDOUT_BYTES).await
         });
         let stderr_task = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
             let mut reader = stderr;
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).await.map(|_| buf)
+            read_to_end_bounded(&mut reader, DEFAULT_MAX_DEFUDDLE_STDERR_BYTES).await
         });
 
         let status = tokio::select! {
@@ -214,11 +224,11 @@ impl DefuddleRunner for SubprocessDefuddleRunner {
             res = child.wait() => res?,
         };
 
-        let stdout_buf = stdout_task
+        let (stdout_buf, stdout_overflowed) = stdout_task
             .await
             .map_err(|e| WebToolError::DefuddleSpawn(format!("stdout reader join: {e}")))?
             .map_err(|e| WebToolError::DefuddleSpawn(format!("stdout read: {e}")))?;
-        let stderr_buf = stderr_task
+        let (stderr_buf, stderr_overflowed) = stderr_task
             .await
             .map_err(|e| WebToolError::DefuddleSpawn(format!("stderr reader join: {e}")))?
             .map_err(|e| WebToolError::DefuddleSpawn(format!("stderr read: {e}")))?;
@@ -227,13 +237,64 @@ impl DefuddleRunner for SubprocessDefuddleRunner {
         drop(tmp);
 
         if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+            let mut stderr_text = String::from_utf8_lossy(&stderr_buf).to_string();
+            if stderr_overflowed {
+                stderr_text.push_str("\n…[truncated]");
+            }
             return Err(WebToolError::DefuddleFailed {
                 exit_code: status.code(),
-                stderr,
+                stderr: stderr_text,
+            });
+        }
+
+        // PR 4.2 of `docs/code_review_2026-04-27/`: a
+        // success exit with overflowed stdout means we
+        // truncated valid JSON. The truncated bytes will not
+        // round-trip through `parse_defuddle_output`, but
+        // surface a typed error explaining *why* parsing
+        // would fail rather than letting the agent see a
+        // confusing "expected `,` or `}`" deserializer
+        // message.
+        if stdout_overflowed {
+            return Err(WebToolError::DefuddleFailed {
+                exit_code: status.code(),
+                stderr: format!(
+                    "defuddle stdout exceeded {DEFAULT_MAX_DEFUDDLE_STDOUT_BYTES} bytes; output truncated and unparseable"
+                ),
             });
         }
         parse_defuddle_output(&stdout_buf)
+    }
+}
+
+/// Read `reader` to EOF, accumulating up to `cap` bytes and
+/// silently discarding any beyond. Returns `(buf, overflowed)`.
+/// Drains the underlying pipe even after the cap is hit so the
+/// child process can finish writing without backpressure
+/// stalling its exit. PR 4.2 of `docs/code_review_2026-04-27/`.
+async fn read_to_end_bounded<R>(reader: &mut R, cap: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok((buf, overflowed));
+        }
+        let remaining = cap.saturating_sub(buf.len());
+        if n > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            overflowed = true;
+        } else if !overflowed {
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        // After overflow, we keep reading but drop bytes — the
+        // pipe must continue draining or the child blocks on
+        // write and never exits.
     }
 }
 
@@ -359,5 +420,30 @@ mod tests {
             ..DefuddleOutput::default()
         };
         assert_eq!(out.markdown_body(), "# Heading\n\nBody.");
+    }
+
+    /// PR 4.2 of `docs/code_review_2026-04-27/`. The bounded
+    /// reader keeps at most `cap` bytes in memory and reports
+    /// `overflowed = true` when the source produced more,
+    /// while still draining the rest of the source so the
+    /// underlying pipe doesn't backpressure the writer.
+    #[tokio::test]
+    async fn read_to_end_bounded_caps_at_size() {
+        // 8 KiB source, 4 KiB cap.
+        let source: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
+        let mut reader = std::io::Cursor::new(source.clone());
+        let (buf, overflowed) = read_to_end_bounded(&mut reader, 4 * 1024).await.unwrap();
+        assert_eq!(buf.len(), 4 * 1024);
+        assert!(overflowed);
+        assert_eq!(&buf[..], &source[..4 * 1024]);
+    }
+
+    #[tokio::test]
+    async fn read_to_end_bounded_returns_full_buffer_when_under_cap() {
+        let source = b"short payload".to_vec();
+        let mut reader = std::io::Cursor::new(source.clone());
+        let (buf, overflowed) = read_to_end_bounded(&mut reader, 1024).await.unwrap();
+        assert_eq!(buf, source);
+        assert!(!overflowed);
     }
 }
