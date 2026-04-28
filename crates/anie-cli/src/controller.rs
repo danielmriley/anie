@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -65,6 +65,13 @@ pub(crate) struct InteractiveController {
     pending_retry: PendingRetry,
     quitting: bool,
     exit_after_run: bool,
+    /// FIFO queue of follow-up prompts the user submitted while
+    /// a run was active. Drained one-at-a-time at the run-
+    /// completion boundary in the main loop. Plan 02 of
+    /// `docs/active_input_2026-04-27/`. Persisted in memory only
+    /// — if anie crashes mid-queue the unstarted prompts are
+    /// lost; that's the documented trade-off in the plan.
+    queued_prompts: VecDeque<String>,
 }
 
 struct CurrentRun {
@@ -121,7 +128,29 @@ impl InteractiveController {
             pending_retry: PendingRetry::Idle,
             quitting: false,
             exit_after_run,
+            queued_prompts: VecDeque::new(),
         }
+    }
+
+    /// Drain the next queued follow-up prompt, if any, and start
+    /// it as a new run. Called at the run-completion boundary in
+    /// the main loop after `finish_run` has persisted the just-
+    /// completed run's messages — this preserves session order
+    /// (current run's assistant content lands before the queued
+    /// user prompt). Returns `true` if a prompt was started.
+    async fn try_drain_queued_prompt(&mut self) -> Result<bool> {
+        let Some(text) = self.queued_prompts.pop_front() else {
+            return Ok(false);
+        };
+        let preview: String = text.lines().next().unwrap_or("").chars().take(80).collect();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::SystemMessage {
+                text: format!("Starting queued follow-up: {preview}"),
+            })
+            .await;
+        self.start_prompt_run(text).await?;
+        Ok(true)
     }
 
     pub(crate) async fn run(mut self) -> Result<()> {
@@ -242,9 +271,25 @@ impl InteractiveController {
                                 }).await;
                             }
                         }
+                        // Drain the next queued follow-up
+                        // (plan 02 of active_input). Done
+                        // *after* the just-completed run's
+                        // messages were persisted by
+                        // `finish_run` so session order is
+                        // current-assistant → queued-user.
+                        // Skipped when a transient retry is
+                        // armed; PR 2.3 will give queued
+                        // prompts priority over stale retries.
+                        if self.current_run.is_none()
+                            && matches!(self.pending_retry, PendingRetry::Idle)
+                        {
+                            self.try_drain_queued_prompt().await?;
+                        }
+
                         if self.exit_after_run
                             && self.current_run.is_none()
                             && matches!(self.pending_retry, PendingRetry::Idle)
+                            && self.queued_prompts.is_empty()
                         {
                             self.quitting = true;
                         }
@@ -330,21 +375,23 @@ impl InteractiveController {
                 }
             }
             UiAction::QueuePrompt(text) => {
-                // PR 2.1 of `docs/active_input_2026-04-27/`. The
-                // TUI emits this action when the user presses
-                // Enter on a non-empty draft while the agent is
-                // active. The controller-side FIFO queue +
-                // post-run drain land in PR 2.2; until then we
-                // surface a clear acknowledgement so the user
-                // doesn't think their input vanished. Idle
-                // queues currently start the prompt directly.
+                // Plan 02 of `docs/active_input_2026-04-27/`.
+                // While a run is active, push onto the FIFO
+                // queue; the main loop drains it after each
+                // run completes. While idle, start the prompt
+                // immediately (matches the SubmitPrompt shape
+                // for callers that emit QueuePrompt
+                // unconditionally).
                 if self.current_run.is_some() {
+                    let preview: String =
+                        text.lines().next().unwrap_or("").chars().take(80).collect();
+                    self.queued_prompts.push_back(text);
+                    let position = self.queued_prompts.len();
                     let _ = self
                         .event_tx
                         .send(AgentEvent::SystemMessage {
                             text: format!(
-                                "Queued follow-up: {}\n(Queue execution lands in PR 2.2; for now the draft is acknowledged.)",
-                                text.lines().next().unwrap_or("").chars().take(80).collect::<String>(),
+                                "Queued follow-up #{position}: {preview} (will run after the current response)",
                             ),
                         })
                         .await;

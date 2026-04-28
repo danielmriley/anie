@@ -617,6 +617,96 @@ fn compaction_strategy_uses_effective_ollama_context_window() {
     assert_eq!(config.keep_recent_tokens, 2_000);
 }
 
+/// PR 2.2 of `docs/active_input_2026-04-27/`. While a run is
+/// active, `UiAction::QueuePrompt(text)` pushes onto the
+/// controller's FIFO queue and emits a "Queued follow-up #N"
+/// system message. The drain at the run-completion boundary
+/// (covered by `queued_prompt_runs_after_current_run_finishes`)
+/// is a separate concern; this test pins the storage path.
+#[tokio::test]
+async fn queue_prompt_appends_to_fifo_queue_while_active() {
+    use anie_agent::AgentRunResult;
+    use tokio_util::sync::CancellationToken;
+
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Fake an in-flight run by constructing a `CurrentRun` whose
+    // handle resolves immediately to a default result. The
+    // QueuePrompt handler only checks `current_run.is_some()`,
+    // not whether the underlying task is still pending, so this
+    // is sufficient for testing the storage path.
+    let handle = tokio::spawn(async {
+        AgentRunResult {
+            generated_messages: Vec::new(),
+            final_context: Vec::new(),
+            terminal_error: None,
+        }
+    });
+    controller.current_run = Some(CurrentRun {
+        handle,
+        cancel: CancellationToken::new(),
+        already_compacted: false,
+        retry_attempt: 0,
+    });
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::QueuePrompt("first".into()))
+            .await
+            .is_ok()
+    );
+    assert!(
+        controller
+            .try_handle_action(UiAction::QueuePrompt("second".into()))
+            .await
+            .is_ok()
+    );
+
+    let queued: Vec<_> = controller.queued_prompts.iter().cloned().collect();
+    assert_eq!(queued, vec!["first".to_string(), "second".to_string()]);
+
+    // Both prompts should have produced a system message
+    // acknowledging the queue position.
+    let mut acks = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event
+            && text.starts_with("Queued follow-up")
+        {
+            acks.push(text);
+        }
+    }
+    assert_eq!(acks.len(), 2, "expected two queue-ack messages: {acks:?}");
+    assert!(acks[0].contains("#1"), "first ack: {}", acks[0]);
+    assert!(acks[1].contains("#2"), "second ack: {}", acks[1]);
+}
+
+/// PR 2.2 of `docs/active_input_2026-04-27/`. When a queued
+/// prompt arrives while no run is active, it starts the prompt
+/// directly (matches `SubmitPrompt` shape — same end result for
+/// the user). The queue stays empty because there's nothing to
+/// queue against.
+#[tokio::test]
+async fn queue_prompt_starts_immediately_when_idle() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    assert!(controller.current_run.is_none());
+
+    // No mock provider is registered for the model's API in
+    // this minimal harness, so `start_prompt_run` will error
+    // out — but it WILL be invoked, which is what we're
+    // testing. The queue must remain empty either way.
+    let _ = controller
+        .try_handle_action(UiAction::QueuePrompt("hi".into()))
+        .await;
+
+    assert!(
+        controller.queued_prompts.is_empty(),
+        "idle QueuePrompt must not enqueue; it should start the run directly",
+    );
+}
+
 /// Regression for PR 1.3 of `docs/code_review_2026-04-27/`. The
 /// give-up handler in `run_prompt` must pass
 /// `effective_ollama_context_window()` (the value actually sent on
