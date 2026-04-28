@@ -220,8 +220,16 @@ pub enum AgentUiState {
 /// Actions emitted from the TUI to the controller layer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
-    /// Submit a user prompt.
+    /// Submit a user prompt. Used by idle Enter, the print/RPC
+    /// paths, and any caller that wants "start now if possible,
+    /// reject otherwise."
     SubmitPrompt(String),
+    /// Queue a follow-up prompt to run after the current run
+    /// finishes. Used by active-state Enter so a draft typed
+    /// while the agent is responding survives across the
+    /// run-boundary instead of racing the active run. Plan 02
+    /// of `docs/active_input_2026-04-27/`.
+    QueuePrompt(String),
     /// Abort the active run.
     Abort,
     /// Quit the app.
@@ -1077,21 +1085,33 @@ impl App {
                 self.output_pane.scroll_to_bottom();
                 RenderDirty::full()
             }
-            // Enter while active: must NOT submit. Plan 02 of
-            // `docs/active_input_2026-04-27/` will introduce a
-            // queued-prompt action; until then, intercepting
-            // Enter here keeps `InputPane::submit()` from
-            // clearing the draft (it does that unconditionally
-            // when invoked).
+            // Enter while active: queue the draft for FIFO
+            // execution after the current run completes. The
+            // controller-side queue (plan 02 PR B) drains
+            // queued prompts at safe boundaries. Slash drafts
+            // route through the existing slash-command path
+            // so commands like `/clear` keep their TUI-local
+            // dispatch and run-affecting commands keep their
+            // active-state guards.
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                if !self.input_pane.content().is_empty() {
-                    self.output_pane.add_system_message(
-                        "Agent is still working. Your draft is preserved; wait for the run to \
-                         finish or press Ctrl+C to abort."
-                            .to_string(),
-                    );
+                let draft = self.input_pane.content().to_string();
+                if draft.is_empty() {
+                    RenderDirty::none()
+                } else if draft.trim_start().starts_with('/') {
+                    // Slash commands continue to dispatch
+                    // immediately. The slash handler clears
+                    // the buffer when appropriate.
+                    self.handle_editor_key(key)
+                } else {
+                    // Queue as a follow-up prompt. Clear the
+                    // draft only after sending the action so
+                    // a send-failure (channel closed) leaves
+                    // the user's text intact.
+                    if self.action_tx.send(UiAction::QueuePrompt(draft)).is_ok() {
+                        self.input_pane.clear();
+                    }
+                    RenderDirty::composer()
                 }
-                RenderDirty::full()
             }
             // Everything else routes through the editor so the
             // user can draft a follow-up while the agent runs.

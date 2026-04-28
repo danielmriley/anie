@@ -329,6 +329,29 @@ impl InteractiveController {
                     self.start_prompt_run(text).await?;
                 }
             }
+            UiAction::QueuePrompt(text) => {
+                // PR 2.1 of `docs/active_input_2026-04-27/`. The
+                // TUI emits this action when the user presses
+                // Enter on a non-empty draft while the agent is
+                // active. The controller-side FIFO queue +
+                // post-run drain land in PR 2.2; until then we
+                // surface a clear acknowledgement so the user
+                // doesn't think their input vanished. Idle
+                // queues currently start the prompt directly.
+                if self.current_run.is_some() {
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::SystemMessage {
+                            text: format!(
+                                "Queued follow-up: {}\n(Queue execution lands in PR 2.2; for now the draft is acknowledged.)",
+                                text.lines().next().unwrap_or("").chars().take(80).collect::<String>(),
+                            ),
+                        })
+                        .await;
+                } else {
+                    self.start_prompt_run(text).await?;
+                }
+            }
             UiAction::Abort => {
                 if let Some(current_run) = &self.current_run {
                     current_run.cancel.cancel();

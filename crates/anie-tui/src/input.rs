@@ -123,6 +123,23 @@ impl InputPane {
         self.insert_char('\n');
     }
 
+    /// Empty the input buffer, reset the cursor, and discard any
+    /// in-flight history navigation. Pushes the current content
+    /// onto history so up-arrow recall keeps working — same
+    /// post-submit shape as `submit`, but without producing an
+    /// `InputAction::Submit`. Used by callers that want to
+    /// commit the draft to a different action (e.g. queueing a
+    /// follow-up rather than submitting it now).
+    pub fn clear(&mut self) {
+        if !self.content.is_empty() {
+            self.history.push(self.content.clone());
+        }
+        self.content.clear();
+        self.cursor = 0;
+        self.history_index = None;
+        self.saved_content = None;
+    }
+
     /// Handle a key press while the editor is focused.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         // Popup-open key routing. Keys that don't belong to the

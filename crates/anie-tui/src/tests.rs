@@ -596,12 +596,12 @@ fn active_tool_execution_accepts_text_input_without_submitting() {
     assert!(action_rx.try_recv().is_err());
 }
 
-/// Enter while active must not clear the draft and must not
-/// emit a `SubmitPrompt`. Plan 02 will turn this into a
-/// `QueuePrompt` action; until then, the draft is preserved
-/// and a system message explains the state.
+/// PR 2.1 of `docs/active_input_2026-04-27/`. Enter while
+/// active sends `UiAction::QueuePrompt(text)` and clears the
+/// draft so the user can immediately start typing the next
+/// follow-up.
 #[test]
-fn enter_while_active_preserves_draft_until_queue_feature_lands() {
+fn enter_while_streaming_sends_queue_prompt_and_clears_draft() {
     let (_event_tx, event_rx) = mpsc::channel(8);
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
@@ -623,16 +623,46 @@ fn enter_while_active_preserves_draft_until_queue_feature_lands() {
 
     assert_eq!(
         app.input_pane_contents(),
-        "queued",
-        "active Enter must not clear the draft",
+        "",
+        "active Enter must clear the draft after queueing",
     );
-    // No `SubmitPrompt` should leak out.
+    let mut saw_queue = false;
     while let Ok(action) = action_rx.try_recv() {
-        assert!(
-            !matches!(action, crate::UiAction::SubmitPrompt(_)),
-            "active Enter must not emit SubmitPrompt before plan 02",
-        );
+        match action {
+            crate::UiAction::QueuePrompt(text) => {
+                assert_eq!(text, "queued");
+                saw_queue = true;
+            }
+            crate::UiAction::SubmitPrompt(_) => {
+                panic!("active Enter must not emit SubmitPrompt; queue is the right action")
+            }
+            _ => {}
+        }
     }
+    assert!(saw_queue, "expected a UiAction::QueuePrompt to be emitted");
+}
+
+/// Active Enter on an empty draft is a no-op — no queue
+/// action, no draft mutation.
+#[test]
+fn enter_while_active_empty_draft_is_noop() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("enter");
+
+    assert_eq!(app.input_pane_contents(), "");
+    assert!(
+        action_rx.try_recv().is_err(),
+        "empty active Enter must not emit any UiAction",
+    );
 }
 
 /// `Home`/`End` follow the idle rule: navigate within the
