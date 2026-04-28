@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use anie_agent::{Tool, ToolError, ToolExecutionContext};
+use anie_agent::{Tool, ToolError, ToolExecutionContext, effective_tool_output_budget};
 use anie_protocol::ToolDef;
 
 use crate::shared::{
@@ -62,12 +62,22 @@ impl Tool for ReadTool {
         args: serde_json::Value,
         _cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<anie_protocol::ToolResult>>,
-        _ctx: &ToolExecutionContext,
+        ctx: &ToolExecutionContext,
     ) -> Result<anie_protocol::ToolResult, ToolError> {
         let path = required_string_arg(&args, "path")?;
         let offset = parse_optional_usize_arg(&args, "offset")?.unwrap_or(1);
         let limit = parse_optional_usize_arg(&args, "limit")?;
         let abs_path = self.resolve_path(path);
+        // Plan 05 PR C: scale the byte cap with the model's
+        // context window. `MAX_READ_BYTES` (50 KiB) remains the
+        // upper bound; small-window models get a tighter cap
+        // floored at `MIN_TOOL_OUTPUT_BUDGET_BYTES` so a single
+        // file read can't blow the model's input.
+        let byte_budget = usize::try_from(effective_tool_output_budget(
+            ctx.context_window,
+            MAX_READ_BYTES as u64,
+        ))
+        .unwrap_or(MAX_READ_BYTES);
 
         // Image branch: check size with metadata BEFORE reading
         // the body into memory. Without this, a 1 GiB image
@@ -191,16 +201,16 @@ impl Tool for ReadTool {
                 break;
             }
 
-            // Byte cap.
+            // Byte cap (scaled by `effective_tool_output_budget`).
             let separator_len = usize::from(!shown_lines.is_empty());
             let candidate_len = separator_len + line.len();
-            if bytes_used + candidate_len > MAX_READ_BYTES {
+            if bytes_used + candidate_len > byte_budget {
                 // Single line wider than the entire byte cap
                 // — keep a partial prefix on a UTF-8 boundary
                 // so the agent at least sees the head of the
                 // line.
                 if shown_lines.is_empty() {
-                    shown_lines.push(trim_to_char_boundary(&line, MAX_READ_BYTES).to_string());
+                    shown_lines.push(trim_to_char_boundary(&line, byte_budget).to_string());
                 }
                 truncated = true;
                 break;

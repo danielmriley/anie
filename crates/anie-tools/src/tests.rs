@@ -224,6 +224,90 @@ async fn read_tool_truncates_at_byte_limit() {
     );
 }
 
+/// Plan 05 PR C: small-context model gets a 1 KB byte
+/// budget for read tool output. A 10 KB file (well over
+/// the floor and under `MAX_READ_LINES`) must come back
+/// truncated to ~1 KB plus the truncation footer, proving
+/// the per-call budget shrunk with the context window.
+#[tokio::test]
+async fn read_tool_truncates_to_effective_budget_for_small_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("wide.txt");
+    // 10 KB on a single line so the line-cap path doesn't
+    // mask the byte-budget path.
+    let contents = "x".repeat(10 * 1024);
+    tokio::fs::write(&path, contents).await.expect("write file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let small_ctx = ToolExecutionContext {
+        context_window: 8_192,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "wide.txt" }),
+            CancellationToken::new(),
+            None,
+            &small_ctx,
+        )
+        .await
+        .expect("read succeeds");
+
+    let text = text_content(&result);
+    assert!(
+        text.contains("[output truncated. Use offset to read more.]"),
+        "small-window read should surface truncation; got: {text}",
+    );
+    // The body before the footer must be ~1 KB (the floor),
+    // not 10 KB. A length above 2 KB means the budget
+    // didn't shrink with the window.
+    assert!(
+        text.len() <= 2_048,
+        "small-window read body should fit ~1KB budget; got {} bytes",
+        text.len(),
+    );
+}
+
+/// Plan 05 PR C: regression guard. A 200K-window model
+/// gets a 20 KB effective budget (10 % of 200K, capped by
+/// the 50 KB `MAX_READ_BYTES`). A 10 KB file fits without
+/// truncation — proves the cloud path is not collapsing
+/// to the small-window floor.
+#[tokio::test]
+async fn read_tool_keeps_full_output_for_cloud_window() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("medium.txt");
+    let contents = "x".repeat(10 * 1024);
+    tokio::fs::write(&path, contents).await.expect("write file");
+
+    let tool = ReadTool::new(tempdir.path());
+    let cloud_ctx = ToolExecutionContext {
+        context_window: 200_000,
+    };
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "medium.txt" }),
+            CancellationToken::new(),
+            None,
+            &cloud_ctx,
+        )
+        .await
+        .expect("read succeeds");
+
+    let text = text_content(&result);
+    assert!(
+        !text.contains("[output truncated. Use offset to read more.]"),
+        "cloud-window read should fit without truncation; got: body of {} bytes",
+        text.len(),
+    );
+    assert!(
+        text.len() >= 10 * 1024,
+        "cloud-window read should return the whole 10 KB file; got {} bytes",
+        text.len(),
+    );
+}
+
 #[tokio::test]
 async fn read_tool_detects_and_encodes_images() {
     let tempdir = tempdir().expect("tempdir");
