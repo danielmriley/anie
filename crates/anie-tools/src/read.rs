@@ -67,20 +67,24 @@ impl Tool for ReadTool {
         let limit = parse_optional_usize_arg(&args, "limit")?;
         let abs_path = self.resolve_path(path);
 
-        let bytes = tokio::fs::read(&abs_path).await.map_err(|error| {
-            ToolError::ExecutionFailed(format!("Failed to read {path}: {error}"))
-        })?;
-
+        // Image branch: check size with metadata BEFORE reading
+        // the body into memory. Without this, a 1 GiB image
+        // would allocate 1 GiB just to fail the cap check on
+        // the next line. PR 5.1 of `docs/code_review_2026-04-27/`.
         if is_image_path(&abs_path) {
-            let image_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if image_size > MAX_IMAGE_BYTES {
+            let meta = tokio::fs::metadata(&abs_path).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!("Failed to stat {path}: {error}"))
+            })?;
+            if meta.len() > MAX_IMAGE_BYTES {
                 return Err(ToolError::ExecutionFailed(format!(
                     "Image {path} is too large to read ({} bytes > {} bytes)",
-                    bytes.len(),
+                    meta.len(),
                     MAX_IMAGE_BYTES
                 )));
             }
-
+            let bytes = tokio::fs::read(&abs_path).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!("Failed to read {path}: {error}"))
+            })?;
             return Ok(anie_protocol::ToolResult {
                 content: vec![anie_protocol::ContentBlock::Image {
                     media_type: image_media_type(&abs_path).to_string(),
@@ -93,6 +97,10 @@ impl Tool for ReadTool {
                 }),
             });
         }
+
+        let bytes = tokio::fs::read(&abs_path).await.map_err(|error| {
+            ToolError::ExecutionFailed(format!("Failed to read {path}: {error}"))
+        })?;
 
         if bytes.contains(&0) {
             return Ok(text_result(

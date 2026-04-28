@@ -229,6 +229,42 @@ async fn read_tool_detects_and_encodes_images() {
     ));
 }
 
+/// PR 5.1 of `docs/code_review_2026-04-27/`. The image cap
+/// must be enforced from `metadata.len()` BEFORE the file
+/// body lands in memory. Use `set_len` to grow a sparse file
+/// to 11 MiB without writing 11 MiB of bytes to disk —
+/// `metadata.len()` reports the logical size, so the pre-read
+/// check rejects, while a regression that called
+/// `tokio::fs::read` first would allocate 11 MiB before the
+/// cap fired.
+#[tokio::test]
+async fn read_tool_rejects_oversized_image_via_metadata() {
+    let tempdir = tempdir().expect("tempdir");
+    let path = tempdir.path().join("huge.png");
+    let file = std::fs::File::create(&path).expect("create image");
+    // 11 MiB is just over MAX_IMAGE_BYTES (10 MiB).
+    file.set_len(11 * 1024 * 1024).expect("set_len");
+    drop(file);
+
+    let tool = ReadTool::new(tempdir.path());
+    let error = tool
+        .execute(
+            "call",
+            serde_json::json!({ "path": "huge.png" }),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("oversized image should reject");
+    match error {
+        anie_agent::ToolError::ExecutionFailed(msg) => {
+            assert!(msg.contains("too large"), "got: {msg}");
+            assert!(msg.contains("huge.png"), "got: {msg}");
+        }
+        other => panic!("expected ExecutionFailed, got: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn read_tool_returns_error_for_missing_file() {
     let tempdir = tempdir().expect("tempdir");
