@@ -63,7 +63,7 @@ fn try_acquire_session_lock(file: &File, path: &Path) -> Result<bool, SessionErr
     }
 }
 
-use anie_protocol::{ContentBlock, Message, UserMessage};
+use anie_protocol::{ContentBlock, Message, UserMessage, now_millis};
 use anie_provider::ThinkingLevel;
 
 /// Current session-file schema version. Bump every time a change is
@@ -1119,6 +1119,137 @@ pub fn estimate_tokens(message: &Message) -> u64 {
         Message::ToolResult(tool_result) => content_tokens(&tool_result.content),
         Message::Custom(_) => 100,
     }
+}
+
+/// Sum-of-content token estimate for a slice of canonical
+/// messages. Unlike [`estimate_context_tokens`], this never
+/// consults provider-reported usage — it's a pure
+/// content-based estimate. The mid-turn compaction gate
+/// (plan 04 of `docs/midturn_compaction_2026-04-27/`) calls
+/// this on the agent loop's local `context: Vec<Message>`,
+/// where no usage data is available because messages haven't
+/// been threaded through the session-side bookkeeping yet.
+///
+/// PR 8.4 PR A.
+#[must_use]
+pub fn estimate_message_tokens(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .map(estimate_tokens)
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Result of an in-memory mid-turn compaction.
+///
+/// Mid-turn compaction operates on a free-standing slice of
+/// messages (the agent loop's local `context`) and returns a
+/// new slice. Unlike pre-prompt compaction, it does NOT
+/// mutate the persistent session state — see plan 04 § "Persisting
+/// the mid-turn compaction" for the rationale (recommendation
+/// A: don't persist mid-turn separately).
+#[derive(Debug, Clone)]
+pub struct InlineCompactionResult {
+    /// New context: a synthetic `User` message carrying the
+    /// summary, followed by the kept tail of the input.
+    pub messages: Vec<Message>,
+    /// The raw summary text (with `<read-files>` /
+    /// `<modified-files>` tag blocks appended, matching the
+    /// pre-prompt compaction shape).
+    pub summary: String,
+    /// Token estimate for the input slice (content-based).
+    pub tokens_before: u64,
+    /// Token estimate for `messages` (content-based).
+    pub tokens_after: u64,
+}
+
+/// Compact a free-standing message slice in memory. Used by
+/// the mid-turn compaction gate; the pre-prompt path lives
+/// inside `Session::auto_compact` and persists a session
+/// entry.
+///
+/// Returns `Ok(None)` when there isn't enough discardable
+/// content to compact (matches `Session::force_compact`'s
+/// shape). The split-turn case from pi is handled the same
+/// way as in `Session::compact_internal`: two parallel
+/// summarizations joined per pi's format.
+///
+/// Plan `docs/midturn_compaction_2026-04-27/04_midturn_compaction_execution.md`.
+pub async fn compact_messages_inline(
+    messages: &[Message],
+    config: &CompactionConfig,
+    summarizer: &dyn MessageSummarizer,
+) -> Result<Option<InlineCompactionResult>> {
+    let tokens_before = estimate_message_tokens(messages);
+
+    // Wrap into `SessionContextMessage` with synthetic entry
+    // IDs so we can reuse `find_cut_point` /
+    // `partition_split_turn` / `detect_split_turn` without
+    // forking those primitives. The synthetic IDs are unique
+    // within this slice, which is all those helpers need.
+    let wrapped: Vec<SessionContextMessage> = messages
+        .iter()
+        .enumerate()
+        .map(|(idx, message)| SessionContextMessage {
+            entry_id: format!("inline:{idx}"),
+            message: message.clone(),
+        })
+        .collect();
+
+    let Ok(cut_point) = find_cut_point(&wrapped, config.keep_recent_tokens) else {
+        return Ok(None);
+    };
+
+    let source_messages: Vec<Message> = cut_point
+        .discarded
+        .iter()
+        .map(|m| m.message.clone())
+        .collect();
+
+    let prose = if let Some(split) = &cut_point.split_turn {
+        // Split-turn case: parallel summaries joined per pi's
+        // format. Same shape as `Session::compact_internal`.
+        let (main_messages, prefix_messages) = partition_split_turn(&cut_point.discarded, split);
+        let main_source: Vec<Message> = main_messages.iter().map(|m| m.message.clone()).collect();
+        let prefix_source: Vec<Message> =
+            prefix_messages.iter().map(|m| m.message.clone()).collect();
+        let (main_prose, prefix_prose) = futures::try_join!(
+            summarizer.summarize(&main_source, None),
+            summarizer.summarize(&prefix_source, None),
+        )?;
+        join_split_turn_prose(&main_prose, &prefix_prose)
+    } else {
+        summarizer.summarize(&source_messages, None).await?
+    };
+
+    let details = extract_compaction_details(&source_messages);
+    let summary = append_details_to_summary(&prose, &details);
+
+    // Build the new context: a synthetic User message
+    // carrying the summary header, followed by the kept tail.
+    // Mirrors `Session::build_context`'s post-compaction
+    // shape so the model sees the same `[Previous
+    // conversation summary]\n\n…` framing whether the
+    // compaction was pre-prompt or mid-turn.
+    let mut new_messages: Vec<Message> =
+        Vec::with_capacity(messages.len() - cut_point.discarded.len() + 1);
+    new_messages.push(Message::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: format!("[Previous conversation summary]\n\n{summary}"),
+        }],
+        timestamp: now_millis(),
+    }));
+    for kept in &messages[cut_point.discarded.len()..] {
+        new_messages.push(kept.clone());
+    }
+
+    let tokens_after = estimate_message_tokens(&new_messages);
+
+    Ok(Some(InlineCompactionResult {
+        messages: new_messages,
+        summary,
+        tokens_before,
+        tokens_after,
+    }))
 }
 
 /// Estimate token usage for a session context.
@@ -3027,5 +3158,253 @@ mod tests {
 
         let second = SessionManager::open_session(&path).expect("reopen");
         assert!(second.by_id.contains_key(&id));
+    }
+}
+
+#[cfg(test)]
+mod inline_compaction_tests {
+    use super::*;
+    use anie_protocol::{AssistantMessage, StopReason, ToolResultMessage, Usage};
+    use async_trait::async_trait;
+
+    /// Minimal `MessageSummarizer` test double — returns a
+    /// pre-baked summary, records the inputs.
+    struct StubSummarizer {
+        summary: String,
+        calls: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl StubSummarizer {
+        fn new(summary: &str) -> Self {
+            Self {
+                summary: summary.to_string(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MessageSummarizer for StubSummarizer {
+        async fn summarize(
+            &self,
+            messages: &[Message],
+            _existing_summary: Option<&str>,
+        ) -> Result<String> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(messages.to_vec());
+            Ok(self.summary.clone())
+        }
+    }
+
+    fn make_user(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: 0,
+        })
+    }
+
+    fn make_assistant(text: &str) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "m".into(),
+            timestamp: 0,
+            reasoning_details: None,
+        })
+    }
+
+    /// PR 8.4 PR A: `estimate_message_tokens` is a pure
+    /// content-based sum. No usage data consulted; protocol-
+    /// level slice goes in, single u64 comes out.
+    #[test]
+    fn estimate_message_tokens_sums_per_message_estimates() {
+        let messages = vec![
+            make_user("first user message"),
+            make_assistant("first assistant reply"),
+            make_user("second user message"),
+        ];
+        let total = estimate_message_tokens(&messages);
+        let expected: u64 = messages.iter().map(estimate_tokens).sum();
+        assert_eq!(total, expected);
+        assert!(
+            total > 0,
+            "non-empty content slice must produce a positive estimate",
+        );
+    }
+
+    #[test]
+    fn estimate_message_tokens_returns_zero_for_empty_slice() {
+        assert_eq!(estimate_message_tokens(&[]), 0);
+    }
+
+    /// PR 8.4 PR A core test: a slice with enough older
+    /// content for `find_cut_point` to bite returns
+    /// `Some(InlineCompactionResult)` whose `messages` is
+    /// exactly: [synthetic-summary user message,
+    /// ...kept-tail...]. The summary contains the prose the
+    /// summarizer produced. Tokens-before reflects the input;
+    /// tokens-after reflects the output.
+    #[tokio::test]
+    async fn compact_messages_inline_returns_summary_plus_kept_tail() {
+        // Build messages large enough that find_cut_point
+        // discards at least one. With keep_recent_tokens=20
+        // and ~10-token-wide messages, the first 3-4 messages
+        // get discarded.
+        let mut messages = Vec::new();
+        for i in 0..6 {
+            messages.push(make_user(&format!(
+                "user message #{i} with some words to estimate"
+            )));
+            messages.push(make_assistant(&format!(
+                "assistant reply #{i} with some content"
+            )));
+        }
+        let summarizer = StubSummarizer::new("summary prose here");
+        let config = CompactionConfig {
+            context_window: 1_000_000,
+            reserve_tokens: 1,
+            keep_recent_tokens: 20,
+        };
+
+        let result = compact_messages_inline(&messages, &config, &summarizer)
+            .await
+            .expect("inline compact ok")
+            .expect("Some result");
+
+        // First message of the new context is the synthetic
+        // summary user message.
+        match &result.messages[0] {
+            Message::User(user) => {
+                let text = user
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert!(text.contains("[Previous conversation summary]"));
+                assert!(text.contains("summary prose here"));
+            }
+            other => panic!("expected synthetic User summary, got {other:?}"),
+        }
+        // Output is shorter than input (compaction reduced it).
+        assert!(
+            result.messages.len() < messages.len(),
+            "compaction must produce fewer messages: {} -> {}",
+            messages.len(),
+            result.messages.len(),
+        );
+        // tokens_before / tokens_after sanity.
+        assert!(result.tokens_before > 0);
+        assert!(result.tokens_after > 0);
+        // The summarizer was consulted exactly once for the
+        // single-summary path (no split-turn here).
+        assert_eq!(summarizer.calls.lock().expect("calls").len(), 1);
+    }
+
+    /// PR 8.4 PR A: when there isn't enough content to
+    /// compact (cut point would discard zero or all
+    /// messages), the helper returns `Ok(None)` rather than
+    /// erroring. Mirrors `Session::force_compact`'s shape.
+    #[tokio::test]
+    async fn compact_messages_inline_returns_none_when_nothing_to_discard() {
+        let messages = vec![make_user("hello"), make_assistant("hi back")];
+        let summarizer = StubSummarizer::new("unused");
+        let config = CompactionConfig {
+            context_window: 1_000_000,
+            reserve_tokens: 1,
+            keep_recent_tokens: 100_000, // much larger than the content
+        };
+
+        let result = compact_messages_inline(&messages, &config, &summarizer)
+            .await
+            .expect("inline compact ok");
+        assert!(
+            result.is_none(),
+            "below-threshold content must return Ok(None)",
+        );
+        // Summarizer was never invoked.
+        assert!(summarizer.calls.lock().expect("calls").is_empty());
+    }
+
+    /// PR 8.4 PR A: a tool-result reply pair surviving in
+    /// the kept tail must come through unchanged. Pins that
+    /// the helper splices the kept slice into the new context
+    /// without re-shaping it. Important for tool-call
+    /// correlation: any in-flight `(assistant tool_call,
+    /// tool_result)` pair in the kept tail must remain
+    /// adjacent.
+    #[tokio::test]
+    async fn compact_messages_inline_preserves_kept_tail_verbatim() {
+        let kept_assistant = make_assistant("tool-using assistant message");
+        let kept_tool_result = Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_keep".into(),
+            tool_name: "keep".into(),
+            content: vec![ContentBlock::Text {
+                text: "tool result body".into(),
+            }],
+            details: serde_json::json!({}),
+            is_error: false,
+            timestamp: 0,
+        });
+
+        let mut messages = Vec::new();
+        for i in 0..8 {
+            messages.push(make_user(&format!(
+                "discarded-{i} with enough text to count"
+            )));
+            messages.push(make_assistant(&format!("discarded-asst-{i} with content")));
+        }
+        // Tail with the assistant tool-call pair we want to
+        // verify survives + a follow-up user message so the
+        // cut doesn't end on a ToolResult (find_cut_point
+        // skips trailing ToolResults by advancing cut_index;
+        // ending on one would mean the cut lands at len()
+        // and Ok(None) comes back).
+        messages.push(kept_assistant.clone());
+        messages.push(kept_tool_result.clone());
+        messages.push(make_user("post-tool follow-up anchoring the cut"));
+
+        let summarizer = StubSummarizer::new("summary");
+        // keep_recent_tokens picked so the walk stops before
+        // kept_assistant — both kept_assistant and
+        // kept_tool_result must end up in the kept slice (and
+        // not be swept into "discarded" by find_cut_point's
+        // trailing-ToolResult-skip).
+        let config = CompactionConfig {
+            context_window: 1_000_000,
+            reserve_tokens: 1,
+            keep_recent_tokens: 25,
+        };
+
+        let result = compact_messages_inline(&messages, &config, &summarizer)
+            .await
+            .expect("inline compact ok")
+            .expect("Some result");
+
+        // The kept tail must contain the original
+        // assistant→tool-result pair adjacent and in order.
+        // Walk the result looking for the tool-result with
+        // the unique id; assert the message immediately
+        // before it is the original assistant.
+        let tool_result_idx = result
+            .messages
+            .iter()
+            .position(|m| matches!(m, Message::ToolResult(t) if t.tool_call_id == "call_keep"))
+            .expect("kept tool result must survive verbatim");
+        assert!(
+            tool_result_idx > 0,
+            "tool result must be preceded by the assistant",
+        );
+        assert!(matches!(
+            result.messages[tool_result_idx - 1],
+            Message::Assistant(_)
+        ));
     }
 }
