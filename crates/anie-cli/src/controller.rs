@@ -432,6 +432,45 @@ impl InteractiveController {
                     self.start_prompt_run(text).await?;
                 }
             }
+            UiAction::AbortAndQueuePrompt(text) => {
+                // Plan 03 of `docs/active_input_2026-04-27/`.
+                // The user has a draft they want to send *now*.
+                // Three cases:
+                //   - active run: front-queue the draft and
+                //     cancel the run. The post-run drain will
+                //     pick the front-queued prompt up before any
+                //     stale FIFO-queued follow-ups.
+                //   - pending retry armed: clear the retry and
+                //     start the prompt immediately (matches
+                //     `QueuePrompt` semantics; the user's fresh
+                //     signal beats a transient-error retry).
+                //   - idle: start the prompt immediately.
+                if let Some(current_run) = &self.current_run {
+                    let preview: String =
+                        text.lines().next().unwrap_or("").chars().take(80).collect();
+                    self.queued_prompts.push_front(text);
+                    current_run.cancel.cancel();
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::SystemMessage {
+                            text: format!(
+                                "Aborting current run; queued draft will send next: {preview}",
+                            ),
+                        })
+                        .await;
+                } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
+                    self.pending_retry = PendingRetry::Idle;
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::SystemMessage {
+                            text: "Cancelling pending retry to start your interrupt.".into(),
+                        })
+                        .await;
+                    self.start_prompt_run(text).await?;
+                } else {
+                    self.start_prompt_run(text).await?;
+                }
+            }
             UiAction::Abort => {
                 if let Some(current_run) = &self.current_run {
                     current_run.cancel.cancel();

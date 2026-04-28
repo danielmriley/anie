@@ -230,6 +230,15 @@ pub enum UiAction {
     /// run-boundary instead of racing the active run. Plan 02
     /// of `docs/active_input_2026-04-27/`.
     QueuePrompt(String),
+    /// Cancel the active run *and* front-queue this prompt so
+    /// it starts the moment the abort completes. The user is
+    /// telling anie "I see you going the wrong way, here's the
+    /// correction" — single-run discipline is preserved (we
+    /// don't inject into a live provider stream), but the next
+    /// thing to run is the user's correction rather than
+    /// whatever else might already be queued. Plan 03 of
+    /// `docs/active_input_2026-04-27/`.
+    AbortAndQueuePrompt(String),
     /// Abort the active run.
     Abort,
     /// Quit the app.

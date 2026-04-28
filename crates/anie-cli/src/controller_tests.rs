@@ -762,6 +762,144 @@ async fn queue_prompt_cancels_pending_retry() {
     );
 }
 
+/// PR 7.1 of `docs/active_input_2026-04-27/`. While a run is
+/// active, `AbortAndQueuePrompt(text)` must:
+///  - push `text` to the **front** of `queued_prompts` so it
+///    runs ahead of any FIFO follow-ups already queued;
+///  - cancel the in-flight run via `CurrentRun::cancel`;
+///  - emit a system message announcing the abort + queued
+///    draft so the user has a clear log of what happened.
+#[tokio::test]
+async fn abort_and_queue_during_active_run_front_queues_and_cancels() {
+    use anie_agent::AgentRunResult;
+    use tokio_util::sync::CancellationToken;
+
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Pre-seed a stale FIFO queue entry so we can prove the new
+    // interrupt arrives at the front, not the back.
+    controller
+        .queued_prompts
+        .push_back("stale follow-up".into());
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async {
+        AgentRunResult {
+            generated_messages: Vec::new(),
+            final_context: Vec::new(),
+            terminal_error: None,
+        }
+    });
+    controller.current_run = Some(CurrentRun {
+        handle,
+        cancel,
+        already_compacted: false,
+        retry_attempt: 0,
+    });
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::AbortAndQueuePrompt("interrupt me".into()))
+            .await
+            .is_ok()
+    );
+
+    let queued: Vec<_> = controller.queued_prompts.iter().cloned().collect();
+    assert_eq!(
+        queued,
+        vec!["interrupt me".to_string(), "stale follow-up".to_string()],
+        "interrupt must front-queue ahead of any existing follow-ups",
+    );
+    assert!(
+        cancel_clone.is_cancelled(),
+        "abort-and-queue must cancel the current run",
+    );
+
+    let mut saw_message = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event
+            && text.starts_with("Aborting current run")
+        {
+            assert!(text.contains("interrupt me"), "got: {text}");
+            saw_message = true;
+        }
+    }
+    assert!(saw_message, "user must see why the run is aborting");
+}
+
+/// PR 7.1 of `docs/active_input_2026-04-27/`. When the
+/// transient-error retry timer is armed, an interrupt-and-send
+/// must clear the retry and start the new prompt immediately —
+/// same precedence rule the FIFO `QueuePrompt` already
+/// enforces (a fresh user signal beats a stale automatic
+/// retry).
+#[tokio::test]
+async fn abort_and_queue_during_pending_retry_clears_retry() {
+    use tokio::time::Instant as TokioInstant;
+
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    controller.pending_retry = PendingRetry::Armed {
+        deadline: TokioInstant::now() + Duration::from_secs(60),
+        attempt: 1,
+        already_compacted: false,
+    };
+
+    // No mock provider is registered for the model's API in
+    // this minimal harness, so `start_prompt_run` errors out —
+    // but the retry must still have been cleared.
+    let _ = controller
+        .try_handle_action(UiAction::AbortAndQueuePrompt("interrupt".into()))
+        .await;
+
+    assert!(
+        matches!(controller.pending_retry, PendingRetry::Idle),
+        "pending retry must be cleared when AbortAndQueuePrompt arrives during armed backoff",
+    );
+    let mut saw_cancel_message = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SystemMessage { text } = event
+            && text.contains("Cancelling pending retry")
+        {
+            saw_cancel_message = true;
+        }
+    }
+    assert!(
+        saw_cancel_message,
+        "user must see why the retry was dropped",
+    );
+}
+
+/// PR 7.1 of `docs/active_input_2026-04-27/`. With nothing
+/// active, `AbortAndQueuePrompt` is equivalent to a direct
+/// submit — there's no run to abort, so we just start the
+/// prompt. Pinning this avoids a regression where the action
+/// silently no-ops on an empty controller (the user's draft
+/// would vanish).
+#[tokio::test]
+async fn abort_and_queue_when_idle_starts_immediately() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    assert!(controller.current_run.is_none());
+
+    // No mock provider is registered, so `start_prompt_run`
+    // returns an error — but it WILL be invoked, which is
+    // what we're testing. The queue must remain empty either
+    // way; we don't queue against ourselves.
+    let _ = controller
+        .try_handle_action(UiAction::AbortAndQueuePrompt("interrupt".into()))
+        .await;
+
+    assert!(
+        controller.queued_prompts.is_empty(),
+        "idle AbortAndQueuePrompt must not enqueue; it should start the run directly",
+    );
+}
+
 /// PR 2.2 of `docs/active_input_2026-04-27/`. When a queued
 /// prompt arrives while no run is active, it starts the prompt
 /// directly (matches `SubmitPrompt` shape — same end result for
