@@ -16,12 +16,12 @@ this tracker owns landing status.
 | # | Plan | Status | Notes |
 |---|------|--------|-------|
 | 00 | Baseline analysis | Reference doc | Cite-anchor for the plan set; not a PR. |
-| 01 | Context-aware compaction reserve | Pending | Foundation for 04 and 05. |
-| 02 | Per-turn compaction budget | Pending | Anti-thrash; needed before 04. |
-| 03 | Agent-loop compaction signal | Pending | Pure plumbing; unblocks 04. |
-| 04 | Mid-turn compaction execution | Pending | Load-bearing change. Depends on 01, 02, 03. |
-| 05 | Tool output caps scale with context | Pending | Independent of 04 in implementation; complementary in effect. |
-| 06 | Compaction telemetry and visibility | Pending | Lands last, against stable mid-turn machinery. |
+| 01 | Context-aware compaction reserve | Done (PR A) | `db94e13` (effective_reserve helper + applied in compaction_strategy). PRs B/C (min_reserve_tokens config + /state rendering) deferred. |
+| 02 | Per-turn compaction budget | Done (PRs A + B) | `1b16ffe` (counter + max_per_turn config + GiveUpReason::CompactionBudgetExhausted). PR C (mid-turn budget consultation) folded into 04 PR B. |
+| 03 | Agent-loop compaction signal | Done | `65248c1` (CompactionGate trait + AgentLoopConfig::with_compaction_gate; default off). |
+| 04 | Mid-turn compaction execution | Done (PRs A + B) | `a000ba4` (compact_messages_inline + estimate_message_tokens). `31adf29` (ControllerCompactionGate + build_agent integration). PR C (manual smoke + docs) deferred. |
+| 05 | Tool output caps scale with context | Pending | Workspace-wide trait change (Tool::execute signature + 9 tool impls); deferred to a fresh session. |
+| 06 | Compaction telemetry and visibility | Pending | Schema change to AgentEvent::CompactionStart/End ripples through TUI/log; deferred to a fresh session. |
 
 ## PR ordering
 
