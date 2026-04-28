@@ -461,6 +461,22 @@ pub fn anie_dir() -> Option<PathBuf> {
 ///
 /// # Platform
 ///
+/// Wrapper around [`atomic_write`] that ensures the parent
+/// directory exists before writing. Use this when the caller
+/// can't guarantee the parent exists (e.g., first-run paths
+/// like `~/.anie/auth.json`).
+///
+/// PR 01 of `docs/code_consolidation_2026-04-26/`. Previously
+/// some auth call sites called bare `atomic_write` without
+/// pre-creating the parent, which would fail on a fresh
+/// install with `InvalidInput`.
+pub fn atomic_write_create_parent(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(path, contents)
+}
+
 /// POSIX-only today. Windows builds are explicitly gated at compile
 /// time until this helper grows a `cfg(windows)` branch using
 /// `ReplaceFileW`-style replacement semantics.
@@ -547,34 +563,42 @@ fn atomic_write_temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf
     tmp
 }
 
+/// Internal helper: resolve a path relative to the anie data
+/// directory. All public path accessors below delegate here so
+/// the `anie_dir().map(|d| d.join(...))` boilerplate lives in
+/// one place. PR 01 of `docs/code_consolidation_2026-04-26/`.
+fn anie_subpath(suffix: &'static str) -> Option<PathBuf> {
+    anie_dir().map(|dir| dir.join(suffix))
+}
+
 /// Return the default global config path (`~/.anie/config.toml`).
 #[must_use]
 pub fn global_config_path() -> Option<PathBuf> {
-    anie_dir().map(|dir| dir.join("config.toml"))
+    anie_subpath("config.toml")
 }
 
 /// Return the JSON auth fallback path (`~/.anie/auth.json`).
 #[must_use]
 pub fn anie_auth_json_path() -> Option<PathBuf> {
-    anie_dir().map(|dir| dir.join("auth.json"))
+    anie_subpath("auth.json")
 }
 
 /// Return the sessions directory (`~/.anie/sessions/`).
 #[must_use]
 pub fn anie_sessions_dir() -> Option<PathBuf> {
-    anie_dir().map(|dir| dir.join("sessions"))
+    anie_subpath("sessions")
 }
 
 /// Return the logs directory (`~/.anie/logs/`).
 #[must_use]
 pub fn anie_logs_dir() -> Option<PathBuf> {
-    anie_dir().map(|dir| dir.join("logs"))
+    anie_subpath("logs")
 }
 
 /// Return the runtime state file (`~/.anie/state.json`).
 #[must_use]
 pub fn anie_state_json_path() -> Option<PathBuf> {
-    anie_dir().map(|dir| dir.join("state.json"))
+    anie_subpath("state.json")
 }
 
 /// Walk upward from `start` to find a project config file.
