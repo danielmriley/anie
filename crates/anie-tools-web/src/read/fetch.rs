@@ -267,9 +267,52 @@ pub async fn validate_destination(
 /// A long-running anie session that hits the same hosts many
 /// times benefits; one-shot CLI invocations re-fetch each
 /// time, which is fine.
+/// Origin key for the robots cache: `(scheme, host, port)`.
+/// Keying by origin (RFC 6454) rather than just host means
+/// `https://example.com:8443/` and `http://example.com/` get
+/// separate cached policies — same host, different origins,
+/// different operators in practice. Pre-PR-6.1 the cache was
+/// keyed by host string alone, so a previously-fetched
+/// `http://example.com/robots.txt` would shadow an HTTPS
+/// fetch on the same host. PR 6.1 of `docs/code_review_2026-04-27/`.
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+struct RobotsOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl RobotsOrigin {
+    fn from_url(url: &Url) -> Result<Self, WebToolError> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| WebToolError::InvalidUrl("URL has no host".into()))?
+            .to_ascii_lowercase();
+        // `port_or_known_default` returns 80 / 443 for http / https
+        // when no explicit port is set, so the cache key for
+        // `http://example.com/` and `http://example.com:80/` lines
+        // up.
+        let port = url.port_or_known_default().ok_or_else(|| {
+            WebToolError::InvalidUrl("URL has unsupported scheme for port resolution".into())
+        })?;
+        Ok(Self {
+            scheme: url.scheme().to_string(),
+            host,
+            port,
+        })
+    }
+}
+
+/// In-memory robots.txt cache, keyed by origin. Stores the raw
+/// `robots.txt` body so [`Robot`] can be re-instantiated against
+/// the requested user-agent on each evaluation — `texting_robots`
+/// bakes the agent into the parsed `Robot` and re-parsing on
+/// every call would lose the cache benefit, while caching one
+/// `Robot` per `(origin, user_agent)` would refetch when the
+/// agent changes. PR 6.1 of `docs/code_review_2026-04-27/`.
 #[derive(Clone, Default)]
 pub struct RobotsCache {
-    inner: Arc<RwLock<HashMap<String, Option<Robot>>>>,
+    inner: Arc<RwLock<HashMap<RobotsOrigin, Option<Vec<u8>>>>>,
 }
 
 impl RobotsCache {
@@ -291,56 +334,70 @@ impl RobotsCache {
         client: &reqwest::Client,
         cancel: &CancellationToken,
     ) -> Result<(), WebToolError> {
-        let host = url
-            .host_str()
-            .ok_or_else(|| WebToolError::InvalidUrl("URL has no host".into()))?
-            .to_string();
+        let origin = RobotsOrigin::from_url(url)?;
 
-        // Fast path: cached.
-        {
+        // Fast path: cached body (or the cached "no robots
+        // available" None marker).
+        let cached = {
             let cache = self.inner.read().await;
-            if let Some(slot) = cache.get(&host) {
-                return self.evaluate(slot.as_ref(), url, user_agent);
-            }
-        }
-
-        // Slow path: fetch robots.txt for this host.
-        let robots = tokio::select! {
-            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
-            r = fetch_robots_for(client, url) => r,
+            cache.get(&origin).cloned()
         };
-        let mut cache = self.inner.write().await;
-        let slot = cache.entry(host).or_insert(robots);
-        self.evaluate(slot.as_ref(), url, user_agent)
+        let body = match cached {
+            Some(body) => body,
+            None => {
+                let fetched = tokio::select! {
+                    _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+                    r = fetch_robots_for(client, url) => r,
+                };
+                let mut cache = self.inner.write().await;
+                cache.entry(origin).or_insert(fetched.clone());
+                fetched
+            }
+        };
+        self.evaluate(body.as_deref(), url, user_agent)
     }
 
+    /// Parse the cached robots body against the requested
+    /// user-agent and consult the rules. `texting_robots` baked
+    /// the agent in at parse time, so we instantiate per-call;
+    /// the parse cost is small relative to the fetch cost the
+    /// cache already saved us.
     fn evaluate(
         &self,
-        robot: Option<&Robot>,
+        body: Option<&[u8]>,
         url: &Url,
-        _user_agent: &str,
+        user_agent: &str,
     ) -> Result<(), WebToolError> {
-        match robot {
-            None => Ok(()), // No robots.txt → permissive.
-            Some(robot) => {
-                if robot.allowed(url.as_str()) {
-                    Ok(())
-                } else {
-                    Err(WebToolError::Forbidden(url.to_string()))
-                }
-            }
+        let Some(body) = body else {
+            return Ok(()); // No robots.txt → permissive.
+        };
+        // Malformed robots.txt → permissive. Failing closed
+        // here would let one malformed robots.txt deny the
+        // whole origin even when the operator's intent was
+        // clearly to allow.
+        let Ok(robot) = Robot::new(user_agent, body) else {
+            return Ok(());
+        };
+        if robot.allowed(url.as_str()) {
+            Ok(())
+        } else {
+            Err(WebToolError::Forbidden(url.to_string()))
         }
     }
 
-    /// Test-only insert.
+    /// Test-only insert. Stores the raw robots body keyed by
+    /// origin; `None` means "no robots.txt available" and
+    /// suppresses a network round-trip on the next check.
     #[cfg(test)]
-    pub async fn insert(&self, host: &str, robot: Option<Robot>) {
+    pub async fn insert_for(&self, url: &Url, body: Option<Vec<u8>>) {
         let mut cache = self.inner.write().await;
-        cache.insert(host.to_string(), robot);
+        if let Ok(origin) = RobotsOrigin::from_url(url) {
+            cache.insert(origin, body);
+        }
     }
 }
 
-async fn fetch_robots_for(client: &reqwest::Client, url: &Url) -> Option<Robot> {
+async fn fetch_robots_for(client: &reqwest::Client, url: &Url) -> Option<Vec<u8>> {
     let mut robots_url = url.clone();
     robots_url.set_path("/robots.txt");
     robots_url.set_query(None);
@@ -374,7 +431,7 @@ async fn fetch_robots_for(client: &reqwest::Client, url: &Url) -> Option<Robot> 
         );
         return None;
     }
-    Robot::new("*", &body).ok()
+    Some(body)
 }
 
 /// Drain a non-2xx response body into a UTF-8 string, capped
@@ -1066,8 +1123,8 @@ mod tests {
     #[tokio::test]
     async fn robots_cache_returns_ok_when_no_robots_txt() {
         let cache = RobotsCache::new();
-        cache.insert("example.com", None).await;
         let url = Url::parse("https://example.com/page").unwrap();
+        cache.insert_for(&url, None).await;
         let client = reqwest::Client::new();
         assert!(
             cache
@@ -1079,10 +1136,11 @@ mod tests {
 
     #[tokio::test]
     async fn robots_cache_disallows_when_robot_says_so() {
-        let robot = Robot::new("anie/test", b"User-agent: *\nDisallow: /private/").unwrap();
         let cache = RobotsCache::new();
-        cache.insert("example.com", Some(robot)).await;
         let url = Url::parse("https://example.com/private/secret").unwrap();
+        cache
+            .insert_for(&url, Some(b"User-agent: *\nDisallow: /private/".to_vec()))
+            .await;
         let client = reqwest::Client::new();
         let err = cache
             .check(&url, "anie/test", &client, &CancellationToken::new())
@@ -1093,10 +1151,11 @@ mod tests {
 
     #[tokio::test]
     async fn robots_cache_allows_unrestricted_paths() {
-        let robot = Robot::new("anie/test", b"User-agent: *\nDisallow: /private/").unwrap();
         let cache = RobotsCache::new();
-        cache.insert("example.com", Some(robot)).await;
         let url = Url::parse("https://example.com/public/article").unwrap();
+        cache
+            .insert_for(&url, Some(b"User-agent: *\nDisallow: /private/".to_vec()))
+            .await;
         let client = reqwest::Client::new();
         assert!(
             cache
@@ -1104,6 +1163,85 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// PR 6.1 of `docs/code_review_2026-04-27/`. A robots.txt
+    /// with an `anie`-specific group must override the
+    /// wildcard rules. Pre-PR-6.1 the cache passed `"*"` to
+    /// `Robot::new`, so anie-specific directives were never
+    /// consulted.
+    #[tokio::test]
+    async fn robots_cache_honors_anie_specific_user_agent() {
+        let cache = RobotsCache::new();
+        let url = Url::parse("https://example.com/secret").unwrap();
+        let body = b"\
+User-agent: *\n\
+Disallow:\n\
+\n\
+User-agent: anie\n\
+Disallow: /secret\n\
+"
+        .to_vec();
+        cache.insert_for(&url, Some(body)).await;
+        let client = reqwest::Client::new();
+        let err = cache
+            .check(&url, "anie", &client, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::Forbidden(_)), "got: {err:?}");
+
+        // Same robots body, different agent → wildcard
+        // group's empty Disallow applies, fetch is permitted.
+        let other_url = Url::parse("https://example.com/secret").unwrap();
+        let cache2 = RobotsCache::new();
+        cache2
+            .insert_for(
+                &other_url,
+                Some(b"User-agent: *\nDisallow:\n\nUser-agent: anie\nDisallow: /secret\n".to_vec()),
+            )
+            .await;
+        assert!(
+            cache2
+                .check(&other_url, "GoogleBot", &client, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// PR 6.1: same host, different ports get separate
+    /// cached policies. Pre-PR-6.1 the cache key was the host
+    /// string alone, so a `Disallow:/admin` policy fetched
+    /// from `:80` would also block fetches on `:8080` even
+    /// when those operators have different rules.
+    #[tokio::test]
+    async fn robots_cache_keys_by_origin_not_just_host() {
+        let cache = RobotsCache::new();
+        let url_8080 = Url::parse("http://example.com:8080/admin").unwrap();
+        let url_80 = Url::parse("http://example.com/admin").unwrap();
+
+        // Set a `Disallow: /admin` policy on :8080 only.
+        cache
+            .insert_for(
+                &url_8080,
+                Some(b"User-agent: *\nDisallow: /admin\n".to_vec()),
+            )
+            .await;
+        // :80 has its own (permissive) policy.
+        cache
+            .insert_for(&url_80, Some(b"User-agent: *\nDisallow:\n".to_vec()))
+            .await;
+
+        let client = reqwest::Client::new();
+        let cancel = CancellationToken::new();
+
+        assert!(matches!(
+            cache
+                .check(&url_8080, "anie", &client, &cancel)
+                .await
+                .unwrap_err(),
+            WebToolError::Forbidden(_),
+        ));
+        assert!(cache.check(&url_80, "anie", &client, &cancel).await.is_ok());
     }
 
     #[test]
