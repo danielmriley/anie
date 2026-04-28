@@ -335,6 +335,19 @@ pub struct CompactionConfig {
     /// Recent-token budget to keep verbatim past the compaction
     /// boundary (the tail of the transcript isn't summarized).
     pub keep_recent_tokens: u64,
+    /// Maximum number of compactions allowed during a single
+    /// user turn. The counter resets on every `start_prompt_run`
+    /// and decrements on every successful compaction; if a
+    /// `ContextOverflow` arrives after the counter hits zero,
+    /// the retry policy gives up with
+    /// `GiveUpReason::CompactionBudgetExhausted` rather than
+    /// looping. Default 2 covers the realistic
+    /// "compact-pre-prompt + compact-once-mid-turn" or
+    /// "compact-pre-prompt + reactive-overflow-retry" shapes.
+    /// Range 1..=8 — anything higher is almost certainly a
+    /// model-fit problem the user should know about. Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
+    pub max_per_turn: u32,
 }
 
 impl Default for CompactionConfig {
@@ -343,6 +356,7 @@ impl Default for CompactionConfig {
             enabled: true,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
+            max_per_turn: 2,
         }
     }
 }
@@ -614,6 +628,7 @@ pub fn load_config_with_paths(
     warn_legacy_ollama_openai_api(&config);
     validate_ollama_config(&config.ollama)?;
     validate_web_tool_config(&config.tools.web)?;
+    validate_compaction_config(&config.compaction)?;
     Ok(config)
 }
 
@@ -634,6 +649,30 @@ fn validate_ollama_config(ollama: &OllamaConfig) -> Result<()> {
         return Err(anyhow::anyhow!(
             "[ollama] default_max_num_ctx = {value} is below the minimum {OLLAMA_DEFAULT_MAX_NUM_CTX_MIN} \
              (the /context-length slash command also rejects values below this threshold)"
+        ));
+    }
+    Ok(())
+}
+
+/// Range bounds for `[compaction] max_per_turn`. Anything
+/// below 1 disables the safety net entirely; anything above
+/// 8 in a single user turn is overwhelmingly a sign the model
+/// can't cope with the workload, in which case failing loudly
+/// is better than grinding. PR 8.2 of
+/// `docs/midturn_compaction_2026-04-27/`.
+const COMPACTION_MAX_PER_TURN_MIN: u32 = 1;
+const COMPACTION_MAX_PER_TURN_MAX: u32 = 8;
+
+/// Validate `[compaction]` config values at load time.
+fn validate_compaction_config(compaction: &CompactionConfig) -> Result<()> {
+    if !(COMPACTION_MAX_PER_TURN_MIN..=COMPACTION_MAX_PER_TURN_MAX)
+        .contains(&compaction.max_per_turn)
+    {
+        return Err(anyhow::anyhow!(
+            "[compaction] max_per_turn = {} is outside the allowed range {}..={}",
+            compaction.max_per_turn,
+            COMPACTION_MAX_PER_TURN_MIN,
+            COMPACTION_MAX_PER_TURN_MAX,
         ));
     }
     Ok(())
@@ -883,6 +922,9 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
         if let Some(keep_recent_tokens) = compaction.keep_recent_tokens {
             config.compaction.keep_recent_tokens = keep_recent_tokens;
         }
+        if let Some(max_per_turn) = compaction.max_per_turn {
+            config.compaction.max_per_turn = max_per_turn;
+        }
     }
 
     if let Some(context) = partial.context {
@@ -1016,6 +1058,7 @@ struct PartialCompactionConfig {
     enabled: Option<bool>,
     reserve_tokens: Option<u64>,
     keep_recent_tokens: Option<u64>,
+    max_per_turn: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1533,6 +1576,59 @@ mod tests {
         let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
             .expect("load config");
         assert_eq!(config.tools.web, WebToolConfig::default());
+    }
+
+    /// PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+    /// `[compaction] max_per_turn` round-trips through the
+    /// loader and slots into the rest of `CompactionConfig`
+    /// without disturbing existing fields.
+    #[test]
+    fn compaction_config_loads_max_per_turn() {
+        let tempdir = tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+            [compaction]
+            max_per_turn = 4
+            "#,
+        )
+        .expect("write config");
+
+        let config = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+            .expect("load config");
+        assert_eq!(config.compaction.max_per_turn, 4);
+        // Other compaction fields keep defaults.
+        assert!(config.compaction.enabled);
+    }
+
+    /// PR 8.2: out-of-range `max_per_turn` is rejected at
+    /// load time so a user typing `9999` doesn't quietly let
+    /// the budget become useless.
+    #[test]
+    fn compaction_config_max_per_turn_out_of_range_is_rejected() {
+        for bad in [0_u32, 9_u32, 100_u32] {
+            let tempdir = tempdir().expect("tempdir");
+            let config_path = tempdir.path().join("config.toml");
+            fs::write(
+                &config_path,
+                format!(
+                    r#"
+                    [compaction]
+                    max_per_turn = {bad}
+                    "#,
+                ),
+            )
+            .expect("write config");
+
+            let err = load_config_with_paths(Some(&config_path), None, CliOverrides::default())
+                .expect_err("out-of-range max_per_turn should reject");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("max_per_turn"),
+                "error must mention the field for bad={bad}: {msg}",
+            );
+        }
     }
 
     /// PR 4.3: validation catches operator typos at load time

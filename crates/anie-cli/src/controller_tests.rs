@@ -762,6 +762,41 @@ async fn queue_prompt_cancels_pending_retry() {
     );
 }
 
+/// PR 8.2 of `docs/midturn_compaction_2026-04-27/`. Every
+/// `start_prompt_run` resets the per-turn compaction budget
+/// to the configured `max_per_turn`. Without this, a previous
+/// turn that consumed budget would silently constrain the
+/// next turn — undermining the semantic that each user turn
+/// gets its own allowance.
+#[tokio::test]
+async fn controller_compaction_budget_resets_to_max_per_turn_on_run_prompt() {
+    use std::sync::atomic::Ordering;
+
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Drain the budget to zero, simulating a prior turn that
+    // exhausted its compactions.
+    controller
+        .compactions_remaining_this_turn
+        .store(0, Ordering::Release);
+
+    // No mock provider for this model's API in the harness, so
+    // `start_prompt_run` errors after the reset path runs —
+    // but the reset happens before that error, so the value
+    // we assert below is the post-reset state regardless.
+    let _ = controller.start_prompt_run("hello".into()).await;
+
+    // Default `max_per_turn` is 2 (see anie_config::CompactionConfig).
+    assert_eq!(
+        controller
+            .compactions_remaining_this_turn
+            .load(Ordering::Acquire),
+        2,
+        "fresh user turn must restore the configured per-turn allowance",
+    );
+}
+
 /// PR 7.1 of `docs/active_input_2026-04-27/`. While a run is
 /// active, `AbortAndQueuePrompt(text)` must:
 ///  - push `text` to the **front** of `queued_prompts` so it

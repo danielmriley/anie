@@ -1,7 +1,10 @@
 use std::{
     collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,6 +28,7 @@ use anie_provider::{
 use anie_session::{CompactionConfig, SessionContext, SessionInfo};
 use anie_tui::UiAction;
 
+use crate::retry_policy::GiveUpReason;
 use crate::{
     Cli,
     compaction::CompactionStrategy,
@@ -72,6 +76,17 @@ pub(crate) struct InteractiveController {
     /// — if anie crashes mid-queue the unstarted prompts are
     /// lost; that's the documented trade-off in the plan.
     queued_prompts: VecDeque<String>,
+    /// Compactions still allowed in the current user turn.
+    /// Reset to `[compaction] max_per_turn` at the top of every
+    /// `start_prompt_run`; decremented in `emit_compaction_end`
+    /// after every successful compaction (pre-prompt and
+    /// reactive paths). Read-only consumers
+    /// (`compaction_budget_remaining`) use `Acquire` loads;
+    /// writers use `Release` stores. The `Arc` shape is
+    /// chosen so plan 04's mid-turn gate can clone the handle
+    /// into a spawned task without moving it. Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
+    compactions_remaining_this_turn: Arc<AtomicU32>,
 }
 
 struct CurrentRun {
@@ -120,6 +135,7 @@ impl InteractiveController {
         event_tx: mpsc::Sender<AgentEvent>,
         exit_after_run: bool,
     ) -> Self {
+        let max_per_turn = state.config.anie_config().compaction.max_per_turn;
         Self {
             state,
             ui_action_rx,
@@ -129,7 +145,16 @@ impl InteractiveController {
             quitting: false,
             exit_after_run,
             queued_prompts: VecDeque::new(),
+            compactions_remaining_this_turn: Arc::new(AtomicU32::new(max_per_turn)),
         }
+    }
+
+    /// Read-only accessor for the per-turn compaction budget.
+    /// Used by the reactive retry path (`RetryPolicy::decide`)
+    /// and — once plan 04 lands — the mid-turn gate's pre-check.
+    /// PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+    fn compaction_budget_remaining(&self) -> u32 {
+        self.compactions_remaining_this_turn.load(Ordering::Acquire)
     }
 
     /// Drain the next queued follow-up prompt, if any, and start
@@ -187,10 +212,26 @@ impl InteractiveController {
                                     let policy = RetryPolicy {
                                         config: &self.state.retry_config,
                                     };
-                                    match policy.decide(error, retry_attempt, already_compacted) {
+                                    let budget_remaining = self.compaction_budget_remaining();
+                                    match policy.decide(
+                                        error,
+                                        retry_attempt,
+                                        already_compacted,
+                                        budget_remaining,
+                                    ) {
                                         RetryDecision::Compact => {
                                             match self.state.retry_after_overflow(&self.event_tx).await {
                                                 Ok(true) => {
+                                                    // Successful reactive compaction
+                                                    // consumes a budget slot. PR 8.2 of
+                                                    // `docs/midturn_compaction_2026-04-27/`.
+                                                    self.compactions_remaining_this_turn
+                                                        .fetch_update(
+                                                            Ordering::Release,
+                                                            Ordering::Acquire,
+                                                            |n| Some(n.saturating_sub(1)),
+                                                        )
+                                                        .ok();
                                                     self.start_continuation_run(true, retry_attempt).await?;
                                                 }
                                                 Ok(false) => {
@@ -261,20 +302,53 @@ impl InteractiveController {
                                             // discovered context_window 262144 would see the
                                             // message claim Ollama tried 262144 / 131072,
                                             // when it actually tried 65536 / 32768.
-                                            let model = self.state.config.current_model();
-                                            let requested_num_ctx =
-                                                self.state.config.effective_ollama_context_window();
-                                            if let Some(message) = render_user_facing_provider_error(
-                                                error,
-                                                requested_num_ctx,
-                                                &model.provider,
-                                                &model.id,
+                                            // PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+                                            // `CompactionBudgetExhausted` carries no
+                                            // model-load-resources detail, so render an
+                                            // actionable message here rather than relying on
+                                            // `render_user_facing_provider_error` (which keys
+                                            // off the underlying ProviderError, not the
+                                            // give-up reason).
+                                            if matches!(
+                                                reason,
+                                                GiveUpReason::CompactionBudgetExhausted
                                             ) {
+                                                let max_per_turn = self
+                                                    .state
+                                                    .config
+                                                    .anie_config()
+                                                    .compaction
+                                                    .max_per_turn;
                                                 anie_agent::send_event(
                                                     &self.event_tx,
-                                                    AgentEvent::SystemMessage { text: message },
+                                                    AgentEvent::SystemMessage {
+                                                        text: format!(
+                                                            "Context overflow; the per-turn compaction budget ({max_per_turn}) is already used. \
+                                                             Try a smaller prompt, raise /context-length, or set [compaction] max_per_turn higher."
+                                                        ),
+                                                    },
                                                 )
                                                 .await;
+                                            } else {
+                                                let model = self.state.config.current_model();
+                                                let requested_num_ctx =
+                                                    self.state.config.effective_ollama_context_window();
+                                                if let Some(message) =
+                                                    render_user_facing_provider_error(
+                                                        error,
+                                                        requested_num_ctx,
+                                                        &model.provider,
+                                                        &model.id,
+                                                    )
+                                                {
+                                                    anie_agent::send_event(
+                                                        &self.event_tx,
+                                                        AgentEvent::SystemMessage {
+                                                            text: message,
+                                                        },
+                                                    )
+                                                    .await;
+                                                }
                                             }
                                             self.state.finish_run(&result).await?;
                                         }
@@ -771,6 +845,13 @@ impl InteractiveController {
             info!("cancelling pending retry in favor of new prompt");
             self.pending_retry = PendingRetry::Idle;
         }
+        // Reset the per-turn compaction budget. Each fresh user
+        // prompt earns the configured allowance — the budget only
+        // protects against compaction storms *within* a single
+        // turn. PR 8.2 of `docs/midturn_compaction_2026-04-27/`.
+        let max_per_turn = self.state.config.anie_config().compaction.max_per_turn;
+        self.compactions_remaining_this_turn
+            .store(max_per_turn, Ordering::Release);
         self.state.refresh_system_prompt_if_needed();
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],
@@ -782,8 +863,17 @@ impl InteractiveController {
             .session
             .inner_mut()
             .append_message(&prompt_message)?;
-        if self.state.config.anie_config().compaction.enabled {
-            self.state.maybe_auto_compact(&self.event_tx).await?;
+        if self.state.config.anie_config().compaction.enabled
+            && self.state.maybe_auto_compact(&self.event_tx).await?
+        {
+            // Successful pre-prompt compaction consumes one of
+            // this turn's budget slots. PR 8.2 of
+            // `docs/midturn_compaction_2026-04-27/`.
+            self.compactions_remaining_this_turn
+                .fetch_update(Ordering::Release, Ordering::Acquire, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
         }
         let context = self.state.context_without_entry(Some(&prompt_entry_id));
         let agent = build_agent(&self.state);
@@ -1091,7 +1181,13 @@ impl ControllerState {
         .await;
     }
 
-    async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
+    /// Returns `Ok(true)` when a compaction successfully ran,
+    /// `Ok(false)` when the threshold wasn't crossed or the
+    /// session couldn't be reduced. The caller uses the bool
+    /// to decrement the per-turn compaction budget tracked on
+    /// `InteractiveController`. Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
+    async fn maybe_auto_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<bool> {
         let (config, strategy) =
             self.compaction_strategy(self.config.anie_config().compaction.keep_recent_tokens);
 
@@ -1106,7 +1202,7 @@ impl ControllerState {
         let tokens_before = self.session.inner().estimate_context_tokens();
         let threshold = config.context_window.saturating_sub(config.reserve_tokens);
         if tokens_before <= threshold {
-            return Ok(());
+            return Ok(false);
         }
 
         anie_agent::send_event(event_tx, AgentEvent::CompactionStart).await;
@@ -1119,8 +1215,10 @@ impl ControllerState {
         {
             self.emit_compaction_end(event_tx, &result).await;
             anie_agent::send_event(event_tx, self.status_event()).await;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 
     async fn force_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
