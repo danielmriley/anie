@@ -101,18 +101,31 @@ impl WebReadTool {
         self.resolver = resolver;
     }
 
-    async fn run(&self, args: &WebReadArgs) -> Result<String, WebToolError> {
+    async fn run(
+        &self,
+        args: &WebReadArgs,
+        cancel: &CancellationToken,
+    ) -> Result<String, WebToolError> {
+        if cancel.is_cancelled() {
+            return Err(WebToolError::Aborted);
+        }
         let url = fetch::validate_url(&args.url, self.fetch_opts.allow_private_ips)?;
         info!(target = %url, javascript = args.javascript, "web_read start");
 
         if self.respect_robots_txt {
             self.robots
-                .check(&url, &self.fetch_opts.user_agent, &self.client)
+                .check(&url, &self.fetch_opts.user_agent, &self.client, cancel)
                 .await?;
             debug!(host = url.host_str().unwrap_or(""), "robots ok");
         }
         if let Some(host) = url.host_str() {
-            self.rate_limiter.acquire(host).await;
+            // Rate-limit waits can be substantial when the
+            // bucket is empty (1 rps default). A queued abort
+            // must not have to wait out the throttle window.
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+                _ = self.rate_limiter.acquire(host) => {}
+            }
         }
 
         let html = if args.javascript {
@@ -128,15 +141,18 @@ impl WebReadTool {
                 // non-headless `fetch_html` path. This call only
                 // covers the initial URL. PR 3.3 of
                 // `docs/code_review_2026-04-27/`.
-                fetch::validate_destination(
-                    &url,
-                    self.resolver.as_ref(),
-                    self.fetch_opts.allow_private_ips,
-                )
-                .await?;
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+                    r = fetch::validate_destination(
+                        &url,
+                        self.resolver.as_ref(),
+                        self.fetch_opts.allow_private_ips,
+                    ) => r?,
+                }
                 crate::read::headless::render_with_chrome(
                     &url,
                     Duration::from_secs(self.fetch_opts.headless_timeout_secs),
+                    cancel,
                 )
                 .await?
             }
@@ -150,11 +166,18 @@ impl WebReadTool {
         } else {
             // `fetch_html` validates every URL in the chain
             // (initial + redirects) against `allow_private_ips`.
-            fetch::fetch_html(&self.client, self.resolver.as_ref(), &url, &self.fetch_opts).await?
+            fetch::fetch_html(
+                &self.client,
+                self.resolver.as_ref(),
+                cancel,
+                &url,
+                &self.fetch_opts,
+            )
+            .await?
         };
         debug!(bytes = html.len(), "fetched html");
 
-        let extracted = self.runner.run(&html, url.as_str()).await?;
+        let extracted = self.runner.run(&html, url.as_str(), cancel).await?;
         debug!(
             title = extracted.title.as_deref().unwrap_or(""),
             words = ?extracted.word_count,
@@ -196,15 +219,15 @@ impl Tool for WebReadTool {
         &self,
         _call_id: &str,
         args: serde_json::Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<ToolResult>>,
     ) -> Result<ToolResult, ToolError> {
         let parsed: WebReadArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_read args: {e}")))?;
-        let body = self
-            .run(&parsed)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let body = self.run(&parsed, &cancel).await.map_err(|e| match e {
+            WebToolError::Aborted => ToolError::Aborted,
+            other => ToolError::ExecutionFailed(other.to_string()),
+        })?;
         Ok(ToolResult {
             content: vec![ContentBlock::Text { text: body }],
             details: serde_json::json!({
@@ -248,6 +271,7 @@ mod tests {
             &self,
             _html: &str,
             _source_url: &str,
+            _cancel: &CancellationToken,
         ) -> Result<DefuddleOutput, WebToolError> {
             Ok(self.output.clone())
         }
@@ -311,10 +335,13 @@ mod tests {
 
         let url = format!("{}/article", server.base_url());
         let body = tool
-            .run(&WebReadArgs {
-                url,
-                javascript: false,
-            })
+            .run(
+                &WebReadArgs {
+                    url,
+                    javascript: false,
+                },
+                &CancellationToken::new(),
+            )
             .await
             .expect("run ok");
 
@@ -352,10 +379,13 @@ mod tests {
 
         let url = format!("{}/big", server.base_url());
         let err = tool
-            .run(&WebReadArgs {
-                url,
-                javascript: false,
-            })
+            .run(
+                &WebReadArgs {
+                    url,
+                    javascript: false,
+                },
+                &CancellationToken::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, WebToolError::TooLarge { .. }));
@@ -382,10 +412,13 @@ mod tests {
 
         let url = format!("{}/missing", server.base_url());
         let err = tool
-            .run(&WebReadArgs {
-                url,
-                javascript: false,
-            })
+            .run(
+                &WebReadArgs {
+                    url,
+                    javascript: false,
+                },
+                &CancellationToken::new(),
+            )
             .await
             .unwrap_err();
         match err {
@@ -405,10 +438,13 @@ mod tests {
         )
         .expect("build tool");
         let err = tool
-            .run(&WebReadArgs {
-                url: "http://127.0.0.1/page".into(),
-                javascript: false,
-            })
+            .run(
+                &WebReadArgs {
+                    url: "http://127.0.0.1/page".into(),
+                    javascript: false,
+                },
+                &CancellationToken::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, WebToolError::PrivateAddress(_)));
@@ -426,13 +462,107 @@ mod tests {
         )
         .expect("build tool");
         let err = tool
-            .run(&WebReadArgs {
-                url: "https://example.com/".into(),
-                javascript: true,
-            })
+            .run(
+                &WebReadArgs {
+                    url: "https://example.com/".into(),
+                    javascript: true,
+                },
+                &CancellationToken::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, WebToolError::HeadlessFailure(_)));
+    }
+
+    /// PR 4.1 of `docs/code_review_2026-04-27/`. A token that
+    /// is already cancelled before `run` is invoked must
+    /// short-circuit immediately — no fetch attempt, no
+    /// Defuddle invocation. The agent loop relies on this for
+    /// cheap "abort just before the call lands" semantics.
+    #[tokio::test]
+    async fn web_read_honors_cancellation_before_fetch() {
+        let tool = WebReadTool::with_runner(
+            opts(true),
+            Arc::new(StubRunner {
+                output: fixed_output(),
+            }),
+            false,
+        )
+        .expect("build tool");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = tool
+            .run(
+                &WebReadArgs {
+                    url: "http://example.com/page".into(),
+                    javascript: false,
+                },
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::Aborted), "got: {err:?}");
+    }
+
+    /// PR 4.1: cancellation during the Defuddle step must
+    /// surface promptly. Use a runner that cooperates by
+    /// observing `cancel.cancelled()` before returning, then
+    /// fire the cancel from the test once `run` is in flight.
+    #[tokio::test]
+    async fn web_read_honors_cancellation_while_defuddle_running() {
+        // A runner that waits on cancel forever.
+        struct StallingRunner;
+        #[async_trait]
+        impl DefuddleRunner for StallingRunner {
+            async fn run(
+                &self,
+                _html: &str,
+                _source_url: &str,
+                cancel: &CancellationToken,
+            ) -> Result<DefuddleOutput, WebToolError> {
+                cancel.cancelled().await;
+                Err(WebToolError::Aborted)
+            }
+        }
+
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/page");
+                then.status(200)
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body("<html><body>ok</body></html>");
+            })
+            .await;
+
+        let tool = WebReadTool::with_runner(opts(true), Arc::new(StallingRunner), false)
+            .expect("build tool");
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Fire cancellation shortly after `run` has started.
+        // 50ms is long enough for the fetch to land and reach
+        // the Defuddle step on a healthy CI host, short enough
+        // that a hung test would still surface within the
+        // tokio runtime watchdog.
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let url = format!("{}/page", server.base_url());
+        let err = tool
+            .run(
+                &WebReadArgs {
+                    url,
+                    javascript: false,
+                },
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::Aborted), "got: {err:?}");
+        canceller.await.expect("canceller task");
     }
 
     /// PR 3.3 of `docs/code_review_2026-04-27/`. The headless
@@ -471,10 +601,13 @@ mod tests {
         )])));
 
         let err = tool
-            .run(&WebReadArgs {
-                url: "http://evil.example/page".into(),
-                javascript: true,
-            })
+            .run(
+                &WebReadArgs {
+                    url: "http://evil.example/page".into(),
+                    javascript: true,
+                },
+                &CancellationToken::new(),
+            )
             .await
             .unwrap_err();
         assert!(

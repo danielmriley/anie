@@ -98,9 +98,14 @@ pub fn locate_chrome() -> Result<PathBuf, WebToolError> {
 pub async fn render_with_chrome(
     url: &url::Url,
     timeout: std::time::Duration,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<String, WebToolError> {
     use chromiumoxide::browser::{Browser, BrowserConfig};
     use futures::StreamExt;
+
+    if cancel.is_cancelled() {
+        return Err(WebToolError::Aborted);
+    }
 
     // Per the doc comment above: the headless path is not SSRF
     // equivalent to the non-headless path. Log this loudly so
@@ -179,11 +184,27 @@ pub async fn render_with_chrome(
         result
     };
 
-    match tokio::time::timeout(timeout, render).await {
-        Ok(res) => res,
-        Err(_) => Err(WebToolError::Timeout {
-            seconds: timeout.as_secs(),
-        }),
+    // Race timeout, cancellation, and the render. The render
+    // closure handles browser cleanup on its own success and
+    // internal-error paths via `browser.close().await`. If
+    // either timeout *or* cancellation wins here, the render
+    // future is dropped before `browser.close()` can run, and
+    // chromiumoxide does NOT tear down Chrome on `Browser`
+    // drop — so the spawned process is leaked until anie's
+    // own exit reaps it. The same leak existed for the
+    // timeout path before this PR; cancellation just adds a
+    // second trigger. Closing this requires a top-level
+    // `Browser` handle so we can call `.kill()` from outside
+    // the inner future, plus rolling our own select against
+    // an explicit timer rather than `tokio::time::timeout`.
+    // Tracked as follow-up to PR 4.1.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(WebToolError::Aborted),
+        result = tokio::time::timeout(timeout, render) => match result {
+            Ok(res) => res,
+            Err(_) => Err(WebToolError::Timeout { seconds: timeout.as_secs() }),
+        }
     }
 }
 

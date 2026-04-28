@@ -27,6 +27,7 @@ use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::WebToolError;
 
@@ -103,11 +104,21 @@ impl DefuddleOutput {
 
 /// Trait abstracting the Defuddle invocation so tests can
 /// substitute a deterministic implementation.
+///
+/// `cancel` is honored cooperatively. Production runners must
+/// kill the spawned subprocess on cancellation rather than
+/// letting it run to completion in the background.
 #[async_trait]
 pub trait DefuddleRunner: Send + Sync {
     /// Run Defuddle against `html`, with `source_url` provided
-    /// for relative-link resolution and metadata.
-    async fn run(&self, html: &str, source_url: &str) -> Result<DefuddleOutput, WebToolError>;
+    /// for relative-link resolution and metadata. Returns
+    /// [`WebToolError::Aborted`] when `cancel` fires.
+    async fn run(
+        &self,
+        html: &str,
+        source_url: &str,
+        cancel: &CancellationToken,
+    ) -> Result<DefuddleOutput, WebToolError>;
 }
 
 /// Production implementation: spawns the `defuddle` CLI as a
@@ -117,7 +128,15 @@ pub struct SubprocessDefuddleRunner;
 
 #[async_trait]
 impl DefuddleRunner for SubprocessDefuddleRunner {
-    async fn run(&self, html: &str, _source_url: &str) -> Result<DefuddleOutput, WebToolError> {
+    async fn run(
+        &self,
+        html: &str,
+        _source_url: &str,
+        cancel: &CancellationToken,
+    ) -> Result<DefuddleOutput, WebToolError> {
+        if cancel.is_cancelled() {
+            return Err(WebToolError::Aborted);
+        }
         // The Defuddle 0.18 CLI takes a file path or URL — no
         // stdin. We write the already-fetched HTML to a tempfile
         // so anie's SSRF guard, robots check, rate limit, and
@@ -149,22 +168,72 @@ impl DefuddleRunner for SubprocessDefuddleRunner {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| WebToolError::DefuddleSpawn(e.to_string()))?;
 
-        let output = child.wait_with_output().await?;
+        // Cancellation: take stdout/stderr into separate read
+        // tasks so we can `child.wait()` cooperatively. On
+        // cancel, kill the child and abort the readers — the
+        // alternative (`wait_with_output()`) consumes `child`
+        // and gives us no kill handle. PR 4.1 of
+        // `docs/code_review_2026-04-27/`.
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| WebToolError::DefuddleSpawn("missing stdout pipe".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| WebToolError::DefuddleSpawn("missing stderr pipe".into()))?;
+
+        let stdout_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut reader = stdout;
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf).await.map(|_| buf)
+        });
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut reader = stderr;
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf).await.map(|_| buf)
+        });
+
+        let status = tokio::select! {
+            _ = cancel.cancelled() => {
+                // start_kill is non-blocking; wait reaps the
+                // process so we don't leave a zombie.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                drop(tmp);
+                return Err(WebToolError::Aborted);
+            }
+            res = child.wait() => res?,
+        };
+
+        let stdout_buf = stdout_task
+            .await
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stdout reader join: {e}")))?
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stdout read: {e}")))?;
+        let stderr_buf = stderr_task
+            .await
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stderr reader join: {e}")))?
+            .map_err(|e| WebToolError::DefuddleSpawn(format!("stderr read: {e}")))?;
+
         // Keep `tmp` alive until after the child has read it.
         drop(tmp);
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
             return Err(WebToolError::DefuddleFailed {
-                exit_code: output.status.code(),
+                exit_code: status.code(),
                 stderr,
             });
         }
-        parse_defuddle_output(&output.stdout)
+        parse_defuddle_output(&stdout_buf)
     }
 }
 

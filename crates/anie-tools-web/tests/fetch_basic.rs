@@ -9,6 +9,7 @@ use anie_tools_web::read::fetch::{
 };
 use httpmock::Method::GET;
 use httpmock::MockServer;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 fn opts_for_test(allow_private: bool) -> FetchOptions {
@@ -35,9 +36,15 @@ async fn fetch_returns_body_within_max_size() {
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let html = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .expect("fetch ok");
+    let html = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .expect("fetch ok");
     assert!(html.contains("<h1>Hello</h1>"));
 }
 
@@ -57,9 +64,15 @@ async fn fetch_rejects_body_above_max_size() {
     opts.max_bytes = 10 * 1024; // 10 KiB cap
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .unwrap_err();
+    let err = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, WebToolError::TooLarge { .. }), "got: {err:?}");
 }
 
@@ -77,9 +90,15 @@ async fn fetch_surfaces_http_404_as_typed_error() {
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .unwrap_err();
+    let err = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .unwrap_err();
     match err {
         WebToolError::HttpStatus { code, body_excerpt } => {
             assert_eq!(code, 404);
@@ -115,9 +134,15 @@ async fn fetch_follows_redirect_chain() {
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let html = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .expect("fetch ok");
+    let html = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .expect("fetch ok");
     assert!(html.contains("arrived"));
 }
 
@@ -149,9 +174,15 @@ async fn fetch_caps_redirect_chain() {
     opts.max_redirects = 5;
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .unwrap_err();
+    let err = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, WebToolError::Fetch(_)), "got: {err:?}");
 }
 
@@ -188,9 +219,15 @@ async fn fetch_rejects_redirect_to_private_address() {
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .unwrap_err();
+    let err = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .unwrap_err();
     // `allow_private_ips = true` lets this through (operator
     // opt-in). Re-test the negative case below.
     assert!(
@@ -254,9 +291,15 @@ async fn fetch_rejects_non_html_content_type() {
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let err = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .unwrap_err();
+    let err = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .unwrap_err();
     match err {
         WebToolError::UnsupportedContentType(ct) => {
             assert!(ct.starts_with("text/plain"), "got: {ct}");
@@ -281,9 +324,15 @@ async fn fetch_accepts_xhtml_and_xml_content_types() {
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let html = fetch_html(&client, resolver.as_ref(), &url, &opts)
-        .await
-        .expect("fetch ok");
+    let html = fetch_html(
+        &client,
+        resolver.as_ref(),
+        &CancellationToken::new(),
+        &url,
+        &opts,
+    )
+    .await
+    .expect("fetch ok");
     assert!(html.contains("ok"));
 }
 
@@ -304,7 +353,7 @@ async fn fetch_rejects_hostname_resolving_to_private_ip() {
     let url = Url::parse("http://evil.example/page").unwrap();
     let opts = opts_for_test(false);
     let client = build_client(&opts).expect("build client");
-    let err = fetch_html(&client, &resolver, &url, &opts)
+    let err = fetch_html(&client, &resolver, &CancellationToken::new(), &url, &opts)
         .await
         .unwrap_err();
     assert!(
@@ -365,7 +414,7 @@ async fn fetch_rejects_redirect_to_hostname_resolving_to_metadata() {
     // runs and trips on the metadata IP.
     let opts = opts_for_test(true);
     let client = build_client(&opts).expect("build client");
-    let err = fetch_html(&client, &resolver, &url, &opts)
+    let err = fetch_html(&client, &resolver, &CancellationToken::new(), &url, &opts)
         .await
         .unwrap_err();
     // With allow_private_ips=true we don't expect the guard
@@ -404,7 +453,7 @@ async fn fetch_allows_hostname_resolving_to_public_ip() {
         ..FetchOptions::default()
     };
     let client = build_client(&opts).expect("build client");
-    let result = fetch_html(&client, &resolver, &url, &opts).await;
+    let result = fetch_html(&client, &resolver, &CancellationToken::new(), &url, &opts).await;
     // PrivateAddress would be a regression — the resolver
     // returned a public IP, so validation must accept.
     if let Err(WebToolError::PrivateAddress(msg)) = &result {

@@ -54,9 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "render" => {
             let url_str = target.ok_or("usage: smoke render <url>")?;
             let url = url::Url::parse(&url_str)?;
+            let cancel = CancellationToken::new();
             let html = anie_tools_web::read::headless::render_with_chrome(
                 &url,
                 std::time::Duration::from_secs(30),
+                &cancel,
             )
             .await?;
             // Print the full HTML so it can be redirected.

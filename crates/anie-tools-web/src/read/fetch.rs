@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 use texting_robots::Robot;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::error::WebToolError;
@@ -263,11 +264,15 @@ impl RobotsCache {
     /// Check whether `url` may be fetched under `user_agent`.
     /// Returns `Ok(())` if allowed (or robots.txt unavailable);
     /// `Err(WebToolError::Forbidden)` if explicitly disallowed.
+    /// Honors `cancel` for the robots.txt fetch on the slow
+    /// path; the in-memory cache lookup is uncancellable but
+    /// effectively instantaneous.
     pub async fn check(
         &self,
         url: &Url,
         user_agent: &str,
         client: &reqwest::Client,
+        cancel: &CancellationToken,
     ) -> Result<(), WebToolError> {
         let host = url
             .host_str()
@@ -283,7 +288,10 @@ impl RobotsCache {
         }
 
         // Slow path: fetch robots.txt for this host.
-        let robots = fetch_robots_for(client, url).await;
+        let robots = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            r = fetch_robots_for(client, url) => r,
+        };
         let mut cache = self.inner.write().await;
         let slot = cache.entry(host).or_insert(robots);
         self.evaluate(slot.as_ref(), url, user_agent)
@@ -458,21 +466,28 @@ pub fn build_client(opts: &FetchOptions) -> Result<reqwest::Client, WebToolError
 pub async fn fetch_html(
     client: &reqwest::Client,
     resolver: &dyn Resolver,
+    cancel: &CancellationToken,
     url: &Url,
     opts: &FetchOptions,
 ) -> Result<String, WebToolError> {
+    if cancel.is_cancelled() {
+        return Err(WebToolError::Aborted);
+    }
     // Initial DNS check. `validate_url` was called by the
     // caller; we add the resolved-IP classification here.
-    validate_destination(url, resolver, opts.allow_private_ips).await?;
+    tokio::select! {
+        _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+        r = validate_destination(url, resolver, opts.allow_private_ips) => r?,
+    }
 
     let mut current = url.clone();
     let mut hops = 0usize;
     let response = loop {
-        let response = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(|e| WebToolError::Fetch(e.to_string()))?;
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            r = client.get(current.clone()).send() => r
+                .map_err(|e| WebToolError::Fetch(e.to_string()))?,
+        };
 
         let status = response.status();
         if !status.is_redirection() {
@@ -514,13 +529,19 @@ pub async fn fetch_html(
         // destination.
         let _ = response;
         current = validate_url(next.as_str(), opts.allow_private_ips)?;
-        validate_destination(&current, resolver, opts.allow_private_ips).await?;
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            r = validate_destination(&current, resolver, opts.allow_private_ips) => r?,
+        }
     };
 
     let status = response.status();
     if !status.is_success() {
         // Try to capture a body excerpt for the agent to see.
-        let body = response.text().await.unwrap_or_default();
+        let body = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            r = response.text() => r.unwrap_or_default(),
+        };
         return Err(WebToolError::HttpStatus {
             code: status.as_u16(),
             body_excerpt: WebToolError::truncate_excerpt(&body),
@@ -560,10 +581,18 @@ pub async fn fetch_html(
     }
 
     // Stream the body, enforcing the size cap as we go.
+    // The chunk-level cancellation check matters: a slow
+    // server feeding us bytes drip-by-drip would otherwise
+    // pin the agent until the timeout fires.
     use futures::stream::StreamExt;
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            n = stream.next() => n,
+        };
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| WebToolError::Fetch(e.to_string()))?;
         if buf.len() + chunk.len() > opts.max_bytes {
             return Err(WebToolError::TooLarge {
@@ -907,7 +936,12 @@ mod tests {
         cache.insert("example.com", None).await;
         let url = Url::parse("https://example.com/page").unwrap();
         let client = reqwest::Client::new();
-        assert!(cache.check(&url, "anie/test", &client).await.is_ok());
+        assert!(
+            cache
+                .check(&url, "anie/test", &client, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -917,7 +951,10 @@ mod tests {
         cache.insert("example.com", Some(robot)).await;
         let url = Url::parse("https://example.com/private/secret").unwrap();
         let client = reqwest::Client::new();
-        let err = cache.check(&url, "anie/test", &client).await.unwrap_err();
+        let err = cache
+            .check(&url, "anie/test", &client, &CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, WebToolError::Forbidden(_)));
     }
 
@@ -928,7 +965,12 @@ mod tests {
         cache.insert("example.com", Some(robot)).await;
         let url = Url::parse("https://example.com/public/article").unwrap();
         let client = reqwest::Client::new();
-        assert!(cache.check(&url, "anie/test", &client).await.is_ok());
+        assert!(
+            cache
+                .check(&url, "anie/test", &client, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

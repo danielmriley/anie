@@ -76,7 +76,14 @@ impl WebSearchTool {
         self.resolver = resolver;
     }
 
-    async fn run(&self, args: &WebSearchArgs) -> Result<String, WebToolError> {
+    async fn run(
+        &self,
+        args: &WebSearchArgs,
+        cancel: &CancellationToken,
+    ) -> Result<String, WebToolError> {
+        if cancel.is_cancelled() {
+            return Err(WebToolError::Aborted);
+        }
         if args.query.trim().is_empty() {
             return Err(WebToolError::SearchBackend("query is empty".into()));
         }
@@ -90,13 +97,17 @@ impl WebSearchTool {
         // Per-host rate limit on the backend host. DDG gets
         // its own bucket because it's a separate hostname
         // from any article hosts the agent might read.
-        self.rate_limiter.acquire("duckduckgo.com").await;
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(WebToolError::Aborted),
+            _ = self.rate_limiter.acquire("duckduckgo.com") => {}
+        }
 
         let hits = match self.backend {
             SearchBackend::DuckDuckGo => {
                 ddg::search(
                     &self.client,
                     self.resolver.as_ref(),
+                    cancel,
                     &self.fetch_opts,
                     &args.query,
                     max as usize,
@@ -141,15 +152,15 @@ impl Tool for WebSearchTool {
         &self,
         _call_id: &str,
         args: serde_json::Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
         _update_tx: Option<mpsc::Sender<ToolResult>>,
     ) -> Result<ToolResult, ToolError> {
         let parsed: WebSearchArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_search args: {e}")))?;
-        let body = self
-            .run(&parsed)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let body = self.run(&parsed, &cancel).await.map_err(|e| match e {
+            WebToolError::Aborted => ToolError::Aborted,
+            other => ToolError::ExecutionFailed(other.to_string()),
+        })?;
         Ok(ToolResult {
             content: vec![ContentBlock::Text { text: body }],
             details: serde_json::json!({
@@ -204,12 +215,36 @@ mod tests {
     async fn web_search_rejects_empty_query() {
         let tool = WebSearchTool::new().expect("build tool");
         let err = tool
-            .run(&WebSearchArgs {
-                query: "   ".into(),
-                max_results: None,
-            })
+            .run(
+                &WebSearchArgs {
+                    query: "   ".into(),
+                    max_results: None,
+                },
+                &CancellationToken::new(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, WebToolError::SearchBackend(_)));
+    }
+
+    /// PR 4.1 of `docs/code_review_2026-04-27/`. A token that
+    /// is already cancelled must short-circuit before the
+    /// rate-limit acquire and before the DDG fetch goes out.
+    #[tokio::test]
+    async fn web_search_honors_cancellation_before_fetch() {
+        let tool = WebSearchTool::new().expect("build tool");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = tool
+            .run(
+                &WebSearchArgs {
+                    query: "anything".into(),
+                    max_results: None,
+                },
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebToolError::Aborted), "got: {err:?}");
     }
 }
