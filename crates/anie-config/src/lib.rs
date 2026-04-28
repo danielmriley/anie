@@ -402,15 +402,42 @@ pub fn anie_dir() -> Option<PathBuf> {
 
 /// Atomically write `contents` to `path`.
 ///
-/// The write goes to a same-directory temp file
-/// (`.{name}.tmp.{pid}.{counter}`), fsyncs, then renames over the destination. On POSIX the
-/// rename is atomic for same-filesystem moves, so a crash during
-/// the write leaves the original `path` intact.
+/// Three guarantees, in order of strength:
+///
+/// 1. **Atomic replacement.** The write goes to a
+///    same-directory temp file (`.{name}.tmp.{pid}.{counter}`)
+///    and is renamed over the destination. On POSIX the
+///    rename is atomic for same-filesystem moves, so a crash
+///    during the write leaves the original `path` intact —
+///    readers see either the old contents or the new
+///    contents, never a half-written file.
+///
+/// 2. **File-body durability.** Before rename, the temp
+///    file's body is synced via `File::sync_all`, so the
+///    bytes themselves are on disk before the directory
+///    entry flips.
+///
+/// 3. **Directory-entry durability** (PR 6.3 of
+///    `docs/code_review_2026-04-27/`). On Unix, after
+///    rename succeeds, the parent directory itself is
+///    synced via `File::sync_all` on the directory handle.
+///    Without this, a crash immediately after rename could
+///    lose the directory-entry update on filesystems /
+///    mount options that buffer metadata writes, even
+///    though the file body was already on disk.
+///
+///    A directory-sync failure is logged via `tracing::warn`
+///    but does not surface as an `Err` from this function:
+///    by then the rename has already succeeded and the new
+///    contents are at `path`. Callers receive `Ok(())` so
+///    they don't double-clean a file that's actually in
+///    place; durability is best-effort beyond the log.
 ///
 /// Use this for any user-facing persistent file (config, auth,
-/// runtime state). On failure the temp file is best-effort
-/// removed and the previous contents of `path` are preserved —
-/// callers should treat `Err` as "nothing happened."
+/// runtime state). On the *write* / *rename* error paths the
+/// temp file is best-effort removed and the previous contents
+/// of `path` are preserved — callers should treat `Err` as
+/// "nothing happened."
 ///
 /// # Errors
 ///
@@ -450,12 +477,46 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 
     match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // PR 6.3: fsync the parent directory so the rename
+            // is durable, not just the file body. See guarantee
+            // 3 in the doc comment above for why this lands in
+            // the success arm specifically and why a sync
+            // failure here does not become an `Err` return.
+            if let Err(err) = sync_parent_dir(parent) {
+                tracing::warn!(
+                    parent = %parent.display(),
+                    %err,
+                    "atomic_write: parent directory fsync failed; data is written but durability is best-effort"
+                );
+            }
+            Ok(())
+        }
         Err(err) => {
             let _ = fs::remove_file(&tmp);
             Err(err)
         }
     }
+}
+
+/// Sync the directory at `parent` so a directory-entry update
+/// (e.g. the rename inside `atomic_write`) is flushed to
+/// stable storage. POSIX-only — `File::sync_all` on a
+/// directory handle is the portable Unix way to fsync a
+/// directory.
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> std::io::Result<()> {
+    let dir = fs::File::open(parent)?;
+    dir.sync_all()
+}
+
+/// Non-Unix stub. Today this only matters on macOS / Linux
+/// because the crate is Windows-gated; if a non-Unix POSIX
+/// target ever lands, this stub is a deliberate "skip" rather
+/// than silent forgetting.
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn atomic_write_temp_path(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
@@ -1053,6 +1114,27 @@ mod tests {
         let target = dir.path().join("config.toml");
         atomic_write(&target, b"hello").expect("write ok");
         assert_eq!(fs::read(&target).expect("read target"), b"hello");
+    }
+
+    /// PR 6.3 of `docs/code_review_2026-04-27/`. The success
+    /// path now fsyncs the parent directory after rename. We
+    /// can't directly verify "directory entry was synced to
+    /// stable storage" without a power-cycle test rig, but we
+    /// can pin that a successful write through a tempdir's
+    /// real parent-directory file descriptor doesn't trip
+    /// either the rename or the new fsync — i.e. the new code
+    /// path runs cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_succeeds_with_parent_directory_sync() {
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("durable.toml");
+        atomic_write(&target, b"persisted").expect("write ok");
+        assert_eq!(fs::read(&target).expect("read target"), b"persisted");
+
+        // Replacement still atomic across a second write.
+        atomic_write(&target, b"persisted-v2").expect("write v2");
+        assert_eq!(fs::read(&target).expect("read v2"), b"persisted-v2");
     }
 
     #[test]
