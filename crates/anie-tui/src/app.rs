@@ -1,6 +1,5 @@
 use std::{
     io::Stdout,
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -49,7 +48,7 @@ use crate::{
 };
 
 /// Rendered tool result details re-exported for consumers.
-pub use crate::output::ToolCallResult;
+use crate::output::ToolCallResult;
 
 /// The UI-only app state for the TUI.
 pub struct App {
@@ -1873,7 +1872,7 @@ impl App {
                     Ok(Some((provider, model))) => {
                         self.output_pane.add_system_message(format!(
                             "Saved configuration to {} ({provider}:{model}).",
-                            display_path(&config_path)
+                            config_path.display()
                         ));
                         let _ = self.action_tx.send(UiAction::ReloadConfig {
                             provider: Some(provider),
@@ -1888,7 +1887,7 @@ impl App {
                     Err(error) => {
                         self.output_pane.add_system_message(format!(
                             "Onboarding could not save configuration to {}: {error}",
-                            display_path(&config_path)
+                            config_path.display()
                         ));
                     }
                 }
@@ -2227,10 +2226,6 @@ fn resolve_provider_api_key(provider_name: &str) -> Option<String> {
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
         _ => None,
     })
-}
-
-fn display_path(path: &Path) -> String {
-    path.display().to_string()
 }
 
 fn render_status_bar(

@@ -1366,8 +1366,14 @@ fn assistant_thinking_lines(
         width,
         usize::MAX,
         PrefixBodyStyle {
-            indent: thinking_gutter_style(),
-            body: thinking_body_style(),
+            // Indent: dim modifier — adapts to current fg.
+            indent: Style::default().add_modifier(Modifier::DIM),
+            // Body: italic + dim, explicit visual secondary
+            // channel for reasoning text so it reads as
+            // "notes" rather than "answer."
+            body: Style::default()
+                .fg(Color::Indexed(248))
+                .add_modifier(Modifier::ITALIC | Modifier::DIM),
         },
     )
 }
@@ -1413,19 +1419,6 @@ fn thinking_label_style() -> Style {
     Style::default()
         .fg(Color::Indexed(246))
         .add_modifier(Modifier::DIM)
-}
-
-fn thinking_gutter_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-}
-
-fn thinking_body_style() -> Style {
-    // Italic + dim — explicit visual secondary channel for
-    // reasoning text so it reads as "notes" rather than
-    // "answer."
-    Style::default()
-        .fg(Color::Indexed(248))
-        .add_modifier(Modifier::ITALIC | Modifier::DIM)
 }
 
 fn wrap_text(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {

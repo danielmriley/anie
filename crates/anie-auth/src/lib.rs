@@ -378,14 +378,9 @@ pub(crate) fn save_credential_at(
     };
     store.providers.insert(provider.to_string(), credential);
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let contents =
         serde_json::to_string_pretty(&store).context("failed to serialize auth store")?;
-    anie_config::atomic_write(path, contents.as_bytes())
+    anie_config::atomic_write_create_parent(path, contents.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     #[cfg(unix)]
@@ -423,13 +418,6 @@ fn quarantine_corrupt_auth_file(path: &Path) -> Result<PathBuf> {
         )
     })?;
     Ok(backup)
-}
-
-/// Return the default auth.json path.
-#[must_use]
-#[deprecated(note = "use CredentialStore::new instead")]
-pub fn auth_file_path() -> Option<PathBuf> {
-    default_auth_file_path()
 }
 
 /// Load credentials from the default auth file.

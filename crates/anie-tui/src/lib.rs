@@ -14,10 +14,10 @@ mod terminal;
 mod terminal_capabilities;
 mod widgets;
 
-pub use app::{AgentUiState, App, Spinner, StatusBarState, ToolCallResult, UiAction, run_tui};
+pub use app::{AgentUiState, App, Spinner, StatusBarState, UiAction, run_tui};
 pub use commands::{ArgumentSpec, SlashCommandInfo, SlashCommandSource};
 pub use input::InputPane;
-pub use output::{OutputPane, RenderedBlock};
+pub use output::{OutputPane, RenderedBlock, ToolCallResult};
 pub use overlays::{
     ConfiguredProvider, ConfiguredProviderKind, ModelPickerAction, ModelPickerPane,
     OnboardingAction, OnboardingCompletion, OnboardingScreen, ProviderEntry,

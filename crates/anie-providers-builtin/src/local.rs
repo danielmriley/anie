@@ -71,36 +71,14 @@ fn is_local_host_normalized(provider_lower: &str, base_url_lower: &str) -> bool 
         || base_url_lower.starts_with("https://[::1]")
 }
 
-/// Model-id families known to support leveled thinking (Ollama's
-/// native `think: "low"|"medium"|"high"`). Kept in sync with the
-/// lists in `model_discovery::reasoning_family` and
-/// `model_discovery::infer_reasoning`.
-const REASONING_FAMILIES: &[&str] = &["qwen3", "qwq", "deepseek-r1", "gpt-oss"];
-
-/// True when `id` equals `family`, or starts with `family:` or
-/// `family-` — i.e., `family` is the leading segment of the id
-/// delimited by a tag/variant separator.
-///
-/// Substring matching on `contains(family)` used to mis-classify
-/// `qwen3.5:9b` (which does not support leveled thinking) as the
-/// `qwen3` family, causing Ollama to 400 the request with
-/// `think value "low" is not supported for this model`. See
-/// `docs/ollama_capability_discovery/README.md` PR 1.
-fn id_matches_reasoning_family(id: &str, family: &str) -> bool {
-    if id == family {
-        return true;
-    }
-    match id.strip_prefix(family) {
-        Some(rest) => matches!(rest.chars().next(), Some(':' | '-')),
-        None => false,
-    }
-}
-
+/// Model-id families known to support leveled thinking
+/// (Ollama's native `think: "low"|"medium"|"high"`).
+/// Delegates to
+/// [`crate::model_discovery::is_reasoning_capable_family_id`]
+/// — single source of truth. Previously this file maintained
+/// a parallel `REASONING_FAMILIES` const + matching helper.
 fn is_reasoning_capable_family(model_id: &str) -> bool {
-    let id = model_id.to_ascii_lowercase();
-    REASONING_FAMILIES
-        .iter()
-        .any(|family| id_matches_reasoning_family(&id, family))
+    crate::model_discovery::is_reasoning_capable_family_id(model_id)
 }
 
 /// Plan 06 PR-F: normalized variant of
