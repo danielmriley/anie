@@ -21,7 +21,9 @@ use tracing::{info, warn};
 use anie_agent::{AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry};
 use anie_auth::AuthResolver;
 use anie_config::{AnieConfig, collect_context_files};
-use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
+use anie_protocol::{
+    AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, Usage, UserMessage, now_millis,
+};
 use anie_provider::{
     ApiKind, Model, ProviderError, ProviderRegistry, RequestOptionsResolver, ThinkingLevel,
 };
@@ -105,14 +107,34 @@ struct CurrentRun {
 /// `CurrentRun` would otherwise carry. On deadline fire the
 /// controller starts a continuation run with the captured values;
 /// on user abort/quit the controller clears the state without
-/// starting anything.
-#[derive(Debug, Clone, Copy)]
+/// starting anything — but PR A of
+/// `docs/run_abort_breadcrumb_2026-04-28/` extends `Armed` with
+/// the failed run's `error`/`provider`/`model` so PR B can write
+/// an error-assistant breadcrumb to the session before clearing.
+///
+/// No longer `Copy` because `ProviderError` and the `String`
+/// fields aren't `Copy`. `Clone` is enough — we never need to
+/// duplicate the state, just match-by-reference.
+#[derive(Debug, Clone)]
 enum PendingRetry {
     Idle,
     Armed {
         deadline: Instant,
         attempt: u32,
         already_compacted: bool,
+        /// The `ProviderError` that triggered the scheduled
+        /// retry. Cloned so the breadcrumb path can render
+        /// the same error string the user already saw via
+        /// `RetryScheduled`.
+        error: ProviderError,
+        /// `provider` and `model` are captured at retry-arm
+        /// time rather than re-read at cancel time so a model
+        /// switch between arming and canceling produces a
+        /// breadcrumb attributed to the original failed run,
+        /// not to whatever the controller has currently
+        /// selected.
+        provider: String,
+        model: String,
     },
 }
 
@@ -305,10 +327,14 @@ impl InteractiveController {
                                                         delay_ms,
                                                     )
                                                     .await?;
+                                                let model = self.state.config.current_model();
                                                 self.pending_retry = PendingRetry::Armed {
                                                     deadline: Instant::now() + Duration::from_millis(delay_ms),
                                                     attempt,
                                                     already_compacted,
+                                                    error: error.clone(),
+                                                    provider: model.provider.clone(),
+                                                    model: model.id.clone(),
                                                 };
                                             }
                                         }
@@ -422,17 +448,30 @@ impl InteractiveController {
                 deadline,
                 attempt,
                 already_compacted,
-            } = self.pending_retry
+                ..
+            } = &self.pending_retry
             {
+                // PendingRetry is no longer `Copy` (PR A of
+                // `docs/run_abort_breadcrumb_2026-04-28/`), so
+                // copy out the primitives via `*` and let the
+                // borrow end before the `select!` body — which
+                // re-borrows `self` mutably to handle UI actions
+                // or to clear `pending_retry` on deadline fire.
+                let deadline = *deadline;
+                let attempt = *attempt;
+                let already_compacted = *already_compacted;
                 tokio::select! {
                     maybe_action = self.ui_action_rx.recv() => {
                         match maybe_action {
                             Some(action) => self.handle_action(action).await?,
                             None => {
                                 // Upstream hung up while backoff
-                                // was armed. Drop the retry and
-                                // fall through to the quit path.
-                                self.pending_retry = PendingRetry::Idle;
+                                // was armed. Write the breadcrumb
+                                // and fall through to the quit path
+                                // so the session log isn't left with
+                                // a dangling user message. Plan
+                                // `docs/run_abort_breadcrumb_2026-04-28/`.
+                                self.abort_pending_retry().await?;
                                 self.quitting = true;
                             }
                         }
@@ -523,9 +562,10 @@ impl InteractiveController {
                         .await;
                 } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
                     // A retry was armed but the user typed a
-                    // new prompt — drop the retry and start
-                    // the prompt now.
-                    self.pending_retry = PendingRetry::Idle;
+                    // new prompt — write the breadcrumb (Plan
+                    // `docs/run_abort_breadcrumb_2026-04-28/`),
+                    // then start the prompt now.
+                    self.abort_pending_retry().await?;
                     let _ = self
                         .event_tx
                         .send(AgentEvent::SystemMessage {
@@ -564,7 +604,7 @@ impl InteractiveController {
                         })
                         .await;
                 } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
-                    self.pending_retry = PendingRetry::Idle;
+                    self.abort_pending_retry().await?;
                     let _ = self
                         .event_tx
                         .send(AgentEvent::SystemMessage {
@@ -580,7 +620,7 @@ impl InteractiveController {
                 if let Some(current_run) = &self.current_run {
                     current_run.cancel.cancel();
                 } else if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
-                    self.pending_retry = PendingRetry::Idle;
+                    self.abort_pending_retry().await?;
                     self.send_system_message("Retry aborted by user.").await;
                 }
             }
@@ -589,11 +629,13 @@ impl InteractiveController {
                 if let Some(current_run) = &self.current_run {
                     current_run.cancel.cancel();
                 }
-                // A pending retry is in-memory state; clearing it
-                // here ensures the outer quit-check tears the loop
-                // down in the next iteration instead of waiting
-                // for the deadline.
-                self.pending_retry = PendingRetry::Idle;
+                // A pending retry is in-memory state; finalize it
+                // (writing the session breadcrumb if one is armed)
+                // and tear it down so the outer quit-check ends the
+                // loop in the next iteration instead of waiting for
+                // the deadline. Plan
+                // `docs/run_abort_breadcrumb_2026-04-28/`.
+                self.abort_pending_retry().await?;
             }
             UiAction::SetModel(requested) => {
                 if self.current_run.is_some() {
@@ -601,7 +643,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_model(&requested).await?;
-                    self.cancel_and_emit_status().await;
+                    self.cancel_and_emit_status().await?;
                     self.send_system_message(&format!(
                         "Model set to {}:{}",
                         self.state.config.current_model().provider,
@@ -618,7 +660,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_model_resolved(*model).await?;
-                    self.cancel_and_emit_status().await;
+                    self.cancel_and_emit_status().await?;
                     self.send_persistence_warning_if_present(persistence_warning)
                         .await;
                 }
@@ -629,7 +671,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_thinking(&level).await?;
-                    self.cancel_and_emit_status().await;
+                    self.cancel_and_emit_status().await?;
                     self.send_system_message(&format!(
                         "Thinking level set to {}",
                         format_thinking(self.state.config.current_thinking()),
@@ -705,7 +747,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.force_compact(&self.event_tx).await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await?;
                 }
             }
             UiAction::ForkSession => {
@@ -714,7 +756,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let new_session_id = self.state.fork_session().await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await?;
                     let transcript = self
                         .state
                         .session_context()
@@ -744,7 +786,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.new_session().await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await?;
                     let _ = self
                         .event_tx
                         .send(AgentEvent::TranscriptReplace {
@@ -770,7 +812,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.switch_session(&session_id).await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await?;
                     let transcript = self
                         .state
                         .session_context()
@@ -833,7 +875,7 @@ impl InteractiveController {
                     self.state
                         .reload_config(provider.as_deref(), model.as_deref())
                         .await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await;
+                    self.cancel_pending_retry_for_run_affecting_change().await?;
                     anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
                     self.send_system_message("Configuration reloaded.").await;
                 }
@@ -843,12 +885,64 @@ impl InteractiveController {
         Ok(())
     }
 
-    async fn cancel_pending_retry_for_run_affecting_change(&mut self) {
+    async fn cancel_pending_retry_for_run_affecting_change(&mut self) -> Result<()> {
         if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
-            self.pending_retry = PendingRetry::Idle;
+            self.abort_pending_retry().await?;
             self.send_system_message("Pending retry canceled because run settings changed.")
                 .await;
         }
+        Ok(())
+    }
+
+    /// Finalize a pending retry as a failed turn before clearing
+    /// it.
+    ///
+    /// When the controller cancels `PendingRetry::Armed` for any
+    /// reason other than the deadline firing — a fresh user
+    /// prompt, abort, quit, session change, or model switch —
+    /// this writes a synthetic error-assistant message into the
+    /// session log so the transcript preserves the invariant
+    /// that every user message has a following assistant
+    /// message. Without this breadcrumb, a later model taking
+    /// over the same session sees back-to-back user messages
+    /// (the failed turn's prompt + the new prompt) and
+    /// reconstructs history incorrectly.
+    ///
+    /// No-op when state is already `Idle`. The error string and
+    /// `provider`/`model` are taken from the captured retry
+    /// context (PR A) so the breadcrumb is attributed to the
+    /// run that actually failed, not to whatever model the
+    /// controller has currently selected.
+    ///
+    /// Plan `docs/run_abort_breadcrumb_2026-04-28/`.
+    async fn abort_pending_retry(&mut self) -> Result<()> {
+        let PendingRetry::Armed {
+            error,
+            provider,
+            model,
+            ..
+        } = std::mem::replace(&mut self.pending_retry, PendingRetry::Idle)
+        else {
+            return Ok(());
+        };
+        let error_string = error.to_string();
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: error_string.clone(),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some(error_string),
+            provider,
+            model,
+            timestamp: now_millis(),
+            reasoning_details: None,
+        };
+        self.state
+            .session
+            .inner_mut()
+            .append_message(&Message::Assistant(assistant))?;
+        Ok(())
     }
 
     async fn start_prompt_run(&mut self, text: String) -> Result<()> {
@@ -861,10 +955,12 @@ impl InteractiveController {
         // A fresh user prompt supersedes any pending retry from
         // the previous turn — without this, the retry's continuation
         // would spawn after the new prompt finishes and interleave
-        // on stale context.
+        // on stale context. Write the breadcrumb before clearing so
+        // the session log records what happened to the failed turn.
+        // Plan `docs/run_abort_breadcrumb_2026-04-28/`.
         if matches!(self.pending_retry, PendingRetry::Armed { .. }) {
             info!("cancelling pending retry in favor of new prompt");
-            self.pending_retry = PendingRetry::Idle;
+            self.abort_pending_retry().await?;
         }
         // Reset the per-turn compaction budget. Each fresh user
         // prompt earns the configured allowance — the budget only
@@ -973,9 +1069,10 @@ impl InteractiveController {
     /// `StatusUpdate` to the UI. Several config-mutation arms
     /// share this two-step pattern; the helper consolidates.
     /// PR 01 of `docs/code_consolidation_2026-04-26/`.
-    async fn cancel_and_emit_status(&mut self) {
-        self.cancel_pending_retry_for_run_affecting_change().await;
+    async fn cancel_and_emit_status(&mut self) -> Result<()> {
+        self.cancel_pending_retry_for_run_affecting_change().await?;
         anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+        Ok(())
     }
 }
 
