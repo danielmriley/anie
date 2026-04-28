@@ -116,37 +116,49 @@ impl CommandRegistry {
     /// Argument-hint column width is computed dynamically from the
     /// longest hint so short hints don't push the summary column
     /// out of alignment when rare long hints exist.
+    ///
+    /// Includes a `Keys:` section after the command listing
+    /// describing the active-input affordances introduced in
+    /// `docs/active_input_2026-04-27/` (drafting, queueing,
+    /// interrupt-and-send) so the feature surfaces somewhere
+    /// discoverable. PR 7.3.
     pub(crate) fn format_help(&self) -> String {
         let mut out = String::from("Commands:\n");
-        if self.all().is_empty() {
-            return out;
-        }
-        let hint_width = self
-            .all()
-            .iter()
-            .filter_map(|info| info.argument_hint)
-            .map(|hint| hint.chars().count())
-            .max()
-            .unwrap_or(0);
-        for (key, entries) in self.grouped_by_source() {
-            out.push_str("  ");
-            out.push_str(group_heading(key));
-            out.push_str(":\n");
-            for info in entries {
-                let hint = info.argument_hint.unwrap_or("");
-                if hint_width > 0 {
-                    out.push_str(&format!(
-                        "    /{:<12} {:<hint_width$}  {}\n",
-                        info.name,
-                        hint,
-                        info.summary,
-                        hint_width = hint_width,
-                    ));
-                } else {
-                    out.push_str(&format!("    /{:<12} {}\n", info.name, info.summary));
+        if !self.all().is_empty() {
+            let hint_width = self
+                .all()
+                .iter()
+                .filter_map(|info| info.argument_hint)
+                .map(|hint| hint.chars().count())
+                .max()
+                .unwrap_or(0);
+            for (key, entries) in self.grouped_by_source() {
+                out.push_str("  ");
+                out.push_str(group_heading(key));
+                out.push_str(":\n");
+                for info in entries {
+                    let hint = info.argument_hint.unwrap_or("");
+                    if hint_width > 0 {
+                        out.push_str(&format!(
+                            "    /{:<12} {:<hint_width$}  {}\n",
+                            info.name,
+                            hint,
+                            info.summary,
+                            hint_width = hint_width,
+                        ));
+                    } else {
+                        out.push_str(&format!("    /{:<12} {}\n", info.name, info.summary));
+                    }
                 }
             }
         }
+        out.push_str("Keys:\n");
+        out.push_str("  Enter         submit prompt (idle) / queue follow-up (while running)\n");
+        out.push_str("  Ctrl+Enter    abort the current run and send this draft next\n");
+        out.push_str("  Ctrl+C        abort the current run (no draft sent)\n");
+        out.push_str(
+            "  Type while running — your draft survives; Enter queues, Ctrl+Enter interrupts\n",
+        );
         out
     }
 
@@ -438,6 +450,27 @@ mod tests {
         let help = registry.format_help();
         assert!(help.contains("  Extensions:\n"));
         assert!(help.contains("/ext-help"));
+    }
+
+    /// PR 7.3 of `docs/active_input_2026-04-27/`. The `/help`
+    /// output mentions the active-input affordances —
+    /// drafting while the agent runs, queueing follow-ups
+    /// with Enter, and interrupt-and-send via Ctrl+Enter — so
+    /// the feature is discoverable somewhere users will look.
+    #[test]
+    fn format_help_documents_active_input_keys() {
+        let registry = CommandRegistry::with_builtins();
+        let help = registry.format_help();
+        assert!(help.contains("Keys:\n"), "got: {help}");
+        assert!(help.contains("Enter"), "got: {help}");
+        assert!(
+            help.contains("Ctrl+Enter"),
+            "Ctrl+Enter affordance must be documented: {help}",
+        );
+        assert!(
+            help.contains("Type while running"),
+            "drafting hint must be documented: {help}",
+        );
     }
 
     #[test]
