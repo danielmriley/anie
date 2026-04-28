@@ -642,6 +642,89 @@ fn enter_while_streaming_sends_queue_prompt_and_clears_draft() {
     assert!(saw_queue, "expected a UiAction::QueuePrompt to be emitted");
 }
 
+/// PR 7.2 of `docs/active_input_2026-04-27/`. Ctrl+Enter
+/// while the agent is active emits
+/// `UiAction::AbortAndQueuePrompt(text)` and clears the draft.
+/// Companion to `enter_while_streaming_sends_queue_prompt_…`:
+/// plain Enter queues for after the run, Ctrl+Enter aborts
+/// the run and front-queues this draft instead.
+#[test]
+fn ctrl_enter_while_streaming_sends_abort_and_queue_and_clears_draft() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    for ch in "wrong path".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("char");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL,
+    )))
+    .expect("ctrl-enter");
+
+    assert_eq!(
+        app.input_pane_contents(),
+        "",
+        "Ctrl+Enter must clear the draft after sending interrupt",
+    );
+    let mut saw_interrupt = false;
+    while let Ok(action) = action_rx.try_recv() {
+        match action {
+            crate::UiAction::AbortAndQueuePrompt(text) => {
+                assert_eq!(text, "wrong path");
+                saw_interrupt = true;
+            }
+            crate::UiAction::QueuePrompt(_) => {
+                panic!(
+                    "Ctrl+Enter must not emit QueuePrompt; AbortAndQueuePrompt is the right action"
+                )
+            }
+            crate::UiAction::Abort => {
+                panic!(
+                    "Ctrl+Enter must not emit a bare Abort; AbortAndQueuePrompt is the right action"
+                )
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_interrupt,
+        "expected a UiAction::AbortAndQueuePrompt to be emitted",
+    );
+}
+
+/// PR 7.2: Ctrl+Enter on an empty draft must NOT abort. The
+/// user pressing the chord without any text in the box hasn't
+/// expressed an interrupt-and-send intent; turning that into a
+/// bare abort would be a footgun. Ctrl+C remains the way to
+/// abort without queueing.
+#[test]
+fn ctrl_enter_with_empty_draft_does_not_abort() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("agent start");
+
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::CONTROL,
+    )))
+    .expect("ctrl-enter");
+
+    assert!(
+        action_rx.try_recv().is_err(),
+        "empty Ctrl+Enter must not emit any UiAction",
+    );
+}
+
 /// Active Enter on an empty draft is a no-op — no queue
 /// action, no draft mutation.
 #[test]

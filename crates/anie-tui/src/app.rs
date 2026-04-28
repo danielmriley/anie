@@ -1094,6 +1094,40 @@ impl App {
                 self.output_pane.scroll_to_bottom();
                 RenderDirty::full()
             }
+            // Ctrl+Enter while active: abort the current run
+            // and front-queue this draft so it sends as soon
+            // as the abort completes. PR 7.2 of
+            // `docs/active_input_2026-04-27/`. Terminal support
+            // for Ctrl+Enter varies (Kitty / WezTerm / iTerm2
+            // 3.5 with CSI-u report it; some legacy terminals
+            // do not), but every terminal that does report it
+            // sends a CONTROL+Enter key event under crossterm —
+            // so this binding is safe-by-default and a no-op on
+            // terminals that don't surface the chord. The
+            // companion command-driven fallback for those
+            // terminals lands in PR 7.3 if needed.
+            //
+            // Empty draft is a deliberate no-op rather than a
+            // bare abort: the user pressing Ctrl+Enter without
+            // text in the box hasn't actually expressed an
+            // interrupt-and-send intent, so falling through to
+            // a bare abort would surprise them. Ctrl+C remains
+            // the way to abort without queueing.
+            (KeyModifiers::CONTROL, KeyCode::Enter) => {
+                let draft = self.input_pane.content().to_string();
+                if draft.is_empty() {
+                    RenderDirty::none()
+                } else if self
+                    .action_tx
+                    .send(UiAction::AbortAndQueuePrompt(draft))
+                    .is_ok()
+                {
+                    self.input_pane.clear();
+                    RenderDirty::composer()
+                } else {
+                    RenderDirty::none()
+                }
+            }
             // Enter while active: queue the draft for FIFO
             // execution after the current run completes. The
             // controller-side queue (plan 02 PR B) drains
