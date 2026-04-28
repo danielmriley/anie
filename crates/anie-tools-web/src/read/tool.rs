@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use anie_agent::{Tool, ToolError, ToolExecutionContext};
+use anie_agent::{Tool, ToolError, ToolExecutionContext, effective_tool_output_budget};
 use anie_protocol::{ContentBlock, ToolDef, ToolResult};
 
 use crate::error::WebToolError;
@@ -117,7 +117,20 @@ impl WebReadTool {
         args: &WebReadArgs,
         cancel: &CancellationToken,
         update_tx: Option<&mpsc::Sender<ToolResult>>,
+        ctx: &ToolExecutionContext,
     ) -> Result<String, WebToolError> {
+        // Plan 05 PR D: clamp the per-call fetch byte cap by
+        // the model's context window. The configured
+        // `fetch_opts.max_bytes` (default 10 MiB) remains the
+        // absolute ceiling; for any context window under
+        // ~100M tokens the share rule dominates and the
+        // operator's default is the upper bound. Floors at
+        // `MIN_TOOL_OUTPUT_BUDGET_BYTES`.
+        let effective_max_bytes = usize::try_from(effective_tool_output_budget(
+            ctx.context_window,
+            self.fetch_opts.max_bytes as u64,
+        ))
+        .unwrap_or(self.fetch_opts.max_bytes);
         if cancel.is_cancelled() {
             return Err(WebToolError::Aborted);
         }
@@ -186,12 +199,19 @@ impl WebReadTool {
         } else {
             // `fetch_html` validates every URL in the chain
             // (initial + redirects) against `allow_private_ips`.
+            // Plan 05 PR D: clone the configured opts and shrink
+            // `max_bytes` to the per-call effective budget. The
+            // operator-configured `max_bytes` remains the upper
+            // bound; small-context models get the smaller of the
+            // two.
+            let mut per_call_opts = self.fetch_opts.clone();
+            per_call_opts.max_bytes = effective_max_bytes;
             fetch::fetch_html(
                 &self.client,
                 self.resolver.as_ref(),
                 cancel,
                 &url,
-                &self.fetch_opts,
+                &per_call_opts,
             )
             .await?
         };
@@ -264,12 +284,12 @@ impl Tool for WebReadTool {
         args: serde_json::Value,
         cancel: CancellationToken,
         update_tx: Option<mpsc::Sender<ToolResult>>,
-        _ctx: &ToolExecutionContext,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let parsed: WebReadArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::ExecutionFailed(format!("invalid web_read args: {e}")))?;
         let body = self
-            .run(&parsed, &cancel, update_tx.as_ref())
+            .run(&parsed, &cancel, update_tx.as_ref(), ctx)
             .await
             .map_err(|e| match e {
                 WebToolError::Aborted => ToolError::Aborted,
@@ -389,6 +409,7 @@ mod tests {
                 },
                 &CancellationToken::new(),
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .expect("run ok");
@@ -434,10 +455,62 @@ mod tests {
                 },
                 &CancellationToken::new(),
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();
         assert!(matches!(err, WebToolError::TooLarge { .. }));
+    }
+
+    /// Plan 05 PR D: a small-window context shrinks the
+    /// per-call fetch byte cap below `fetch_opts.max_bytes`,
+    /// so a fetch that would otherwise succeed (5 KB body
+    /// against the default 10 MiB cap) errors with `TooLarge`
+    /// when the budget collapses to ~1 KB on an 8 K window.
+    #[tokio::test]
+    async fn web_read_caps_per_call_max_bytes_by_context_window() {
+        let server = MockServer::start_async().await;
+        let body = "x".repeat(5 * 1024);
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/medium");
+                then.status(200).body(body);
+            })
+            .await;
+
+        let tool = WebReadTool::with_runner(
+            // 5 KB body would normally fit fine — 10 MiB cap.
+            opts(true),
+            Arc::new(StubRunner {
+                output: fixed_output(),
+            }),
+            false,
+        )
+        .expect("build tool");
+
+        let url = format!("{}/medium", server.base_url());
+        let small_ctx = ToolExecutionContext {
+            context_window: 8_192,
+        };
+        let err = tool
+            .run(
+                &WebReadArgs {
+                    url,
+                    javascript: false,
+                },
+                &CancellationToken::new(),
+                None,
+                &small_ctx,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            WebToolError::TooLarge { max, .. } => assert_eq!(
+                max, 1024,
+                "small-window fetch cap should match the floor (1024); got {max}",
+            ),
+            other => panic!("expected TooLarge, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -468,6 +541,7 @@ mod tests {
                 },
                 &CancellationToken::new(),
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();
@@ -495,6 +569,7 @@ mod tests {
                 },
                 &CancellationToken::new(),
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();
@@ -520,6 +595,7 @@ mod tests {
                 },
                 &CancellationToken::new(),
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();
@@ -551,6 +627,7 @@ mod tests {
                 },
                 &cancel,
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();
@@ -612,6 +689,7 @@ mod tests {
                 },
                 &cancel,
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();
@@ -658,6 +736,7 @@ mod tests {
                 },
                 &cancel,
                 Some(&tx),
+                &ToolExecutionContext::default(),
             )
             .await
             .expect("run ok");
@@ -733,6 +812,7 @@ mod tests {
                 },
                 &CancellationToken::new(),
                 None,
+                &ToolExecutionContext::default(),
             )
             .await
             .unwrap_err();
