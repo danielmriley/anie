@@ -45,6 +45,21 @@ ratio — smallest impactful changes first. Check off items as they ship.
       cross-provider invariants, error taxonomy, session schema
       migration, multi-turn integration tests
 
+## Next Up — Foundational Architecture
+
+### 0. REPL-shaped agent loop — **top priority**
+**What**: Refactor `AgentLoop::run` into an explicit
+Read → Eval → Print → Loop runtime while preserving current behavior
+first.
+**Why**: Creates stable step boundaries for error recovery, proactive
+compaction, context augmentation, queued user steering, verifier loops,
+recursive task decomposition, and stronger local-small-model behavior.
+This benefits frontier models too.
+**Effort**: Large, staged refactor — first land behavior-characterization
+tests, then extract run state, then introduce internal intents /
+observations / decisions.
+**Details**: [docs/repl_agent_loop_2026-04-27.md](repl_agent_loop_2026-04-27.md)
+
 ## Next Up — Small, High-Impact
 
 ### 1. Automatic context compaction

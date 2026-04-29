@@ -13,10 +13,22 @@ Entry point for the anie-rs docs tree.
   refactors. Currently just the pi-shaped extension system (plan 10)
   plus the pi-mono comparison it's grounded in.
 - **[code_review_2026-04-24/](code_review_2026-04-24/)** —
-  implementation-ready hardening plans from the GPT-5.5 review,
+  shipped hardening plan set from the GPT-5.5 review,
   cross-checked against pi and Codex. Covers async auth, OpenAI image
   support, retry consistency, persistence visibility, resource caps,
   TUI event draining, and repo hygiene.
+- **[ollama_native_chat_api/](ollama_native_chat_api/)**,
+  **[ollama_context_length_override/](ollama_context_length_override/)**,
+  and **[ollama_default_num_ctx_cap/](ollama_default_num_ctx_cap/)** —
+  native Ollama `/api/chat`, discovered context windows, runtime
+  `/context-length`, and workspace-level `num_ctx` cap plans.
+- **[web_tool_2026-04-26/](web_tool_2026-04-26/)** and
+  **[code_review_2026-04-27/](code_review_2026-04-27/)** — live web
+  tool design plus follow-up hardening for SSRF, redirects,
+  cancellation, and configurable budgets.
+- **[active_input_2026-04-27/](active_input_2026-04-27/)** —
+  editable active drafts and queued follow-up prompts while a run is
+  active.
 - **[add_providers/](add_providers/)** — plans for adding new LLM
   providers (OpenRouter, Gemini, xAI/Groq/Cerebras/Mistral, Azure,
   Bedrock, OpenAI Responses). Complements the `adding-providers`
