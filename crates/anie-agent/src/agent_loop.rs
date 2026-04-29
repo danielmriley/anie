@@ -271,6 +271,74 @@ pub trait CompactionGate: Send + Sync {
     ) -> Result<CompactionGateOutcome, anyhow::Error>;
 }
 
+/// Read-phase snapshot passed to a [`BeforeModelPolicy`] before
+/// each `ModelTurn` step. Borrowed; the policy must not retain
+/// any of these references past the `before_model` call.
+///
+/// Plan `docs/repl_agent_loop/07_first_policy_boundary.md`.
+pub struct BeforeModelRequest<'a> {
+    /// The full canonical context the loop is about to send to
+    /// the provider, including the original prompts plus every
+    /// generated, follow-up, and policy-injected message so far.
+    pub context: &'a [Message],
+    /// The subset of messages produced by the assistant/tool
+    /// loop (controller-persisted output). Excludes prompts,
+    /// follow-ups, steering messages, and prior policy
+    /// injections.
+    pub generated_messages: &'a [Message],
+    /// The model the loop is configured for.
+    pub model: &'a Model,
+    /// Zero-based index of the REPL step about to run. Stable
+    /// per run; stays consistent with the `run_step` field on
+    /// the `agent_repl_step` tracing span.
+    pub step_index: u64,
+}
+
+/// What a [`BeforeModelPolicy`] returns. `Continue` is the
+/// noop default. `AppendMessages` injects messages into the
+/// loop's context (context-only — these messages do *not*
+/// appear in `AgentRunResult::generated_messages`, so the
+/// controller does not persist them as agent output).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BeforeModelResponse {
+    /// Proceed with the model request unchanged.
+    Continue,
+    /// Append these messages to the run context before the
+    /// model request goes out. Useful for context augmentation
+    /// (repo-map injection, queued-prompt folding, retrieved
+    /// excerpts) and proactive compaction summaries.
+    AppendMessages(Vec<Message>),
+}
+
+/// Hook invoked before every `ModelTurn` step. The default
+/// installation is [`NoopBeforeModelPolicy`]; the loop pays a
+/// single virtual call per turn for callers that don't install
+/// a custom one.
+///
+/// This is the first cross-step extension point on
+/// [`AgentRunMachine`]. Future hooks (after-model, on-tool-error,
+/// before-tool, after-stream-error) get their own traits when
+/// real consumers materialize.
+///
+/// Plan `docs/repl_agent_loop/07_first_policy_boundary.md`.
+#[async_trait::async_trait]
+pub trait BeforeModelPolicy: Send + Sync {
+    /// Inspect the upcoming model request and either let it
+    /// proceed unchanged or append context messages first.
+    async fn before_model(&self, request: BeforeModelRequest<'_>) -> BeforeModelResponse;
+}
+
+/// Default `BeforeModelPolicy` — always returns `Continue`.
+/// Behavior is identical to having no hook at all.
+pub struct NoopBeforeModelPolicy;
+
+#[async_trait::async_trait]
+impl BeforeModelPolicy for NoopBeforeModelPolicy {
+    async fn before_model(&self, _request: BeforeModelRequest<'_>) -> BeforeModelResponse {
+        BeforeModelResponse::Continue
+    }
+}
+
 /// Immutable configuration for an agent loop instance.
 pub struct AgentLoopConfig {
     model: Model,
@@ -289,6 +357,11 @@ pub struct AgentLoopConfig {
     /// today's call sites all pass `None`, so this is a pure
     /// plumbing change with zero behavioral effect.
     compaction_gate: Option<Arc<dyn CompactionGate>>,
+    /// Hook invoked before every `ModelTurn` step. Defaults to
+    /// `NoopBeforeModelPolicy`, so the call adds a single
+    /// virtual call per turn with no behavioral change. Plan
+    /// `docs/repl_agent_loop/07_first_policy_boundary.md`.
+    before_model_policy: Arc<dyn BeforeModelPolicy>,
 }
 
 impl AgentLoopConfig {
@@ -313,7 +386,18 @@ impl AgentLoopConfig {
             before_tool_call_hook: None,
             after_tool_call_hook: None,
             compaction_gate: None,
+            before_model_policy: Arc::new(NoopBeforeModelPolicy),
         }
+    }
+
+    /// Install a [`BeforeModelPolicy`] that the loop consults at
+    /// the start of every `ModelTurn` step. Defaults to
+    /// `NoopBeforeModelPolicy`. Plan
+    /// `docs/repl_agent_loop/07_first_policy_boundary.md`.
+    #[must_use]
+    pub fn with_before_model_policy(mut self, policy: Arc<dyn BeforeModelPolicy>) -> Self {
+        self.before_model_policy = policy;
+        self
     }
 
     /// Install a [`CompactionGate`] that the loop consults at
@@ -428,6 +512,11 @@ struct AgentRunState {
     /// double-emit. Every other terminal path relies on the
     /// tail emission.
     suppress_tail_agent_end: bool,
+    /// Zero-based index of the next REPL step. Bumped by
+    /// `next_step` after each iteration. Read by phase methods
+    /// for tracing fields and surfaced to `BeforeModelPolicy`
+    /// via `BeforeModelRequest::step_index`.
+    step_index: u64,
 }
 
 impl AgentRunState {
@@ -442,6 +531,7 @@ impl AgentRunState {
             terminal_error: None,
             finished: false,
             suppress_tail_agent_end: false,
+            step_index: 0,
         }
     }
 
@@ -475,6 +565,18 @@ impl AgentRunState {
     /// and steering injections, which are not persisted as
     /// agent output.
     fn extend_context<I>(&mut self, messages: I)
+    where
+        I: IntoIterator<Item = Message>,
+    {
+        self.context.extend(messages);
+    }
+
+    /// Append messages produced by a `BeforeModelPolicy` hook.
+    /// Identical to `extend_context` today; lives as a
+    /// separately-named helper so the rule "policy injections
+    /// are context-only, never persisted" has one obvious
+    /// callsite if we ever revisit it.
+    fn append_policy_context<I>(&mut self, messages: I)
     where
         I: IntoIterator<Item = Message>,
     {
@@ -693,7 +795,6 @@ impl AgentLoop {
             agent_loop: self,
             state,
             intent: AgentIntent::ModelTurn,
-            step_index: 0,
             run_span,
         }
     }
@@ -773,6 +874,33 @@ impl AgentLoop {
         event_tx: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> AgentObservation {
+        // Policy hook: every `ModelTurn` step lets the configured
+        // `BeforeModelPolicy` inspect the upcoming request and
+        // optionally inject context messages before resolution
+        // begins. Default `NoopBeforeModelPolicy` returns
+        // `Continue` so this is one virtual call per turn for
+        // callers that don't install a custom policy. The
+        // injection (if any) is context-only: policy messages
+        // are not added to `generated_messages` and the
+        // controller does not persist them as agent output.
+        let policy_request = BeforeModelRequest {
+            context: state.context(),
+            generated_messages: state.generated_messages(),
+            model: &self.config.model,
+            step_index: state.step_index,
+        };
+        match self
+            .config
+            .before_model_policy
+            .before_model(policy_request)
+            .await
+        {
+            BeforeModelResponse::Continue => {}
+            BeforeModelResponse::AppendMessages(messages) => {
+                state.append_policy_context(messages);
+            }
+        }
+
         let request = match self
             .config
             .request_options_resolver
@@ -1446,7 +1574,6 @@ pub struct AgentRunMachine<'a> {
     agent_loop: &'a AgentLoop,
     state: AgentRunState,
     intent: AgentIntent,
-    step_index: u64,
     run_span: tracing::Span,
 }
 
@@ -1489,7 +1616,7 @@ impl<'a> AgentRunMachine<'a> {
         let step_span = debug_span!(
             parent: &self.run_span,
             "agent_repl_step",
-            run_step = self.step_index,
+            run_step = self.state.step_index,
             intent = self.intent.kind(),
             context_messages = self.state.context().len(),
             generated_messages = self.state.generated_messages().len(),
@@ -1529,7 +1656,7 @@ impl<'a> AgentRunMachine<'a> {
             }
         }
 
-        self.step_index += 1;
+        self.state.step_index += 1;
 
         if self.state.finished {
             AgentStepBoundary::Finished
