@@ -25,6 +25,7 @@ use std::sync::{
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tracing::{debug, info};
 
 use anie_agent::{CompactionGate, CompactionGateOutcome};
 use anie_protocol::{AgentEvent, CompactionPhase, Message};
@@ -240,6 +241,19 @@ impl CompactionGate for ControllerCompactionGate {
         // counter, so a fresh user turn's reset is visible
         // here before we consult it.
         if self.budget.load(Ordering::Acquire) == 0 {
+            // Diagnostic: log the history so an operator
+            // running with `RUST_LOG=anie_cli::compaction_gate=debug`
+            // can audit why we hit the budget without
+            // stagnation having fired (e.g., only 2 weak
+            // compactions before exhaustion, when 3 would have
+            // tripped detection).
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            info!(
+                history_len = state.history.len(),
+                aggressive_level = state.aggressive_level,
+                history = ?state.history,
+                "compaction budget exhausted; logging gate history for diagnosis"
+            );
             return Ok(CompactionGateOutcome::Skipped {
                 reason: format!(
                     "per-turn compaction budget exhausted ({tokens} tokens over threshold {threshold})"
@@ -258,25 +272,106 @@ impl CompactionGate for ControllerCompactionGate {
         //     uses a tighter `keep_recent_tokens`.
         // No-op when fewer than `STAGNATION_WINDOW` outcomes
         // have been recorded.
-        let aggressive_level = {
+        //
+        // Observability: each call logs the history length +
+        // detection result so a user running with
+        // `RUST_LOG=anie_cli::compaction_gate=debug` can see
+        // exactly why aggressive mode did or didn't fire.
+        //
+        // The lock is dropped *before* any `.await` so the
+        // future stays `Send`. `MutexGuard` from
+        // `std::sync::Mutex` is not `Send`-friendly across
+        // await points; we capture what we need and drop.
+        enum StagnationDispatch {
+            Continue {
+                aggressive_level: u8,
+                level_changed_to: Option<u8>,
+            },
+            SkipRegressing,
+        }
+        let dispatch = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            match detect_stagnation(&state.history) {
+            let stagnation = detect_stagnation(&state.history);
+            debug!(
+                history_len = state.history.len(),
+                tokens,
+                threshold,
+                aggressive_level_before = state.aggressive_level,
+                stagnation = ?stagnation,
+                "compaction gate stagnation check"
+            );
+            match stagnation {
                 Some(StagnationKind::Regressing) => {
-                    return Ok(CompactionGateOutcome::Skipped {
-                        reason: format!(
-                            "compaction stagnated (summarizer regressing: tokens_after did not shrink across the last {STAGNATION_WINDOW} calls); falling through to reactive overflow path"
-                        ),
-                    });
+                    info!(
+                        history_len = state.history.len(),
+                        "stagnation: regressing — skipping compaction; reactive overflow takes over"
+                    );
+                    StagnationDispatch::SkipRegressing
                 }
                 Some(StagnationKind::ConvergingFloor) => {
-                    state.aggressive_level = state
+                    let new_level = state
                         .aggressive_level
                         .saturating_add(1)
                         .min(MAX_AGGRESSIVE_LEVEL);
+                    let level_changed = new_level != state.aggressive_level;
+                    state.aggressive_level = new_level;
+                    if level_changed {
+                        info!(
+                            new_level,
+                            default_keep_recent = self.config.keep_recent_tokens,
+                            halved_keep_recent =
+                                aggressive_keep_recent(self.config.keep_recent_tokens, new_level,),
+                            "stagnation: converging floor — bumping aggressive level"
+                        );
+                    }
+                    StagnationDispatch::Continue {
+                        aggressive_level: new_level,
+                        level_changed_to: level_changed.then_some(new_level),
+                    }
                 }
-                None => {}
+                None => StagnationDispatch::Continue {
+                    aggressive_level: state.aggressive_level,
+                    level_changed_to: None,
+                },
             }
-            state.aggressive_level
+        };
+
+        let aggressive_level = match dispatch {
+            StagnationDispatch::SkipRegressing => {
+                anie_agent::send_event(
+                    &self.event_tx,
+                    AgentEvent::SystemMessage {
+                        text: format!(
+                            "[compaction] stagnation detected (summarizer regressing across last {STAGNATION_WINDOW} calls); skipping. Reactive overflow path will handle the next sampling request."
+                        ),
+                    },
+                )
+                .await;
+                return Ok(CompactionGateOutcome::Skipped {
+                    reason: format!(
+                        "compaction stagnated (summarizer regressing: tokens_after did not shrink across the last {STAGNATION_WINDOW} calls); falling through to reactive overflow path"
+                    ),
+                });
+            }
+            StagnationDispatch::Continue {
+                aggressive_level,
+                level_changed_to,
+            } => {
+                if let Some(new_level) = level_changed_to {
+                    let halved = aggressive_keep_recent(self.config.keep_recent_tokens, new_level);
+                    anie_agent::send_event(
+                        &self.event_tx,
+                        AgentEvent::SystemMessage {
+                            text: format!(
+                                "[compaction] aggressive mode → level {new_level}: keep_recent_tokens reduced {} → {halved} for the next compaction.",
+                                self.config.keep_recent_tokens,
+                            ),
+                        },
+                    )
+                    .await;
+                }
+                aggressive_level
+            }
         };
 
         // Build a per-call config with `keep_recent_tokens`
@@ -327,6 +422,12 @@ impl CompactionGate for ControllerCompactionGate {
                 // the configured default. This is what lets the
                 // gate "come back" to normal mode after a brief
                 // burst of context pressure.
+                //
+                // Observability: every recorded outcome logs
+                // the shrink ratio + post-state so a user
+                // running with `RUST_LOG=anie_cli::compaction_gate=debug`
+                // can audit later whether stagnation should
+                // have fired.
                 {
                     let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let outcome = CompactionOutcome {
@@ -339,9 +440,30 @@ impl CompactionGate for ControllerCompactionGate {
                     }
                     let shrunk = inline.tokens_before.saturating_sub(inline.tokens_after);
                     let ratio = shrunk as f64 / inline.tokens_before.max(1) as f64;
-                    if ratio >= STAGNATION_RECOVERY_THRESHOLD {
+                    let weak = ratio < STAGNATION_PROGRESS_THRESHOLD;
+                    let recovered = ratio >= STAGNATION_RECOVERY_THRESHOLD;
+                    if recovered {
+                        let prior = state.aggressive_level;
                         state.aggressive_level = state.aggressive_level.saturating_sub(1);
+                        if state.aggressive_level != prior {
+                            info!(
+                                prior_level = prior,
+                                new_level = state.aggressive_level,
+                                shrink_ratio = ratio,
+                                "stagnation: recovery — meaningful shrink dropped aggressive level"
+                            );
+                        }
                     }
+                    debug!(
+                        tokens_before = inline.tokens_before,
+                        tokens_after = inline.tokens_after,
+                        shrink_ratio = ratio,
+                        weak,
+                        recovered,
+                        history_len_after = state.history.len(),
+                        aggressive_level_after = state.aggressive_level,
+                        "compaction outcome recorded"
+                    );
                 }
 
                 anie_agent::send_event(
