@@ -12,11 +12,11 @@ consumes one `AgentRunResult` per run. These PRs stack on
 
 | PR | Plan | Status | Commit |
 |----|------|--------|--------|
-| PR 1 | [Behavior characterization tests](../01_behavior_characterization.md) | not started | — |
-| PR 2 | [Extract `AgentRunState`](../02_run_state_extraction.md) | not started | — |
-| PR 3 | [Internal REPL driver](../03_internal_repl_driver.md) | not started | — |
-| PR 4 | [Step tracing spans](../04_step_tracing.md) | not started | — |
-| PR 5 | [Public step-machine API](../05_step_machine_api.md) | not started | — |
+| PR 1 | [Behavior characterization tests](../01_behavior_characterization.md) | landed | `2b3f951` |
+| PR 2 | [Extract `AgentRunState`](../02_run_state_extraction.md) | landed | `02cc0cd` |
+| PR 3 | [Internal REPL driver](../03_internal_repl_driver.md) | landed | `f053013` |
+| PR 4 | [Step tracing spans](../04_step_tracing.md) | landed | `df07082` |
+| PR 5 | [Public step-machine API](../05_step_machine_api.md) | landed | `f3e3cf7` |
 | PR 6 | [Controller pilot integration](../06_controller_pilot.md) | not started | — |
 | PR 7 | [First policy boundary: before-model](../07_first_policy_boundary.md) | not started | — |
 

@@ -1001,9 +1001,14 @@ impl InteractiveController {
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
         let handle = tokio::spawn(async move {
-            agent
-                .run(vec![prompt_message], context, event_tx, task_cancel)
-                .await
+            run_via_step_machine(
+                &agent,
+                vec![prompt_message],
+                context,
+                &event_tx,
+                &task_cancel,
+            )
+            .await
         });
         self.current_run = Some(CurrentRun {
             handle,
@@ -1031,10 +1036,9 @@ impl InteractiveController {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
-        let handle =
-            tokio::spawn(
-                async move { agent.run(Vec::new(), context, event_tx, task_cancel).await },
-            );
+        let handle = tokio::spawn(async move {
+            run_via_step_machine(&agent, Vec::new(), context, &event_tx, &task_cancel).await
+        });
         self.current_run = Some(CurrentRun {
             handle,
             cancel,
@@ -1655,6 +1659,28 @@ impl ControllerState {
         self.prompt_cache
             .refresh_if_stale(&cwd, &self.tool_registry, self.config.anie_config());
     }
+}
+
+/// Drive an agent run through the public REPL step machine.
+///
+/// Equivalent to calling `AgentLoop::run` directly — both take
+/// the same path through `start_run_machine`/`next_step`/`finish`
+/// — but the explicit driver shape is the seam future PRs use
+/// to interpose step-level policy (queued-prompt folding,
+/// proactive compaction, verifier loops). Plan
+/// `docs/repl_agent_loop/06_controller_pilot.md`.
+async fn run_via_step_machine(
+    agent: &AgentLoop,
+    prompts: Vec<anie_protocol::Message>,
+    context: Vec<anie_protocol::Message>,
+    event_tx: &mpsc::Sender<anie_protocol::AgentEvent>,
+    cancel: &CancellationToken,
+) -> anie_agent::AgentRunResult {
+    let mut machine = agent.start_run_machine(prompts, context, event_tx).await;
+    while !machine.is_finished() {
+        machine.next_step(event_tx, cancel).await;
+    }
+    machine.finish(event_tx).await
 }
 
 fn build_agent(
