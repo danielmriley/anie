@@ -902,6 +902,20 @@ impl SessionManager {
             .await
     }
 
+    /// Return whether the active branch has enough discardable
+    /// context for compaction to produce a shorter context.
+    ///
+    /// This is intentionally a cheap preflight for callers that
+    /// need to emit `CompactionStart` before the slow summarizer
+    /// call. Emitting start when `find_cut_point` will return
+    /// `None` leaves UIs stuck in a compacting state because no
+    /// matching `CompactionEnd` can be produced.
+    #[must_use]
+    pub fn can_compact(&self, keep_recent_tokens: u64) -> bool {
+        let context = self.build_context();
+        find_cut_point(&context.messages, keep_recent_tokens).is_ok()
+    }
+
     /// Return the latest compaction summary on the active branch, if any.
     #[must_use]
     pub fn latest_compaction_summary(&self) -> Option<String> {
@@ -1180,20 +1194,7 @@ pub async fn compact_messages_inline(
     summarizer: &dyn MessageSummarizer,
 ) -> Result<Option<InlineCompactionResult>> {
     let tokens_before = estimate_message_tokens(messages);
-
-    // Wrap into `SessionContextMessage` with synthetic entry
-    // IDs so we can reuse `find_cut_point` /
-    // `partition_split_turn` / `detect_split_turn` without
-    // forking those primitives. The synthetic IDs are unique
-    // within this slice, which is all those helpers need.
-    let wrapped: Vec<SessionContextMessage> = messages
-        .iter()
-        .enumerate()
-        .map(|(idx, message)| SessionContextMessage {
-            entry_id: format!("inline:{idx}"),
-            message: message.clone(),
-        })
-        .collect();
+    let wrapped = wrap_inline_messages(messages);
 
     let Ok(cut_point) = find_cut_point(&wrapped, config.keep_recent_tokens) else {
         return Ok(None);
@@ -1250,6 +1251,31 @@ pub async fn compact_messages_inline(
         tokens_before,
         tokens_after,
     }))
+}
+
+/// Return whether a free-standing message slice has enough
+/// discardable context for inline compaction to produce a
+/// shorter replacement.
+#[must_use]
+pub fn can_compact_messages_inline(messages: &[Message], keep_recent_tokens: u64) -> bool {
+    let wrapped = wrap_inline_messages(messages);
+    find_cut_point(&wrapped, keep_recent_tokens).is_ok()
+}
+
+fn wrap_inline_messages(messages: &[Message]) -> Vec<SessionContextMessage> {
+    // Wrap into `SessionContextMessage` with synthetic entry
+    // IDs so we can reuse `find_cut_point` /
+    // `partition_split_turn` / `detect_split_turn` without
+    // forking those primitives. The synthetic IDs are unique
+    // within this slice, which is all those helpers need.
+    messages
+        .iter()
+        .enumerate()
+        .map(|(idx, message)| SessionContextMessage {
+            entry_id: format!("inline:{idx}"),
+            message: message.clone(),
+        })
+        .collect()
 }
 
 /// Estimate token usage for a session context.

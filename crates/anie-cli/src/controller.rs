@@ -1363,6 +1363,9 @@ impl ControllerState {
         if tokens_before <= threshold {
             return Ok(false);
         }
+        if !self.session.inner().can_compact(config.keep_recent_tokens) {
+            return Ok(false);
+        }
 
         anie_agent::send_event(
             event_tx,
@@ -1390,6 +1393,17 @@ impl ControllerState {
     async fn force_compact(&mut self, event_tx: &mpsc::Sender<AgentEvent>) -> Result<()> {
         let (config, strategy) =
             self.compaction_strategy(self.config.anie_config().compaction.keep_recent_tokens);
+        if !self.session.inner().can_compact(config.keep_recent_tokens) {
+            anie_agent::send_event(
+                event_tx,
+                AgentEvent::SystemMessage {
+                    text: "Nothing to compact yet.".into(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
         // Manual `/compact` runs at the prompt boundary; classify
         // it as `PrePrompt` so telemetry treats it the same as the
         // automatic pre-prompt path.
@@ -1516,6 +1530,16 @@ impl ControllerState {
         // over the context window, so we need to discard more aggressively.
         let keep_recent = (self.config.anie_config().compaction.keep_recent_tokens / 2).max(1_000);
         let (config, strategy) = self.compaction_strategy(keep_recent);
+        if !self.session.inner().can_compact(config.keep_recent_tokens) {
+            anie_agent::send_event(
+                event_tx,
+                AgentEvent::SystemMessage {
+                    text: "Context overflow recovery could not compact the session further.".into(),
+                },
+            )
+            .await;
+            return Ok(false);
+        }
         anie_agent::send_event(
             event_tx,
             AgentEvent::CompactionStart {

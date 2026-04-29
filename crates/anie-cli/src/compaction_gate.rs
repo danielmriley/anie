@@ -28,7 +28,8 @@ use tokio::sync::mpsc;
 use anie_agent::{CompactionGate, CompactionGateOutcome};
 use anie_protocol::{AgentEvent, CompactionPhase, Message};
 use anie_session::{
-    CompactionConfig, MessageSummarizer, compact_messages_inline, estimate_message_tokens,
+    CompactionConfig, MessageSummarizer, can_compact_messages_inline, compact_messages_inline,
+    estimate_message_tokens,
 };
 
 use crate::compaction_stats::CompactionStatsAtomic;
@@ -91,6 +92,15 @@ impl CompactionGate for ControllerCompactionGate {
                     "per-turn compaction budget exhausted ({tokens} tokens over threshold {threshold})"
                 ),
             });
+        }
+
+        // Preflight the cut point before emitting CompactionStart.
+        // Without this, a threshold breach with no discardable
+        // prefix would emit Start, `compact_messages_inline` would
+        // return None, and the TUI would stay in Compacting because
+        // no matching End event exists.
+        if !can_compact_messages_inline(context, self.config.keep_recent_tokens) {
+            return Ok(CompactionGateOutcome::Continue);
         }
 
         anie_agent::send_event(
@@ -244,6 +254,36 @@ mod tests {
         // Budget remains at zero; the gate must not wrap the
         // counter via `saturating_sub` on a skip path.
         assert_eq!(gate.budget.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: a threshold breach alone is not enough to
+    /// announce compaction. If the cut-point heuristic cannot
+    /// discard anything, the gate must return Continue without
+    /// emitting CompactionStart; otherwise the TUI enters
+    /// `AgentUiState::Compacting` and never receives a matching
+    /// CompactionEnd.
+    #[tokio::test]
+    async fn midturn_compaction_without_discardable_cut_does_not_emit_start() {
+        let config = CompactionConfig {
+            context_window: 10,
+            reserve_tokens: 10,
+            keep_recent_tokens: 100_000,
+        };
+        let (gate, mut rx) = build_gate(config, 1);
+
+        let outcome = gate
+            .maybe_compact(&small_context_below_threshold())
+            .await
+            .expect("gate ok");
+
+        assert!(matches!(outcome, CompactionGateOutcome::Continue));
+        assert_eq!(gate.budget.load(Ordering::Acquire), 1);
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::CompactionStart { .. }),
+                "must not emit CompactionStart without a possible CompactionEnd"
+            );
+        }
     }
 
     /// PR 8.4 PR B: above the threshold with budget remaining,
