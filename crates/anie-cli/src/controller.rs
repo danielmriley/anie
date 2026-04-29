@@ -206,6 +206,13 @@ impl InteractiveController {
             budget: Arc::clone(&self.compactions_remaining_this_turn),
             event_tx: self.event_tx.clone(),
             stats: Arc::clone(&self.state.compaction_stats),
+            // Stagnation history is per-turn: a fresh
+            // `Default::default()` gives an empty history and
+            // `aggressive_level: 0`, matching the per-turn
+            // semantics of the existing budget reset.
+            state: Arc::new(std::sync::Mutex::new(
+                crate::compaction_gate::GateState::default(),
+            )),
         };
         Some(Arc::new(gate) as Arc<dyn anie_agent::CompactionGate>)
     }
