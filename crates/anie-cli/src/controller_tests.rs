@@ -1089,12 +1089,17 @@ async fn controller_compaction_budget_resets_to_max_per_turn_on_run_prompt() {
     // we assert below is the post-reset state regardless.
     let _ = controller.start_prompt_run("hello".into()).await;
 
-    // Default `max_per_turn` is 2 (see anie_config::CompactionConfig).
+    // Default `max_per_turn` is 8 (raised 2026-04-29; see
+    // `anie_config::CompactionConfig`). The exact number isn't
+    // the contract under test — what matters is the reset, so
+    // the assertion reads the live default rather than hard-
+    // coding it again.
+    let expected = anie_config::CompactionConfig::default().max_per_turn;
     assert_eq!(
         controller
             .compactions_remaining_this_turn
             .load(Ordering::Acquire),
-        2,
+        expected,
         "fresh user turn must restore the configured per-turn allowance",
     );
 }

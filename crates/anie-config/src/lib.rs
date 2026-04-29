@@ -341,12 +341,24 @@ pub struct CompactionConfig {
     /// `ContextOverflow` arrives after the counter hits zero,
     /// the retry policy gives up with
     /// `GiveUpReason::CompactionBudgetExhausted` rather than
-    /// looping. Default 2 covers the realistic
-    /// "compact-pre-prompt + compact-once-mid-turn" or
-    /// "compact-pre-prompt + reactive-overflow-retry" shapes.
-    /// Range 1..=8 — anything higher is almost certainly a
-    /// model-fit problem the user should know about. Plan
-    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
+    /// looping.
+    ///
+    /// Default 8 covers small-local-model workloads where
+    /// reasoning blocks (qwen3.5, deepseek-coder) and tool-
+    /// heavy turns (web_read + bash + grep cycles) push
+    /// context up several times in a single user prompt.
+    /// Frontier models with multi-hundred-K context windows
+    /// won't hit this ceiling in practice, so a higher
+    /// default is harmless for them and load-bearing for
+    /// small models. Range 1..=32 — anything higher than
+    /// 32 in a single user turn is almost certainly a
+    /// pathological loop the user should know about.
+    ///
+    /// Plan
+    /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`
+    /// (default + range raised 2026-04-29 in response to
+    /// real qwen3.5:9b sessions hitting "budget exhausted"
+    /// after the original 2-per-turn ceiling).
     pub max_per_turn: u32,
 }
 
@@ -356,7 +368,7 @@ impl Default for CompactionConfig {
             enabled: true,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
-            max_per_turn: 2,
+            max_per_turn: 8,
         }
     }
 }
@@ -679,13 +691,19 @@ fn validate_ollama_config(ollama: &OllamaConfig) -> Result<()> {
 }
 
 /// Range bounds for `[compaction] max_per_turn`. Anything
-/// below 1 disables the safety net entirely; anything above
-/// 8 in a single user turn is overwhelmingly a sign the model
-/// can't cope with the workload, in which case failing loudly
-/// is better than grinding. PR 8.2 of
-/// `docs/midturn_compaction_2026-04-27/`.
+/// below 1 disables the safety net entirely. The original
+/// upper bound of 8 (PR 8.2 of
+/// `docs/midturn_compaction_2026-04-27/`) was set when only
+/// frontier models were in scope; small local coders
+/// (qwen3.5:9b, deepseek-coder, gemma3) burn through
+/// compactions much faster because reasoning blocks plus
+/// tool-heavy turns inflate context within a single prompt.
+/// 2026-04-29: raised to 32 so small-model operators have
+/// headroom; anything above 32 is almost certainly a
+/// pathological loop and failing loudly is still better than
+/// grinding.
 const COMPACTION_MAX_PER_TURN_MIN: u32 = 1;
-const COMPACTION_MAX_PER_TURN_MAX: u32 = 8;
+const COMPACTION_MAX_PER_TURN_MAX: u32 = 32;
 
 /// Validate `[compaction]` config values at load time.
 fn validate_compaction_config(compaction: &CompactionConfig) -> Result<()> {
@@ -1628,10 +1646,12 @@ mod tests {
 
     /// PR 8.2: out-of-range `max_per_turn` is rejected at
     /// load time so a user typing `9999` doesn't quietly let
-    /// the budget become useless.
+    /// the budget become useless. Range bounds were raised
+    /// 2026-04-29 to accommodate small-local-model workloads
+    /// (range 1..=32 — see `COMPACTION_MAX_PER_TURN_MAX`).
     #[test]
     fn compaction_config_max_per_turn_out_of_range_is_rejected() {
-        for bad in [0_u32, 9_u32, 100_u32] {
+        for bad in [0_u32, 33_u32, 100_u32, 9999_u32] {
             let tempdir = tempdir().expect("tempdir");
             let config_path = tempdir.path().join("config.toml");
             fs::write(
