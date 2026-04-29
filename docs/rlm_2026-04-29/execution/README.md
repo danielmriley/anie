@@ -16,10 +16,23 @@ work lands.
 | Plan | Branch | Status | Commit |
 |---|---|---|---|
 | [01 — Stagnation detection + aggressive compaction](../01_stagnation_detection.md) | `main` | landed | `a2863e7` |
-| [02 — RLM `recurse` tool (shape 1)](../02_recurse_tool.md) | `dev_rlm` (after 01) | not started | — |
+| [02 — RLM `recurse` tool (shape 1)](../02_recurse_tool.md) | `dev_rlm` | Phase A of 06 | — |
 | [03 — RLM recurse intent (shape 2)](../03_recurse_intent.md) | TBD | deferred | — |
 | [04 — Native RLM compat (shape 3)](../04_native_rlm_compat.md) | TBD | speculative | — |
-| [05 — Passive context management](../05_passive_context_management.md) | TBD | parallel option | — |
+| [05 — Passive context management](../05_passive_context_management.md) | TBD | absorbed into 06 | — |
+| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **next: Phase A** | — |
+| [07 — Evaluation harness + mode flags](../07_evaluation_harness.md) | `dev_rlm` (parallel to 06A) | not started | — |
+
+## Phase status (Plan 06)
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| A | `recurse` tool | not started |
+| B | indexed external store | not started |
+| C | active context ceiling + FIFO eviction | not started |
+| D | ledger injection | not started |
+| E | smart inclusion (relevance-based paging-in) | not started |
+| F | background summarization for paged-out content | not started |
 
 ## Ordering rationale
 

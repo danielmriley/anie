@@ -34,18 +34,60 @@ Three things lined up:
    models into frontier-quality territory on long-context
    work. That's the entire reason anie exists.
 
+## Unified vision: context virtualization
+
+The plan series progressed through several reframings as we
+talked it through. The final picture:
+
+> **The harness owns the model's active context.** A fixed
+> ceiling well below the model's actual window keeps every
+> LLM call lean. Content beyond the ceiling lives in an
+> indexed external store. The model navigates that store via
+> the `recurse` tool. Compaction stays in as a fallback for
+> runs where the ceiling isn't tight enough; in normal
+> operation it rarely fires.
+
+This is **context virtualization** — analogous to OS virtual
+memory. The active context is the working set; the external
+store is the backing store; `recurse` is the page-in
+mechanism. The model performs at its quality ceiling on every
+call because it never sees a bloated context.
+
+Plan 06 is the engineering roadmap that composes Plans 02 and
+05 into this unified target. Plan 07 is the measurement
+infrastructure (mode flags, scenarios, scoring) that lets us
+report the win.
+
 ## Scope of the plan series
 
-Six plans, ordered by what unlocks what:
+Eight plans, organized by purpose:
 
-| # | Plan | Branch | Status |
-|---|------|--------|--------|
-| 01 | [Stagnation detection + aggressive compaction](01_stagnation_detection.md) | `main` | next |
-| 02 | [RLM `recurse` tool (shape 1)](02_recurse_tool.md) | `dev_rlm` | after 01 |
-| 03 | [RLM recurse intent (shape 2)](03_recurse_intent.md) | TBD | deferred |
-| 04 | [Native RLM compat flag (shape 3)](04_native_rlm_compat.md) | TBD | deferred |
-| 05 | [Passive context management (background summarization + JIT filtering)](05_passive_context_management.md) | TBD | complementary |
+| # | Plan | Purpose | Branch |
+|---|------|---------|--------|
+| 01 | [Stagnation detection + aggressive compaction](01_stagnation_detection.md) | Endgame for the compaction-only paradigm; safety net while RLM ships | `main` (landed) |
+| 02 | [RLM `recurse` tool (shape 1)](02_recurse_tool.md) | The model's interface to external context | `dev_rlm` (Phase A of 06) |
+| 03 | [RLM recurse intent (shape 2)](03_recurse_intent.md) | Promotes recursion to a first-class loop step | deferred (revisit after 06 + 07 data) |
+| 04 | [Native RLM compat (shape 3)](04_native_rlm_compat.md) | Profile for natively-recursive models | speculative |
+| 05 | [Passive context management](05_passive_context_management.md) | Background summarization + JIT filtering — components Plan 06 composes | absorbed into 06 |
+| **06** | [**Phased path to context virtualization**](06_phased_implementation.md) | **The unified roadmap: A through F, ~5–6 weeks** | `dev_rlm` |
+| 07 | [Evaluation harness + mode flags](07_evaluation_harness.md) | `--harness-mode {baseline,current,rlm}`; scenario corpus; scoring | `dev_rlm` (parallel to 06A) |
 | — | [Execution tracker](execution/README.md) | — | — |
+
+## Reading order
+
+Read in this order:
+
+1. **This README** — the unified picture.
+2. **Plan 06** — the phased roadmap. Phases A–F describe
+   what we actually build, in order.
+3. **Plan 07** — how we measure whether each phase worked.
+4. **Plan 02** — Phase A's spec sheet (the recurse tool).
+5. **Plan 05** — components of Phases C–E (referenced from
+   06; not standalone work anymore).
+6. **Plan 01** — already shipped; the compaction work that
+   serves as the fallback under the new paradigm.
+7. **Plans 03, 04** — deferred / speculative; revisit after
+   Plan 06 phases land + Plan 07 produces eval data.
 
 ## A note on context scope
 
