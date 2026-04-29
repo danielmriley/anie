@@ -1808,9 +1808,14 @@ fn build_rlm_extras(
     if !state.harness_mode.installs_rlm_features() {
         return Vec::new();
     }
-    let context_view = Arc::new(tokio::sync::RwLock::new(context_snapshot));
+    // Phase B: build the indexed external store from the
+    // run-start snapshot. Phase C will start *moving*
+    // messages into this store (eviction); for now it
+    // mirrors the active context so the recurse tool's
+    // scopes can resolve against it.
+    let store = crate::external_context::ExternalContext::from_messages(context_snapshot);
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
-        context_view,
+        Arc::new(tokio::sync::RwLock::new(store)),
     ));
     let factory = Arc::new(crate::recurse_factory::ControllerSubAgentFactory {
         provider_registry: Arc::clone(&state.provider_registry),

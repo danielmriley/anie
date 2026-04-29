@@ -8,6 +8,7 @@ mod compaction_gate;
 mod compaction_reserve;
 mod compaction_stats;
 mod controller;
+mod external_context;
 mod harness_mode;
 mod interactive_mode;
 mod login_command;

@@ -1,14 +1,21 @@
 //! Controller-side [`ContextProvider`] implementation.
 //!
-//! Resolves a [`RecurseScope`] against an
-//! `Arc<RwLock<Vec<Message>>>` view of the parent run's
-//! active context, plus filesystem access for
-//! `RecurseScope::File`. All four scope kinds are
-//! implemented (`MessageRange`, `MessageGrep`, `ToolResult`,
-//! `File`).
+//! Resolves a [`RecurseScope`] against an indexed
+//! [`ExternalContext`] view of the parent run's accumulated
+//! messages, plus filesystem access for `RecurseScope::File`.
+//! All four scope kinds are implemented (`MessageRange`,
+//! `MessageGrep`, `ToolResult`, `File`).
+//!
+//! Phase B (`docs/rlm_2026-04-29/06_phased_implementation.md`)
+//! switched the underlying view from a raw `Vec<Message>` to
+//! [`ExternalContext`], which carries `by_tool_call_id` and
+//! `by_kind` indexes. The `ToolResult` scope is now an O(1)
+//! hash lookup; `MessageGrep` is still a linear scan but
+//! over the store's typed iterator.
 //!
 //! Plan: `docs/rlm_2026-04-29/02_recurse_tool.md` and
-//! `docs/rlm_2026-04-29/06_phased_implementation.md` Phase A.
+//! `docs/rlm_2026-04-29/06_phased_implementation.md` Phase A
+//! and B.
 
 use std::sync::Arc;
 
@@ -18,6 +25,8 @@ use tokio::sync::RwLock;
 
 use anie_agent::{ContextProvider, RecurseScope};
 use anie_protocol::{ContentBlock, Message, UserMessage, now_millis};
+
+use crate::external_context::ExternalContext;
 
 /// Maximum file size the `File` scope will load. Mirrors the
 /// 50 KiB cap that the `read` tool uses for normal file
@@ -49,21 +58,22 @@ fn message_matches_regex(message: &Message, re: &regex::Regex) -> bool {
 
 /// Controller-side resolver for [`RecurseScope`] values.
 ///
-/// Holds a *view* of the parent run's context — not an
-/// owning copy. The controller updates the view after each
-/// REPL `Print` step (Phase C of Plan 06 wires this up); for
-/// now the view is a snapshot taken at run start. Reads are
-/// async because the `File` scope blocks on I/O; the lock is
+/// Holds a shared [`ExternalContext`] — the indexed store
+/// the controller populates at run start. The controller
+/// updates the store after each REPL `Print` step (Phase C
+/// of Plan 06 wires this up); for now the store is a
+/// snapshot taken at run start. Reads are async because the
+/// `File` scope blocks on I/O; the lock is
 /// `tokio::sync::RwLock` so multiple concurrent recurse
-/// calls can read the view in parallel.
+/// calls can read the store in parallel.
 pub(crate) struct ControllerContextProvider {
-    context_view: Arc<RwLock<Vec<Message>>>,
+    store: Arc<RwLock<ExternalContext>>,
 }
 
 impl ControllerContextProvider {
-    /// Construct a provider around a shared context view.
-    pub(crate) fn new(context_view: Arc<RwLock<Vec<Message>>>) -> Self {
-        Self { context_view }
+    /// Construct a provider around a shared external store.
+    pub(crate) fn new(store: Arc<RwLock<ExternalContext>>) -> Self {
+        Self { store }
     }
 }
 
@@ -72,26 +82,17 @@ impl ContextProvider for ControllerContextProvider {
     async fn resolve(&self, scope: &RecurseScope) -> Result<Vec<Message>> {
         match scope {
             RecurseScope::MessageRange { start, end } => {
-                let context = self.context_view.read().await;
-                if start > end {
-                    return Err(anyhow!(
-                        "RecurseScope::MessageRange start ({start}) > end ({end})"
-                    ));
-                }
-                if *end > context.len() {
-                    return Err(anyhow!(
-                        "RecurseScope::MessageRange end ({end}) exceeds context length ({})",
-                        context.len()
-                    ));
-                }
-                Ok(context[*start..*end].to_vec())
+                let store = self.store.read().await;
+                store
+                    .range(*start, *end)
+                    .map_err(|msg| anyhow!("RecurseScope::MessageRange {msg}"))
             }
             RecurseScope::MessageGrep { pattern } => {
                 let re = regex::Regex::new(pattern).map_err(|e| {
                     anyhow!("RecurseScope::MessageGrep invalid regex `{pattern}`: {e}")
                 })?;
-                let context = self.context_view.read().await;
-                let matched: Vec<Message> = context
+                let store = self.store.read().await;
+                let matched: Vec<Message> = store
                     .iter()
                     .filter(|m| message_matches_regex(m, &re))
                     .cloned()
@@ -99,21 +100,20 @@ impl ContextProvider for ControllerContextProvider {
                 Ok(matched)
             }
             RecurseScope::ToolResult { tool_call_id } => {
-                let context = self.context_view.read().await;
-                let matched: Vec<Message> = context
-                    .iter()
-                    .filter(|m| match m {
-                        Message::ToolResult(t) => &t.tool_call_id == tool_call_id,
-                        _ => false,
-                    })
-                    .cloned()
-                    .collect();
-                if matched.is_empty() {
-                    return Err(anyhow!(
+                let store = self.store.read().await;
+                // O(1) lookup via the by_tool_call_id index.
+                let id = store.find_by_tool_call_id(tool_call_id).ok_or_else(|| {
+                    anyhow!(
                         "RecurseScope::ToolResult tool_call_id `{tool_call_id}` not found in parent context"
-                    ));
-                }
-                Ok(matched)
+                    )
+                })?;
+                // The store guarantees `find_by_tool_call_id` ID
+                // is in-range, so unwrap is safe — but we still
+                // route through `Option` for explicitness.
+                let message = store.get_by_id(id).cloned().ok_or_else(|| {
+                    anyhow!("RecurseScope::ToolResult store inconsistency: id {id} not found")
+                })?;
+                Ok(vec![message])
             }
             RecurseScope::File { path } => {
                 let metadata = tokio::fs::metadata(path)
@@ -160,7 +160,9 @@ mod tests {
     }
 
     fn provider_with_context(messages: Vec<Message>) -> ControllerContextProvider {
-        ControllerContextProvider::new(Arc::new(RwLock::new(messages)))
+        ControllerContextProvider::new(Arc::new(RwLock::new(ExternalContext::from_messages(
+            messages,
+        ))))
     }
 
     /// MessageRange resolves the half-open `[start, end)`
