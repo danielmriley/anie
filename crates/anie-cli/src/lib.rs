@@ -15,6 +15,7 @@ mod model_catalog;
 mod models_command;
 mod onboarding;
 mod print_mode;
+mod recurse_provider;
 mod retry_policy;
 mod rpc;
 mod runtime;
