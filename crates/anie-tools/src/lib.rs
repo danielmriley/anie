@@ -8,6 +8,7 @@ mod find;
 mod grep;
 mod ls;
 mod read;
+mod recurse;
 mod shared;
 mod write;
 
@@ -18,6 +19,7 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read::ReadTool;
+pub use recurse::RecurseTool;
 pub use write::WriteTool;
 
 #[cfg(test)]

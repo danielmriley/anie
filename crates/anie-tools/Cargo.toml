@@ -29,4 +29,5 @@ anie-agent.workspace = true
 anie-protocol.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 anie-provider = { workspace = true, features = ["mock"] }
