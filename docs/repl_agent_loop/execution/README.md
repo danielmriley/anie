@@ -18,7 +18,7 @@ consumes one `AgentRunResult` per run. These PRs stack on
 | PR 4 | [Step tracing spans](../04_step_tracing.md) | landed | `df07082` |
 | PR 5 | [Public step-machine API](../05_step_machine_api.md) | landed | `f3e3cf7` |
 | PR 6 | [Controller pilot integration](../06_controller_pilot.md) | landed | `9aedb35` |
-| PR 7 | [First policy boundary: before-model](../07_first_policy_boundary.md) | landed | (this commit) |
+| PR 7 | [First policy boundary: before-model](../07_first_policy_boundary.md) | landed | `e55948a` |
 
 ## Ordering rationale
 
