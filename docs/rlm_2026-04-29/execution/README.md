@@ -20,7 +20,7 @@ work lands.
 | [03 — RLM recurse intent (shape 2)](../03_recurse_intent.md) | TBD | deferred | — |
 | [04 — Native RLM compat (shape 3)](../04_native_rlm_compat.md) | TBD | speculative | — |
 | [05 — Passive context management](../05_passive_context_management.md) | TBD | absorbed into 06 | — |
-| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phases A + B landed; next: Phase C** | — |
+| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phases A + B + C landed; next: Phase D** | — |
 | [07 — Evaluation harness + mode flags](../07_evaluation_harness.md) | `dev_rlm` | partial (`--harness-mode` flag; scenarios deferred) | `8a162d3` |
 
 ## Phase status (Plan 06)
@@ -29,7 +29,7 @@ work lands.
 |-------|-------------|--------|---------|
 | A | `recurse` tool | **landed** | rlm/01–06.3 (`8a162d3..64dcbe2`) |
 | B | indexed external store | **landed** | rlm/07 (`ec2ccb4`) |
-| C | active context ceiling + FIFO eviction | not started | — |
+| C | active context ceiling + FIFO eviction | **landed** | rlm/08.1–08.3 (`11130da..7f741ec`) |
 | D | ledger injection | not started | — |
 | E | smart inclusion (relevance-based paging-in) | not started | — |
 | F | background summarization for paged-out content | not started | — |
@@ -52,6 +52,14 @@ work lands.
 | Sub | What | Commit |
 |---|---|---|
 | 07 | indexed `ExternalContext` store; `ToolResult` lookup is now O(1) | `ec2ccb4` |
+
+## Phase C sub-commit breakdown (rlm/08.1–08.3 on `dev_rlm`)
+
+| Sub | What | Commit |
+|---|---|---|
+| 08.1 | `BeforeModelResponse::ReplaceMessages` variant + dispatch | `11130da` |
+| 08.2 | `ContextVirtualizationPolicy` (ceiling + FIFO eviction + archive) | `24bb96a` |
+| 08.3 | install policy in `--harness-mode=rlm`; opt-in via `ANIE_ACTIVE_CEILING_TOKENS` / `ANIE_KEEP_LAST_N` | `7f741ec` |
 
 ## Ordering rationale
 
