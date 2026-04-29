@@ -127,6 +127,7 @@ dependencies = [
  "futures",
  "opener",
  "rand 0.9.4",
+ "regex",
  "rpassword",
  "serde",
  "serde_json",

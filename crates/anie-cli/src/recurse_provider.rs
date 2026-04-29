@@ -22,7 +22,27 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use anie_agent::{ContextProvider, RecurseScope};
-use anie_protocol::Message;
+use anie_protocol::{ContentBlock, Message};
+
+/// True iff `re` matches any text content in `message`. Walks
+/// every text-bearing block — assistant text, user text,
+/// tool-result text — so a recurse-with-grep can locate
+/// content regardless of which role originally produced it.
+/// Non-text blocks (tool calls, images, thinking signatures)
+/// are ignored.
+fn message_matches_regex(message: &Message, re: &regex::Regex) -> bool {
+    let blocks: &[ContentBlock] = match message {
+        Message::User(u) => &u.content,
+        Message::Assistant(a) => &a.content,
+        Message::ToolResult(t) => &t.content,
+        Message::Custom(_) => return false,
+    };
+    blocks.iter().any(|b| match b {
+        ContentBlock::Text { text } => re.is_match(text),
+        ContentBlock::Thinking { thinking, .. } => re.is_match(thinking),
+        _ => false,
+    })
+}
 
 /// Controller-side resolver for [`RecurseScope`] values.
 ///
@@ -72,9 +92,18 @@ impl ContextProvider for ControllerContextProvider {
                 }
                 Ok(context[*start..*end].to_vec())
             }
-            RecurseScope::MessageGrep { .. } => Err(anyhow!(
-                "RecurseScope::MessageGrep is not yet implemented (planned for rlm/06.x)"
-            )),
+            RecurseScope::MessageGrep { pattern } => {
+                let re = regex::Regex::new(pattern).map_err(|e| {
+                    anyhow!("RecurseScope::MessageGrep invalid regex `{pattern}`: {e}")
+                })?;
+                let context = self.context_view.read().await;
+                let matched: Vec<Message> = context
+                    .iter()
+                    .filter(|m| message_matches_regex(m, &re))
+                    .cloned()
+                    .collect();
+                Ok(matched)
+            }
             RecurseScope::ToolResult { .. } => Err(anyhow!(
                 "RecurseScope::ToolResult is not yet implemented (planned for rlm/06.x)"
             )),
@@ -189,19 +218,15 @@ mod tests {
         );
     }
 
-    /// MessageGrep, ToolResult, File: not yet implemented.
-    /// Each returns a typed error mentioning the scope kind
-    /// and the milestone it ships in. The recurse tool will
-    /// route these to the model as tool errors so it can
-    /// adapt strategy (e.g., fall back to MessageRange).
+    /// ToolResult and File are not yet implemented (each
+    /// gets its own commit). They return typed errors
+    /// mentioning the scope kind and the milestone they ship
+    /// in.
     #[tokio::test]
     async fn unimplemented_scopes_error_with_clear_text() {
         let provider = provider_with_context(Vec::new());
 
         let cases: Vec<RecurseScope> = vec![
-            RecurseScope::MessageGrep {
-                pattern: "weather".into(),
-            },
             RecurseScope::ToolResult {
                 tool_call_id: "call_abc".into(),
             },
@@ -221,5 +246,57 @@ mod tests {
                 "error for {kind} should say 'not yet implemented'; got: {msg}",
             );
         }
+    }
+
+    /// MessageGrep returns every message whose any text block
+    /// matches the regex.
+    #[tokio::test]
+    async fn message_grep_returns_matching_messages() {
+        let provider = provider_with_context(vec![
+            user_message("the weather in paris is rainy"),
+            user_message("totally unrelated thought"),
+            user_message("today's WEATHER forecast for nyc"),
+            user_message("another unrelated thing"),
+        ]);
+        let resolved = provider
+            .resolve(&RecurseScope::MessageGrep {
+                pattern: "(?i)weather".into(),
+            })
+            .await
+            .expect("resolve ok");
+        assert_eq!(resolved.len(), 2);
+    }
+
+    /// MessageGrep with no matches returns an empty Vec, not
+    /// an error — the model can interpret "no results" cleanly
+    /// and either retry with a different pattern or move on.
+    #[tokio::test]
+    async fn message_grep_no_matches_returns_empty() {
+        let provider = provider_with_context(vec![user_message("hello"), user_message("world")]);
+        let resolved = provider
+            .resolve(&RecurseScope::MessageGrep {
+                pattern: "absent_pattern".into(),
+            })
+            .await
+            .expect("resolve ok");
+        assert!(resolved.is_empty());
+    }
+
+    /// Invalid regex surfaces as a typed error naming the
+    /// pattern.
+    #[tokio::test]
+    async fn message_grep_invalid_regex_errors() {
+        let provider = provider_with_context(vec![user_message("doesn't matter")]);
+        let err = provider
+            .resolve(&RecurseScope::MessageGrep {
+                pattern: "[unbalanced".into(),
+            })
+            .await
+            .expect_err("invalid regex should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid regex"),
+            "error should mention regex invalidity; got: {msg}",
+        );
     }
 }
