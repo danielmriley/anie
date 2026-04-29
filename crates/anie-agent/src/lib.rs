@@ -3,6 +3,7 @@
 
 mod agent_loop;
 mod hooks;
+mod recurse;
 mod tool;
 
 pub use agent_loop::{
@@ -10,6 +11,7 @@ pub use agent_loop::{
     BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, CompactionGate,
     CompactionGateOutcome, NoopBeforeModelPolicy, ToolExecutionMode, send_event,
 };
+pub use recurse::{ContextProvider, RecurseScope, SubAgentBuildContext, SubAgentFactory};
 pub use tool::{
     MIN_TOOL_OUTPUT_BUDGET_BYTES, Tool, ToolError, ToolExecutionContext, ToolRegistry,
     effective_tool_output_budget,
