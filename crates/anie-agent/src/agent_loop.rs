@@ -299,6 +299,11 @@ pub struct BeforeModelRequest<'a> {
 /// loop's context (context-only — these messages do *not*
 /// appear in `AgentRunResult::generated_messages`, so the
 /// controller does not persist them as agent output).
+/// `ReplaceMessages` swaps the entire run context with a new
+/// vector — the policy is responsible for deciding what stays
+/// (the surviving subset, in order) and what is dropped
+/// (caller is responsible for archiving evicted content via
+/// e.g. an external store).
 #[derive(Debug, Clone, PartialEq)]
 pub enum BeforeModelResponse {
     /// Proceed with the model request unchanged.
@@ -308,6 +313,18 @@ pub enum BeforeModelResponse {
     /// (repo-map injection, queued-prompt folding, retrieved
     /// excerpts) and proactive compaction summaries.
     AppendMessages(Vec<Message>),
+    /// Replace the entire run context with this vector before
+    /// the model request goes out. Used by context-
+    /// virtualization policies that enforce an active-context
+    /// ceiling: the policy computes which messages survive
+    /// (system note, current prompt, last N turns) and returns
+    /// the surviving subset. The caller is responsible for
+    /// archiving any messages it dropped — the loop itself
+    /// just trusts the new context.
+    ///
+    /// Plan `docs/rlm_2026-04-29/06_phased_implementation.md`
+    /// Phase C.
+    ReplaceMessages(Vec<Message>),
 }
 
 /// Hook invoked before every `ModelTurn` step. The default
@@ -898,6 +915,9 @@ impl AgentLoop {
             BeforeModelResponse::Continue => {}
             BeforeModelResponse::AppendMessages(messages) => {
                 state.append_policy_context(messages);
+            }
+            BeforeModelResponse::ReplaceMessages(messages) => {
+                state.replace_context(messages);
             }
         }
 
@@ -2539,5 +2559,24 @@ mod tests {
         assert!(state.finished);
         assert_eq!(state.terminal_error, Some(error.clone()));
         assert_eq!(state.into_result().terminal_error, Some(error));
+    }
+
+    /// `replace_context` swaps the entire run context. This is
+    /// the helper that `BeforeModelResponse::ReplaceMessages`
+    /// dispatches to — context-virtualization policies (Plan
+    /// 06 Phase C) call it to enforce an active-context ceiling
+    /// by returning only the surviving subset.
+    #[test]
+    fn agent_run_state_replace_context_overwrites_existing() {
+        let prompts = vec![user_message("prompt", 1)];
+        let prior_context = vec![user_message("prior", 0)];
+        let mut state = AgentRunState::new(&prompts, prior_context);
+
+        let replacement = vec![user_message("survivor", 5)];
+        state.replace_context(replacement.clone());
+
+        let result = state.into_result();
+        assert_eq!(result.final_context, replacement);
+        assert!(result.generated_messages.is_empty());
     }
 }

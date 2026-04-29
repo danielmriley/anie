@@ -239,3 +239,92 @@ async fn append_policy_injects_messages_into_context() {
     let seen = policy.seen_step_indices.lock().unwrap().clone();
     assert_eq!(seen, vec![0u64]);
 }
+
+/// A policy that returns `ReplaceMessages` on its first call.
+/// Verifies that the loop swaps the entire run context to the
+/// supplied vector before sending the request to the provider.
+/// This is the dispatch path
+/// `BeforeModelResponse::ReplaceMessages` ->
+/// `AgentRunState::replace_context`. Plan
+/// `docs/rlm_2026-04-29/06_phased_implementation.md` Phase C.
+#[tokio::test]
+async fn replace_policy_swaps_run_context() {
+    struct ReplaceOncePolicy {
+        replacement: Vec<Message>,
+        first_call_done: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl BeforeModelPolicy for ReplaceOncePolicy {
+        async fn before_model(&self, _request: BeforeModelRequest<'_>) -> BeforeModelResponse {
+            let mut first = self.first_call_done.lock().unwrap();
+            if !*first {
+                *first = true;
+                BeforeModelResponse::ReplaceMessages(self.replacement.clone())
+            } else {
+                BeforeModelResponse::Continue
+            }
+        }
+    }
+
+    let survivor = Message::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: "lone survivor".into(),
+        }],
+        timestamp: 7,
+    });
+    let policy = Arc::new(ReplaceOncePolicy {
+        replacement: vec![survivor.clone()],
+        first_call_done: Mutex::new(false),
+    });
+
+    let scripts = vec![MockStreamScript::from_message(assistant_text(
+        "after-replace",
+        StopReason::Stop,
+    ))];
+    let agent_loop = build_loop(scripts, config_with_policy(Some(policy)));
+    let (tx, _rx) = mpsc::channel(64);
+    let result = agent_loop
+        .run(
+            vec![user_prompt("would-be-evicted")],
+            Vec::new(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+
+    // Final context: replacement (1) + assistant reply (1).
+    // The original prompt is gone — replaced wholesale.
+    assert_eq!(result.final_context.len(), 2);
+    let survivor_text = match &result.final_context[0] {
+        Message::User(u) => match &u.content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        },
+        other => panic!("expected User, got {other:?}"),
+    };
+    assert_eq!(survivor_text, "lone survivor");
+    assert!(matches!(result.final_context[1], Message::Assistant(_)));
+
+    // The original prompt does *not* appear in final_context.
+    let any_would_be_evicted = result.final_context.iter().any(|m| match m {
+        Message::User(u) => match &u.content[0] {
+            ContentBlock::Text { text } => text == "would-be-evicted",
+            _ => false,
+        },
+        _ => false,
+    });
+    assert!(
+        !any_would_be_evicted,
+        "ReplaceMessages should drop the original prompt"
+    );
+
+    // generated_messages still contains only the assistant
+    // reply — replacement happens on `context`, not on the
+    // controller-persisted output stream.
+    assert_eq!(result.generated_messages.len(), 1);
+    assert!(matches!(
+        result.generated_messages[0],
+        Message::Assistant(_)
+    ));
+}
