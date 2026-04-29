@@ -64,10 +64,10 @@ pub struct Cli {
     /// Harness profile: `baseline` exposes no tools or
     /// compaction gate (model-only floor for measurement);
     /// `current` (default) is anie's existing behavior;
-    /// `rlm` will enable context virtualization once the
-    /// recurse tool and active-context policy land in
-    /// later commits on the dev_rlm branch. Plan
-    /// `docs/rlm_2026-04-29/07_evaluation_harness.md`.
+    /// `rlm` enables context virtualization — installs the
+    /// `recurse` tool plus the active-context ceiling policy
+    /// (opt in to a budget via `ANIE_ACTIVE_CEILING_TOKENS`).
+    /// Plan `docs/rlm_2026-04-29/07_evaluation_harness.md`.
     #[arg(long, value_enum, default_value_t = harness_mode::HarnessMode::default())]
     pub harness_mode: harness_mode::HarnessMode,
     /// Initial prompt.
