@@ -16,23 +16,36 @@ work lands.
 | Plan | Branch | Status | Commit |
 |---|---|---|---|
 | [01 — Stagnation detection + aggressive compaction](../01_stagnation_detection.md) | `main` | landed | `a2863e7` |
-| [02 — RLM `recurse` tool (shape 1)](../02_recurse_tool.md) | `dev_rlm` | Phase A of 06 | — |
+| [02 — RLM `recurse` tool (shape 1)](../02_recurse_tool.md) | `dev_rlm` | landed (Phase A of 06) | `64dcbe2` |
 | [03 — RLM recurse intent (shape 2)](../03_recurse_intent.md) | TBD | deferred | — |
 | [04 — Native RLM compat (shape 3)](../04_native_rlm_compat.md) | TBD | speculative | — |
 | [05 — Passive context management](../05_passive_context_management.md) | TBD | absorbed into 06 | — |
-| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **next: Phase A** | — |
-| [07 — Evaluation harness + mode flags](../07_evaluation_harness.md) | `dev_rlm` (parallel to 06A) | not started | — |
+| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phase A landed; next: Phase B** | — |
+| [07 — Evaluation harness + mode flags](../07_evaluation_harness.md) | `dev_rlm` | partial (`--harness-mode` flag; scenarios deferred) | `8a162d3` |
 
 ## Phase status (Plan 06)
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| A | `recurse` tool | not started |
-| B | indexed external store | not started |
-| C | active context ceiling + FIFO eviction | not started |
-| D | ledger injection | not started |
-| E | smart inclusion (relevance-based paging-in) | not started |
-| F | background summarization for paged-out content | not started |
+| Phase | Description | Status | Commits |
+|-------|-------------|--------|---------|
+| A | `recurse` tool | **landed** | rlm/01–06.3 (`8a162d3..64dcbe2`) |
+| B | indexed external store | not started | — |
+| C | active context ceiling + FIFO eviction | not started | — |
+| D | ledger injection | not started | — |
+| E | smart inclusion (relevance-based paging-in) | not started | — |
+| F | background summarization for paged-out content | not started | — |
+
+## Phase A sub-commit breakdown (rlm/01–06.3 on `dev_rlm`)
+
+| Sub | What | Commit |
+|---|---|---|
+| 01 | `--harness-mode {baseline,current,rlm}` flag plumbing | `8a162d3` |
+| 02 | `SubAgentFactory` + `ContextProvider` + `RecurseScope` traits/types in anie-agent | `4dc5a2e` |
+| 03 | `ControllerContextProvider` with `MessageRange` resolution | `bf602e8` |
+| 04 | `RecurseTool` (drives a sub-`AgentRunMachine`) | `9c04dbb` |
+| 05 | Wire `RecurseTool` into the controller for `--harness-mode=rlm` | `a5503d5` |
+| 06.1 | `MessageGrep` scope resolution | `32a5b70` |
+| 06.2 | `ToolResult` scope resolution | `084675c` |
+| 06.3 | `File` scope resolution + provider doc cleanup | `64dcbe2` |
 
 ## Ordering rationale
 
