@@ -350,15 +350,17 @@ pub struct CompactionConfig {
     /// Frontier models with multi-hundred-K context windows
     /// won't hit this ceiling in practice, so a higher
     /// default is harmless for them and load-bearing for
-    /// small models. Range 1..=32 — anything higher than
-    /// 32 in a single user turn is almost certainly a
-    /// pathological loop the user should know about.
+    /// small models. Range 1..=500 — see
+    /// `COMPACTION_MAX_PER_TURN_MAX` for why the upper bound
+    /// is essentially "no cap": the threshold gate already
+    /// prevents infinite compaction; the count cap is a
+    /// nuclear-option backstop, not the primary safeguard.
     ///
     /// Plan
     /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`
-    /// (default + range raised 2026-04-29 in response to
-    /// real qwen3.5:9b sessions hitting "budget exhausted"
-    /// after the original 2-per-turn ceiling).
+    /// (default + range tuned 2026-04-29 in response to real
+    /// qwen3.5:9b sessions hitting "budget exhausted" after
+    /// the original 2-per-turn ceiling).
     pub max_per_turn: u32,
 }
 
@@ -691,19 +693,28 @@ fn validate_ollama_config(ollama: &OllamaConfig) -> Result<()> {
 }
 
 /// Range bounds for `[compaction] max_per_turn`. Anything
-/// below 1 disables the safety net entirely. The original
-/// upper bound of 8 (PR 8.2 of
-/// `docs/midturn_compaction_2026-04-27/`) was set when only
-/// frontier models were in scope; small local coders
-/// (qwen3.5:9b, deepseek-coder, gemma3) burn through
-/// compactions much faster because reasoning blocks plus
-/// tool-heavy turns inflate context within a single prompt.
-/// 2026-04-29: raised to 32 so small-model operators have
-/// headroom; anything above 32 is almost certainly a
-/// pathological loop and failing loudly is still better than
-/// grinding.
+/// below 1 disables the safety net entirely.
+///
+/// History:
+/// - PR 8.2 of `docs/midturn_compaction_2026-04-27/` set the
+///   upper bound at 8, framed as "anything above is almost
+///   certainly a model-fit problem."
+/// - 2026-04-29 (earlier this commit series): raised to 32
+///   to accommodate small-local-model workloads.
+/// - 2026-04-29 (this commit): raised again to 500. The
+///   count cap is mostly vestigial — the threshold gate
+///   already prevents infinite compaction (each call
+///   shrinks tokens; the loop only re-fires when the model
+///   genuinely re-crossed the threshold). 500 leaves a
+///   nuclear-option ceiling against truly pathological
+///   loops (broken summarizer that returns its input
+///   unchanged, etc.) without interrupting legitimate
+///   progress on small-model workloads. The real safeguard
+///   against bad-summarizer behavior is the stagnation
+///   detector planned for a follow-up commit; once that
+///   lands, the count cap is purely belt-and-suspenders.
 const COMPACTION_MAX_PER_TURN_MIN: u32 = 1;
-const COMPACTION_MAX_PER_TURN_MAX: u32 = 32;
+const COMPACTION_MAX_PER_TURN_MAX: u32 = 500;
 
 /// Validate `[compaction]` config values at load time.
 fn validate_compaction_config(compaction: &CompactionConfig) -> Result<()> {
@@ -1648,10 +1659,10 @@ mod tests {
     /// load time so a user typing `9999` doesn't quietly let
     /// the budget become useless. Range bounds were raised
     /// 2026-04-29 to accommodate small-local-model workloads
-    /// (range 1..=32 — see `COMPACTION_MAX_PER_TURN_MAX`).
+    /// (range 1..=500 — see `COMPACTION_MAX_PER_TURN_MAX`).
     #[test]
     fn compaction_config_max_per_turn_out_of_range_is_rejected() {
-        for bad in [0_u32, 33_u32, 100_u32, 9999_u32] {
+        for bad in [0_u32, 501_u32, 9999_u32, u32::MAX] {
             let tempdir = tempdir().expect("tempdir");
             let config_path = tempdir.path().join("config.toml");
             fs::write(
