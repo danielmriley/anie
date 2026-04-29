@@ -37,15 +37,28 @@ use anie_session::{
 use crate::compaction_stats::CompactionStatsAtomic;
 
 /// How many recent compaction outcomes the gate inspects when
-/// deciding whether the loop has stagnated. Three is enough to
-/// distinguish a noisy single-call dip from a stuck pattern; any
-/// fewer would over-fire on bursty contexts.
-const STAGNATION_WINDOW: usize = 3;
+/// deciding whether the loop has stagnated. Two is responsive
+/// enough to catch real-world cases (qwen3.5:9b sessions where
+/// each compaction shrinks ~13–16% — just barely above the old
+/// 10% threshold — but stagnation never accumulated three weak
+/// entries in a single user turn). Tuned 2026-04-29.
+const STAGNATION_WINDOW: usize = 2;
 
 /// A compaction is "weak progress" when it shrinks the context
-/// by less than this fraction of its tokens_before. Three weak
+/// by less than this fraction of its tokens_before. Two weak
 /// calls in a row trip `StagnationKind::ConvergingFloor`.
-const STAGNATION_PROGRESS_THRESHOLD: f64 = 0.10;
+/// Raised from 10% to 20% on 2026-04-29 to catch real cases
+/// where each compaction makes only modest progress against a
+/// floor that's near-threshold.
+const STAGNATION_PROGRESS_THRESHOLD: f64 = 0.20;
+
+/// A compaction is "near-zero progress" when it shrinks the
+/// context by less than this fraction. Two such calls in a
+/// row trip `StagnationKind::Regressing` — distinct from
+/// `ConvergingFloor` because at <5% shrink the summarizer is
+/// essentially returning its input, which aggressive mode
+/// won't fix. Reactive overflow is the right next step.
+const STAGNATION_REGRESSION_THRESHOLD: f64 = 0.05;
 
 /// A compaction "recovers from aggressive mode" when it shrinks
 /// the context by at least this fraction of its tokens_before.
@@ -81,17 +94,21 @@ struct CompactionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StagnationKind {
     /// Each of the last `STAGNATION_WINDOW` compactions shrunk
-    /// by less than `STAGNATION_PROGRESS_THRESHOLD` of its
-    /// tokens_before. The summarizer is making real progress
-    /// but the floor (kept_recent + summary frame) is itself
-    /// above threshold. Action: aggressive compaction —
-    /// halve `keep_recent_tokens` for the next call.
+    /// by less than `STAGNATION_PROGRESS_THRESHOLD` (20%) but
+    /// at least `STAGNATION_REGRESSION_THRESHOLD` (5%). The
+    /// summarizer is making real but modest progress; the
+    /// floor (kept_recent + summary frame) is near-threshold,
+    /// so each call buys only a few thousand tokens of
+    /// headroom. Action: aggressive compaction — halve
+    /// `keep_recent_tokens` for the next call.
     ConvergingFloor,
-    /// `tokens_after` did not shrink across the last
-    /// `STAGNATION_WINDOW` calls. The summarizer is producing
-    /// at least as much as it consumes — broken or
-    /// adversarial. Action: skip and let reactive overflow
-    /// take over; aggressive compaction can't help.
+    /// Each of the last `STAGNATION_WINDOW` compactions
+    /// shrunk by less than `STAGNATION_REGRESSION_THRESHOLD`
+    /// (5%). The summarizer is essentially producing its
+    /// input — broken, adversarial, or completely stuck.
+    /// Action: skip and let reactive overflow take over;
+    /// aggressive compaction can't help when the summarizer
+    /// itself isn't shrinking.
     Regressing,
 }
 
@@ -118,41 +135,50 @@ pub(crate) struct GateState {
 
 /// Pure stagnation detection over a history slice. Public to
 /// the module so unit tests can drive it directly.
+///
+/// Three tiers, evaluated newest-first over the last
+/// `STAGNATION_WINDOW` outcomes:
+///
+/// - **All under `STAGNATION_REGRESSION_THRESHOLD` (5%)** →
+///   `Regressing`. The summarizer is essentially returning
+///   its input. Aggressive mode won't help.
+/// - **All under `STAGNATION_PROGRESS_THRESHOLD` (20%) but
+///   not all under 5%** → `ConvergingFloor`. The summarizer
+///   is working but each call buys only modest headroom.
+///   Aggressive mode (halve `keep_recent_tokens`) can help.
+/// - **Otherwise** → `None`. At least one call in the window
+///   shrank meaningfully; nothing to act on.
+///
+/// Regressing takes precedence over ConvergingFloor because
+/// the regressing tier is a strict subset of weak progress
+/// (every regression-tier call is also weak), but the
+/// response is different.
 fn detect_stagnation(history: &VecDeque<CompactionOutcome>) -> Option<StagnationKind> {
     if history.len() < STAGNATION_WINDOW {
         return None;
     }
-    // Newest-first slice of the last `STAGNATION_WINDOW`
-    // outcomes.
-    let recent: Vec<CompactionOutcome> = history
+    // Per-call shrink ratio, newest-first slice of the last
+    // `STAGNATION_WINDOW` outcomes.
+    let ratios: Vec<f64> = history
         .iter()
         .rev()
         .take(STAGNATION_WINDOW)
-        .copied()
+        .map(|c| {
+            let shrunk = c.tokens_before.saturating_sub(c.tokens_after);
+            shrunk as f64 / c.tokens_before.max(1) as f64
+        })
         .collect();
 
-    // Regression takes precedence over convergence: if the
-    // summarizer is regressing AND the per-call shrink is
-    // also weak, the regression diagnosis is the safer
-    // dispatch (skip rather than aggress).
-    //
-    // "Regression" here means tokens_after didn't shrink
-    // across the window. `recent` is newest-first, so newer
-    // is index 0; we want to check that newer >= older for
-    // every adjacent pair.
-    let monotone_grow = recent
-        .windows(2)
-        .all(|w| w[0].tokens_after >= w[1].tokens_after);
-    if monotone_grow {
+    // Regression: every call's shrink is below the
+    // near-zero threshold (5%). Strict subset of weak; check
+    // first so it takes precedence.
+    if ratios.iter().all(|r| *r < STAGNATION_REGRESSION_THRESHOLD) {
         return Some(StagnationKind::Regressing);
     }
 
-    let weak_progress = recent.iter().all(|c| {
-        let shrunk = c.tokens_before.saturating_sub(c.tokens_after);
-        let ratio = shrunk as f64 / c.tokens_before.max(1) as f64;
-        ratio < STAGNATION_PROGRESS_THRESHOLD
-    });
-    if weak_progress {
+    // ConvergingFloor: every call is weak (<20%) but at
+    // least one was above the regression threshold.
+    if ratios.iter().all(|r| *r < STAGNATION_PROGRESS_THRESHOLD) {
         return Some(StagnationKind::ConvergingFloor);
     }
 
@@ -747,63 +773,71 @@ mod tests {
     /// classified — there's not enough history to call it
     /// stagnation, even if the entries individually look weak.
     #[test]
-    fn stagnation_not_detected_with_fewer_than_3_outcomes() {
+    fn stagnation_not_detected_with_fewer_than_2_outcomes() {
         let empty: VecDeque<CompactionOutcome> = VecDeque::new();
         assert_eq!(detect_stagnation(&empty), None);
 
         let one = history([outcome(1000, 990)]);
         assert_eq!(detect_stagnation(&one), None);
-
-        let two = history([outcome(1000, 990), outcome(1000, 990)]);
-        assert_eq!(detect_stagnation(&two), None);
     }
 
-    /// Three outcomes each shrinking less than 10% of their
-    /// tokens_before classify as ConvergingFloor.
+    /// Two outcomes each shrinking between 5% and 20% classify
+    /// as ConvergingFloor — weak progress, but not regressing.
     #[test]
-    fn converging_floor_detected_when_progress_is_under_10pct() {
+    fn converging_floor_detected_when_progress_is_under_20pct() {
         let h = history([
-            outcome(1000, 950), // 5% shrink
-            outcome(960, 920),  // 4.2%
-            outcome(930, 900),  // 3.2%
+            outcome(1000, 880), // 12% shrink
+            outcome(900, 800),  // 11.1%
         ]);
         assert_eq!(detect_stagnation(&h), Some(StagnationKind::ConvergingFloor));
     }
 
-    /// Three outcomes whose tokens_after grow monotonically
-    /// classify as Regressing — the summarizer is producing more
-    /// than it consumes.
+    /// Two outcomes shrinking by less than 5% each classify as
+    /// Regressing — the summarizer is essentially returning its
+    /// input.
     #[test]
-    fn regressing_detected_when_tokens_after_grows() {
-        // tokens_after: 800 -> 900 -> 1000 (newest at the back).
-        let h = history([outcome(1500, 800), outcome(1500, 900), outcome(1500, 1000)]);
+    fn regressing_detected_when_progress_under_5pct() {
+        let h = history([
+            outcome(1500, 1490), // 0.67% shrink
+            outcome(1500, 1480), // 1.33%
+        ]);
         assert_eq!(detect_stagnation(&h), Some(StagnationKind::Regressing));
     }
 
-    /// A history that satisfies both predicates dispatches to
-    /// Regressing. The "skip and let reactive overflow take
-    /// over" response is safer than "aggress" when the
-    /// summarizer is broken.
+    /// A history where every call is below the regression
+    /// threshold (5%) dispatches to Regressing — even though
+    /// it's also "weak progress" (<20%), the regressing tier
+    /// is a strict subset of weak and takes precedence.
     #[test]
     fn regressing_takes_precedence_over_converging() {
-        // Both weak progress (~0%) AND tokens_after grew slightly
-        // monotonically (newest >= older).
-        let h = history([outcome(1000, 990), outcome(1010, 1000), outcome(1020, 1010)]);
-        // tokens_after sequence (newest-first): 1010, 1000, 990 —
-        // each newer is >= older, so monotone_grow is true,
-        // and Regressing wins despite weak_progress also being
-        // true.
+        let h = history([
+            outcome(1000, 990),  // 1% shrink — regressing
+            outcome(1010, 1000), // ~1% — regressing
+        ]);
         assert_eq!(detect_stagnation(&h), Some(StagnationKind::Regressing));
     }
 
-    /// One healthy compaction sandwiched between weak ones is
-    /// enough to break the stagnation pattern.
+    /// One healthy compaction in the window breaks the
+    /// stagnation pattern. With WINDOW=2, [big_shrink, weak]
+    /// means at least one call ≥20%, so neither tier fires.
     #[test]
     fn one_healthy_call_breaks_stagnation() {
         let h = history([
-            outcome(1000, 950), // weak
-            outcome(1000, 500), // big shrink — recovered
-            outcome(1000, 950), // weak
+            outcome(1000, 500), // 50% shrink — healthy
+            outcome(1000, 950), // 5% — weak but window has the healthy call too
+        ]);
+        assert_eq!(detect_stagnation(&h), None);
+    }
+
+    /// Boundary case: a call exactly at
+    /// `STAGNATION_PROGRESS_THRESHOLD` (20%) is *not* weak —
+    /// the predicate is strict less-than. Two calls exactly at
+    /// the threshold should leave the gate untouched.
+    #[test]
+    fn at_threshold_progress_not_weak() {
+        let h = history([
+            outcome(1000, 800), // exactly 20% shrink
+            outcome(1000, 800),
         ]);
         assert_eq!(detect_stagnation(&h), None);
     }
@@ -856,12 +890,13 @@ mod tests {
             keep_recent_tokens: 50,
         };
         let (gate, _rx) = build_gate(config, 5);
-        // Pre-seed history with a regressing pattern.
+        // Pre-seed history with a regressing pattern: every
+        // call shrinks by less than STAGNATION_REGRESSION_THRESHOLD
+        // (5%), which is the new definition of "regressing."
         {
             let mut state = gate.state.lock().expect("state lock");
-            state.history.push_back(outcome(1500, 800));
-            state.history.push_back(outcome(1500, 900));
-            state.history.push_back(outcome(1500, 1000));
+            state.history.push_back(outcome(1500, 1490)); // 0.67%
+            state.history.push_back(outcome(1500, 1480)); // 1.33%
         }
         let outcome = gate
             .maybe_compact(&small_context_below_threshold())
@@ -907,12 +942,14 @@ mod tests {
         let (gate, mut rx) = build_gate(config, 5);
         // Pre-seed a converging-floor history so the gate
         // detects stagnation on entry and bumps to level 1
-        // (keep_recent_tokens halved 200 -> 100).
+        // (keep_recent_tokens halved 200 -> 100). Each entry
+        // shrinks 10–15% — weak progress (<20%) but above the
+        // 5% regression threshold, so it dispatches to
+        // ConvergingFloor not Regressing.
         {
             let mut state = gate.state.lock().expect("state lock");
-            state.history.push_back(outcome(1000, 950));
-            state.history.push_back(outcome(960, 920));
-            state.history.push_back(outcome(930, 900));
+            state.history.push_back(outcome(1000, 880)); // 12%
+            state.history.push_back(outcome(900, 800)); // 11.1%
         }
 
         let result = gate.maybe_compact(&messages).await.expect("gate ok");
@@ -923,8 +960,8 @@ mod tests {
         // History grew — the new outcome was appended.
         let history_len = gate.state.lock().expect("state lock").history.len();
         assert_eq!(
-            history_len, 4,
-            "successful compaction should append to history (3 pre-seeded + 1 new)",
+            history_len, 3,
+            "successful compaction should append to history (2 pre-seeded + 1 new)",
         );
         // Drain emitted events to keep `_rx` quiet.
         while rx.try_recv().is_ok() {}
@@ -950,12 +987,13 @@ mod tests {
             // outcome that itself is weak progress.
             {
                 let mut state = gate.state.lock().expect("state lock");
-                // Force the history to a converging pattern
-                // each iteration.
+                // Force the history to a converging-floor pattern
+                // each iteration: every entry shrinks 10–15%
+                // (weak <20%, but above the 5% regression
+                // threshold).
                 state.history.clear();
-                state.history.push_back(outcome(1000, 950));
-                state.history.push_back(outcome(960, 920));
-                state.history.push_back(outcome(930, 900));
+                state.history.push_back(outcome(1000, 880)); // 12%
+                state.history.push_back(outcome(900, 800)); // 11.1%
             }
             // Re-trigger detection by reading the state.
             let kind = detect_stagnation(&gate.state.lock().expect("lock").history);
