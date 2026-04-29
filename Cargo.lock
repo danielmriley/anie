@@ -248,6 +248,7 @@ dependencies = [
  "anie-agent",
  "anie-protocol",
  "anie-provider",
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
  "dashmap 6.1.0",

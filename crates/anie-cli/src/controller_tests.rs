@@ -255,6 +255,42 @@ fn no_tools_flag_builds_empty_registry() {
     assert!(registry.definitions().is_empty());
 }
 
+/// Plan `docs/rlm_2026-04-29/06_phased_implementation.md`
+/// Phase A: the recurse tool is installed only when
+/// `--harness-mode=rlm`. Other modes get an empty extras
+/// list, so `build_agent` reuses the bootstrap tool registry.
+#[test]
+fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
+    use std::sync::atomic::AtomicU32;
+
+    let (controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    // Default mode is `current` — no recurse tool.
+    let extras = build_rlm_extras(&controller.state, Arc::new(AtomicU32::new(8)), Vec::new());
+    assert!(
+        extras.is_empty(),
+        "current mode should not install rlm extras",
+    );
+
+    // Flip to baseline — also no recurse.
+    let mut controller = controller;
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Baseline;
+    let extras = build_rlm_extras(&controller.state, Arc::new(AtomicU32::new(8)), Vec::new());
+    assert!(
+        extras.is_empty(),
+        "baseline mode should not install rlm extras",
+    );
+
+    // Flip to rlm — exactly one tool, named `recurse`.
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    let extras = build_rlm_extras(&controller.state, Arc::new(AtomicU32::new(8)), Vec::new());
+    assert_eq!(
+        extras.len(),
+        1,
+        "rlm mode should install exactly one extra tool"
+    );
+    assert_eq!(extras[0].definition().name, "recurse");
+}
+
 #[test]
 fn tool_registry_contains_core_tools_by_default() {
     let registry = build_tool_registry(Path::new("."), false);
@@ -1371,7 +1407,7 @@ async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
         runtime_state,
         provider_registry,
     );
-    let agent = build_agent(&state, None);
+    let agent = build_agent(&state, None, Vec::new());
     let (event_tx, _event_rx) = mpsc::channel(16);
 
     let result = agent
@@ -1836,7 +1872,7 @@ async fn context_length_override_applies_to_next_request_without_reload() {
         .handle_action(UiAction::ContextLength(Some("16384".into())))
         .await
         .expect("set context length");
-    let agent = build_agent(&controller.state, None);
+    let agent = build_agent(&controller.state, None, Vec::new());
     let (event_tx, _event_rx) = mpsc::channel(16);
     let result = agent
         .run(

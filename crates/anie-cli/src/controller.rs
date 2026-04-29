@@ -90,7 +90,31 @@ pub(crate) struct InteractiveController {
     /// into a spawned task without moving it. Plan
     /// `docs/midturn_compaction_2026-04-27/02_per_turn_compaction_budget.md`.
     compactions_remaining_this_turn: Arc<AtomicU32>,
+    /// Recurse-tool budget for the current top-level run.
+    /// Reset to `RECURSION_BUDGET_DEFAULT` at the top of
+    /// every `start_prompt_run`; decremented inside the
+    /// recurse tool atomically. Shared with sub-agents so
+    /// deeper recursion (when re-enabled in a later commit)
+    /// uses the same counter. Only consulted in
+    /// `--harness-mode=rlm`. Plan
+    /// `docs/rlm_2026-04-29/02_recurse_tool.md`.
+    recursions_remaining_this_run: Arc<AtomicU32>,
 }
+
+/// Default recursion budget per top-level run. Plan 02
+/// recommended 16; 8 is a tighter starting value (per the
+/// commit-1 default discussion) so we hit budget exhaustion
+/// quickly during testing and catch wiring bugs.
+const RECURSION_BUDGET_DEFAULT: u32 = 8;
+
+/// Maximum recursion depth. At depth >= this, the factory
+/// drops `recurse` from the sub-agent's tool registry. Plan
+/// 06 Phase A. Note: `rlm/05` ships sub-agents without any
+/// tools at all, so this is effectively only enforced at the
+/// top-level → depth-1 boundary; deeper depths are
+/// inaccessible until a follow-up commit registers recurse
+/// on sub-agents.
+const RECURSION_MAX_DEPTH: u8 = 2;
 
 struct CurrentRun {
     handle: JoinHandle<anie_agent::AgentRunResult>,
@@ -169,6 +193,7 @@ impl InteractiveController {
             exit_after_run,
             queued_prompts: VecDeque::new(),
             compactions_remaining_this_turn: Arc::new(AtomicU32::new(max_per_turn)),
+            recursions_remaining_this_run: Arc::new(AtomicU32::new(RECURSION_BUDGET_DEFAULT)),
         }
     }
 
@@ -1012,7 +1037,18 @@ impl InteractiveController {
             .state
             .session
             .context_without_entry(Some(&prompt_entry_id));
-        let agent = build_agent(&self.state, self.build_compaction_gate());
+        // Reset the per-run recursion budget at the top of
+        // every fresh user prompt. The recurse tool (only
+        // installed in --harness-mode=rlm) reads + decrements
+        // this atomic on every invocation.
+        self.recursions_remaining_this_run
+            .store(RECURSION_BUDGET_DEFAULT, Ordering::Release);
+        let extra_tools = build_rlm_extras(
+            &self.state,
+            Arc::clone(&self.recursions_remaining_this_run),
+            context.clone(),
+        );
+        let agent = build_agent(&self.state, self.build_compaction_gate(), extra_tools);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -1048,7 +1084,16 @@ impl InteractiveController {
             .into_iter()
             .map(|message| message.message)
             .collect::<Vec<_>>();
-        let agent = build_agent(&self.state, self.build_compaction_gate());
+        // Continuation runs share the recursion budget with
+        // the original prompt run — they're the same user
+        // turn, just retried after a transient error or a
+        // post-compaction re-attempt. No reset here.
+        let extra_tools = build_rlm_extras(
+            &self.state,
+            Arc::clone(&self.recursions_remaining_this_run),
+            context.clone(),
+        );
+        let agent = build_agent(&self.state, self.build_compaction_gate(), extra_tools);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -1711,10 +1756,30 @@ async fn run_via_step_machine(
 fn build_agent(
     state: &ControllerState,
     compaction_gate: Option<Arc<dyn anie_agent::CompactionGate>>,
+    extra_tools: Vec<Arc<dyn anie_agent::Tool>>,
 ) -> AgentLoop {
+    // Most runs (current / baseline modes) reuse the bootstrap
+    // tool registry verbatim — cheap `Arc::clone`. Only `rlm`
+    // mode builds a per-run registry on top, because the
+    // recurse tool needs the run's recursion-budget atomic and
+    // a context-view snapshot.
+    let tool_registry = if extra_tools.is_empty() {
+        Arc::clone(&state.tool_registry)
+    } else {
+        let mut new_registry = ToolRegistry::new();
+        for def in state.tool_registry.definitions() {
+            if let Some(tool) = state.tool_registry.get(&def.name) {
+                new_registry.register(tool);
+            }
+        }
+        for tool in extra_tools {
+            new_registry.register(tool);
+        }
+        Arc::new(new_registry)
+    };
     AgentLoop::new(
         Arc::clone(&state.provider_registry),
-        Arc::clone(&state.tool_registry),
+        tool_registry,
         AgentLoopConfig::new(
             state.config.current_model().clone(),
             state.prompt_cache.current().to_string(),
@@ -1725,6 +1790,44 @@ fn build_agent(
         .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
         .with_compaction_gate(compaction_gate),
     )
+}
+
+/// Build the per-run extras (right now: just the `recurse`
+/// tool) injected into the agent loop when
+/// `--harness-mode=rlm`. Returns an empty `Vec` for any other
+/// mode, so the caller can pass the result to `build_agent`
+/// unconditionally without an extra branch.
+///
+/// Plan: `docs/rlm_2026-04-29/02_recurse_tool.md` and
+/// `docs/rlm_2026-04-29/06_phased_implementation.md` Phase A.
+fn build_rlm_extras(
+    state: &ControllerState,
+    recursion_budget: Arc<AtomicU32>,
+    context_snapshot: Vec<Message>,
+) -> Vec<Arc<dyn anie_agent::Tool>> {
+    if !state.harness_mode.installs_rlm_features() {
+        return Vec::new();
+    }
+    let context_view = Arc::new(tokio::sync::RwLock::new(context_snapshot));
+    let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
+        context_view,
+    ));
+    let factory = Arc::new(crate::recurse_factory::ControllerSubAgentFactory {
+        provider_registry: Arc::clone(&state.provider_registry),
+        model: state.config.current_model().clone(),
+        system_prompt: state.prompt_cache.current().to_string(),
+        thinking: state.config.current_thinking(),
+        request_options_resolver: Arc::clone(&state.request_options_resolver),
+        ollama_num_ctx_override: state.config.active_ollama_num_ctx_override(),
+    });
+    let recurse_tool = Arc::new(anie_tools::RecurseTool::new(
+        factory,
+        provider,
+        recursion_budget,
+        0, // top-level depth
+        RECURSION_MAX_DEPTH,
+    ));
+    vec![recurse_tool]
 }
 
 /// Build the system prompt for interactive, print, and RPC runs.
