@@ -1,16 +1,11 @@
 //! Controller-side [`ContextProvider`] implementation.
 //!
-//! Resolves a [`RecurseScope`] against an `Arc<RwLock<Vec<Message>>>`
-//! view of the parent run's active context, plus (in later
-//! commits) filesystem access for `RecurseScope::File`.
-//!
-//! This commit (`rlm/03`) ships [`RecurseScope::MessageRange`]
-//! resolution only. The other scope kinds (`MessageGrep`,
-//! `ToolResult`, `File`) return a typed "not yet
-//! implemented" error so the recurse tool — which will land
-//! in `rlm/04` — can route them through to the model as a
-//! tool error rather than silently mis-handling them. Each
-//! gets its own commit (`rlm/06.x`).
+//! Resolves a [`RecurseScope`] against an
+//! `Arc<RwLock<Vec<Message>>>` view of the parent run's
+//! active context, plus filesystem access for
+//! `RecurseScope::File`. All four scope kinds are
+//! implemented (`MessageRange`, `MessageGrep`, `ToolResult`,
+//! `File`).
 //!
 //! Plan: `docs/rlm_2026-04-29/02_recurse_tool.md` and
 //! `docs/rlm_2026-04-29/06_phased_implementation.md` Phase A.
@@ -22,7 +17,15 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use anie_agent::{ContextProvider, RecurseScope};
-use anie_protocol::{ContentBlock, Message};
+use anie_protocol::{ContentBlock, Message, UserMessage, now_millis};
+
+/// Maximum file size the `File` scope will load. Mirrors the
+/// 50 KiB cap that the `read` tool uses for normal file
+/// reads (`anie_tools::shared::MAX_READ_BYTES`); larger files
+/// surface as an explicit "too large" error so the model
+/// retries with `read` + a focused range, or with a
+/// different scope kind.
+const FILE_SCOPE_MAX_BYTES: u64 = 50 * 1024;
 
 /// True iff `re` matches any text content in `message`. Walks
 /// every text-bearing block — assistant text, user text,
@@ -49,23 +52,14 @@ fn message_matches_regex(message: &Message, re: &regex::Regex) -> bool {
 /// Holds a *view* of the parent run's context — not an
 /// owning copy. The controller updates the view after each
 /// REPL `Print` step (Phase C of Plan 06 wires this up); for
-/// now the view is whatever a caller threads in. Reads are
-/// async because future scope kinds (`File`) will block on
-/// I/O; the lock is `tokio::sync::RwLock` so multiple
-/// concurrent recurse calls can read the view in parallel.
-///
-/// `#[allow(dead_code)]`: this commit (`rlm/03`) ships the
-/// resolver as a standalone, fully-tested unit. The recurse
-/// tool that consumes it lands in `rlm/04`. Tests in this
-/// file exercise the resolver directly; production code
-/// doesn't reference it yet, hence the lint allowance until
-/// commit 4 wires it up.
-#[allow(dead_code)]
+/// now the view is a snapshot taken at run start. Reads are
+/// async because the `File` scope blocks on I/O; the lock is
+/// `tokio::sync::RwLock` so multiple concurrent recurse
+/// calls can read the view in parallel.
 pub(crate) struct ControllerContextProvider {
     context_view: Arc<RwLock<Vec<Message>>>,
 }
 
-#[allow(dead_code)]
 impl ControllerContextProvider {
     /// Construct a provider around a shared context view.
     pub(crate) fn new(context_view: Arc<RwLock<Vec<Message>>>) -> Self {
@@ -121,9 +115,34 @@ impl ContextProvider for ControllerContextProvider {
                 }
                 Ok(matched)
             }
-            RecurseScope::File { .. } => Err(anyhow!(
-                "RecurseScope::File is not yet implemented (planned for rlm/06.x)"
-            )),
+            RecurseScope::File { path } => {
+                let metadata = tokio::fs::metadata(path)
+                    .await
+                    .map_err(|e| anyhow!("RecurseScope::File could not stat `{path}`: {e}"))?;
+                if !metadata.is_file() {
+                    return Err(anyhow!("RecurseScope::File `{path}` is not a regular file"));
+                }
+                if metadata.len() > FILE_SCOPE_MAX_BYTES {
+                    return Err(anyhow!(
+                        "RecurseScope::File `{path}` exceeds the {FILE_SCOPE_MAX_BYTES}-byte limit ({} bytes); use the `read` tool with a focused offset/limit instead",
+                        metadata.len(),
+                    ));
+                }
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .map_err(|e| anyhow!("RecurseScope::File could not read `{path}`: {e}"))?;
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                // Wrap the file as a single User message so the
+                // sub-agent's prompt format is uniform across
+                // scope kinds. The header names the source path
+                // so the sub-agent knows where the content came
+                // from when it composes its answer.
+                let body = format!("[file: {path}]\n\n{text}");
+                Ok(vec![Message::User(UserMessage {
+                    content: vec![ContentBlock::Text { text: body }],
+                    timestamp: now_millis(),
+                })])
+            }
         }
     }
 }
@@ -232,17 +251,82 @@ mod tests {
         );
     }
 
-    /// File is not yet implemented; returns a typed error.
+    /// File scope reads a small file from disk and wraps the
+    /// contents in a single User message tagged with the
+    /// source path.
     #[tokio::test]
-    async fn unimplemented_file_scope_errors_with_clear_text() {
+    async fn file_scope_reads_small_file() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+        let mut tmp = NamedTempFile::new().expect("tmp");
+        writeln!(tmp, "hello from disk").expect("write");
+        let path = tmp.path().to_string_lossy().into_owned();
+        let provider = provider_with_context(Vec::new());
+        let resolved = provider
+            .resolve(&RecurseScope::File { path: path.clone() })
+            .await
+            .expect("resolve ok");
+        assert_eq!(resolved.len(), 1);
+        match &resolved[0] {
+            Message::User(u) => {
+                let ContentBlock::Text { text } = &u.content[0] else {
+                    panic!("expected text content");
+                };
+                assert!(text.contains(&format!("[file: {path}]")));
+                assert!(text.contains("hello from disk"));
+            }
+            other => panic!("expected User message, got {other:?}"),
+        }
+    }
+
+    /// Files larger than the cap surface as a typed error
+    /// rather than loading silently. The error message
+    /// suggests `read` as the right tool for focused reads.
+    #[tokio::test]
+    async fn file_scope_rejects_oversize_file() {
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+        let mut tmp = NamedTempFile::new().expect("tmp");
+        let big = vec![b'x'; (FILE_SCOPE_MAX_BYTES as usize) + 100];
+        tmp.write_all(&big).expect("write");
         let provider = provider_with_context(Vec::new());
         let err = provider
             .resolve(&RecurseScope::File {
-                path: "/tmp/whatever".into(),
+                path: tmp.path().to_string_lossy().into_owned(),
             })
             .await
-            .expect_err("file scope unimplemented");
-        assert!(err.to_string().contains("not yet implemented"));
+            .expect_err("oversize file should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("byte limit"),
+            "error should name the limit; got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn file_scope_missing_path_errors() {
+        let provider = provider_with_context(Vec::new());
+        let err = provider
+            .resolve(&RecurseScope::File {
+                path: "/nonexistent/path/whatever".into(),
+            })
+            .await
+            .expect_err("missing path should error");
+        assert!(err.to_string().contains("could not stat"));
+    }
+
+    #[tokio::test]
+    async fn file_scope_directory_errors() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let provider = provider_with_context(Vec::new());
+        let err = provider
+            .resolve(&RecurseScope::File {
+                path: dir.path().to_string_lossy().into_owned(),
+            })
+            .await
+            .expect_err("directory should error");
+        assert!(err.to_string().contains("not a regular file"));
     }
 
     /// ToolResult resolves a single ToolResultMessage by
