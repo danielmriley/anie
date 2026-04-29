@@ -104,9 +104,23 @@ impl ContextProvider for ControllerContextProvider {
                     .collect();
                 Ok(matched)
             }
-            RecurseScope::ToolResult { .. } => Err(anyhow!(
-                "RecurseScope::ToolResult is not yet implemented (planned for rlm/06.x)"
-            )),
+            RecurseScope::ToolResult { tool_call_id } => {
+                let context = self.context_view.read().await;
+                let matched: Vec<Message> = context
+                    .iter()
+                    .filter(|m| match m {
+                        Message::ToolResult(t) => &t.tool_call_id == tool_call_id,
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                if matched.is_empty() {
+                    return Err(anyhow!(
+                        "RecurseScope::ToolResult tool_call_id `{tool_call_id}` not found in parent context"
+                    ));
+                }
+                Ok(matched)
+            }
             RecurseScope::File { .. } => Err(anyhow!(
                 "RecurseScope::File is not yet implemented (planned for rlm/06.x)"
             )),
@@ -218,34 +232,63 @@ mod tests {
         );
     }
 
-    /// ToolResult and File are not yet implemented (each
-    /// gets its own commit). They return typed errors
-    /// mentioning the scope kind and the milestone they ship
-    /// in.
+    /// File is not yet implemented; returns a typed error.
     #[tokio::test]
-    async fn unimplemented_scopes_error_with_clear_text() {
+    async fn unimplemented_file_scope_errors_with_clear_text() {
         let provider = provider_with_context(Vec::new());
-
-        let cases: Vec<RecurseScope> = vec![
-            RecurseScope::ToolResult {
-                tool_call_id: "call_abc".into(),
-            },
-            RecurseScope::File {
+        let err = provider
+            .resolve(&RecurseScope::File {
                 path: "/tmp/whatever".into(),
-            },
-        ];
-        for scope in cases {
-            let kind = scope.kind();
-            let err = provider
-                .resolve(&scope)
-                .await
-                .expect_err("unimplemented scope should error");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("not yet implemented"),
-                "error for {kind} should say 'not yet implemented'; got: {msg}",
-            );
-        }
+            })
+            .await
+            .expect_err("file scope unimplemented");
+        assert!(err.to_string().contains("not yet implemented"));
+    }
+
+    /// ToolResult resolves a single ToolResultMessage by
+    /// `tool_call_id`. The match is exact; the resolver
+    /// returns a Vec for shape uniformity with the other
+    /// scopes (always exactly 0 or 1 entry in the success
+    /// case — empty triggers an error so the model knows the
+    /// id was wrong).
+    #[tokio::test]
+    async fn tool_result_resolves_by_call_id() {
+        use anie_protocol::{ToolResultMessage, now_millis};
+        let tool_result = Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_xyz".into(),
+            tool_name: "bash".into(),
+            content: vec![ContentBlock::Text {
+                text: "hello\n".into(),
+            }],
+            details: serde_json::Value::Null,
+            is_error: false,
+            timestamp: now_millis(),
+        });
+        let provider = provider_with_context(vec![user_message("before"), tool_result.clone()]);
+        let resolved = provider
+            .resolve(&RecurseScope::ToolResult {
+                tool_call_id: "call_xyz".into(),
+            })
+            .await
+            .expect("resolve ok");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0], tool_result);
+    }
+
+    #[tokio::test]
+    async fn tool_result_unknown_id_errors() {
+        let provider = provider_with_context(vec![user_message("anything")]);
+        let err = provider
+            .resolve(&RecurseScope::ToolResult {
+                tool_call_id: "missing".into(),
+            })
+            .await
+            .expect_err("unknown id should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing") && msg.contains("not found"),
+            "error should name the missing id; got: {msg}",
+        );
     }
 
     /// MessageGrep returns every message whose any text block
