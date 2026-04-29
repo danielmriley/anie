@@ -423,6 +423,11 @@ struct AgentRunState {
     generated_messages: Vec<Message>,
     terminal_error: Option<ProviderError>,
     finished: bool,
+    /// Set by `finish_with_assistant` (the preflight failure
+    /// path) so the driver's tail `AgentEnd` emission does not
+    /// double-emit. Every other terminal path relies on the
+    /// tail emission.
+    suppress_tail_agent_end: bool,
 }
 
 impl AgentRunState {
@@ -436,6 +441,7 @@ impl AgentRunState {
             generated_messages: Vec::new(),
             terminal_error: None,
             finished: false,
+            suppress_tail_agent_end: false,
         }
     }
 
@@ -502,6 +508,73 @@ impl AgentRunState {
     }
 }
 
+/// One bounded action the driver evaluates per REPL iteration.
+///
+/// `ModelTurn` resolves request options and streams a single
+/// provider response. `ExecuteTools` runs the tool batch the
+/// most recent assistant requested. `AppendFollowUps` and
+/// `RunCompactionGate` are short bookkeeping intents that bridge
+/// between turns. `Finish` is a sentinel — the driver loop
+/// breaks before evaluating it.
+///
+/// `clippy::large_enum_variant`: `AssistantMessage` is much
+/// larger than the other variants but at most one intent value
+/// exists at a time (held as a single mutable local), so boxing
+/// it would add indirection without saving meaningful memory.
+#[allow(clippy::large_enum_variant)]
+enum AgentIntent {
+    ModelTurn,
+    ExecuteTools {
+        assistant: AssistantMessage,
+        tool_calls: Vec<ToolCall>,
+    },
+    AppendFollowUps {
+        messages: Vec<Message>,
+    },
+    /// Mid-turn compaction gate plus the next-turn `TurnStart`
+    /// emission. Originally inlined at the bottom of the
+    /// monolithic loop.
+    RunCompactionGate,
+    Finish,
+}
+
+/// The result of one `Eval` step. Carries enough information
+/// for the subsequent `Print` (state mutation + boundary
+/// events) and `Decide` (next intent) phases to act on the
+/// step's outcome.
+enum AgentObservation {
+    AssistantCollected {
+        assistant: AssistantMessage,
+        terminal_error: Option<ProviderError>,
+    },
+    ToolResults {
+        assistant: AssistantMessage,
+        results: Vec<ToolResultMessage>,
+    },
+    FollowUpsAppended,
+    CompactionGateChecked,
+    /// `Eval` already drove the run to a terminal state — the
+    /// preflight failure path emits its own
+    /// `MessageStart`/`MessageEnd`/`TurnEnd`/`AgentEnd` sequence
+    /// via `finish_with_assistant`. `Print` and `Decide` short-
+    /// circuit on this observation.
+    PreflightFailed,
+    /// Sentinel for `AgentIntent::Finish` — should never be
+    /// reached because the driver breaks before evaluating
+    /// `Finish`. Present so the dispatch is exhaustive.
+    Finished,
+}
+
+/// What the driver does after the current iteration completes.
+///
+/// `clippy::large_enum_variant`: see `AgentIntent`.
+#[allow(clippy::large_enum_variant)]
+enum AgentDecision {
+    Continue(AgentIntent),
+    Finish,
+    FinishWithError(ProviderError),
+}
+
 /// The core provider/tool-agnostic agent loop.
 pub struct AgentLoop {
     provider_registry: Arc<ProviderRegistry>,
@@ -525,6 +598,15 @@ impl AgentLoop {
     }
 
     /// Run the agent loop using owned prompt and context state.
+    ///
+    /// The body is shaped as a Read → Eval → Print → Decide
+    /// driver over an explicit `AgentIntent` cursor. Each
+    /// iteration evaluates one bounded intent (model turn, tool
+    /// batch, follow-up append, compaction gate), commits the
+    /// observation to `state` and emits the boundary events
+    /// that go with it, then decides on the next intent. The
+    /// run terminates when state is finished; `AgentEnd` is
+    /// emitted once at the tail.
     pub async fn run(
         &self,
         prompts: Vec<Message>,
@@ -539,10 +621,52 @@ impl AgentLoop {
         // need to move a sender into a spawned task.
         let event_tx = &event_tx;
 
+        self.start_run(&prompts, event_tx).await;
+
+        let mut intent = AgentIntent::ModelTurn;
+        while !state.finished {
+            let observation = self.eval_step(intent, &mut state, event_tx, &cancel).await;
+            self.print_step(&mut state, &observation, event_tx).await;
+            match self.decide_next_step(&state, &observation, &cancel) {
+                AgentDecision::Continue(next) => intent = next,
+                AgentDecision::Finish => {
+                    state.finish();
+                    intent = AgentIntent::Finish;
+                }
+                AgentDecision::FinishWithError(error) => {
+                    state.finish_with_error(error);
+                    intent = AgentIntent::Finish;
+                }
+            }
+        }
+
+        // Tail emission of `AgentEnd`. The preflight failure path
+        // (resolver error, missing provider, stream-init error)
+        // emits its own `AgentEnd` via `finish_with_assistant` and
+        // sets `state.suppress_tail_agent_end` to true so this
+        // call is a no-op for those runs. Every other path —
+        // terminal assistant, no-tools-no-follow-ups, mid-tool
+        // cancellation — relies on this tail emission.
+        if !state.suppress_tail_agent_end {
+            send_event(
+                event_tx,
+                AgentEvent::AgentEnd {
+                    messages: state.generated_messages().to_vec(),
+                },
+            )
+            .await;
+        }
+
+        state.into_result()
+    }
+
+    /// Read-phase prelude: emit `AgentStart`, the initial
+    /// `TurnStart`, and one `MessageStart`/`MessageEnd` pair per
+    /// prompt before the driver loop begins.
+    async fn start_run(&self, prompts: &[Message], event_tx: &mpsc::Sender<AgentEvent>) {
         send_event(event_tx, AgentEvent::AgentStart).await;
         send_event(event_tx, AgentEvent::TurnStart).await;
-
-        for prompt in &prompts {
+        for prompt in prompts {
             send_event(
                 event_tx,
                 AgentEvent::MessageStart {
@@ -558,217 +682,329 @@ impl AgentLoop {
             )
             .await;
         }
-
-        while !state.finished {
-            let request = match self
-                .config
-                .request_options_resolver
-                .resolve(&self.config.model, state.context())
-                .await
-            {
-                Ok(request) => request,
-                Err(error) => {
-                    let assistant =
-                        self.error_assistant_message(error.to_string(), StopReason::Error);
-                    self.finish_with_assistant(assistant, &mut state, event_tx, Vec::new())
-                        .await;
-                    state.finish_with_error(error);
-                    break;
-                }
-            };
-
-            let Some(provider) = self.provider_registry.get(&self.config.model.api) else {
-                let assistant = self.error_assistant_message(
-                    format!("No provider registered for {:?}", self.config.model.api),
-                    StopReason::Error,
-                );
-                self.finish_with_assistant(assistant, &mut state, event_tx, Vec::new())
-                    .await;
-                state.finish();
-                break;
-            };
-
-            let mut model = self.config.model.clone();
-            if let Some(base_url_override) = request.base_url_override {
-                model.base_url = base_url_override;
-            }
-
-            let replay = model.effective_replay_capabilities();
-            let sanitized_context = sanitize_context_for_request(
-                state.context(),
-                provider.includes_thinking_in_replay(),
-                replay.requires_thinking_signature,
-            );
-            let llm_context = LlmContext {
-                system_prompt: self.config.system_prompt.clone(),
-                messages: provider.convert_messages(&sanitized_context),
-                tools: self.tool_registry.definitions(),
-            };
-            let options = self.config.stream_options(request.api_key, request.headers);
-
-            let stream = match provider.stream(&model, llm_context, options) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    let assistant =
-                        self.error_assistant_message(error.to_string(), StopReason::Error);
-                    self.finish_with_assistant(assistant, &mut state, event_tx, Vec::new())
-                        .await;
-                    state.finish_with_error(error);
-                    break;
-                }
-            };
-
-            let collected = self.collect_stream(stream, event_tx, &cancel).await;
-            let assistant = collected.assistant;
-            state.append_assistant(assistant.clone());
-
-            if collected.provider_error.is_some()
-                || matches!(
-                    assistant.stop_reason,
-                    StopReason::Error | StopReason::Aborted
-                )
-            {
-                send_event(
-                    event_tx,
-                    AgentEvent::TurnEnd {
-                        assistant,
-                        tool_results: Vec::new(),
-                    },
-                )
-                .await;
-                send_event(
-                    event_tx,
-                    AgentEvent::AgentEnd {
-                        messages: state.generated_messages().to_vec(),
-                    },
-                )
-                .await;
-                if let Some(error) = collected.provider_error {
-                    state.finish_with_error(error);
-                } else {
-                    state.finish();
-                }
-                break;
-            }
-
-            let tool_calls = extract_tool_calls(&assistant);
-            if tool_calls.is_empty() {
-                if let Some(get_follow_up_messages) = &self.config.get_follow_up_messages {
-                    let follow_up_messages = get_follow_up_messages();
-                    if !follow_up_messages.is_empty() {
-                        state.extend_context(follow_up_messages);
-                        send_event(
-                            event_tx,
-                            AgentEvent::TurnEnd {
-                                assistant,
-                                tool_results: Vec::new(),
-                            },
-                        )
-                        .await;
-                        send_event(event_tx, AgentEvent::TurnStart).await;
-                        continue;
-                    }
-                }
-
-                send_event(
-                    event_tx,
-                    AgentEvent::TurnEnd {
-                        assistant,
-                        tool_results: Vec::new(),
-                    },
-                )
-                .await;
-                send_event(
-                    event_tx,
-                    AgentEvent::AgentEnd {
-                        messages: state.generated_messages().to_vec(),
-                    },
-                )
-                .await;
-                state.finish();
-                break;
-            }
-
-            let tool_results = self
-                .execute_tool_calls(&tool_calls, state.context(), event_tx, &cancel)
-                .await;
-
-            state.append_tool_results(&tool_results);
-
-            if let Some(get_steering_messages) = &self.config.get_steering_messages {
-                state.extend_context(get_steering_messages());
-            }
-
-            send_event(
-                event_tx,
-                AgentEvent::TurnEnd {
-                    assistant,
-                    tool_results: tool_results.clone(),
-                },
-            )
-            .await;
-
-            if cancel.is_cancelled() {
-                send_event(
-                    event_tx,
-                    AgentEvent::AgentEnd {
-                        messages: state.generated_messages().to_vec(),
-                    },
-                )
-                .await;
-                state.finish();
-                break;
-            }
-
-            // Mid-turn compaction gate. PR 8.3 of
-            // `docs/midturn_compaction_2026-04-27/`. Fires AFTER
-            // tool results / steering messages have been merged
-            // into `context` and BEFORE the next sampling
-            // iteration starts. The first iteration is unaffected
-            // because we never reach this point without having
-            // completed at least one full sampling cycle. Default
-            // `None` makes this a single `Option::is_some` branch
-            // — zero cost for callers that don't install a gate.
-            if let Some(gate) = self.config.compaction_gate.as_ref() {
-                match gate.maybe_compact(state.context()).await {
-                    Ok(CompactionGateOutcome::Continue) => {}
-                    Ok(CompactionGateOutcome::Compacted { messages }) => {
-                        state.replace_context(messages);
-                        send_event(
-                            event_tx,
-                            AgentEvent::TranscriptReplace {
-                                messages: state.context().to_vec(),
-                            },
-                        )
-                        .await;
-                    }
-                    Ok(CompactionGateOutcome::Skipped { reason }) => {
-                        send_event(
-                            event_tx,
-                            AgentEvent::SystemMessage {
-                                text: format!("Skipped mid-turn compaction: {reason}"),
-                            },
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        // A gate failure is non-fatal: the next
-                        // sampling request may still overflow, and
-                        // the reactive retry path will handle it.
-                        // Surfacing as a warn keeps the failure
-                        // observable without killing an in-flight
-                        // turn.
-                        warn!(?error, "compaction gate failed");
-                    }
-                }
-            }
-
-            send_event(event_tx, AgentEvent::TurnStart).await;
-        }
-
-        state.into_result()
     }
 
+    /// Eval phase: dispatch on the current intent and execute
+    /// it. Streaming events (provider deltas, tool progress)
+    /// are still emitted *live* from inside `collect_stream` /
+    /// `execute_tool_calls` — `Eval` does not buffer them until
+    /// `Print`. The returned observation drives the subsequent
+    /// `Print` and `Decide` phases.
+    async fn eval_step(
+        &self,
+        intent: AgentIntent,
+        state: &mut AgentRunState,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> AgentObservation {
+        match intent {
+            AgentIntent::ModelTurn => self.eval_model_turn(state, event_tx, cancel).await,
+            AgentIntent::ExecuteTools {
+                assistant,
+                tool_calls,
+            } => {
+                let results = self
+                    .execute_tool_calls(&tool_calls, state.context(), event_tx, cancel)
+                    .await;
+                AgentObservation::ToolResults { assistant, results }
+            }
+            AgentIntent::AppendFollowUps { messages } => {
+                state.extend_context(messages);
+                AgentObservation::FollowUpsAppended
+            }
+            AgentIntent::RunCompactionGate => {
+                self.run_compaction_gate(state, event_tx).await;
+                AgentObservation::CompactionGateChecked
+            }
+            AgentIntent::Finish => AgentObservation::Finished,
+        }
+    }
+
+    /// One model-turn iteration. Resolves request options, looks
+    /// up the provider, builds the LLM context, and drives
+    /// `collect_stream`. Preflight failures (resolver error,
+    /// missing provider, stream-build error) emit their own
+    /// terminal `MessageStart`/`MessageEnd`/`TurnEnd`/`AgentEnd`
+    /// sequence via `finish_with_assistant` and surface as
+    /// `AgentObservation::PreflightFailed`; the driver's tail
+    /// `AgentEnd` is suppressed for those paths.
+    async fn eval_model_turn(
+        &self,
+        state: &mut AgentRunState,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> AgentObservation {
+        let request = match self
+            .config
+            .request_options_resolver
+            .resolve(&self.config.model, state.context())
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                let assistant = self.error_assistant_message(error.to_string(), StopReason::Error);
+                self.finish_with_assistant(assistant, state, event_tx, Vec::new())
+                    .await;
+                state.finish_with_error(error);
+                return AgentObservation::PreflightFailed;
+            }
+        };
+
+        let Some(provider) = self.provider_registry.get(&self.config.model.api) else {
+            let assistant = self.error_assistant_message(
+                format!("No provider registered for {:?}", self.config.model.api),
+                StopReason::Error,
+            );
+            self.finish_with_assistant(assistant, state, event_tx, Vec::new())
+                .await;
+            state.finish();
+            return AgentObservation::PreflightFailed;
+        };
+
+        let mut model = self.config.model.clone();
+        if let Some(base_url_override) = request.base_url_override {
+            model.base_url = base_url_override;
+        }
+
+        let replay = model.effective_replay_capabilities();
+        let sanitized_context = sanitize_context_for_request(
+            state.context(),
+            provider.includes_thinking_in_replay(),
+            replay.requires_thinking_signature,
+        );
+        let llm_context = LlmContext {
+            system_prompt: self.config.system_prompt.clone(),
+            messages: provider.convert_messages(&sanitized_context),
+            tools: self.tool_registry.definitions(),
+        };
+        let options = self.config.stream_options(request.api_key, request.headers);
+
+        let stream = match provider.stream(&model, llm_context, options) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let assistant = self.error_assistant_message(error.to_string(), StopReason::Error);
+                self.finish_with_assistant(assistant, state, event_tx, Vec::new())
+                    .await;
+                state.finish_with_error(error);
+                return AgentObservation::PreflightFailed;
+            }
+        };
+
+        let collected = self.collect_stream(stream, event_tx, cancel).await;
+        AgentObservation::AssistantCollected {
+            assistant: collected.assistant,
+            terminal_error: collected.provider_error,
+        }
+    }
+
+    /// Run the mid-turn compaction gate (if installed) and emit
+    /// the appropriate `TurnStart` for the next model turn.
+    /// Originally inlined at the bottom of the loop; carrying
+    /// the same shape here means a no-gate run gets a single
+    /// `Option::is_some` branch and one `TurnStart` send.
+    async fn run_compaction_gate(
+        &self,
+        state: &mut AgentRunState,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        if let Some(gate) = self.config.compaction_gate.as_ref() {
+            match gate.maybe_compact(state.context()).await {
+                Ok(CompactionGateOutcome::Continue) => {}
+                Ok(CompactionGateOutcome::Compacted { messages }) => {
+                    state.replace_context(messages);
+                    send_event(
+                        event_tx,
+                        AgentEvent::TranscriptReplace {
+                            messages: state.context().to_vec(),
+                        },
+                    )
+                    .await;
+                }
+                Ok(CompactionGateOutcome::Skipped { reason }) => {
+                    send_event(
+                        event_tx,
+                        AgentEvent::SystemMessage {
+                            text: format!("Skipped mid-turn compaction: {reason}"),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    // A gate failure is non-fatal: the next
+                    // sampling request may still overflow, and
+                    // the reactive retry path will handle it.
+                    // Surfacing as a warn keeps the failure
+                    // observable without killing an in-flight
+                    // turn.
+                    warn!(?error, "compaction gate failed");
+                }
+            }
+        }
+        send_event(event_tx, AgentEvent::TurnStart).await;
+    }
+
+    /// Print phase: commit the observation's content to `state`
+    /// and emit any boundary events that mark the transition.
+    /// Live streaming/tool events were emitted from inside
+    /// `Eval`; `Print` only handles the post-eval commit and
+    /// turn-boundary markers.
+    async fn print_step(
+        &self,
+        state: &mut AgentRunState,
+        observation: &AgentObservation,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        match observation {
+            AgentObservation::AssistantCollected {
+                assistant,
+                terminal_error,
+            } => {
+                state.append_assistant(assistant.clone());
+
+                let is_terminal_assistant = matches!(
+                    assistant.stop_reason,
+                    StopReason::Error | StopReason::Aborted,
+                );
+                let extracted = extract_tool_calls(assistant);
+                if terminal_error.is_some() || is_terminal_assistant || extracted.is_empty() {
+                    // Three cases share this TurnEnd emission:
+                    //   - terminal_error (stream failure): the
+                    //     next decision is FinishWithError; tail
+                    //     emits AgentEnd.
+                    //   - Error/Aborted stop reason: the next
+                    //     decision is Finish; tail emits
+                    //     AgentEnd.
+                    //   - Clean assistant with no tool calls:
+                    //     either the next decision is
+                    //     AppendFollowUps (no AgentEnd) or
+                    //     Finish (tail emits).
+                    // For the with-tools case the next intent
+                    // is ExecuteTools, and TurnEnd is emitted
+                    // by `Print(ToolResults)` once the batch
+                    // returns.
+                    send_event(
+                        event_tx,
+                        AgentEvent::TurnEnd {
+                            assistant: assistant.clone(),
+                            tool_results: Vec::new(),
+                        },
+                    )
+                    .await;
+                }
+            }
+            AgentObservation::ToolResults { assistant, results } => {
+                state.append_tool_results(results);
+                if let Some(get_steering_messages) = &self.config.get_steering_messages {
+                    state.extend_context(get_steering_messages());
+                }
+                send_event(
+                    event_tx,
+                    AgentEvent::TurnEnd {
+                        assistant: assistant.clone(),
+                        tool_results: results.clone(),
+                    },
+                )
+                .await;
+            }
+            AgentObservation::FollowUpsAppended => {
+                // `TurnEnd` was already emitted as part of
+                // `Print(AssistantCollected)` above (the no-tool
+                // branch). After follow-ups land in context we
+                // emit `TurnStart` so the next `ModelTurn` step
+                // is framed inside a fresh turn.
+                send_event(event_tx, AgentEvent::TurnStart).await;
+            }
+            AgentObservation::CompactionGateChecked
+            | AgentObservation::PreflightFailed
+            | AgentObservation::Finished => {
+                // CompactionGateChecked: `eval_step` emitted
+                // TranscriptReplace / SystemMessage / TurnStart
+                // already.
+                //
+                // PreflightFailed: `finish_with_assistant`
+                // emitted MessageStart/End/TurnEnd/AgentEnd.
+                //
+                // Finished: terminal observation, no work.
+            }
+        }
+    }
+
+    /// Decide phase: produce the next intent based on the
+    /// observation just printed and the current state.
+    fn decide_next_step(
+        &self,
+        state: &AgentRunState,
+        observation: &AgentObservation,
+        cancel: &CancellationToken,
+    ) -> AgentDecision {
+        if state.finished {
+            // Eval already drove us to a terminal state (preflight
+            // failure path); short-circuit before inspecting the
+            // observation.
+            return AgentDecision::Finish;
+        }
+
+        match observation {
+            AgentObservation::AssistantCollected {
+                assistant,
+                terminal_error,
+            } => {
+                if let Some(error) = terminal_error {
+                    return AgentDecision::FinishWithError(error.clone());
+                }
+                if matches!(
+                    assistant.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                ) {
+                    return AgentDecision::Finish;
+                }
+
+                let tool_calls = extract_tool_calls(assistant);
+                if !tool_calls.is_empty() {
+                    return AgentDecision::Continue(AgentIntent::ExecuteTools {
+                        assistant: assistant.clone(),
+                        tool_calls,
+                    });
+                }
+
+                if let Some(get_follow_up_messages) = &self.config.get_follow_up_messages {
+                    let messages = get_follow_up_messages();
+                    if !messages.is_empty() {
+                        return AgentDecision::Continue(AgentIntent::AppendFollowUps { messages });
+                    }
+                }
+
+                // No tool calls, no follow-ups: clean finish.
+                AgentDecision::Finish
+            }
+            AgentObservation::ToolResults { .. } => {
+                if cancel.is_cancelled() {
+                    AgentDecision::Finish
+                } else {
+                    AgentDecision::Continue(AgentIntent::RunCompactionGate)
+                }
+            }
+            AgentObservation::FollowUpsAppended => {
+                // `Print(FollowUpsAppended)` already emitted
+                // `TurnStart`; the next intent is a fresh
+                // `ModelTurn`.
+                AgentDecision::Continue(AgentIntent::ModelTurn)
+            }
+            AgentObservation::CompactionGateChecked => {
+                // `RunCompactionGate` already emitted TurnStart;
+                // the next step is a fresh ModelTurn.
+                AgentDecision::Continue(AgentIntent::ModelTurn)
+            }
+            AgentObservation::PreflightFailed | AgentObservation::Finished => AgentDecision::Finish,
+        }
+    }
+
+    /// Preflight failure helper. Emits the standard "we never
+    /// reached the provider" event sequence
+    /// (`MessageStart`/`MessageEnd`/`TurnEnd`/`AgentEnd`) for an
+    /// error assistant message and marks state so the driver's
+    /// tail `AgentEnd` does not double-emit. Used by the three
+    /// preflight failure paths in `eval_model_turn`.
     async fn finish_with_assistant(
         &self,
         assistant: AssistantMessage,
@@ -807,6 +1043,7 @@ impl AgentLoop {
             },
         )
         .await;
+        state.suppress_tail_agent_end = true;
     }
 
     async fn collect_stream(
