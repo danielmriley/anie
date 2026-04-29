@@ -75,9 +75,15 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         local_models_available,
     )?;
 
+    // Plan `docs/rlm_2026-04-29/07_evaluation_harness.md`:
+    // baseline mode opts out of tools entirely (model-only
+    // measurement floor). The mode is captured in
+    // ControllerState below for the rest of the harness to
+    // consult; here we use it to gate tool registration.
+    let suppress_tools = cli.no_tools || !cli.harness_mode.registers_tools();
     let tool_registry = build_tool_registry_with_policy(
         &cwd,
-        cli.no_tools,
+        suppress_tools,
         bash_policy_from_config(&config.tools.bash.policy),
         config.tools.web.clone(),
     );
@@ -102,6 +108,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: cli.harness_mode,
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {

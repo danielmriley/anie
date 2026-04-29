@@ -156,6 +156,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         },
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: crate::harness_mode::HarnessMode::default(),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -227,6 +228,7 @@ fn controller_with_runtime_state_path(
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: crate::harness_mode::HarnessMode::default(),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -565,6 +567,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: crate::harness_mode::HarnessMode::default(),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -608,6 +611,7 @@ fn build_state_with_registry(
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: crate::harness_mode::HarnessMode::default(),
     }
 }
 
@@ -1456,6 +1460,7 @@ fn controller_for_context_length_test_with_cap(
         retry_config: RetryConfig::default(),
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: crate::harness_mode::HarnessMode::default(),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1920,6 +1925,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         retry_config: RetryConfig::default(),
         command_registry,
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: crate::harness_mode::HarnessMode::default(),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2054,6 +2060,7 @@ fn spawn_live_controller(
         retry_config,
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
+        harness_mode: crate::harness_mode::HarnessMode::default(),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);

@@ -193,6 +193,15 @@ impl InteractiveController {
         if !self.state.config.anie_config().compaction.enabled {
             return None;
         }
+        // Plan `docs/rlm_2026-04-29/07_evaluation_harness.md`:
+        // baseline mode opts out of the compaction gate so
+        // measurements isolate the model's raw behavior. The
+        // user's eventual `Skipped` reasons / overflow errors
+        // are then attributable to the model, not the
+        // harness.
+        if !self.state.harness_mode.installs_compaction_gate() {
+            return None;
+        }
         let (config, strategy) = self.state.compaction_strategy(
             self.state
                 .config
@@ -1127,6 +1136,15 @@ pub(crate) struct ControllerState {
     /// same atomic. Plan 06 of
     /// `docs/midturn_compaction_2026-04-27/`.
     pub(crate) compaction_stats: Arc<CompactionStatsAtomic>,
+    /// Harness profile selected at startup via `--harness-mode`.
+    /// Determines which capabilities the harness exposes:
+    /// `Baseline` (no tools, no gate, no policies),
+    /// `Current` (today's behavior), or `Rlm` (Plan 06
+    /// context virtualization — currently identical to
+    /// `Current` until later commits land the recurse tool
+    /// and the active-context policy). Plan
+    /// `docs/rlm_2026-04-29/07_evaluation_harness.md`.
+    pub(crate) harness_mode: crate::harness_mode::HarnessMode,
 }
 
 impl ControllerState {
