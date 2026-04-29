@@ -34,15 +34,16 @@ isolation direction, not current behavior.
 
 | Crate | Responsibility | Must not own |
 |---|---|---|
-| `anie-cli` | CLI parsing, mode dispatch, onboarding commands, controller state machine, retry policy, runtime-state persistence, provider/tool/session wiring | Rendering internals, provider wire formats, tool implementation details |
-| `anie-tui` | Ratatui/crossterm UI state, input handling, overlays, slash-command UX, transcript rendering, model/provider picker surfaces | Agent orchestration, session mutation, provider calls |
-| `anie-agent` | Provider/tool-agnostic agent loop, tool-call validation/execution, streaming event normalization into `AgentEvent` | Persistence, retry policy, auth storage, UI rendering |
+| `anie-cli` | CLI parsing, mode dispatch, onboarding commands, controller state machine, retry policy, runtime-state persistence, slash-command registry, provider/tool/session wiring | Rendering internals, provider wire formats, tool implementation details |
+| `anie-tui` | Ratatui/crossterm UI state, active-draft input, overlays, slash-command UX, autocomplete, transcript rendering, model/provider picker surfaces | Agent orchestration, session mutation, provider calls |
+| `anie-agent` | Provider/tool-agnostic agent loop, REPL step machine (`AgentRunMachine`), `BeforeModelPolicy` hook, tool-call validation/execution, streaming event normalization into `AgentEvent` | Persistence, retry policy, auth storage, UI rendering |
 | `anie-provider` | Provider traits, model metadata, request options, normalized provider events, structured provider error taxonomy | Built-in HTTP implementations, credential lookup |
 | `anie-providers-builtin` | Built-in provider implementations, SSE/HTTP helpers, local-server probing, model discovery, built-in model catalog helpers | Controller policy, session persistence, credential storage |
 | `anie-tools` | Built-in tools and file-mutation serialization (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) | Agent loop policy, UI rendering, sandbox policy beyond its path behavior |
+| `anie-tools-web` | Default-feature web tools (`web_read`, `web_search`), HTTP fetch/search boundaries, robots/rate-limit/SSRF handling, optional headless rendering | Core filesystem tools, controller orchestration, provider calls |
 | `anie-protocol` | Shared message/content/tool/event/usage/stop-reason types | Persistence policy, provider-specific HTTP conversion |
 | `anie-session` | Append-only session file schema, file locking, context reconstruction, branch/fork support, compaction records | Config merging, auth, provider calls |
-| `anie-config` | Config schema, global/project config loading and merging, context-file discovery, comment-preserving config mutation | Secret storage, session history |
+| `anie-config` | Config schema, global/project config loading and merging, context-file discovery, web/Ollama/UI/tool config, comment-preserving config mutation | Secret storage, session history |
 | `anie-auth` | Credential storage/resolution, OAuth provider clients, OAuth refresh locking, request-option resolution | Provider streaming, model selection policy |
 | `anie-integration-tests` | Cross-crate behavior tests | Runtime code |
 
@@ -57,6 +58,7 @@ anie-cli
   -> anie-providers-builtin
   -> anie-session
   -> anie-tools
+  -> anie-tools-web (default `web` feature)
   -> anie-tui
 
 anie-agent
@@ -79,6 +81,10 @@ anie-session
   -> anie-protocol
 
 anie-tools
+  -> anie-agent
+  -> anie-protocol
+
+anie-tools-web
   -> anie-agent
   -> anie-protocol
 
@@ -108,20 +114,64 @@ User input
   -> anie-tui InputPane / slash-command handling
   -> UiAction sent to anie-cli InteractiveController
   -> session/config/runtime state mutation, if needed
-  -> AgentLoop::run(prompts, context, event_tx, cancel)
-  -> AuthResolver resolves per-request options
-  -> ProviderRegistry selects a Provider from Model.api
-  -> Provider::stream returns normalized ProviderEvent stream
-  -> AgentLoop collects AssistantMessage and emits AgentEvent deltas
-  -> tool calls are validated through ToolRegistry and executed
-  -> generated assistant/tool messages return in AgentRunResult
+  -> AgentLoop::start_run_machine -> AgentRunMachine
+       (emits AgentStart, initial TurnStart, prompt MessageStart/End)
+  -> machine.next_step() per REPL iteration:
+       Read   — BeforeModelPolicy hook; resolve request options;
+                look up provider; sanitize replay context; build LlmContext
+       Eval   — Provider::stream  -> collect_stream emits MessageStart/Delta/End live
+                or execute_tool_calls -> ToolExec* emitted live
+       Print  — commit observation to AgentRunState; emit boundary events
+                (TurnEnd, follow-up TurnStart) not already emitted live
+       Decide — produce next AgentIntent: ModelTurn | ExecuteTools |
+                AppendFollowUps | RunCompactionGate | Finish
+  -> machine.finish() -> AgentRunResult (tail AgentEnd emission)
   -> controller persists generated messages to anie-session
   -> anie-tui renders AgentEvent updates and returns to idle
 ```
 
-The controller owns retries. The agent loop returns structured terminal
-provider errors in `AgentRunResult`; `anie-cli::retry_policy::RetryPolicy`
-decides whether to retry, compact, or give up.
+The agent loop is a Read → Eval → Print → Decide REPL driver, exposed
+publicly as `AgentRunMachine`. Each step evaluates one bounded
+`AgentIntent` and produces one `AgentObservation`; the dispatcher then
+calls `decide_next_step` synchronously to choose the next intent.
+`AgentLoop::run` is a thin run-to-completion wrapper that print mode,
+RPC mode, and integration tests still use; the interactive controller
+drives the same machine through `run_via_step_machine`, so the seam is
+in place for future PRs that want to interpose policy at step
+boundaries (queued-prompt folding, proactive compaction, verifier
+loops). Streaming events stay live: `MessageStart/Delta/End` are emitted
+during `Eval` from inside `collect_stream`, not buffered until `Print`.
+
+The first cross-step extension point is `BeforeModelPolicy`, called in
+the `Read` phase of every `ModelTurn`. The default install is
+`NoopBeforeModelPolicy`; a custom policy can return
+`AppendMessages(Vec<Message>)` to inject *context-only* messages
+(`AgentRunState::append_policy_context`) that do not appear in
+`AgentRunResult::generated_messages` and are therefore not persisted by
+the controller. Future hooks (after-model, on-tool-error, etc.) get
+their own traits when real consumers materialize. Plan series:
+`docs/repl_agent_loop/`.
+
+Each run is wrapped in a tracing `agent_run` span keyed by a UUID
+`run_id`; each REPL iteration gets a child `agent_repl_step` span with
+`run_step` (monotonic), `intent`, `context_messages`, and
+`generated_messages` fields; phase methods carry `agent_eval`,
+`agent_print`, and `agent_decide` spans. None of this changes the
+public `AgentEvent` protocol — observability lives entirely in tracing.
+
+The controller owns run-level retries. The agent loop returns
+structured terminal provider errors in `AgentRunResult`;
+`anie-cli::retry_policy::RetryPolicy` decides whether to retry, compact,
+or give up. Step-level policy lives behind the `AgentRunMachine`
+boundary; run-level policy stays in the controller.
+
+The current interactive model is still single-run: an active provider/tool loop
+must finish or be aborted before another provider request starts. The TUI can,
+however, keep an editable draft while the agent is running. Pressing Enter in an
+active state sends `UiAction::QueuePrompt`; the controller appends that prompt to
+an in-memory FIFO and starts it after the current run's assistant/tool messages
+have been persisted. Queued prompts are not written to the session until they
+actually start, preserving transcript order.
 
 ## Controller and TUI boundary
 
@@ -152,11 +202,14 @@ controller must not know how a transcript block is rendered.
 `ControllerState` is intentionally decomposed into focused handles:
 
 - `ConfigState` owns loaded config, runtime defaults, current model, current
-  thinking level, and CLI API-key override.
+  thinking level, native Ollama context-length overrides, and CLI API-key
+  override.
 - `SessionHandle` owns the active `SessionManager`, sessions directory, and
   session cwd.
 - `SystemPromptCache` owns loaded system/context prompt text and context-file
   staleness tracking.
+- `CommandRegistry` owns slash-command metadata for `/help`, validation,
+  autocomplete, and dispatch coupling.
 
 New long-lived controller state should usually be introduced as another focused
 handle, not as a loose field on `ControllerState`.
@@ -167,25 +220,66 @@ The controller uses a `PendingRetry` state machine rather than sleeping inline.
 That lets the main loop keep polling `ui_action_rx` while a retry backoff is
 armed. Ctrl+C, quit, and other actions remain responsive during backoff.
 
-Current review risk: model/thinking changes are accepted while a retry is
-armed, and the continuation run is built from the latest controller state. A
-future fix should either cancel the retry when run-affecting settings change or
-reject those changes until the retry resolves.
+Run-affecting changes now have explicit retry policy:
+
+- model and thinking changes are rejected while a run is active;
+- model and thinking changes cancel an armed pending retry before the next
+  continuation can start;
+- `/context-length` mutation is rejected while a run is active or a retry is
+  armed, because changing native Ollama `num_ctx` would alter the retry's
+  request shape;
+- a queued follow-up prompt supersedes a stale armed retry and starts a fresh
+  run instead.
+
+These rules keep retries responsive without silently changing the failed
+request's settings under the user.
 
 ## Agent loop contract
 
 `anie-agent::AgentLoop` is provider/tool agnostic. Each run receives owned
 prompt and context vectors, immutable `AgentLoopConfig`, a sender for
-`AgentEvent`, and a cancellation token.
+`AgentEvent`, and a cancellation token. Internally the loop is a Read →
+Eval → Print → Decide REPL driver — see `AgentRunMachine` and
+"End-to-end control flow" above.
+
+Run state is held in a private `AgentRunState`:
+
+- `context: Vec<Message>` — prompts plus every generated, follow-up,
+  steering, and policy-injected message. This is what the next provider
+  request sees.
+- `generated_messages: Vec<Message>` — assistants and tool results
+  only. Excludes prompts, follow-ups, steering, and policy injections.
+  This is the controller's session-persistence input.
+- `terminal_error: Option<ProviderError>`, `finished: bool`,
+  `step_index: u64`, `suppress_tail_agent_end: bool` — driver
+  bookkeeping.
+
+Helpers enforce the dual-append rule for content the controller
+persists (`append_assistant`, `append_tool_results`) versus the
+context-only rule for runtime injections (`extend_context`,
+`append_policy_context`).
 
 Agent-loop invariants:
 
-- Context is mutable only inside `AgentLoop::run`; callers persist the returned
-  generated messages after the run.
+- Context is mutable only inside `AgentRunMachine`/`AgentLoop::run`;
+  callers persist the returned generated messages after the run.
+- Each REPL step evaluates exactly one bounded `AgentIntent`
+  (`ModelTurn`, `ExecuteTools`, `AppendFollowUps`, `RunCompactionGate`,
+  `Finish`) and produces one `AgentObservation`.
+- Streaming events (`MessageStart`/`Delta`/`End`, `ToolExec*`) are
+  emitted live during `Eval`, not buffered until `Print`.
 - Provider lookup is by `Model.api`; absence of a registered provider is a
   request/build failure.
 - Per-request auth/routing is resolved immediately before the provider call
   through `RequestOptionsResolver`.
+- `BeforeModelPolicy` is consulted in the `Read` phase of every
+  `ModelTurn` step; the default `NoopBeforeModelPolicy` always returns
+  `Continue`. Policy-injected messages are context-only and are never
+  persisted as agent output.
+- Per-run native Ollama `num_ctx` overrides are snapshotted from
+  `ConfigState` into `AgentLoopConfig`, then copied to
+  `StreamOptions::num_ctx_override` for the provider call. The provider remains
+  stateless.
 - The loop sanitizes replay context based on provider/model replay
   capabilities before converting messages.
 - Tool definitions are provided to the model from `ToolRegistry` in
@@ -196,6 +290,11 @@ Agent-loop invariants:
 - Cancellation is propagated by `CancellationToken`; tools receive child tokens
   and should return `ToolError::Aborted` or an equivalent terminal result when
   cancelled.
+- `AgentEnd` is emitted exactly once per run: at the tail of
+  `AgentRunMachine::finish` for the common path, or inline via
+  `finish_with_assistant` for preflight failures (resolver error,
+  missing provider, stream-init error) which set
+  `state.suppress_tail_agent_end` so the tail no-ops.
 - The loop does not decide retry policy. It returns terminal provider errors to
   the caller.
 
@@ -244,10 +343,48 @@ human-readable error strings.
 
 - `ApiKind::AnthropicMessages` -> `AnthropicProvider`
 - `ApiKind::OpenAICompletions` -> `OpenAIProvider`
+- `ApiKind::OllamaChatApi` -> `OllamaChatProvider`
 
-OpenRouter, Ollama, LM Studio, and custom OpenAI-compatible endpoints are routed
-through model catalog/config/base-url behavior on top of those provider shapes,
-not through separate registered provider trait objects.
+`ApiKind::OpenAIResponses` and `ApiKind::GoogleGenerativeAI` exist as protocol
+enum variants for planned providers but do not have registered providers today.
+
+OpenRouter, LM Studio, and custom OpenAI-compatible endpoints are routed through
+model catalog/config/base-url/compat behavior on top of
+`OpenAICompletions`. Ollama has two paths:
+
+- legacy OpenAI-compatible configs (`api = "OpenAICompletions"`, usually
+  `base_url = ".../v1"`) continue to work, but cannot honor Ollama-native
+  `think` or `options.num_ctx`;
+- native configs/discovery (`api = "OllamaChatApi"`, root base URL) use
+  `/api/chat`, stream Ollama NDJSON, send `think` for reasoning-capable models,
+  and send `options.num_ctx` from `StreamOptions::num_ctx_override` or
+  `Model.context_window`.
+
+Native Ollama support is anie-specific; pi uses Ollama's OpenAI-compatible
+endpoint.
+
+### Model metadata and compat knobs
+
+`Model` is the routing and request-parameter source of truth. It carries the
+provider id, model id, `ApiKind`, base URL, context window, max output tokens,
+image/reasoning support, replay requirements, pricing, and per-family compat
+metadata.
+
+Important current compat behavior:
+
+- OpenAI-compatible user messages keep the legacy string `content` shape for
+  text-only turns, but switch to ordered `text` / `image_url` content parts
+  when an image block is present. User-side thinking blocks become text parts in
+  that mixed-content shape; redacted thinking remains provider-opaque and is
+  dropped for OpenAI-compatible backends.
+- OpenRouter catalog/discovery entries can attach routing preferences and
+  `max_tokens` wire-name selection through `ModelCompat::OpenAICompletions`.
+- Native Ollama discovery reads `/api/tags` + `/api/show`, maps capabilities
+  such as `thinking` and `vision`, and propagates discovered context lengths
+  into `Model.context_window`.
+- `[ollama] default_max_num_ctx` is an optional workspace-wide cap applied to
+  native Ollama context windows at catalog-load time. `/context-length <N>` is a
+  per-model runtime override that wins over this cap until reset.
 
 ## Tool contract
 
@@ -274,7 +411,8 @@ Tool responsibilities:
 - send bounded partial updates through `update_tx` when useful;
 - implement its own resource/time limits where the operation can grow large.
 
-The built-in tool registry is assembled in `anie-cli::bootstrap` with:
+The built-in tool registry is assembled in `anie-cli::bootstrap`. The core
+tool set is always available unless `--no-tools` is passed:
 
 - `read`
 - `write`
@@ -285,6 +423,27 @@ The built-in tool registry is assembled in `anie-cli::bootstrap` with:
 - `ls`
 
 `write` and `edit` share a `FileMutationQueue` so file mutations are serialized.
+
+The default `anie-cli` build enables the `web` feature and also registers:
+
+- `web_read`
+- `web_search`
+
+Lean builds can compile those out with `--no-default-features`. The
+`web-headless` feature additionally enables `web_read(javascript=true)` through
+Chrome/Chromium.
+
+### Tool resource boundaries
+
+Tool limits are guardrails, not an isolation layer:
+
+- `read` caps text output by lines/bytes and caps image reads by bytes.
+- `edit` caps edit count, per-edit text sizes, total edit argument bytes, input
+  file bytes, and output file bytes before writing.
+- `grep` and `bash` share line/byte truncation helpers for large outputs.
+- `bash` has timeout/cancellation support plus the optional deny policy below.
+- Web tools enforce configurable fetch timeouts, page byte caps, redirect caps,
+  bounded error/robots bodies, cancellation checks, and per-host rate limiting.
 
 ### Bash deny policy
 
@@ -314,6 +473,31 @@ execute commands anywhere the process user has access.
 Future isolation work should be designed as a separate tool-execution layer.
 The preferred direction is WASM/containerized tool execution rather than
 quietly changing today's path resolver into a partial sandbox.
+
+### Web tool network boundary
+
+`anie-tools-web` is a separate crate because network fetch/search has a
+different risk profile from local filesystem tools. It exposes typed
+`WebToolError` variants rather than stringly errors and registers through the
+same `ToolRegistry` as the core tools.
+
+Default non-headless `web_read` / `web_search` behavior:
+
+- allows only `http` and `https` URLs;
+- rejects private, loopback, link-local, mDNS/local, and internal-looking
+  destinations unless `[tools.web].allow_private_ips = true`;
+- resolves hostnames before requests and rejects private resolved IPs;
+- disables automatic redirects and manually validates every redirect target
+  before following it;
+- honors `robots.txt` for `web_read`;
+- streams bodies with configured byte caps instead of buffering unbounded
+  responses;
+- shares a per-host rate limiter across `web_read` and `web_search`.
+
+Known limitation: the resolved-IP check has a small DNS TOCTOU between
+validation and reqwest's actual connection. The headless Chrome path validates
+the initial URL but cannot currently intercept every browser redirect or
+subresource, so it is intentionally documented as a weaker boundary.
 
 ## Protocol and replay fidelity
 
@@ -388,8 +572,10 @@ Session invariants:
 - Compaction entries may carry `CompactionDetails` with deduplicated read and
   modified file lists from the discarded interval.
 
-Session files are the audit trail. Every user-visible run-affecting state
-change should be represented in the session log, not only in runtime state.
+Session files are the audit trail. Every run-affecting change that must be
+reconstructable during resume/fork, such as user prompts, generated messages,
+model changes, thinking changes, and compactions, belongs in the session log
+rather than only in runtime state.
 
 ## Config and runtime state
 
@@ -399,6 +585,10 @@ change should be represented in the session log, not only in runtime state.
 - project config: nearest `.anie/config.toml` found by walking upward
 - context files: defaults to `AGENTS.md` and `CLAUDE.md`, also found by walking
   upward with per-file and total-byte caps
+- UI preferences: slash-command popup, finalized-message markdown rendering,
+  and successful `bash`/`read` tool-output display mode
+- tool preferences: bash deny policy and web fetch budgets/network policy
+- Ollama preferences: optional workspace-wide native `num_ctx` cap
 
 Config load order:
 
@@ -419,13 +609,23 @@ Merge rules:
 - CLI overrides are unconditional and applied last.
 
 `~/.anie/state.json` is runtime state, not config. It stores last-used
-non-secret selections such as provider, model, thinking level, and last session.
-Failures to persist runtime state are currently logged but not surfaced to the
-user; the session log remains the stronger audit record.
+non-secret selections such as provider, model, thinking level, last session, and
+per-model native Ollama `num_ctx` overrides keyed by `"{provider}:{model_id}"`.
 
-Config and auth writes use an atomic temp-file-plus-rename helper. This is crash
-safe on POSIX, but it is not a multi-writer lock and has known Windows
-replacement caveats. Config mutation assumes a single writer.
+Runtime state is convenience state. The session log remains the stronger audit
+record for run-affecting history. User-visible settings such as model and
+thinking changes are also appended to the session log; `/context-length`
+overrides are runtime preferences that affect future requests but are not a
+session entry today. Persistence failures on user-command mutation paths are
+surfaced as non-fatal warnings where the command can keep the setting active for
+the current session; bootstrap/session-maintenance persistence failures are
+logged.
+
+Config, auth, and runtime-state writes use an atomic temp-file-plus-rename
+helper with PID + in-process counter temp names. This is crash safe on POSIX,
+but it is not a multi-writer lock. Windows builds are explicitly compile-gated
+until the helper grows `ReplaceFileW`-style replacement semantics. Config
+mutation assumes a single writer.
 
 ## Authentication and request options
 
@@ -456,9 +656,8 @@ OAuth refresh uses a per-provider fs4 lock under an auth lock directory. The
 refresh path follows a double-check pattern: read credential, check expiry,
 acquire lock, re-check, refresh only if still needed, persist, unlock.
 
-Current review risk: refresh lock acquisition currently polls with blocking
-sleep from an async request path. Move it to `spawn_blocking` or an async sleep
-loop before increasing concurrent OAuth usage.
+Lock acquisition is isolated with `tokio::task::spawn_blocking`; the blocking
+fs4 polling loop does not occupy a Tokio worker thread.
 
 ## TUI rendering and responsiveness
 
@@ -467,18 +666,25 @@ The TUI is a hot path during streaming. The current design uses:
 - `RenderDirty` to separate full redraws from urgent input-only redraws;
 - streaming text accumulation and line caching in `OutputPane`;
 - markdown rendering for finalized blocks, not for actively streaming blocks;
+- configurable markdown rendering for finalized assistant messages;
+- compact/verbose successful tool-output display modes for noisy `bash` and
+  `read` results;
+- inline slash-command autocomplete and controller-sourced command metadata;
+- editable active drafts and FIFO queued follow-up prompts while a run is
+  active;
 - spinner tick debouncing;
 - stall-aware redraw suppression when no streaming delta has arrived recently;
 - transcript replacement events for session switches/resumes instead of
   piecemeal replay.
+- bounded per-frame agent event draining (`MAX_AGENT_EVENTS_PER_FRAME = 256`)
+  with adjacent text/thinking delta coalescing.
 
 Responsiveness invariant: keyboard input should not wait behind expensive
 transcript rebuilds when only the composer changed.
 
-Current review risk: the TUI drains all queued agent events into a batch before
-returning to terminal input. Under a very large stream/tool burst, this can
-starve input. A future refactor should bound event draining by event count or
-time budget per frame while preserving delta coalescing.
+The TUI no longer drains an unbounded number of agent events per frame. The cap
+is set to the observed saturated channel burst size, and coalescing preserves
+streaming efficiency without starving terminal input indefinitely.
 
 ## Performance-sensitive seams
 
@@ -488,9 +694,10 @@ time budget per frame while preserving delta coalescing.
 | Tool schemas | JSON Schema validators precompiled at registration | Invalid schemas stay registered and fail on first use with preserved error text. |
 | Provider streaming | Normalized `ProviderEvent` stream | Preserve opaque replay fields; do not flatten unsupported provider blocks. |
 | TUI output | Cached wrapped lines by width/markdown state | Streaming blocks should avoid per-frame markdown parsing. |
-| Retry backoff | `PendingRetry` in controller select loop | Run-affecting UI changes during backoff need explicit policy. |
+| Retry backoff | `PendingRetry` in controller select loop | Keep run-affecting changes explicit: cancel, reject, or supersede according to command semantics. |
 | Session persistence | Append-only JSONL with advisory lock | Avoid multi-writer use of one session; fork for branches. |
-| Config/auth writes | Atomic temp file and rename | Not a concurrent-write lock; Windows replacement semantics need hardening. |
+| Config/auth/state writes | Atomic temp file and POSIX rename | Not a concurrent-write lock; Windows replacement semantics are compile-gated until implemented. |
+| Web fetches | Manual redirect validation, DNS private-IP checks, byte caps | Headless Chrome path has weaker network controls; DNS validation has a small TOCTOU. |
 
 ## Error handling patterns
 
@@ -513,14 +720,13 @@ check whether they are still true.
 | Risk | Area | Why it matters | Preferred direction |
 |---|---|---|---|
 | Full filesystem access is intentional | Tools | Agents can access any path the process user can access. | Keep tool docs explicit until a dedicated WASM/containerized execution layer exists. |
-| Blocking OAuth refresh lock in async path | Auth | Lock contention can occupy Tokio worker threads. | Move polling to `spawn_blocking` or use async sleep around short lock attempts. |
-| OpenAI-compatible image support can be advertised while images are flattened to text | Providers/protocol | Image-capable models may silently receive placeholders instead of image content. | Implement OpenAI multimodal content arrays or mark those models unsupported for images. |
-| Model/thinking changes during pending retry | Controller | Retry continuation may run with settings different from the failed attempt. | Cancel retry on run-affecting changes or reject those changes while armed. |
-| OAuth callback accepted-socket read lacks timeout | Auth/login | Local idle connection can hang login beyond overall deadline. | Apply deadline to read/write after accept. |
-| Runtime-state persistence failure only logs | CLI/config | UI can report success while next launch reverts last-used settings. | Return a warning/result and surface it non-fatally. |
-| POSIX-oriented atomic write | Config/auth | Windows CI exists; rename-over-existing and temp-name collision behavior need hardening. | Add platform-specific replace semantics and unique temp names. |
-| Unbounded edit batch arguments | Tools | Malformed model output can allocate large vectors/strings. | Add schema and runtime caps. |
-| Unbounded TUI event drain | TUI | Large bursts can starve input processing. | Bound per-frame event count or elapsed processing time. |
+| Windows compile gate for atomic writes | Config/auth/state | `anie-config` intentionally refuses Windows builds until replace-over-existing semantics are implemented safely. | Add a `cfg(windows)` `ReplaceFileW`-style implementation before claiming Windows support. |
+| Runtime state is not an audit log | CLI/config | `/context-length` and last-used selections persist as convenience state, not session entries; crashes before persistence can lose unlogged preferences. | Keep run-affecting audit data in sessions; add session entries only when a setting must be replayable as history. |
+| Headless web fetch boundary is weaker than non-headless | Web tools | Chrome owns redirects/subresources, so anie cannot currently validate every network hop under `javascript=true`. | Prefer non-headless fetch; add browser request interception before treating headless as equivalent. |
+| DNS validation TOCTOU | Web tools | A hostname can theoretically resolve differently between anie's preflight check and reqwest's connection. | Use a custom reqwest resolver/connector if this becomes a product security boundary. |
+| External Defuddle dependency | Web tools | `web_read` extraction depends on `defuddle` or `npx defuddle` being available at runtime. | Keep the error typed/actionable; consider vendoring or a pure-Rust extractor only if deployment friction warrants it. |
+| Active drafts are not persisted | TUI/controller | Drafts and queued prompts are in-memory only; a crash loses unstarted follow-ups. | Persist drafts only if product requirements grow beyond the current single-run queue. |
+| Provider enum has reserved unimplemented variants | Providers | `OpenAIResponses` and `GoogleGenerativeAI` are protocol variants without registered providers, so selecting them fails provider lookup. | Add providers through the provider-addition process, with explicit replay/wire-shape tests. |
 | Large monolithic session module | Session | Schema, storage, context, compaction, listing, and tests collide in one file. | Split into schema/storage/context/compaction/listing modules when session work resumes. |
 
 ## Refactor rules of thumb
@@ -551,8 +757,11 @@ Use these rules during future cleanup:
 The normal workspace validation gate is:
 
 ```bash
+cargo build --release
 cargo test --workspace
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo +1.85 check --workspace --all-targets
 ```
 
 Documentation-only changes do not need the full gate unless they modify tested
@@ -571,3 +780,14 @@ against the current code before being treated as authoritative.
   plans.
 - [`../code_review_performance_2026-04-21/`](../code_review_performance_2026-04-21/)
   performance review plans.
+- [`../ollama_native_chat_api/`](../ollama_native_chat_api/) - native Ollama
+  `/api/chat` implementation plan.
+- [`../ollama_context_length_override/`](../ollama_context_length_override/) -
+  runtime `/context-length` design.
+- [`../ollama_default_num_ctx_cap/`](../ollama_default_num_ctx_cap/) -
+  workspace-wide native Ollama context cap.
+- [`../web_tool_2026-04-26/`](../web_tool_2026-04-26/) and
+  [`../code_review_2026-04-27/`](../code_review_2026-04-27/) - web tool design
+  and hardening plans.
+- [`../active_input_2026-04-27/`](../active_input_2026-04-27/) - active-draft
+  and queued-follow-up design.
