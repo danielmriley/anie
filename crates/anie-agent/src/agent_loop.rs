@@ -635,6 +635,12 @@ impl AgentLoop {
     /// that go with it, then decides on the next intent. The
     /// run terminates when state is finished; `AgentEnd` is
     /// emitted once at the tail.
+    /// Run the agent loop to completion. Thin wrapper over
+    /// `AgentRunMachine` for callers that just want a single
+    /// `AgentRunResult` per run (print mode, RPC mode, tests,
+    /// the controller's spawn until step-level policy is wired
+    /// up). Step-level callers should use `start_run_machine`
+    /// directly.
     pub async fn run(
         &self,
         prompts: Vec<Message>,
@@ -642,6 +648,27 @@ impl AgentLoop {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> AgentRunResult {
+        let mut machine = self.start_run_machine(prompts, context, &event_tx).await;
+        while !machine.is_finished() {
+            machine.next_step(&event_tx, &cancel).await;
+        }
+        machine.finish(&event_tx).await
+    }
+
+    /// Construct a step-driven machine and emit run-start events
+    /// (`AgentStart`, initial `TurnStart`, prompt
+    /// `MessageStart`/`MessageEnd` pairs) before returning. The
+    /// returned machine is ready for `next_step` calls.
+    ///
+    /// `event_tx` is borrowed for the start-event emission; the
+    /// machine does not retain it, so the caller passes a fresh
+    /// reference into each `next_step`.
+    pub async fn start_run_machine(
+        &self,
+        prompts: Vec<Message>,
+        context: Vec<Message>,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> AgentRunMachine<'_> {
         // Root tracing span for the run. `run_id` is generated
         // here so each `AgentLoop::run` invocation has a unique
         // marker even when many runs share the same model /
@@ -656,76 +683,19 @@ impl AgentLoop {
             provider = %self.config.model.provider,
             prompt_count = prompts.len(),
         );
-        self.run_inner(prompts, context, event_tx, cancel)
-            .instrument(run_span)
-            .await
-    }
-
-    async fn run_inner(
-        &self,
-        prompts: Vec<Message>,
-        context: Vec<Message>,
-        event_tx: mpsc::Sender<AgentEvent>,
-        cancel: CancellationToken,
-    ) -> AgentRunResult {
-        let mut state = AgentRunState::new(&prompts, context);
-        // Reborrow event_tx as a shared reference so every call site
-        // below and the helper methods (which already take `&`) share
-        // the same shape. `.clone()` on `&Sender` still works where we
-        // need to move a sender into a spawned task.
-        let event_tx = &event_tx;
-
-        self.start_run(&prompts, event_tx).await;
-
-        let mut intent = AgentIntent::ModelTurn;
-        let mut step_index: u64 = 0;
-        while !state.finished {
-            let step_span = debug_span!(
-                "agent_repl_step",
-                run_step = step_index,
-                intent = intent.kind(),
-                context_messages = state.context().len(),
-                generated_messages = state.generated_messages().len(),
-            );
-            let observation = async {
-                let observation = self.eval_step(intent, &mut state, event_tx, &cancel).await;
-                self.print_step(&mut state, &observation, event_tx).await;
-                observation
-            }
-            .instrument(step_span)
-            .await;
-            match self.decide_next_step(&state, &observation, &cancel) {
-                AgentDecision::Continue(next) => intent = next,
-                AgentDecision::Finish => {
-                    state.finish();
-                    intent = AgentIntent::Finish;
-                }
-                AgentDecision::FinishWithError(error) => {
-                    state.finish_with_error(error);
-                    intent = AgentIntent::Finish;
-                }
-            }
-            step_index += 1;
+        let state = AgentRunState::new(&prompts, context);
+        async {
+            self.start_run(&prompts, event_tx).await;
         }
-
-        // Tail emission of `AgentEnd`. The preflight failure path
-        // (resolver error, missing provider, stream-init error)
-        // emits its own `AgentEnd` via `finish_with_assistant` and
-        // sets `state.suppress_tail_agent_end` to true so this
-        // call is a no-op for those runs. Every other path —
-        // terminal assistant, no-tools-no-follow-ups, mid-tool
-        // cancellation — relies on this tail emission.
-        if !state.suppress_tail_agent_end {
-            send_event(
-                event_tx,
-                AgentEvent::AgentEnd {
-                    messages: state.generated_messages().to_vec(),
-                },
-            )
-            .await;
+        .instrument(run_span.clone())
+        .await;
+        AgentRunMachine {
+            agent_loop: self,
+            state,
+            intent: AgentIntent::ModelTurn,
+            step_index: 0,
+            run_span,
         }
-
-        state.into_result()
     }
 
     /// Read-phase prelude: emit `AgentStart`, the initial
@@ -1451,6 +1421,141 @@ impl AgentLoop {
             timestamp: now_millis(),
             reasoning_details: None,
         }
+    }
+}
+
+/// Step-driven view of an agent run. Each call to
+/// [`AgentRunMachine::next_step`] evaluates exactly one REPL
+/// iteration (one `AgentIntent`) and returns whether the run
+/// is finished. The expected pattern is to drive the machine
+/// to `AgentStepBoundary::Finished`, then call
+/// [`AgentRunMachine::finish`] to consume it and produce the
+/// `AgentRunResult`.
+///
+/// Construct one with [`AgentLoop::start_run_machine`]. The
+/// constructor emits the run-start events (`AgentStart`,
+/// initial `TurnStart`, prompt `MessageStart`/`MessageEnd`)
+/// before returning, so the very first `next_step` call
+/// already sees a turn in progress.
+///
+/// `clippy::large_enum_variant`-style payloads (`AssistantMessage`
+/// inside `AgentIntent`) are intentional: at most one intent
+/// value lives on the machine at a time, so boxing would add
+/// indirection without saving meaningful memory.
+pub struct AgentRunMachine<'a> {
+    agent_loop: &'a AgentLoop,
+    state: AgentRunState,
+    intent: AgentIntent,
+    step_index: u64,
+    run_span: tracing::Span,
+}
+
+/// Result of a single [`AgentRunMachine::next_step`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStepBoundary {
+    /// The step ran. The run has more work to do; call
+    /// `next_step` again.
+    Continue,
+    /// The run reached a terminal state. Call `finish` to
+    /// consume the machine and produce the `AgentRunResult`.
+    /// Subsequent `next_step` calls are no-ops that return
+    /// `Finished` again.
+    Finished,
+}
+
+impl<'a> AgentRunMachine<'a> {
+    /// True iff the next call to `next_step` would return
+    /// `Finished` immediately. Mirrors `state.finished`.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.state.finished
+    }
+
+    /// Drive one REPL iteration: Read → Eval → Print → Decide.
+    /// Streaming events (provider deltas, tool progress) are
+    /// emitted live during this call, exactly as they are from
+    /// `AgentLoop::run`. After this returns `Finished`, the
+    /// caller should invoke [`Self::finish`] to consume the
+    /// machine and obtain the `AgentRunResult`.
+    pub async fn next_step(
+        &mut self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> AgentStepBoundary {
+        if self.state.finished {
+            return AgentStepBoundary::Finished;
+        }
+
+        let step_span = debug_span!(
+            parent: &self.run_span,
+            "agent_repl_step",
+            run_step = self.step_index,
+            intent = self.intent.kind(),
+            context_messages = self.state.context().len(),
+            generated_messages = self.state.generated_messages().len(),
+        );
+
+        // Take ownership of the current intent — it gets passed
+        // by value to `eval_step`. The slot is repopulated below
+        // via `decide_next_step`, or set to `Finish` on
+        // termination.
+        let intent = std::mem::replace(&mut self.intent, AgentIntent::Finish);
+
+        let observation = async {
+            let observation = self
+                .agent_loop
+                .eval_step(intent, &mut self.state, event_tx, cancel)
+                .await;
+            self.agent_loop
+                .print_step(&mut self.state, &observation, event_tx)
+                .await;
+            observation
+        }
+        .instrument(step_span)
+        .await;
+
+        match self
+            .agent_loop
+            .decide_next_step(&self.state, &observation, cancel)
+        {
+            AgentDecision::Continue(next) => self.intent = next,
+            AgentDecision::Finish => {
+                self.state.finish();
+                self.intent = AgentIntent::Finish;
+            }
+            AgentDecision::FinishWithError(error) => {
+                self.state.finish_with_error(error);
+                self.intent = AgentIntent::Finish;
+            }
+        }
+
+        self.step_index += 1;
+
+        if self.state.finished {
+            AgentStepBoundary::Finished
+        } else {
+            AgentStepBoundary::Continue
+        }
+    }
+
+    /// Consume the machine and produce the `AgentRunResult`.
+    /// Emits the tail `AgentEnd` (unless the preflight path
+    /// already emitted one). Calling this before `is_finished`
+    /// is true is allowed — the result then reflects whatever
+    /// state the run has accumulated so far. This is the
+    /// intended behavior for cancellation cleanup paths; it is
+    /// not an error.
+    pub async fn finish(self, event_tx: &mpsc::Sender<AgentEvent>) -> AgentRunResult {
+        if !self.state.suppress_tail_agent_end {
+            send_event(
+                event_tx,
+                AgentEvent::AgentEnd {
+                    messages: self.state.generated_messages().to_vec(),
+                },
+            )
+            .await;
+        }
+        self.state.into_result()
     }
 }
 

@@ -6,8 +6,8 @@ mod hooks;
 mod tool;
 
 pub use agent_loop::{
-    AgentLoop, AgentLoopConfig, AgentRunResult, CompactionGate, CompactionGateOutcome,
-    ToolExecutionMode, send_event,
+    AgentLoop, AgentLoopConfig, AgentRunMachine, AgentRunResult, AgentStepBoundary, CompactionGate,
+    CompactionGateOutcome, ToolExecutionMode, send_event,
 };
 pub use tool::{
     MIN_TOOL_OUTPUT_BUDGET_BYTES, Tool, ToolError, ToolExecutionContext, ToolRegistry,
