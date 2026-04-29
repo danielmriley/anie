@@ -33,8 +33,13 @@ pub async fn search(
     let url = Url::parse(&format!("{DDG_HTML_BASE}?q={}", urlencoding::encode(query),))
         .map_err(|e| WebToolError::SearchBackend(e.to_string()))?;
 
-    let html = fetch_html(client, resolver, cancel, &url, fetch_opts).await?;
-    parse_ddg_html(&html, max)
+    // Truncation on the DDG SERP is benign: result entries are
+    // at the top of the document, so a truncated body still
+    // yields the early hits we care about. We discard the
+    // truncation flag here and let the parser take whatever
+    // it can find.
+    let fetched = fetch_html(client, resolver, cancel, &url, fetch_opts).await?;
+    parse_ddg_html(&fetched.body, max)
 }
 
 /// Parse DDG's SERP HTML into [`SearchHit`]s. Public so tests

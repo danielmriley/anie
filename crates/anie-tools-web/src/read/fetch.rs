@@ -27,6 +27,39 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default page-size ceiling (10 MiB).
 pub const DEFAULT_MAX_BYTES: usize = 10 * 1024 * 1024;
 
+/// Result of a successful (or successfully-truncated) HTML fetch.
+///
+/// `fetch_html` no longer errors when a body exceeds `max_bytes`;
+/// it streams the first `max_bytes` and reports the truncation in
+/// `truncation`. The caller (`web_read`, search backends) decides
+/// what to do — for `web_read` the marker is appended to the
+/// model-facing output so the agent can decide whether the
+/// truncated content is enough or whether to try a different
+/// approach. Treating cap hits as observations rather than
+/// failures means the model gets useful content instead of
+/// burning a turn on an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedBody {
+    /// Body content, possibly chopped at `max_bytes`. Always
+    /// valid UTF-8 (lossy on non-UTF-8 input).
+    pub body: String,
+    /// `Some` iff the source had more bytes than `max_bytes`
+    /// allowed. The body in this struct is the prefix that fit.
+    pub truncation: Option<FetchTruncation>,
+}
+
+/// Diagnostic info attached to a truncated [`FetchedBody`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchTruncation {
+    /// Number of bytes captured before the cap was hit. Always
+    /// `<= max_bytes`. The string in `FetchedBody.body` may be
+    /// slightly shorter due to lossy UTF-8 conversion of a
+    /// truncated final code point.
+    pub bytes_returned: usize,
+    /// The cap that was applied to this fetch.
+    pub max_bytes: usize,
+}
+
 /// Default redirect ceiling.
 pub const DEFAULT_MAX_REDIRECTS: usize = 10;
 
@@ -631,7 +664,7 @@ pub async fn fetch_html(
     cancel: &CancellationToken,
     url: &Url,
     opts: &FetchOptions,
-) -> Result<String, WebToolError> {
+) -> Result<FetchedBody, WebToolError> {
     if cancel.is_cancelled() {
         return Err(WebToolError::Aborted);
     }
@@ -744,13 +777,20 @@ pub async fn fetch_html(
         }
     }
 
-    // Stream the body, enforcing the size cap as we go.
-    // The chunk-level cancellation check matters: a slow
-    // server feeding us bytes drip-by-drip would otherwise
-    // pin the agent until the timeout fires.
+    // Stream the body, enforcing the size cap as we go. The
+    // chunk-level cancellation check matters: a slow server
+    // feeding us bytes drip-by-drip would otherwise pin the
+    // agent until the timeout fires.
+    //
+    // When a chunk would push past `opts.max_bytes`, we keep
+    // the prefix that fits and report truncation rather than
+    // erroring out. The downstream parser (defuddle) handles
+    // truncated HTML; the model-facing tool layer appends a
+    // marker so the agent knows the content was clipped.
     use futures::stream::StreamExt;
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut stream = response.bytes_stream();
+    let mut truncation: Option<FetchTruncation> = None;
     loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => return Err(WebToolError::Aborted),
@@ -759,20 +799,26 @@ pub async fn fetch_html(
         let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| WebToolError::Fetch(e.to_string()))?;
         if buf.len() + chunk.len() > opts.max_bytes {
-            return Err(WebToolError::TooLarge {
-                bytes: buf.len() + chunk.len(),
-                max: opts.max_bytes,
+            let take = opts.max_bytes.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..take]);
+            truncation = Some(FetchTruncation {
+                bytes_returned: buf.len(),
+                max_bytes: opts.max_bytes,
             });
+            break;
         }
         buf.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(buf).or_else(|err| {
+    let body = String::from_utf8(buf).unwrap_or_else(|err| {
         // Lossy fallback: the bytes weren't valid UTF-8, but
         // most HTML parsers handle this. Defuddle is happy
-        // with replacement-char-decoded input.
-        Ok(String::from_utf8_lossy(err.as_bytes()).into_owned())
-    })
+        // with replacement-char-decoded input. This is
+        // particularly likely on truncated bodies where the
+        // chop landed mid-codepoint.
+        String::from_utf8_lossy(err.as_bytes()).into_owned()
+    });
+    Ok(FetchedBody { body, truncation })
 }
 
 // --------------------------------------------------------------

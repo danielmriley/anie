@@ -45,11 +45,18 @@ async fn fetch_returns_body_within_max_size() {
     )
     .await
     .expect("fetch ok");
-    assert!(html.contains("<h1>Hello</h1>"));
+    assert!(html.body.contains("<h1>Hello</h1>"));
+    assert!(html.truncation.is_none());
 }
 
+/// `fetch_html` no longer errors when a body exceeds
+/// `max_bytes`; it returns the prefix that fits and reports
+/// the truncation in the result. The `web_read` tool surfaces
+/// the truncation as a marker in the model-facing output (see
+/// `read::tool` tests). This test pins the lower-level
+/// behavior.
 #[tokio::test]
-async fn fetch_rejects_body_above_max_size() {
+async fn fetch_truncates_body_above_max_size_and_reports_it() {
     let server = MockServer::start_async().await;
     let big = "x".repeat(50 * 1024); // 50 KiB body
     server
@@ -64,7 +71,7 @@ async fn fetch_rejects_body_above_max_size() {
     opts.max_bytes = 10 * 1024; // 10 KiB cap
     let client = build_client(&opts).expect("build client");
     let resolver = system_resolver();
-    let err = fetch_html(
+    let fetched = fetch_html(
         &client,
         resolver.as_ref(),
         &CancellationToken::new(),
@@ -72,8 +79,19 @@ async fn fetch_rejects_body_above_max_size() {
         &opts,
     )
     .await
-    .unwrap_err();
-    assert!(matches!(err, WebToolError::TooLarge { .. }), "got: {err:?}");
+    .expect("fetch should succeed with truncation");
+
+    let truncation = fetched
+        .truncation
+        .expect("truncation should be reported when body exceeds cap");
+    assert_eq!(truncation.max_bytes, 10 * 1024);
+    assert_eq!(truncation.bytes_returned, 10 * 1024);
+    assert_eq!(
+        fetched.body.len(),
+        10 * 1024,
+        "body length should match the cap"
+    );
+    assert!(fetched.body.bytes().all(|b| b == b'x'));
 }
 
 #[tokio::test]
@@ -143,7 +161,7 @@ async fn fetch_follows_redirect_chain() {
     )
     .await
     .expect("fetch ok");
-    assert!(html.contains("arrived"));
+    assert!(html.body.contains("arrived"));
 }
 
 #[tokio::test]
@@ -333,7 +351,7 @@ async fn fetch_accepts_xhtml_and_xml_content_types() {
     )
     .await
     .expect("fetch ok");
-    assert!(html.contains("ok"));
+    assert!(html.body.contains("ok"));
 }
 
 /// PR 3.2 of `docs/code_review_2026-04-27/`. The textual SSRF

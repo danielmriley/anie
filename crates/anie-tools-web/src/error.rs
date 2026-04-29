@@ -44,6 +44,15 @@ pub enum WebToolError {
     },
 
     /// Page exceeded the configured size cap.
+    ///
+    /// **No longer raised by `fetch_html`.** The streaming HTTP
+    /// fetch now returns a [`crate::read::fetch::FetchedBody`]
+    /// with `truncation: Some(...)` instead of erroring; the
+    /// `web_read` tool surfaces the truncation as a marker in
+    /// the model-facing output. This variant is kept for future
+    /// paths (e.g., headless render post-trim) and to preserve
+    /// the typed-error surface for callers that pattern-match
+    /// the variant set.
     #[error("page size {bytes} exceeds max {max} bytes")]
     TooLarge {
         /// Bytes received before the cap was hit.

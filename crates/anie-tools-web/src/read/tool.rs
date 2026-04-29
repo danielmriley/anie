@@ -160,7 +160,7 @@ impl WebReadTool {
         // can't backpressure the fetch.
         emit_phase(update_tx, &args.url, "fetching").await;
 
-        let html = if args.javascript {
+        let (html, truncation) = if args.javascript {
             #[cfg(feature = "headless")]
             {
                 use std::time::Duration;
@@ -185,8 +185,7 @@ impl WebReadTool {
                 // Capping headless renders requires either a
                 // post-render trim or a `--virtual-time-budget`
                 // tweak; both are speculative and tracked as a
-                // deferred follow-up rather than blocking the
-                // mid-turn-compaction milestone.
+                // deferred follow-up.
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(WebToolError::Aborted),
                     r = fetch::validate_destination(
@@ -196,12 +195,13 @@ impl WebReadTool {
                     ) => r?,
                 }
                 emit_phase(update_tx, &args.url, "rendering").await;
-                crate::read::headless::render_with_chrome(
+                let html = crate::read::headless::render_with_chrome(
                     &url,
                     Duration::from_secs(self.fetch_opts.headless_timeout_secs),
                     cancel,
                 )
-                .await?
+                .await?;
+                (html, None)
             }
             #[cfg(not(feature = "headless"))]
             {
@@ -218,21 +218,47 @@ impl WebReadTool {
             // operator-configured `max_bytes` remains the upper
             // bound; small-context models get the smaller of the
             // two.
+            //
+            // Truncation: `fetch_html` returns the prefix that
+            // fits when a body exceeds `max_bytes`; the marker
+            // appended to the model-facing output below tells
+            // the agent whether content was clipped.
             let mut per_call_opts = self.fetch_opts.clone();
             per_call_opts.max_bytes = effective_max_bytes;
-            fetch::fetch_html(
+            let fetched = fetch::fetch_html(
                 &self.client,
                 self.resolver.as_ref(),
                 cancel,
                 &url,
                 &per_call_opts,
             )
-            .await?
+            .await?;
+            (fetched.body, fetched.truncation)
         };
-        debug!(bytes = html.len(), "fetched html");
+        debug!(
+            bytes = html.len(),
+            truncated = truncation.is_some(),
+            "fetched html"
+        );
 
         emit_phase(update_tx, &args.url, "extracting").await;
-        let extracted = self.runner.run(&html, url.as_str(), cancel).await?;
+        let extracted = match self.runner.run(&html, url.as_str(), cancel).await {
+            Ok(extracted) => extracted,
+            Err(extract_err) => {
+                // If extraction failed *and* the body was
+                // truncated, the failure is almost certainly
+                // because the cap chopped the HTML mid-document
+                // and removed the structure defuddle would
+                // extract. Surface a clear "page too big to
+                // extract" message instead of a confusing
+                // "no content could be extracted" — that's the
+                // whole point of the soft-truncation policy.
+                if let Some(t) = truncation {
+                    return Ok(format_truncation_unextractable_marker(t));
+                }
+                return Err(extract_err);
+            }
+        };
         debug!(
             title = extracted.title.as_deref().unwrap_or(""),
             words = ?extracted.word_count,
@@ -240,8 +266,51 @@ impl WebReadTool {
         );
 
         let yaml = frontmatter::build(&extracted, url.as_str());
-        Ok(format!("{yaml}\n{}", extracted.markdown_body()))
+        let mut output = format!("{yaml}\n{}", extracted.markdown_body());
+        if let Some(t) = truncation {
+            output.push_str(&format_truncation_marker(t));
+        }
+        Ok(output)
     }
+}
+
+/// Returned when a fetch hit `max_bytes` *and* defuddle could
+/// not extract any usable content from the truncated prefix
+/// (typical for HTML pages where main content sits below the
+/// cap, like Wikipedia's article body). The model gets a clear
+/// "page too big to extract" message instead of defuddle's
+/// less-actionable "no content could be extracted" error.
+fn format_truncation_unextractable_marker(t: fetch::FetchTruncation) -> String {
+    format!(
+        "[note: the source page exceeded the per-call fetch \
+         limit of {bytes} bytes, and the captured prefix did not \
+         contain any extractable content (the page's main body \
+         likely sits beyond the cutoff). Try a more specific URL, \
+         a leaner endpoint (e.g. an API or RSS feed), or a \
+         different source.]\n",
+        bytes = t.max_bytes,
+    )
+}
+
+/// Marker appended to the model-facing tool output when a fetch
+/// hit `max_bytes`. Phrased as a directive note so the agent
+/// can reason about whether the truncated content is enough or
+/// whether to try a narrower URL / different source.
+///
+/// The two byte counts in `FetchTruncation` are equal at the
+/// truncation point (we capture exactly `max_bytes` and stop),
+/// so the marker uses a single number and a clear "source
+/// exceeded the cap" phrasing rather than implying we know the
+/// source's actual total size — we don't.
+fn format_truncation_marker(t: fetch::FetchTruncation) -> String {
+    format!(
+        "\n\n> [note: the source page exceeded the per-call fetch \
+         limit of {bytes} bytes; only that prefix was captured and \
+         the content above may be incomplete. If the answer seems \
+         cut off, try a more specific URL, a leaner endpoint (e.g. \
+         an API or RSS feed), or a different source.]\n",
+        bytes = t.max_bytes,
+    )
 }
 
 /// Best-effort phase update. Builds a `ToolResult` shaped like
@@ -358,6 +427,27 @@ mod tests {
         }
     }
 
+    /// Test stub that always returns a `DefuddleFailed` error.
+    /// Used to verify the truncation+extraction-failure path
+    /// surfaces the unextractable-marker rather than letting
+    /// the defuddle error reach the model.
+    struct FailingRunner;
+
+    #[async_trait]
+    impl DefuddleRunner for FailingRunner {
+        async fn run(
+            &self,
+            _html: &str,
+            _source_url: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<DefuddleOutput, WebToolError> {
+            Err(WebToolError::DefuddleFailed {
+                exit_code: Some(1),
+                stderr: "No content could be extracted".into(),
+            })
+        }
+    }
+
     fn fixed_output() -> DefuddleOutput {
         DefuddleOutput {
             title: Some("Test Article".into()),
@@ -437,7 +527,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_read_surfaces_too_large_as_typed_error() {
+    /// An oversize body now succeeds with a truncation marker
+    /// rather than failing — the agent gets useful content
+    /// instead of burning a turn on an error. The marker text
+    /// names the cap so the model can decide whether to retry
+    /// with a different URL or work with what's there.
+    async fn web_read_truncates_oversize_body_and_emits_marker() {
         let server = MockServer::start_async().await;
         let big = "x".repeat(50 * 1024);
         server
@@ -461,6 +556,102 @@ mod tests {
         .expect("build tool");
 
         let url = format!("{}/big", server.base_url());
+        let output = tool
+            .run(
+                &WebReadArgs {
+                    url,
+                    javascript: false,
+                },
+                &CancellationToken::new(),
+                None,
+                &ToolExecutionContext::default(),
+            )
+            .await
+            .expect("truncation should not fail the call");
+        assert!(
+            output.contains("exceeded the per-call fetch limit"),
+            "expected truncation marker; got:\n{output}",
+        );
+        assert!(
+            output.contains("1024 bytes"),
+            "marker should name the byte cap; got:\n{output}",
+        );
+    }
+
+    /// When truncation hits *and* defuddle can't extract
+    /// anything from the chopped HTML (typical for sites where
+    /// main content sits below the cutoff), the tool returns the
+    /// unextractable marker rather than propagating the defuddle
+    /// error. The model sees a clear "page too big to extract"
+    /// message instead of "no content could be extracted".
+    #[tokio::test]
+    async fn web_read_truncation_with_extraction_failure_returns_unextractable_marker() {
+        let server = MockServer::start_async().await;
+        let big = "x".repeat(50 * 1024);
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/big");
+                then.status(200).body(big);
+            })
+            .await;
+
+        let tool = WebReadTool::with_runner(
+            FetchOptions {
+                allow_private_ips: true,
+                max_bytes: 1024,
+                ..FetchOptions::default()
+            },
+            Arc::new(FailingRunner),
+            false,
+        )
+        .expect("build tool");
+
+        let url = format!("{}/big", server.base_url());
+        let output = tool
+            .run(
+                &WebReadArgs {
+                    url,
+                    javascript: false,
+                },
+                &CancellationToken::new(),
+                None,
+                &ToolExecutionContext::default(),
+            )
+            .await
+            .expect("truncation+extraction-fail should surface a marker, not an error");
+        assert!(
+            output.contains("did not contain any extractable content"),
+            "expected unextractable-marker text; got:\n{output}",
+        );
+        assert!(
+            output.contains("1024 bytes"),
+            "marker should name the byte cap; got:\n{output}",
+        );
+        assert!(
+            !output.contains("No content could be extracted"),
+            "defuddle's stderr text must not leak through; got:\n{output}",
+        );
+    }
+
+    /// When defuddle fails *without* truncation, the error is
+    /// propagated normally — only the truncation case suppresses
+    /// the defuddle error. Locks down the negation: the soft-
+    /// truncation policy must not silently swallow defuddle
+    /// failures on small, fully-fetched pages.
+    #[tokio::test]
+    async fn web_read_extraction_failure_without_truncation_propagates() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET).path("/small");
+                then.status(200).body("<html></html>");
+            })
+            .await;
+
+        let tool = WebReadTool::with_runner(opts(true), Arc::new(FailingRunner), false)
+            .expect("build tool");
+
+        let url = format!("{}/small", server.base_url());
         let err = tool
             .run(
                 &WebReadArgs {
@@ -473,14 +664,19 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, WebToolError::TooLarge { .. }));
+        assert!(
+            matches!(err, WebToolError::DefuddleFailed { .. }),
+            "expected DefuddleFailed without truncation; got: {err:?}",
+        );
     }
 
     /// Plan 05 PR D: a small-window context shrinks the
     /// per-call fetch byte cap below `fetch_opts.max_bytes`,
-    /// so a fetch that would otherwise succeed (5 KB body
-    /// against the default 10 MiB cap) errors with `TooLarge`
-    /// when the budget collapses to ~1 KB on an 8 K window.
+    /// so a 5 KB body fetched on an 8 K-window model gets
+    /// clipped at the 1 KB floor and surfaces as a truncation
+    /// marker rather than an error. The marker names the
+    /// effective cap so the model knows the budget that
+    /// applied.
     #[tokio::test]
     async fn web_read_caps_per_call_max_bytes_by_context_window() {
         let server = MockServer::start_async().await;
@@ -506,7 +702,7 @@ mod tests {
         let small_ctx = ToolExecutionContext {
             context_window: 8_192,
         };
-        let err = tool
+        let output = tool
             .run(
                 &WebReadArgs {
                     url,
@@ -517,14 +713,15 @@ mod tests {
                 &small_ctx,
             )
             .await
-            .unwrap_err();
-        match err {
-            WebToolError::TooLarge { max, .. } => assert_eq!(
-                max, 1024,
-                "small-window fetch cap should match the floor (1024); got {max}",
-            ),
-            other => panic!("expected TooLarge, got: {other:?}"),
-        }
+            .expect("truncation should not fail the call");
+        assert!(
+            output.contains("exceeded the per-call fetch limit"),
+            "expected truncation marker; got:\n{output}",
+        );
+        assert!(
+            output.contains("1024 bytes"),
+            "marker should reflect the small-window floor (1024); got:\n{output}",
+        );
     }
 
     #[tokio::test]
