@@ -407,6 +407,101 @@ pub struct AgentRunResult {
     pub terminal_error: Option<ProviderError>,
 }
 
+/// Mutable per-run state owned by `AgentLoop::run`. Holds the
+/// canonical context (prompts + generated messages + follow-up
+/// and steering injections), the subset of messages produced by
+/// the assistant/tool loop that the controller persists, and any
+/// terminal provider error that the run ended with.
+///
+/// The split between `context` and `generated_messages` mirrors
+/// the original loop's two locals (see `agent_loop.rs:440-441`
+/// pre-refactor): every assistant and tool result is dual-
+/// appended; follow-up and steering messages enter `context`
+/// only and are not persisted as agent output.
+struct AgentRunState {
+    context: Vec<Message>,
+    generated_messages: Vec<Message>,
+    terminal_error: Option<ProviderError>,
+    finished: bool,
+}
+
+impl AgentRunState {
+    /// Initialize the run state by appending the prompts to the
+    /// caller-supplied context (matches the pre-refactor
+    /// `context.extend(prompts.iter().cloned())` step).
+    fn new(prompts: &[Message], mut context: Vec<Message>) -> Self {
+        context.extend(prompts.iter().cloned());
+        Self {
+            context,
+            generated_messages: Vec::new(),
+            terminal_error: None,
+            finished: false,
+        }
+    }
+
+    fn context(&self) -> &[Message] {
+        &self.context
+    }
+
+    fn generated_messages(&self) -> &[Message] {
+        &self.generated_messages
+    }
+
+    /// Dual-append an assistant: into both `context` (for the
+    /// next provider request) and `generated_messages` (for
+    /// session persistence).
+    fn append_assistant(&mut self, assistant: AssistantMessage) {
+        let message = Message::Assistant(assistant);
+        self.context.push(message.clone());
+        self.generated_messages.push(message);
+    }
+
+    /// Dual-append a batch of tool result messages.
+    fn append_tool_results(&mut self, results: &[ToolResultMessage]) {
+        for result in results {
+            let message = Message::ToolResult(result.clone());
+            self.context.push(message.clone());
+            self.generated_messages.push(message);
+        }
+    }
+
+    /// Append messages to `context` only — used for follow-up
+    /// and steering injections, which are not persisted as
+    /// agent output.
+    fn extend_context<I>(&mut self, messages: I)
+    where
+        I: IntoIterator<Item = Message>,
+    {
+        self.context.extend(messages);
+    }
+
+    /// Replace `context` wholesale — used by the mid-turn
+    /// compaction gate.
+    fn replace_context(&mut self, messages: Vec<Message>) {
+        self.context = messages;
+    }
+
+    /// Mark the run finished without a terminal error.
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+
+    /// Mark the run finished and record a terminal provider
+    /// error for the controller's retry policy.
+    fn finish_with_error(&mut self, error: ProviderError) {
+        self.terminal_error = Some(error);
+        self.finished = true;
+    }
+
+    fn into_result(self) -> AgentRunResult {
+        AgentRunResult {
+            generated_messages: self.generated_messages,
+            final_context: self.context,
+            terminal_error: self.terminal_error,
+        }
+    }
+}
+
 /// The core provider/tool-agnostic agent loop.
 pub struct AgentLoop {
     provider_registry: Arc<ProviderRegistry>,
@@ -437,9 +532,7 @@ impl AgentLoop {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> AgentRunResult {
-        let mut context = context;
-        let mut generated_messages = Vec::new();
-        context.extend(prompts.iter().cloned());
+        let mut state = AgentRunState::new(&prompts, context);
         // Reborrow event_tx as a shared reference so every call site
         // below and the helper methods (which already take `&`) share
         // the same shape. `.clone()` on `&Sender` still works where we
@@ -466,30 +559,21 @@ impl AgentLoop {
             .await;
         }
 
-        loop {
+        while !state.finished {
             let request = match self
                 .config
                 .request_options_resolver
-                .resolve(&self.config.model, &context)
+                .resolve(&self.config.model, state.context())
                 .await
             {
                 Ok(request) => request,
                 Err(error) => {
                     let assistant =
                         self.error_assistant_message(error.to_string(), StopReason::Error);
-                    self.finish_with_assistant(
-                        assistant,
-                        &mut context,
-                        &mut generated_messages,
-                        event_tx,
-                        Vec::new(),
-                    )
-                    .await;
-                    return AgentRunResult {
-                        generated_messages,
-                        final_context: context,
-                        terminal_error: Some(error),
-                    };
+                    self.finish_with_assistant(assistant, &mut state, event_tx, Vec::new())
+                        .await;
+                    state.finish_with_error(error);
+                    break;
                 }
             };
 
@@ -498,19 +582,10 @@ impl AgentLoop {
                     format!("No provider registered for {:?}", self.config.model.api),
                     StopReason::Error,
                 );
-                self.finish_with_assistant(
-                    assistant,
-                    &mut context,
-                    &mut generated_messages,
-                    event_tx,
-                    Vec::new(),
-                )
-                .await;
-                return AgentRunResult {
-                    generated_messages,
-                    final_context: context,
-                    terminal_error: None,
-                };
+                self.finish_with_assistant(assistant, &mut state, event_tx, Vec::new())
+                    .await;
+                state.finish();
+                break;
             };
 
             let mut model = self.config.model.clone();
@@ -520,7 +595,7 @@ impl AgentLoop {
 
             let replay = model.effective_replay_capabilities();
             let sanitized_context = sanitize_context_for_request(
-                &context,
+                state.context(),
                 provider.includes_thinking_in_replay(),
                 replay.requires_thinking_signature,
             );
@@ -536,27 +611,16 @@ impl AgentLoop {
                 Err(error) => {
                     let assistant =
                         self.error_assistant_message(error.to_string(), StopReason::Error);
-                    self.finish_with_assistant(
-                        assistant,
-                        &mut context,
-                        &mut generated_messages,
-                        event_tx,
-                        Vec::new(),
-                    )
-                    .await;
-                    return AgentRunResult {
-                        generated_messages,
-                        final_context: context,
-                        terminal_error: Some(error),
-                    };
+                    self.finish_with_assistant(assistant, &mut state, event_tx, Vec::new())
+                        .await;
+                    state.finish_with_error(error);
+                    break;
                 }
             };
 
             let collected = self.collect_stream(stream, event_tx, &cancel).await;
             let assistant = collected.assistant;
-            let assistant_message = Message::Assistant(assistant.clone());
-            context.push(assistant_message.clone());
-            generated_messages.push(assistant_message);
+            state.append_assistant(assistant.clone());
 
             if collected.provider_error.is_some()
                 || matches!(
@@ -575,15 +639,16 @@ impl AgentLoop {
                 send_event(
                     event_tx,
                     AgentEvent::AgentEnd {
-                        messages: generated_messages.clone(),
+                        messages: state.generated_messages().to_vec(),
                     },
                 )
                 .await;
-                return AgentRunResult {
-                    generated_messages,
-                    final_context: context,
-                    terminal_error: collected.provider_error,
-                };
+                if let Some(error) = collected.provider_error {
+                    state.finish_with_error(error);
+                } else {
+                    state.finish();
+                }
+                break;
             }
 
             let tool_calls = extract_tool_calls(&assistant);
@@ -591,7 +656,7 @@ impl AgentLoop {
                 if let Some(get_follow_up_messages) = &self.config.get_follow_up_messages {
                     let follow_up_messages = get_follow_up_messages();
                     if !follow_up_messages.is_empty() {
-                        context.extend(follow_up_messages);
+                        state.extend_context(follow_up_messages);
                         send_event(
                             event_tx,
                             AgentEvent::TurnEnd {
@@ -616,29 +681,22 @@ impl AgentLoop {
                 send_event(
                     event_tx,
                     AgentEvent::AgentEnd {
-                        messages: generated_messages.clone(),
+                        messages: state.generated_messages().to_vec(),
                     },
                 )
                 .await;
-                return AgentRunResult {
-                    generated_messages,
-                    final_context: context,
-                    terminal_error: None,
-                };
+                state.finish();
+                break;
             }
 
             let tool_results = self
-                .execute_tool_calls(&tool_calls, &context, event_tx, &cancel)
+                .execute_tool_calls(&tool_calls, state.context(), event_tx, &cancel)
                 .await;
 
-            for tool_result in &tool_results {
-                let message = Message::ToolResult(tool_result.clone());
-                context.push(message.clone());
-                generated_messages.push(message);
-            }
+            state.append_tool_results(&tool_results);
 
             if let Some(get_steering_messages) = &self.config.get_steering_messages {
-                context.extend(get_steering_messages());
+                state.extend_context(get_steering_messages());
             }
 
             send_event(
@@ -654,15 +712,12 @@ impl AgentLoop {
                 send_event(
                     event_tx,
                     AgentEvent::AgentEnd {
-                        messages: generated_messages.clone(),
+                        messages: state.generated_messages().to_vec(),
                     },
                 )
                 .await;
-                return AgentRunResult {
-                    generated_messages,
-                    final_context: context,
-                    terminal_error: None,
-                };
+                state.finish();
+                break;
             }
 
             // Mid-turn compaction gate. PR 8.3 of
@@ -675,14 +730,14 @@ impl AgentLoop {
             // `None` makes this a single `Option::is_some` branch
             // — zero cost for callers that don't install a gate.
             if let Some(gate) = self.config.compaction_gate.as_ref() {
-                match gate.maybe_compact(&context).await {
+                match gate.maybe_compact(state.context()).await {
                     Ok(CompactionGateOutcome::Continue) => {}
                     Ok(CompactionGateOutcome::Compacted { messages }) => {
-                        context = messages;
+                        state.replace_context(messages);
                         send_event(
                             event_tx,
                             AgentEvent::TranscriptReplace {
-                                messages: context.clone(),
+                                messages: state.context().to_vec(),
                             },
                         )
                         .await;
@@ -710,13 +765,14 @@ impl AgentLoop {
 
             send_event(event_tx, AgentEvent::TurnStart).await;
         }
+
+        state.into_result()
     }
 
     async fn finish_with_assistant(
         &self,
         assistant: AssistantMessage,
-        context: &mut Vec<Message>,
-        generated_messages: &mut Vec<Message>,
+        state: &mut AgentRunState,
         event_tx: &mpsc::Sender<AgentEvent>,
         tool_results: Vec<ToolResultMessage>,
     ) {
@@ -735,8 +791,7 @@ impl AgentLoop {
             },
         )
         .await;
-        context.push(message.clone());
-        generated_messages.push(message);
+        state.append_assistant(assistant.clone());
         send_event(
             event_tx,
             AgentEvent::TurnEnd {
@@ -748,7 +803,7 @@ impl AgentLoop {
         send_event(
             event_tx,
             AgentEvent::AgentEnd {
-                messages: generated_messages.clone(),
+                messages: state.generated_messages().to_vec(),
             },
         )
         .await;
@@ -1506,7 +1561,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry,
+        AgentLoop, AgentLoopConfig, AgentRunState, ToolExecutionMode, ToolRegistry,
         sanitize_assistant_for_request, sanitize_context_for_request,
     };
 
@@ -1900,5 +1955,41 @@ mod tests {
         let sanitized = sanitize_assistant_for_request(&assistant, true, true);
 
         assert!(sanitized.is_none());
+    }
+
+    /// `AgentRunState::new` appends the prompts onto the
+    /// caller-supplied context (matching the pre-refactor
+    /// `context.extend(prompts.iter().cloned())` step), and
+    /// `into_result` produces an `AgentRunResult` with prompts
+    /// in `final_context` and an empty `generated_messages`.
+    #[test]
+    fn agent_run_state_new_appends_prompts_to_context() {
+        let prompts = vec![user_message("first", 1), user_message("second", 2)];
+        let prior_context = vec![user_message("prior", 0)];
+
+        let state = AgentRunState::new(&prompts, prior_context.clone());
+
+        let result = state.into_result();
+        assert!(result.generated_messages.is_empty());
+        assert_eq!(result.terminal_error, None);
+        // final_context = prior_context ++ prompts
+        let mut expected = prior_context;
+        expected.extend(prompts);
+        assert_eq!(result.final_context, expected);
+    }
+
+    /// `finish_with_error` populates `terminal_error` and marks
+    /// the run finished so the loop's `while !state.finished`
+    /// drives to the tail return.
+    #[test]
+    fn agent_run_state_finish_with_error_records_terminal_error() {
+        let mut state = AgentRunState::new(&[], Vec::new());
+        let error = ProviderError::Auth("nope".into());
+
+        state.finish_with_error(error.clone());
+
+        assert!(state.finished);
+        assert_eq!(state.terminal_error, Some(error.clone()));
+        assert_eq!(state.into_result().terminal_error, Some(error));
     }
 }
