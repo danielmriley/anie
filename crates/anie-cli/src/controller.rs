@@ -1043,12 +1043,12 @@ impl InteractiveController {
         // this atomic on every invocation.
         self.recursions_remaining_this_run
             .store(RECURSION_BUDGET_DEFAULT, Ordering::Release);
-        let extra_tools = build_rlm_extras(
+        let rlm_extras = build_rlm_extras(
             &self.state,
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
         );
-        let agent = build_agent(&self.state, self.build_compaction_gate(), extra_tools);
+        let agent = build_agent(&self.state, self.build_compaction_gate(), rlm_extras);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -1088,12 +1088,12 @@ impl InteractiveController {
         // the original prompt run — they're the same user
         // turn, just retried after a transient error or a
         // post-compaction re-attempt. No reset here.
-        let extra_tools = build_rlm_extras(
+        let rlm_extras = build_rlm_extras(
             &self.state,
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
         );
-        let agent = build_agent(&self.state, self.build_compaction_gate(), extra_tools);
+        let agent = build_agent(&self.state, self.build_compaction_gate(), rlm_extras);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -1756,14 +1756,14 @@ async fn run_via_step_machine(
 fn build_agent(
     state: &ControllerState,
     compaction_gate: Option<Arc<dyn anie_agent::CompactionGate>>,
-    extra_tools: Vec<Arc<dyn anie_agent::Tool>>,
+    rlm_extras: RlmExtras,
 ) -> AgentLoop {
     // Most runs (current / baseline modes) reuse the bootstrap
     // tool registry verbatim — cheap `Arc::clone`. Only `rlm`
     // mode builds a per-run registry on top, because the
     // recurse tool needs the run's recursion-budget atomic and
     // a context-view snapshot.
-    let tool_registry = if extra_tools.is_empty() {
+    let tool_registry = if rlm_extras.tools.is_empty() {
         Arc::clone(&state.tool_registry)
     } else {
         let mut new_registry = ToolRegistry::new();
@@ -1772,50 +1772,101 @@ fn build_agent(
                 new_registry.register(tool);
             }
         }
-        for tool in extra_tools {
+        for tool in rlm_extras.tools {
             new_registry.register(tool);
         }
         Arc::new(new_registry)
     };
-    AgentLoop::new(
-        Arc::clone(&state.provider_registry),
-        tool_registry,
-        AgentLoopConfig::new(
-            state.config.current_model().clone(),
-            state.prompt_cache.current().to_string(),
-            state.config.current_thinking(),
-            ToolExecutionMode::Parallel,
-            Arc::clone(&state.request_options_resolver),
-        )
-        .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
-        .with_compaction_gate(compaction_gate),
+    let mut config = AgentLoopConfig::new(
+        state.config.current_model().clone(),
+        state.prompt_cache.current().to_string(),
+        state.config.current_thinking(),
+        ToolExecutionMode::Parallel,
+        Arc::clone(&state.request_options_resolver),
     )
+    .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
+    .with_compaction_gate(compaction_gate);
+    if let Some(policy) = rlm_extras.policy {
+        config = config.with_before_model_policy(policy);
+    }
+    AgentLoop::new(Arc::clone(&state.provider_registry), tool_registry, config)
 }
 
-/// Build the per-run extras (right now: just the `recurse`
-/// tool) injected into the agent loop when
-/// `--harness-mode=rlm`. Returns an empty `Vec` for any other
-/// mode, so the caller can pass the result to `build_agent`
-/// unconditionally without an extra branch.
+/// Per-run RLM-mode extras: the recurse tool plus the
+/// context-virtualization policy. Empty / `None` for any
+/// other harness mode, so callers can plumb the result
+/// through `build_agent` unconditionally without branching.
+pub(crate) struct RlmExtras {
+    pub tools: Vec<Arc<dyn anie_agent::Tool>>,
+    pub policy: Option<Arc<dyn anie_agent::BeforeModelPolicy>>,
+}
+
+impl RlmExtras {
+    fn empty() -> Self {
+        Self {
+            tools: Vec::new(),
+            policy: None,
+        }
+    }
+}
+
+/// Read the per-run active-context ceiling override from
+/// `ANIE_ACTIVE_CEILING_TOKENS`. Returns `u64::MAX` (the
+/// effective-noop ceiling) when unset or unparseable, which
+/// is the documented default that preserves existing
+/// behavior. When set, the policy enforces an active-context
+/// budget — the opt-in path Plan 06 Phase C calls out.
+fn rlm_active_ceiling_tokens() -> u64 {
+    std::env::var("ANIE_ACTIVE_CEILING_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Read the keep-last-N override from `ANIE_KEEP_LAST_N`.
+/// Default `6` (≈3 turns × 2 messages each); large enough to
+/// cover a typical user prompt + assistant reply + tool
+/// result + the same again.
+fn rlm_keep_last_n() -> usize {
+    std::env::var("ANIE_KEEP_LAST_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6)
+}
+
+/// Build the per-run extras (recurse tool + virtualization
+/// policy) injected into the agent loop when
+/// `--harness-mode=rlm`. Returns an empty `RlmExtras` for any
+/// other mode, so the caller can pass the result to
+/// `build_agent` unconditionally without an extra branch.
+///
+/// The recurse tool and the policy share the same
+/// `Arc<RwLock<ExternalContext>>` — the policy writes
+/// evicted messages into the store; the recurse tool reads
+/// from it.
 ///
 /// Plan: `docs/rlm_2026-04-29/02_recurse_tool.md` and
-/// `docs/rlm_2026-04-29/06_phased_implementation.md` Phase A.
+/// `docs/rlm_2026-04-29/06_phased_implementation.md`
+/// Phases A + B + C.
 fn build_rlm_extras(
     state: &ControllerState,
     recursion_budget: Arc<AtomicU32>,
     context_snapshot: Vec<Message>,
-) -> Vec<Arc<dyn anie_agent::Tool>> {
+) -> RlmExtras {
     if !state.harness_mode.installs_rlm_features() {
-        return Vec::new();
+        return RlmExtras::empty();
     }
     // Phase B: build the indexed external store from the
-    // run-start snapshot. Phase C will start *moving*
-    // messages into this store (eviction); for now it
-    // mirrors the active context so the recurse tool's
-    // scopes can resolve against it.
+    // run-start snapshot. Phase C uses the same store as
+    // the eviction archive — the policy and the recurse
+    // tool share one `Arc<RwLock<ExternalContext>>`.
+    let pushed_set = crate::context_virt::ContextVirtualizationPolicy::pushed_set_from_snapshot(
+        &context_snapshot,
+    );
     let store = crate::external_context::ExternalContext::from_messages(context_snapshot);
+    let store = Arc::new(tokio::sync::RwLock::new(store));
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
-        Arc::new(tokio::sync::RwLock::new(store)),
+        Arc::clone(&store),
     ));
     let factory = Arc::new(crate::recurse_factory::ControllerSubAgentFactory {
         provider_registry: Arc::clone(&state.provider_registry),
@@ -1832,7 +1883,19 @@ fn build_rlm_extras(
         0, // top-level depth
         RECURSION_MAX_DEPTH,
     ));
-    vec![recurse_tool]
+    // Phase C: install the active-ceiling policy. With the
+    // env var unset, ceiling = u64::MAX → policy returns
+    // Continue on every fire (default behavior preserved).
+    let policy = Arc::new(crate::context_virt::ContextVirtualizationPolicy::new(
+        rlm_active_ceiling_tokens(),
+        rlm_keep_last_n(),
+        store,
+        pushed_set,
+    ));
+    RlmExtras {
+        tools: vec![recurse_tool],
+        policy: Some(policy),
+    }
 }
 
 /// Build the system prompt for interactive, print, and RPC runs.

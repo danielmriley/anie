@@ -36,7 +36,6 @@ use tokio::sync::RwLock;
 use crate::external_context::ExternalContext;
 
 /// Extract a Message's timestamp, regardless of variant.
-#[allow(dead_code)] // wired up by 08.3 (controller install).
 fn message_timestamp(m: &Message) -> u64 {
     match m {
         Message::User(u) => u.timestamp,
@@ -50,7 +49,6 @@ fn message_timestamp(m: &Message) -> u64 {
 ///
 /// Holds a shared handle to the `ExternalContext` store so
 /// evicted content stays reachable via the recurse tool.
-#[allow(dead_code)] // wired up by 08.3 (controller install).
 pub(crate) struct ContextVirtualizationPolicy {
     /// Maximum total tokens permitted in the active context
     /// at the start of any `ModelTurn`. When the active
@@ -83,27 +81,30 @@ pub(crate) struct ContextVirtualizationPolicy {
 }
 
 impl ContextVirtualizationPolicy {
-    /// Build a policy bound to the given external store.
-    /// Reads the store's current contents to seed the
-    /// pushed-timestamps set; subsequent fires will only
-    /// archive messages whose timestamps aren't already in
-    /// the set.
-    #[allow(dead_code)] // wired up by 08.3 (controller install).
-    pub(crate) async fn new(
+    /// Build a policy bound to the given external store. The
+    /// caller passes the set of timestamps already present in
+    /// the store so we don't double-push them on the first
+    /// fire — typically built by walking the run-start
+    /// snapshot before the store is wrapped in the `RwLock`.
+    pub(crate) fn new(
         active_ceiling_tokens: u64,
         keep_last_n: usize,
         external: Arc<RwLock<ExternalContext>>,
+        pushed: HashSet<u64>,
     ) -> Self {
-        let pushed = {
-            let store = external.read().await;
-            store.iter().map(message_timestamp).collect()
-        };
         Self {
             active_ceiling_tokens,
             keep_last_n,
             external,
             pushed: Mutex::new(pushed),
         }
+    }
+
+    /// Convenience: build the pushed-timestamps set from a
+    /// `Vec<Message>` snapshot — the run-start context the
+    /// controller hands to `build_rlm_extras`.
+    pub(crate) fn pushed_set_from_snapshot(snapshot: &[Message]) -> HashSet<u64> {
+        snapshot.iter().map(message_timestamp).collect()
     }
 }
 
@@ -237,7 +238,7 @@ mod tests {
     #[tokio::test]
     async fn ceiling_unlimited_returns_continue() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let policy = ContextVirtualizationPolicy::new(u64::MAX, 4, store).await;
+        let policy = ContextVirtualizationPolicy::new(u64::MAX, 4, store, HashSet::new());
         let context: Vec<Message> = (0..20).map(|i| user("hello", i as u64)).collect();
         let response = policy.before_model(sample_request(&context)).await;
         assert_eq!(response, BeforeModelResponse::Continue);
@@ -249,7 +250,7 @@ mod tests {
     async fn under_ceiling_returns_continue() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         // 10-token ceiling, content is small.
-        let policy = ContextVirtualizationPolicy::new(10_000, 4, store).await;
+        let policy = ContextVirtualizationPolicy::new(10_000, 4, store, HashSet::new());
         let context = vec![user("hi", 1), assistant("hello", 2)];
         let response = policy.before_model(sample_request(&context)).await;
         assert_eq!(response, BeforeModelResponse::Continue);
@@ -270,7 +271,7 @@ mod tests {
             .map(|i| user(&format!("msg{i}"), i as u64))
             .collect();
         // Ceiling = 5 tokens; keep_last_n = 3.
-        let policy = ContextVirtualizationPolicy::new(5, 3, store).await;
+        let policy = ContextVirtualizationPolicy::new(5, 3, store, HashSet::new());
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -296,7 +297,7 @@ mod tests {
         // The pinned tail (5 messages) will be over the
         // ceiling but the policy refuses to evict pinned
         // messages.
-        let policy = ContextVirtualizationPolicy::new(1, 5, store).await;
+        let policy = ContextVirtualizationPolicy::new(1, 5, store, HashSet::new());
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -319,7 +320,7 @@ mod tests {
         let context: Vec<Message> = (0..8)
             .map(|i| user(&format!("msg{i}"), 100 + i as u64))
             .collect();
-        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&store)).await;
+        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&store), HashSet::new());
         let _ = policy.before_model(sample_request(&context)).await;
         let external = store.read().await;
         // Every original message landed in external (or was
@@ -339,7 +340,10 @@ mod tests {
         // context (this matches Phase B's
         // `from_messages(context_snapshot)`).
         let external = Arc::new(RwLock::new(ExternalContext::from_messages(context.clone())));
-        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&external)).await;
+        // Pre-populated dedup set matching the snapshot
+        // currently in the store.
+        let pushed = ContextVirtualizationPolicy::pushed_set_from_snapshot(&context);
+        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&external), pushed);
         let _ = policy.before_model(sample_request(&context)).await;
         let external = external.read().await;
         // Length unchanged: 5 from pre-population, 0
@@ -362,7 +366,7 @@ mod tests {
             assistant("ack2", 6),
             user("third", 7),
         ];
-        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&store)).await;
+        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&store), HashSet::new());
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
