@@ -9,7 +9,7 @@ use std::{
 use futures::{StreamExt, future::join_all};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{Instrument, debug_span, warn};
 
 /// Process-global "have we already warned about a closed AgentEvent
 /// channel?" flag. First failure per process lifetime logs a
@@ -575,6 +575,34 @@ enum AgentDecision {
     FinishWithError(ProviderError),
 }
 
+impl AgentIntent {
+    /// Static discriminant for tracing fields. Matched once at
+    /// span creation, never serialized; cheap and non-allocating.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::ModelTurn => "ModelTurn",
+            Self::ExecuteTools { .. } => "ExecuteTools",
+            Self::AppendFollowUps { .. } => "AppendFollowUps",
+            Self::RunCompactionGate => "RunCompactionGate",
+            Self::Finish => "Finish",
+        }
+    }
+}
+
+impl AgentObservation {
+    /// Static discriminant for tracing fields.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::AssistantCollected { .. } => "AssistantCollected",
+            Self::ToolResults { .. } => "ToolResults",
+            Self::FollowUpsAppended => "FollowUpsAppended",
+            Self::CompactionGateChecked => "CompactionGateChecked",
+            Self::PreflightFailed => "PreflightFailed",
+            Self::Finished => "Finished",
+        }
+    }
+}
+
 /// The core provider/tool-agnostic agent loop.
 pub struct AgentLoop {
     provider_registry: Arc<ProviderRegistry>,
@@ -614,6 +642,32 @@ impl AgentLoop {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> AgentRunResult {
+        // Root tracing span for the run. `run_id` is generated
+        // here so each `AgentLoop::run` invocation has a unique
+        // marker even when many runs share the same model /
+        // provider — invaluable for filtering one run out of a
+        // multi-session log. The UUID is tracing-only: never
+        // persisted, never on the wire, never on
+        // `AgentRunResult`.
+        let run_span = debug_span!(
+            "agent_run",
+            run_id = %uuid::Uuid::new_v4(),
+            model = %self.config.model.id,
+            provider = %self.config.model.provider,
+            prompt_count = prompts.len(),
+        );
+        self.run_inner(prompts, context, event_tx, cancel)
+            .instrument(run_span)
+            .await
+    }
+
+    async fn run_inner(
+        &self,
+        prompts: Vec<Message>,
+        context: Vec<Message>,
+        event_tx: mpsc::Sender<AgentEvent>,
+        cancel: CancellationToken,
+    ) -> AgentRunResult {
         let mut state = AgentRunState::new(&prompts, context);
         // Reborrow event_tx as a shared reference so every call site
         // below and the helper methods (which already take `&`) share
@@ -624,9 +678,22 @@ impl AgentLoop {
         self.start_run(&prompts, event_tx).await;
 
         let mut intent = AgentIntent::ModelTurn;
+        let mut step_index: u64 = 0;
         while !state.finished {
-            let observation = self.eval_step(intent, &mut state, event_tx, &cancel).await;
-            self.print_step(&mut state, &observation, event_tx).await;
+            let step_span = debug_span!(
+                "agent_repl_step",
+                run_step = step_index,
+                intent = intent.kind(),
+                context_messages = state.context().len(),
+                generated_messages = state.generated_messages().len(),
+            );
+            let observation = async {
+                let observation = self.eval_step(intent, &mut state, event_tx, &cancel).await;
+                self.print_step(&mut state, &observation, event_tx).await;
+                observation
+            }
+            .instrument(step_span)
+            .await;
             match self.decide_next_step(&state, &observation, &cancel) {
                 AgentDecision::Continue(next) => intent = next,
                 AgentDecision::Finish => {
@@ -638,6 +705,7 @@ impl AgentLoop {
                     intent = AgentIntent::Finish;
                 }
             }
+            step_index += 1;
         }
 
         // Tail emission of `AgentEnd`. The preflight failure path
@@ -690,6 +758,7 @@ impl AgentLoop {
     /// `execute_tool_calls` — `Eval` does not buffer them until
     /// `Print`. The returned observation drives the subsequent
     /// `Print` and `Decide` phases.
+    #[tracing::instrument(name = "agent_eval", skip_all, fields(intent = intent.kind()))]
     async fn eval_step(
         &self,
         intent: AgentIntent,
@@ -848,6 +917,11 @@ impl AgentLoop {
     /// Live streaming/tool events were emitted from inside
     /// `Eval`; `Print` only handles the post-eval commit and
     /// turn-boundary markers.
+    #[tracing::instrument(
+        name = "agent_print",
+        skip_all,
+        fields(observation = observation.kind()),
+    )]
     async fn print_step(
         &self,
         state: &mut AgentRunState,
@@ -931,6 +1005,11 @@ impl AgentLoop {
 
     /// Decide phase: produce the next intent based on the
     /// observation just printed and the current state.
+    #[tracing::instrument(
+        name = "agent_decide",
+        skip_all,
+        fields(observation = observation.kind()),
+    )]
     fn decide_next_step(
         &self,
         state: &AgentRunState,
