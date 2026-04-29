@@ -15,7 +15,7 @@ work lands.
 
 | Plan | Branch | Status | Commit |
 |---|---|---|---|
-| [01 — Stagnation detection + aggressive compaction](../01_stagnation_detection.md) | `main` | not started | — |
+| [01 — Stagnation detection + aggressive compaction](../01_stagnation_detection.md) | `main` | landed | `a2863e7` |
 | [02 — RLM `recurse` tool (shape 1)](../02_recurse_tool.md) | `dev_rlm` (after 01) | not started | — |
 | [03 — RLM recurse intent (shape 2)](../03_recurse_intent.md) | TBD | deferred | — |
 | [04 — Native RLM compat (shape 3)](../04_native_rlm_compat.md) | TBD | speculative | — |
