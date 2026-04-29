@@ -7,6 +7,7 @@ mod compaction;
 mod compaction_gate;
 mod compaction_reserve;
 mod compaction_stats;
+mod context_virt;
 mod controller;
 mod external_context;
 mod harness_mode;
