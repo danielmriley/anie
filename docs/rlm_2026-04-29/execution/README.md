@@ -20,7 +20,7 @@ work lands.
 | [03 — RLM recurse intent (shape 2)](../03_recurse_intent.md) | TBD | deferred | — |
 | [04 — Native RLM compat (shape 3)](../04_native_rlm_compat.md) | TBD | speculative | — |
 | [05 — Passive context management](../05_passive_context_management.md) | TBD | absorbed into 06 | — |
-| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phase A landed; next: Phase B** | — |
+| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phases A + B landed; next: Phase C** | — |
 | [07 — Evaluation harness + mode flags](../07_evaluation_harness.md) | `dev_rlm` | partial (`--harness-mode` flag; scenarios deferred) | `8a162d3` |
 
 ## Phase status (Plan 06)
@@ -28,7 +28,7 @@ work lands.
 | Phase | Description | Status | Commits |
 |-------|-------------|--------|---------|
 | A | `recurse` tool | **landed** | rlm/01–06.3 (`8a162d3..64dcbe2`) |
-| B | indexed external store | not started | — |
+| B | indexed external store | **landed** | rlm/07 (`ec2ccb4`) |
 | C | active context ceiling + FIFO eviction | not started | — |
 | D | ledger injection | not started | — |
 | E | smart inclusion (relevance-based paging-in) | not started | — |
@@ -46,6 +46,12 @@ work lands.
 | 06.1 | `MessageGrep` scope resolution | `32a5b70` |
 | 06.2 | `ToolResult` scope resolution | `084675c` |
 | 06.3 | `File` scope resolution + provider doc cleanup | `64dcbe2` |
+
+## Phase B sub-commit breakdown (rlm/07 on `dev_rlm`)
+
+| Sub | What | Commit |
+|---|---|---|
+| 07 | indexed `ExternalContext` store; `ToolResult` lookup is now O(1) | `ec2ccb4` |
 
 ## Ordering rationale
 
