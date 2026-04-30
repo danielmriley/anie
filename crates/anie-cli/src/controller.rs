@@ -1895,7 +1895,7 @@ fn rlm_relevance_budget_tokens(active_ceiling_tokens: u64) -> u64 {
 ///
 /// Plan: `docs/rlm_2026-04-29/02_recurse_tool.md` and
 /// `docs/rlm_2026-04-29/06_phased_implementation.md`
-/// Phases A + B + C + D + E.
+/// Phases A + B + C + D + E + F.
 fn build_rlm_extras(
     state: &ControllerState,
     recursion_budget: Arc<AtomicU32>,
@@ -1906,14 +1906,25 @@ fn build_rlm_extras(
         return RlmExtras::empty();
     }
     // Phase B: build the indexed external store from the
-    // run-start snapshot. Phase C uses the same store as
-    // the eviction archive — the policy and the recurse
-    // tool share one `Arc<RwLock<ExternalContext>>`.
+    // run-start snapshot. Phases C/D/E/F all share this
+    // single `Arc<RwLock<ExternalContext>>`.
     let pushed_set = crate::context_virt::ContextVirtualizationPolicy::pushed_set_from_snapshot(
         &context_snapshot,
     );
     let store = crate::external_context::ExternalContext::from_messages(context_snapshot);
     let store = Arc::new(tokio::sync::RwLock::new(store));
+
+    // Phase F: spawn the background summarizer. The default
+    // `HeadTruncationSummarizer` is a fast, deterministic
+    // baseline that just keeps the head of the message
+    // text. A future commit will plug in an LLM-driven
+    // summarizer (one-off Provider call) without touching
+    // the worker's signature. Skipping this means archive
+    // entries stay un-summarized — recurse still returns
+    // full bodies.
+    let summarizer: Arc<dyn crate::bg_summarizer::Summarizer> =
+        Arc::new(crate::bg_summarizer::HeadTruncationSummarizer);
+    let summarizer_tx = crate::bg_summarizer::spawn_worker(summarizer, Arc::clone(&store));
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
         Arc::clone(&store),
     ));
@@ -1954,7 +1965,8 @@ fn build_rlm_extras(
         store,
         pushed_set,
     )
-    .with_external_size_atomic(Arc::clone(&state.rlm_archived_messages));
+    .with_external_size_atomic(Arc::clone(&state.rlm_archived_messages))
+    .with_summarizer(summarizer_tx);
     if let Some(tx) = event_tx {
         policy = policy.with_event_sender(tx);
     }

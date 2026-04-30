@@ -78,6 +78,13 @@ pub(crate) struct StoredMessage {
     #[allow(dead_code)]
     pub id: MessageId,
     pub message: Message,
+    /// Optional Phase-F summary, written by the background
+    /// summarizer worker after archive. The recurse provider
+    /// can return this in place of the full message body
+    /// when the model only needs an outline; the relevance
+    /// reranker can page summaries in cheaply when the full
+    /// content wouldn't fit under the budget.
+    pub summary: Option<String>,
 }
 
 /// Indexed store of messages. Owns its messages; clones
@@ -137,8 +144,43 @@ impl ExternalContext {
                 .push(id);
             self.by_tool_call_id.insert(t.tool_call_id.clone(), id);
         }
-        self.messages.push(StoredMessage { id, message });
+        self.messages.push(StoredMessage {
+            id,
+            message,
+            summary: None,
+        });
         id
+    }
+
+    /// Attach a summary to an existing stored message.
+    /// Idempotent — replaces the previous summary if any.
+    /// Used by the Phase-F background summarizer worker
+    /// after it produces a summary for a recently-archived
+    /// message. No-op when `id` is out of bounds.
+    pub(crate) fn set_summary(&mut self, id: MessageId, summary: String) {
+        if let Some(stored) = self.messages.get_mut(id) {
+            stored.summary = Some(summary);
+        }
+    }
+
+    /// Borrow the optional summary attached to `id`. Used by
+    /// the recurse tool when the caller asks for the
+    /// summarized form rather than the full body.
+    /// `#[allow(dead_code)]` — Phase F's recurse-side
+    /// integration lands in a follow-up commit.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn get_summary(&self, id: MessageId) -> Option<&str> {
+        self.messages.get(id).and_then(|s| s.summary.as_deref())
+    }
+
+    /// Number of stored messages that currently have a
+    /// summary attached. Used by the ledger to surface
+    /// "N summaries available" so the model knows the
+    /// summarizer has caught up.
+    #[must_use]
+    pub(crate) fn summary_count(&self) -> usize {
+        self.messages.iter().filter(|s| s.summary.is_some()).count()
     }
 
     /// Number of stored messages. `#[allow(dead_code)]` —

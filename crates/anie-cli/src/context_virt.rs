@@ -270,6 +270,13 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// see the archive growing in rlm mode without paying
     /// for synchronization on every render.
     external_size: Arc<AtomicUsize>,
+
+    /// Optional handle to the Phase-F background
+    /// summarizer worker. When `Some`, the policy enqueues
+    /// summarize requests for newly-archived messages above
+    /// the size threshold. `None` in tests + when the
+    /// summarizer is disabled.
+    summarizer_tx: Option<mpsc::Sender<crate::bg_summarizer::SummaryRequest>>,
 }
 
 impl ContextVirtualizationPolicy {
@@ -294,7 +301,22 @@ impl ContextVirtualizationPolicy {
             last_ledger_ts: Mutex::new(None),
             event_tx: None,
             external_size: Arc::new(AtomicUsize::new(0)),
+            summarizer_tx: None,
         }
+    }
+
+    /// Attach a Phase-F background summarizer queue. The
+    /// policy will enqueue summarize requests for newly-
+    /// archived messages over the
+    /// [`SUMMARIZE_MIN_TOKENS`] threshold. The worker
+    /// itself is owned by the controller; this just gives
+    /// the policy a handle to dispatch work to it.
+    pub(crate) fn with_summarizer(
+        mut self,
+        tx: mpsc::Sender<crate::bg_summarizer::SummaryRequest>,
+    ) -> Self {
+        self.summarizer_tx = Some(tx);
+        self
     }
 
     /// Attach an event sender so the policy can emit user-
@@ -358,21 +380,42 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         // so eviction is reversible via the recurse tool.
         // Hold both guards within one sync block — no `.await`
         // between acquire and drop — so the future stays Send.
-        // Capture the post-archive size so the status-bar
-        // atomic + the breadcrumb message both see the same
-        // value.
-        let archived_total: usize = {
+        // Capture the post-archive size + the (id, message)
+        // pairs we just inserted so we can hand them off to
+        // the Phase-F summarizer below.
+        let (archived_total, newly_archived): (
+            usize,
+            Vec<(crate::external_context::MessageId, Message)>,
+        ) = {
             let mut external = self.external.write().await;
             let mut pushed = self.pushed.lock().unwrap_or_else(|p| p.into_inner());
+            let mut newly_archived = Vec::new();
             for m in &working {
                 let ts = message_timestamp(m);
                 if pushed.insert(ts) {
-                    external.push(m.clone());
+                    let id = external.push(m.clone());
+                    newly_archived.push((id, m.clone()));
                 }
             }
-            external.len()
+            (external.len(), newly_archived)
         };
         self.external_size.store(archived_total, Ordering::Release);
+
+        // Step 2.5 (Phase F): fan newly-archived messages
+        // out to the background summarizer if one's wired
+        // up. Skip messages below the size threshold —
+        // they don't benefit from summarization. The queue
+        // is bounded; if the worker is behind, `try_send`
+        // returns Full and we drop the request rather than
+        // blocking the model turn.
+        if let Some(tx) = &self.summarizer_tx {
+            for (id, message) in newly_archived {
+                if estimate_tokens(&message) < crate::bg_summarizer::SUMMARIZE_MIN_TOKENS {
+                    continue;
+                }
+                let _ = tx.try_send(crate::bg_summarizer::SummaryRequest { id, message });
+            }
+        }
 
         // Step 3: FIFO-evict from the front while over
         // ceiling and outside the pinned tail.
@@ -687,6 +730,18 @@ impl ContextVirtualizationPolicy {
             if paged_in_count > 0 {
                 lines.push(format!(
                     "- {paged_in_count} relevant prior messages paged in for this turn"
+                ));
+            }
+
+            // Phase F: report how many archive entries the
+            // background summarizer has produced. Lets the
+            // model know summaries are available; future
+            // recurse-side work will let it ask for the
+            // summary form directly.
+            let summarized = external.summary_count();
+            if summarized > 0 {
+                lines.push(format!(
+                    "- {summarized} archive entries have summaries available"
                 ));
             }
 

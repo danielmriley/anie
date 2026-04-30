@@ -258,13 +258,15 @@ fn no_tools_flag_builds_empty_registry() {
 }
 
 /// Plan `docs/rlm_2026-04-29/06_phased_implementation.md`
-/// Phases A + C: the recurse tool and the
-/// virtualization policy are both installed only when
-/// `--harness-mode=rlm`. Other modes get empty extras + no
-/// policy, so `build_agent` reuses the bootstrap tool
-/// registry and the noop policy.
-#[test]
-fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
+/// Phases A + C + F: the recurse tool, the virtualization
+/// policy, and the background summarizer are all
+/// installed only when `--harness-mode=rlm`. Other modes
+/// get empty extras + no policy, so `build_agent` reuses
+/// the bootstrap tool registry and the noop policy.
+/// Tokio test because Phase F's `spawn_worker` requires a
+/// runtime context.
+#[tokio::test]
+async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
     use std::sync::atomic::AtomicU32;
 
     let (controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
