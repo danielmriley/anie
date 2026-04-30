@@ -18,6 +18,21 @@
 //! ledger; (5) returns
 //! `BeforeModelResponse::ReplaceMessages(working + ledger)`.
 //!
+//! Pinning rules (eviction-resistant):
+//! - The latest `User` message is always preserved
+//!   (rlm/17). Without this, tight ceilings can evict the
+//!   user's directive itself, leading the model to
+//!   confabulate a task from contextual cues.
+//! - The last `keep_last_n` messages by position are
+//!   preserved. Protects turn continuity (current prompt
+//!   + recent assistant/tool work).
+//!
+//! These two pins compose: a pinned user message can be at
+//! any position; the pinned tail is always the trailing
+//! window. When both pins together exceed the ceiling, the
+//! policy stops evicting and accepts being over budget —
+//! correctness over budget compliance.
+//!
 //! The ledger is a `User` message wrapped in
 //! `<system-reminder>` tags — universally compatible with
 //! every provider, recognized by the model as a system note
