@@ -774,10 +774,35 @@ impl ContextVirtualizationPolicy {
             let total = external.len();
             let evicted = total.saturating_sub(active_len);
 
+            // Imperative header. Earlier versions said "use
+            // the recurse tool to access evicted content" —
+            // permissive language the model treated as
+            // optional, leading to repeated re-fetches of
+            // URLs already in the archive. The directive
+            // form below is explicit: scan the lists, prefer
+            // recurse over re-running tools whose targets
+            // are already listed.
             let mut lines = vec![
                 "<system-reminder>".to_string(),
-                "external context — call the recurse tool to access evicted content".to_string(),
-                format!("- {total} total messages ({evicted} evicted, {active_len} active)"),
+                format!(
+                    "external context — {total} archived messages ({evicted} evicted, {active_len} active)"
+                ),
+                String::new(),
+                "Before issuing a new tool call, scan the lists below.".to_string(),
+                "If the URL, query, command, or path you're about to use is already listed,"
+                    .to_string(),
+                "the result is in the archive — do NOT re-run the tool. Instead use one of:"
+                    .to_string(),
+                "  - `recurse` with `scope.kind=tool_result`, `tool_call_id=<id>` to fetch a"
+                    .to_string(),
+                "    specific prior result verbatim;".to_string(),
+                "  - `recurse` with `scope.kind=summary`, `id=<archive_id>` for the gist;"
+                    .to_string(),
+                "  - `recurse` with `scope.kind=message_grep`, `pattern=<regex>` to search"
+                    .to_string(),
+                "    archived messages by keyword.".to_string(),
+                "Re-running a tool whose output is already archived wastes user time.".to_string(),
+                String::new(),
             ];
 
             if paged_in_count > 0 {
@@ -1165,8 +1190,14 @@ mod tests {
             _ => panic!("expected User ledger"),
         };
         assert!(ledger_text.contains("<system-reminder>"));
-        assert!(ledger_text.contains("recurse tool"));
-        assert!(ledger_text.contains("5 total messages"));
+        assert!(ledger_text.contains("recurse"));
+        // Imperative directive must be present — this is
+        // the rlm/14 anti-re-fetch fix.
+        assert!(
+            ledger_text.contains("do NOT re-run the tool"),
+            "ledger should explicitly forbid re-running tools: {ledger_text}",
+        );
+        assert!(ledger_text.contains("5 archived messages"));
         assert!(ledger_text.contains("3 tool results"));
         assert!(ledger_text.contains("bash x2"));
         assert!(ledger_text.contains("read x1"));

@@ -1791,9 +1791,16 @@ fn build_agent(
         }
         Arc::new(new_registry)
     };
+    // Compose the per-run system prompt. In rlm mode we
+    // append a paragraph establishing the archive policy
+    // upfront, in the system role — without it, the
+    // model's trained pattern of "use web tools for
+    // live-world questions" drowns out the per-turn
+    // ledger's request to prefer recurse.
+    let system_prompt = compose_system_prompt(state);
     let mut config = AgentLoopConfig::new(
         state.config.current_model().clone(),
-        state.prompt_cache.current().to_string(),
+        system_prompt,
         state.config.current_thinking(),
         ToolExecutionMode::Parallel,
         Arc::clone(&state.request_options_resolver),
@@ -1804,6 +1811,25 @@ fn build_agent(
         config = config.with_before_model_policy(policy);
     }
     AgentLoop::new(Arc::clone(&state.provider_registry), tool_registry, config)
+}
+
+/// rlm-mode system-prompt augment. Establishes the policy
+/// before the conversation starts so it competes with —
+/// not just supplements — the cached prompt's "use
+/// web_search/web_read for live-world questions" line.
+/// Combined with the per-turn imperative ledger, this is
+/// what closes the re-fetch loop.
+const RLM_SYSTEM_PROMPT_AUGMENT: &str = "\n\n# Context virtualization (rlm mode)\n\nThis run uses an external archive of prior conversation. Every tool call you issue is recorded there with its arguments. Each turn you receive a `<system-reminder>` ledger listing the URLs, queries, commands, and paths already used.\n\nWhen the user asks a follow-up question, FIRST scan the ledger. If the answer would come from a URL, query, command, or path already listed, do NOT re-run the tool. Instead call `recurse`:\n  - `scope.kind=tool_result`, `tool_call_id=<id>` — fetch a specific prior result verbatim;\n  - `scope.kind=summary`, `id=<archive_id>` — fetch the gist (cheaper);\n  - `scope.kind=message_grep`, `pattern=<regex>` — search archived messages by keyword.\n\nThis applies even to live-world questions (weather, news, prices) when the relevant pages are already in the archive — re-fetching wastes the user's time. Reach for `web_read` / `web_search` only when no archived material would answer the question.";
+
+/// Build the per-run system prompt. In non-rlm modes
+/// returns the cached prompt verbatim. In rlm mode
+/// appends [`RLM_SYSTEM_PROMPT_AUGMENT`].
+fn compose_system_prompt(state: &ControllerState) -> String {
+    let mut prompt = state.prompt_cache.current().to_string();
+    if state.harness_mode.installs_rlm_features() {
+        prompt.push_str(RLM_SYSTEM_PROMPT_AUGMENT);
+    }
+    prompt
 }
 
 /// Per-run RLM-mode extras: the recurse tool plus the

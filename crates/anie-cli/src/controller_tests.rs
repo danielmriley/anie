@@ -324,6 +324,49 @@ async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
     );
 }
 
+/// `compose_system_prompt` appends the rlm-mode augment
+/// only when `harness_mode == Rlm`. Other modes get the
+/// cached prompt unchanged. The augment establishes the
+/// archive policy upfront in the system role so it
+/// competes with the cached "use web tools for live-world
+/// questions" line, which would otherwise drown out the
+/// per-turn ledger.
+#[test]
+fn compose_system_prompt_only_augments_in_rlm_mode() {
+    let (controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    let cached = controller.state.prompt_cache.current().to_string();
+
+    // Default `current` mode: no augment.
+    let composed = compose_system_prompt(&controller.state);
+    assert_eq!(composed, cached, "current mode should not augment");
+
+    // Baseline mode: no augment either.
+    let mut state_baseline = controller;
+    state_baseline.state.harness_mode = crate::harness_mode::HarnessMode::Baseline;
+    let composed = compose_system_prompt(&state_baseline.state);
+    assert_eq!(composed, cached, "baseline mode should not augment");
+
+    // Rlm mode: augment appended verbatim.
+    state_baseline.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    let composed = compose_system_prompt(&state_baseline.state);
+    assert!(
+        composed.starts_with(&cached),
+        "augment must be appended, not replace the cached prompt"
+    );
+    assert!(
+        composed.contains("Context virtualization (rlm mode)"),
+        "augment header missing: {composed}"
+    );
+    assert!(
+        composed.contains("do NOT re-run the tool"),
+        "augment must include the imperative directive"
+    );
+    assert!(
+        composed.contains("scope.kind=tool_result"),
+        "augment must name the recurse scope kinds"
+    );
+}
+
 #[test]
 fn tool_registry_contains_core_tools_by_default() {
     let registry = build_tool_registry(Path::new("."), false);
