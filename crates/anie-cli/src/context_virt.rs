@@ -432,23 +432,53 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             }
         }
 
+        // Capture the latest User message's timestamp before
+        // eviction. The user's current directive must always
+        // stay in active context — without it, the model
+        // loses anchor and hallucinates a task from
+        // contextual cues. (Observed in smoke testing:
+        // qwen3.5:9b under a 1.5k ceiling + KEEP_LAST_N=2
+        // confabulated a fix narrative for `SummaryOutputStore`
+        // — a struct that doesn't exist — because the
+        // user's "just say done" directive had been evicted.)
+        let pinned_user_ts: Option<u64> = working.iter().rev().find_map(|m| match m {
+            Message::User(u) => Some(u.timestamp),
+            _ => None,
+        });
+
         // Step 3: FIFO-evict from the front while over
-        // ceiling and outside the pinned tail.
+        // ceiling. Skip the pinned user message + the
+        // pinned tail (last `keep_last_n` messages).
         let mut running_total: u64 = working
             .iter()
             .map(estimate_tokens)
             .fold(0u64, u64::saturating_add);
-        let mut idx = 0usize;
-        while running_total > self.active_ceiling_tokens
-            && working.len().saturating_sub(idx) > self.keep_last_n
-        {
-            let cost = estimate_tokens(&working[idx]);
-            running_total = running_total.saturating_sub(cost);
-            idx += 1;
+        let working_len = working.len();
+        let pinned_tail_start = working_len.saturating_sub(self.keep_last_n);
+        let mut to_evict: Vec<usize> = Vec::new();
+        for (idx, m) in working.iter().enumerate() {
+            if running_total <= self.active_ceiling_tokens {
+                break;
+            }
+            // Skip pinned tail.
+            if idx >= pinned_tail_start {
+                break;
+            }
+            // Skip pinned user message regardless of position.
+            let is_pinned_user = matches!(m, Message::User(u)
+                if pinned_user_ts == Some(u.timestamp));
+            if is_pinned_user {
+                continue;
+            }
+            running_total = running_total.saturating_sub(estimate_tokens(m));
+            to_evict.push(idx);
         }
-        let evicted_count = idx;
-        if idx > 0 {
-            working.drain(..idx);
+        let evicted_count = to_evict.len();
+        if !to_evict.is_empty() {
+            // Drop in reverse so earlier indices stay valid.
+            for &idx in to_evict.iter().rev() {
+                working.remove(idx);
+            }
         }
 
         // Step 3.5: relevance-based paging-in. Score every
@@ -1061,6 +1091,52 @@ mod tests {
         assert!(originals.len() >= 3);
         assert!(originals.len() < context.len());
         assert_eq!(&originals[originals.len() - 3..], &context[n - 3..]);
+    }
+
+    /// rlm/17: the latest User message must always be
+    /// preserved. Without this pinning, tight ceilings can
+    /// evict the user's directive itself, leading the model
+    /// to confabulate a task from contextual cues.
+    /// (Observed: qwen3.5:9b under 1.5k ceiling +
+    /// KEEP_LAST_N=2 invented a fix narrative for a struct
+    /// that doesn't exist.)
+    #[tokio::test]
+    async fn latest_user_message_survives_aggressive_eviction() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        // Build a context where, with KEEP_LAST_N=2 and a
+        // tight ceiling, ordinary FIFO eviction would
+        // evict the user prompt at position 0.
+        let context = vec![
+            user("Just say done.", 1), // the directive — must survive
+            assistant("ok let me read", 2),
+            tool_result("c1", "read", "lots of file content here", 3),
+            assistant("read result", 4),
+            tool_result("c2", "read", "more file content", 5),
+            assistant("another read", 6),
+            tool_result("c3", "read", "final file content", 7),
+        ];
+        // Tiny ceiling forces eviction; KEEP_LAST_N=2 means
+        // only the last 2 messages would normally pin.
+        let policy = ContextVirtualizationPolicy::new(2, 2, 0, store, HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+
+        // The user prompt should be in survivors despite
+        // tight ceiling.
+        let has_user_directive = survivors.iter().any(|m| match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => text == "Just say done.",
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(
+            has_user_directive,
+            "user's directive must survive eviction; got {survivors:?}"
+        );
     }
 
     /// Pinned tail itself exceeds the ceiling: the policy
