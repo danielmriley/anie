@@ -53,7 +53,12 @@ nix = { version = "0.30", features = ["signal", "process"] }
 # `xdg-open`/`open`/`start`; no heavy transitive deps.
 opener = { version = "0.8", default-features = false }
 rand = "0.9"
-ratatui = "0.29"
+# `unstable-rendered-line-info` enables `Paragraph::line_count`,
+# which the status bar uses to size itself to the wrapped
+# height of its content. The "unstable" name is upstream's
+# stability marker; the API itself is stable enough for our
+# use (issue: ratatui-org/ratatui#293).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 rpassword = "7"
 # sha2 — needed for PKCE SHA-256 challenge in the OAuth flow.

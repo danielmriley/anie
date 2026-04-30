@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use tokio::sync::{Mutex, mpsc};
 
@@ -614,8 +614,15 @@ impl App {
                 .preferred_height(frame.area().width)
                 .clamp(8, half_height.max(8)),
         };
+        // Compute the status bar's wrapped height before
+        // the layout so it can grow into multiple rows when
+        // the status string overflows the terminal width.
+        // Capped at MAX_STATUS_BAR_HEIGHT so a single
+        // overlong line can't claim half the screen.
+        let status_text = format_status_text(&mut self.status_bar, self.output_pane.is_scrolled());
+        let status_height = status_bar_height(&status_text, frame.area().width);
         let (output_area, spinner_area, bottom_area, status_area) =
-            layout(frame.area(), bottom_height);
+            layout(frame.area(), bottom_height, status_height);
 
         self.output_pane.render(
             output_area,
@@ -647,13 +654,9 @@ impl App {
                     .render(bottom_area, frame.buffer_mut(), spinner_frame)
             }
         };
-        render_status_bar(
-            &mut self.status_bar,
-            &self.agent_state,
-            self.output_pane.is_scrolled(),
-            status_area,
-            frame.buffer_mut(),
-        );
+        // status_text was built earlier for sizing; reuse
+        // it here rather than reformatting.
+        build_status_paragraph(status_text).render(status_area, frame.buffer_mut());
         frame.set_cursor_position(cursor);
 
         // Draw the inline autocomplete popup on top of the
@@ -2176,14 +2179,14 @@ pub async fn run_tui(
 /// below the input matches pi's layout — the information that
 /// "belongs" to what you're typing lives under the typing box,
 /// not above it.
-fn layout(area: Rect, bottom_height: u16) -> (Rect, Rect, Rect, Rect) {
+fn layout(area: Rect, bottom_height: u16, status_height: u16) -> (Rect, Rect, Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(bottom_height),
-            Constraint::Length(1),
+            Constraint::Length(status_height.max(1)),
         ])
         .split(area);
     (chunks[0], chunks[1], chunks[2], chunks[3])
@@ -2243,25 +2246,21 @@ fn resolve_provider_api_key(provider_name: &str) -> Option<String> {
     })
 }
 
-fn render_status_bar(
-    state: &mut StatusBarState,
-    agent_state: &AgentUiState,
-    transcript_scrolled: bool,
-    area: Rect,
-    buf: &mut ratatui::buffer::Buffer,
-) {
+/// Maximum number of rows the status bar can grow to before
+/// we cap and let ratatui truncate. Keeps the rest of the
+/// screen usable even on tiny terminals where the status
+/// content would otherwise wrap to many lines.
+const MAX_STATUS_BAR_HEIGHT: u16 = 4;
+
+/// Build the single concatenated status string without
+/// rendering. Used both to size the status bar (via
+/// `Paragraph::line_count`) and to render it. Takes
+/// `&mut StatusBarState` because the cached short-cwd
+/// accessor is `&mut self`.
+fn format_status_text(state: &mut StatusBarState, transcript_scrolled: bool) -> String {
     let used_tokens = state
         .last_known_input_tokens
         .unwrap_or(state.estimated_context_tokens);
-    // `responding...` / `compacting Ns` used to live in the
-    // status bar as the leading char of the row. It moved to
-    // `render_spinner_row` so the activity indicator sits
-    // right above the input box (stable position, doesn't
-    // jitter into and out of the persistent info row).
-    let _ = agent_state;
-    // Resolve the cached cwd before the format!, since the
-    // shortened_cwd accessor takes &mut self and the
-    // remaining state reads inside format! are immutable.
     let short_cwd = state.shortened_cwd().to_string();
     // The mode segment lives between provider:model and the
     // thinking label so it stays visible even on narrow
@@ -2284,7 +2283,7 @@ fn render_status_bar(
     } else {
         String::new()
     };
-    let status = format!(
+    format!(
         " {}{}:{}{} │ thinking: {} │ {}/{}{} │ {}",
         if transcript_scrolled {
             "↑ history │ "
@@ -2299,12 +2298,30 @@ fn render_status_bar(
         format_tokens(state.context_window),
         archive_segment,
         short_cwd,
-    );
-    Paragraph::new(Line::from(Span::styled(
-        status,
+    )
+}
+
+/// Build the status-bar paragraph. Same shape every call —
+/// the only thing that varies between sizing and rendering
+/// is whether we're measuring or drawing.
+fn build_status_paragraph(text: String) -> Paragraph<'static> {
+    Paragraph::new(Span::styled(
+        text,
         Style::default().add_modifier(Modifier::DIM),
-    )))
-    .render(area, buf);
+    ))
+    .wrap(Wrap { trim: false })
+}
+
+/// Number of rows the status bar needs to render `text` at
+/// the given terminal `width`. Capped at
+/// [`MAX_STATUS_BAR_HEIGHT`] so a single overlong line
+/// can't claim half the screen on a narrow terminal.
+fn status_bar_height(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let measured = build_status_paragraph(text.to_string()).line_count(width) as u16;
+    measured.clamp(1, MAX_STATUS_BAR_HEIGHT)
 }
 
 /// Render the 1-row activity strip that sits directly above
