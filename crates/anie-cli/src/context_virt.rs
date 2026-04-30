@@ -1,15 +1,25 @@
 //! Context-virtualization policy.
 //!
-//! Phase C of `docs/rlm_2026-04-29/06_phased_implementation.md`.
+//! Phases C + D of
+//! `docs/rlm_2026-04-29/06_phased_implementation.md`.
 //!
 //! [`ContextVirtualizationPolicy`] is a [`BeforeModelPolicy`]
-//! that enforces a configurable active-context token ceiling.
-//! When the run's active context exceeds the ceiling, the
-//! policy evicts oldest messages — pinning the last N — until
-//! the surviving subset is under ceiling, archives the full
-//! snapshot to the shared [`ExternalContext`] store so the
-//! recurse tool can read evicted content, and returns
-//! `BeforeModelResponse::ReplaceMessages(survivors)`.
+//! that enforces a configurable active-context token ceiling
+//! AND injects a per-turn ledger telling the model what's
+//! externally available. When the run's active context
+//! exceeds the ceiling, the policy evicts oldest messages —
+//! pinning the last N — until the surviving subset is under
+//! ceiling, archives the full snapshot to the shared
+//! [`ExternalContext`] store so the recurse tool can read
+//! evicted content, builds a structured ledger summarizing
+//! the external state, and returns
+//! `BeforeModelResponse::ReplaceMessages(survivors + ledger)`.
+//!
+//! The ledger is a `User` message wrapped in
+//! `<system-reminder>` tags — universally compatible with
+//! every provider, recognized by the model as a system note
+//! rather than a user prompt. The previous turn's ledger is
+//! stripped before injecting a new one (no accumulation).
 //!
 //! Identity / dedup: messages are tracked by `timestamp`. The
 //! agent loop generates one message per `now_millis()`
@@ -20,20 +30,23 @@
 //!
 //! Default behavior: with `active_ceiling_tokens = u64::MAX`
 //! the policy is effectively a noop — it returns `Continue`
-//! on every call. The controller installs the policy in
-//! `--harness-mode=rlm`; default builds keep the noop policy.
+//! on every call (no ledger, no eviction). The controller
+//! installs the policy in `--harness-mode=rlm`; default
+//! builds keep the noop policy. Setting
+//! `ANIE_ACTIVE_CEILING_TOKENS` to a finite value turns on
+//! both eviction *and* ledger injection.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
 use anie_agent::{BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse};
-use anie_protocol::Message;
+use anie_protocol::{ContentBlock, Message, UserMessage, now_millis};
 use anie_session::estimate_tokens;
 use tokio::sync::RwLock;
 
-use crate::external_context::ExternalContext;
+use crate::external_context::{ExternalContext, MessageKindLabel};
 
 /// Extract a Message's timestamp, regardless of variant.
 fn message_timestamp(m: &Message) -> u64 {
@@ -78,6 +91,13 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// run-start snapshot so we never re-push the messages
     /// that were already in the store.
     pushed: Mutex<HashSet<u64>>,
+
+    /// Timestamp of the ledger message injected on the
+    /// previous fire, if any. Used to strip the stale ledger
+    /// out of `request.context` before computing the new one
+    /// so successive turns don't accumulate stale ledgers.
+    /// `None` until the policy injects its first ledger.
+    last_ledger_ts: Mutex<Option<u64>>,
 }
 
 impl ContextVirtualizationPolicy {
@@ -97,6 +117,7 @@ impl ContextVirtualizationPolicy {
             keep_last_n,
             external,
             pushed: Mutex::new(pushed),
+            last_ledger_ts: Mutex::new(None),
         }
     }
 
@@ -111,32 +132,41 @@ impl ContextVirtualizationPolicy {
 #[async_trait::async_trait]
 impl BeforeModelPolicy for ContextVirtualizationPolicy {
     async fn before_model(&self, request: BeforeModelRequest<'_>) -> BeforeModelResponse {
-        // Sum once up front; if we're already under ceiling,
-        // skip every other code path. This is the hot path
-        // for runs that don't need eviction.
-        let mut running_total: u64 = request
-            .context
-            .iter()
-            .map(estimate_tokens)
-            .fold(0u64, u64::saturating_add);
-        if running_total <= self.active_ceiling_tokens {
+        // Default-preserving fast path: with the ceiling at
+        // u64::MAX (the noop install) we don't archive, don't
+        // evict, and don't inject a ledger. Identical
+        // behavior to NoopBeforeModelPolicy. Operators flip
+        // this on by setting `ANIE_ACTIVE_CEILING_TOKENS`.
+        if self.active_ceiling_tokens == u64::MAX {
             return BeforeModelResponse::Continue;
         }
 
-        // Step 1: archive any messages whose timestamps we
-        // haven't seen before. The recurse tool reads from
-        // `external`; if we evict without archiving, the
-        // model loses the ability to recurse into that
-        // content.
-        //
-        // We hold the std::sync::Mutex guard alongside the
-        // tokio RwLock write guard; both releases happen
-        // before any `.await` in this function (there are
-        // none after this block), so the future stays Send.
+        // Step 1: strip the previous turn's ledger out of
+        // working. If we left it in, archiving would push
+        // stale ledgers into `external` and the model would
+        // see two ledgers (old + new) every turn.
+        let stale_ledger_ts = *self
+            .last_ledger_ts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut working: Vec<Message> = match stale_ledger_ts {
+            None => request.context.to_vec(),
+            Some(ts) => request
+                .context
+                .iter()
+                .filter(|m| message_timestamp(m) != ts)
+                .cloned()
+                .collect(),
+        };
+
+        // Step 2: archive any unseen messages to `external`
+        // so eviction is reversible via the recurse tool.
+        // Hold both guards within one sync block — no `.await`
+        // between acquire and drop — so the future stays Send.
         {
             let mut external = self.external.write().await;
             let mut pushed = self.pushed.lock().unwrap_or_else(|p| p.into_inner());
-            for m in request.context.iter() {
+            for m in &working {
                 let ts = message_timestamp(m);
                 if pushed.insert(ts) {
                     external.push(m.clone());
@@ -144,24 +174,102 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             }
         }
 
-        // Step 2: build the survivor list by FIFO-evicting
-        // from the front of the active context until we're
-        // under ceiling, never touching the pinned tail.
-        // Cheap incremental subtract avoids re-summing on
-        // every iteration.
-        let mut survivors: Vec<Message> = request.context.to_vec();
+        // Step 3: FIFO-evict from the front while over
+        // ceiling and outside the pinned tail.
+        let mut running_total: u64 = working
+            .iter()
+            .map(estimate_tokens)
+            .fold(0u64, u64::saturating_add);
         let mut idx = 0usize;
-        while running_total > self.active_ceiling_tokens && survivors.len() - idx > self.keep_last_n
+        while running_total > self.active_ceiling_tokens
+            && working.len().saturating_sub(idx) > self.keep_last_n
         {
-            let cost = estimate_tokens(&survivors[idx]);
+            let cost = estimate_tokens(&working[idx]);
             running_total = running_total.saturating_sub(cost);
             idx += 1;
         }
         if idx > 0 {
-            survivors.drain(..idx);
+            working.drain(..idx);
         }
 
-        BeforeModelResponse::ReplaceMessages(survivors)
+        // Step 4: build the ledger from current external
+        // state and append it. The ledger sits at the very
+        // end of working, right before the model generates,
+        // so it's maximally visible to the model.
+        let ledger = self.build_ledger(working.len()).await;
+        let ledger_ts = message_timestamp(&ledger);
+        working.push(ledger);
+
+        // Record the ledger timestamp so the next fire
+        // strips it. Also add to `pushed` so we don't
+        // archive it (the ledger isn't real conversational
+        // content; the recurse tool shouldn't surface it).
+        *self
+            .last_ledger_ts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(ledger_ts);
+        self.pushed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(ledger_ts);
+
+        BeforeModelResponse::ReplaceMessages(working)
+    }
+}
+
+impl ContextVirtualizationPolicy {
+    /// Build the structured ledger as a `User` message
+    /// wrapped in `<system-reminder>` tags. Counts come from
+    /// the shared `ExternalContext` indexes; tool-result
+    /// breakdown is sorted by frequency and capped at 8 names
+    /// to keep the ledger bounded (target ≤500 tokens).
+    async fn build_ledger(&self, active_len: usize) -> Message {
+        let lines = {
+            let external = self.external.read().await;
+            let total = external.len();
+            let evicted = total.saturating_sub(active_len);
+
+            let mut lines = vec![
+                "<system-reminder>".to_string(),
+                "external context — call the recurse tool to access evicted content".to_string(),
+                format!("- {total} total messages ({evicted} evicted, {active_len} active)"),
+            ];
+
+            // Tool-result breakdown by tool name. Walk the
+            // ToolResult ID list once, count per tool name.
+            let tool_result_ids = external.ids_by_kind(MessageKindLabel::ToolResult);
+            if !tool_result_ids.is_empty() {
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                for &id in tool_result_ids {
+                    if let Some(Message::ToolResult(t)) = external.get_by_id(id) {
+                        *counts.entry(t.tool_name.clone()).or_default() += 1;
+                    }
+                }
+                let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                let parts = sorted
+                    .iter()
+                    .take(8)
+                    .map(|(n, c)| format!("{n} x{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!(
+                    "- {} tool results: {}",
+                    tool_result_ids.len(),
+                    parts
+                ));
+            }
+
+            lines.push("</system-reminder>".to_string());
+            lines
+        };
+
+        Message::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: lines.join("\n"),
+            }],
+            timestamp: now_millis(),
+        })
     }
 }
 
@@ -244,16 +352,27 @@ mod tests {
         assert_eq!(response, BeforeModelResponse::Continue);
     }
 
-    /// Under the ceiling: `Continue`. Eviction is not
-    /// triggered for runs whose active context is small.
+    /// Finite ceiling, under-ceiling content: no eviction
+    /// happens but the policy still injects a ledger so the
+    /// model knows the recurse tool is available. The
+    /// originals come through unchanged; the ledger is
+    /// appended at the very end.
     #[tokio::test]
-    async fn under_ceiling_returns_continue() {
+    async fn under_ceiling_keeps_all_messages_and_appends_ledger() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
-        // 10-token ceiling, content is small.
+        // 10_000-token ceiling, content is tiny.
         let policy = ContextVirtualizationPolicy::new(10_000, 4, store, HashSet::new());
         let context = vec![user("hi", 1), assistant("hello", 2)];
         let response = policy.before_model(sample_request(&context)).await;
-        assert_eq!(response, BeforeModelResponse::Continue);
+
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        // 2 originals + 1 ledger.
+        assert_eq!(survivors.len(), 3);
+        assert_eq!(&survivors[..2], &context[..]);
+        assert!(is_ledger(&survivors[2]));
     }
 
     /// Over ceiling: evicts oldest first, pins the last N.
@@ -278,12 +397,14 @@ mod tests {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-        // Pinned tail: at least the last 3.
-        assert!(survivors.len() >= 3);
-        assert!(survivors.len() < context.len());
-        // The last 3 messages are the most-recent originals.
+        // Pinned tail (last 3 originals) + ledger at the
+        // very end.
+        assert!(is_ledger(survivors.last().expect("non-empty")));
         let n = context.len();
-        assert_eq!(&survivors[survivors.len() - 3..], &context[n - 3..]);
+        let originals = &survivors[..survivors.len() - 1];
+        assert!(originals.len() >= 3);
+        assert!(originals.len() < context.len());
+        assert_eq!(&originals[originals.len() - 3..], &context[n - 3..]);
     }
 
     /// Pinned tail itself exceeds the ceiling: the policy
@@ -304,10 +425,11 @@ mod tests {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-        // Exactly 5 survivors (the pinned tail). One was
-        // evicted.
-        assert_eq!(survivors.len(), 5);
-        assert_eq!(&survivors[..], &context[1..]);
+        // Exactly 5 originals (the pinned tail) + 1 ledger.
+        // One original was evicted from the front.
+        assert_eq!(survivors.len(), 6);
+        assert!(is_ledger(survivors.last().expect("non-empty")));
+        assert_eq!(&survivors[..5], &context[1..]);
     }
 
     /// Evicted messages are archived to `external`. After
@@ -373,11 +495,111 @@ mod tests {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-        // Last 2 pinned: tool_result(c2) + ack2 + third? No
-        // — keep_last_n=2 keeps the last 2 only.
-        assert!(survivors.len() >= 2);
-        assert_eq!(&survivors[survivors.len() - 2..], &context[5..]);
-        // External holds every original (archived).
+        // Pinned tail (last 2 originals) + ledger at the
+        // end. keep_last_n=2 keeps assistant("ack2") and
+        // user("third").
+        assert!(is_ledger(survivors.last().expect("non-empty")));
+        let originals = &survivors[..survivors.len() - 1];
+        assert!(originals.len() >= 2);
+        assert_eq!(&originals[originals.len() - 2..], &context[5..]);
+        // External holds every original (archived); the
+        // ledger itself is *not* archived, so length matches
+        // the input context.
         assert_eq!(store.read().await.len(), context.len());
+    }
+
+    /// Ledger does not accumulate across fires: each turn
+    /// strips the previous turn's ledger before injecting a
+    /// fresh one. After two fires the survivors should
+    /// contain exactly one ledger, not two.
+    #[tokio::test]
+    async fn ledger_replaced_each_turn_no_accumulation() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, store, HashSet::new());
+
+        // Fire 1: ledger appended.
+        let r1 = policy.before_model(sample_request(&context)).await;
+        let after_fire_1 = match r1 {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        assert_eq!(after_fire_1.len(), 4);
+        assert_eq!(after_fire_1.iter().filter(|m| is_ledger(m)).count(), 1);
+
+        // Fire 2: feed the post-fire-1 context back in (this
+        // is what the loop does — it persists the
+        // ReplaceMessages output as the new state).
+        let r2 = policy.before_model(sample_request(&after_fire_1)).await;
+        let after_fire_2 = match r2 {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        // Still exactly one ledger; old one was stripped.
+        assert_eq!(after_fire_2.len(), 4);
+        assert_eq!(after_fire_2.iter().filter(|m| is_ledger(m)).count(), 1);
+    }
+
+    /// Ledger reflects current external state: when external
+    /// holds N messages of various kinds, the ledger text
+    /// names the count and the tool-result breakdown.
+    #[tokio::test]
+    async fn ledger_reflects_external_state() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context = vec![
+            user("u0", 1),
+            tool_result("c1", "bash", "ls", 2),
+            tool_result("c2", "bash", "pwd", 3),
+            tool_result("c3", "read", "file", 4),
+            assistant("ack", 5),
+        ];
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, store, HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ledger_text = match survivors.last().expect("non-empty") {
+            Message::User(u) => match &u.content[0] {
+                ContentBlock::Text { text } => text.clone(),
+                _ => panic!("expected text"),
+            },
+            _ => panic!("expected User ledger"),
+        };
+        assert!(ledger_text.contains("<system-reminder>"));
+        assert!(ledger_text.contains("recurse tool"));
+        assert!(ledger_text.contains("5 total messages"));
+        assert!(ledger_text.contains("3 tool results"));
+        assert!(ledger_text.contains("bash x2"));
+        assert!(ledger_text.contains("read x1"));
+    }
+
+    /// Ledger is not archived to `external` — the recurse
+    /// tool surfaces conversational content, not policy
+    /// metadata. After a fire that injects a ledger, the
+    /// store size matches the input count exactly.
+    #[tokio::test]
+    async fn ledger_not_archived_to_external() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, Arc::clone(&store), HashSet::new());
+        let _ = policy.before_model(sample_request(&context)).await;
+        // External: 3 originals, 0 ledgers.
+        assert_eq!(store.read().await.len(), 3);
+    }
+
+    /// Helper: identifies our ledger messages. The wire
+    /// shape is `User` with a `<system-reminder>` opening
+    /// tag in the first text block; tests use this to find
+    /// the ledger inside survivors.
+    fn is_ledger(m: &Message) -> bool {
+        match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => text.starts_with("<system-reminder>"),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 }
