@@ -1810,28 +1810,39 @@ impl RlmExtras {
     }
 }
 
-/// Read the per-run active-context ceiling override from
-/// `ANIE_ACTIVE_CEILING_TOKENS`. Returns `u64::MAX` (the
-/// effective-noop ceiling) when unset or unparseable, which
-/// is the documented default that preserves existing
-/// behavior. When set, the policy enforces an active-context
-/// budget — the opt-in path Plan 06 Phase C calls out.
+/// Default active-context ceiling under `--harness-mode=rlm`.
+/// 16k tokens is Plan 06 Phase C's recommendation for small
+/// models — tight enough that long sessions actually trigger
+/// eviction, loose enough that ordinary multi-turn use never
+/// crosses it. Operators tune via `ANIE_ACTIVE_CEILING_TOKENS`.
+const DEFAULT_RLM_ACTIVE_CEILING_TOKENS: u64 = 16_384;
+
+/// Default pinned tail under `--harness-mode=rlm`. 6 messages
+/// ≈ 3 user-assistant turns; protects current-turn continuity
+/// even if the pinned tail itself exceeds the ceiling.
+const DEFAULT_RLM_KEEP_LAST_N: usize = 6;
+
+/// Read the per-run active-context ceiling. `--harness-mode=rlm`
+/// installs a finite default so the eviction + ledger +
+/// relevance pipeline runs out of the box (the user's request:
+/// the flag should make the feature *work*, not require a
+/// constellation of env vars). Override via
+/// `ANIE_ACTIVE_CEILING_TOKENS`. Set the env var to a very
+/// large value (e.g. 18446744073709551615) to opt out and
+/// restore the noop fast path.
 fn rlm_active_ceiling_tokens() -> u64 {
     std::env::var("ANIE_ACTIVE_CEILING_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(u64::MAX)
+        .unwrap_or(DEFAULT_RLM_ACTIVE_CEILING_TOKENS)
 }
 
 /// Read the keep-last-N override from `ANIE_KEEP_LAST_N`.
-/// Default `6` (≈3 turns × 2 messages each); large enough to
-/// cover a typical user prompt + assistant reply + tool
-/// result + the same again.
 fn rlm_keep_last_n() -> usize {
     std::env::var("ANIE_KEEP_LAST_N")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(6)
+        .unwrap_or(DEFAULT_RLM_KEEP_LAST_N)
 }
 
 /// Read the relevance-budget override from

@@ -64,9 +64,13 @@ pub struct Cli {
     /// Harness profile: `baseline` exposes no tools or
     /// compaction gate (model-only floor for measurement);
     /// `current` (default) is anie's existing behavior;
-    /// `rlm` enables context virtualization — installs the
-    /// `recurse` tool plus the active-context ceiling policy
-    /// (opt in to a budget via `ANIE_ACTIVE_CEILING_TOKENS`).
+    /// `rlm` turns on context virtualization end-to-end —
+    /// installs the `recurse` tool plus the active-context
+    /// ceiling, FIFO eviction, ledger injection, and
+    /// relevance-based paging-in. Defaults: 16k token
+    /// ceiling, last 6 messages pinned, ceiling/4 relevance
+    /// budget. Override via `ANIE_ACTIVE_CEILING_TOKENS`,
+    /// `ANIE_KEEP_LAST_N`, `ANIE_RELEVANCE_BUDGET_TOKENS`.
     /// Plan `docs/rlm_2026-04-29/07_evaluation_harness.md`.
     #[arg(long, value_enum, default_value_t = harness_mode::HarnessMode::default())]
     pub harness_mode: harness_mode::HarnessMode,
