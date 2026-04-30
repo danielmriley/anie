@@ -20,7 +20,7 @@ work lands.
 | [03 — RLM recurse intent (shape 2)](../03_recurse_intent.md) | TBD | deferred | — |
 | [04 — Native RLM compat (shape 3)](../04_native_rlm_compat.md) | TBD | speculative | — |
 | [05 — Passive context management](../05_passive_context_management.md) | TBD | absorbed into 06 | — |
-| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phases A + B + C + D landed; next: Phase E** | — |
+| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phases A–E landed; next: Phase F** | — |
 | [07 — Evaluation harness + mode flags](../07_evaluation_harness.md) | `dev_rlm` | partial (`--harness-mode` flag; scenarios deferred) | `8a162d3` |
 
 ## Phase status (Plan 06)
@@ -31,7 +31,7 @@ work lands.
 | B | indexed external store | **landed** | rlm/07 (`ec2ccb4`) |
 | C | active context ceiling + FIFO eviction | **landed** | rlm/08.1–08.3 (`11130da..7f741ec`) |
 | D | ledger injection | **landed** | rlm/09 (`7ef8ce9`) |
-| E | smart inclusion (relevance-based paging-in) | not started | — |
+| E | smart inclusion (relevance-based paging-in) | **landed** | rlm/10 (`2d4f6af`) |
 | F | background summarization for paged-out content | not started | — |
 
 ## Phase A sub-commit breakdown (rlm/01–06.3 on `dev_rlm`)
@@ -66,6 +66,12 @@ work lands.
 | Sub | What | Commit |
 |---|---|---|
 | 09 | per-turn ledger as `<system-reminder>`-tagged User message; stale ledger stripped before injecting next | `7ef8ce9` |
+
+## Phase E sub-commit breakdown (rlm/10 on `dev_rlm`)
+
+| Sub | What | Commit |
+|---|---|---|
+| 10 | keyword-overlap reranker pages relevant evicted content back in for the current turn; opt-in via `ANIE_RELEVANCE_BUDGET_TOKENS` (default ceiling/4) | `2d4f6af` |
 
 ## Ordering rationale
 
