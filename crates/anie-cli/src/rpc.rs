@@ -161,6 +161,11 @@ enum RpcEvent {
     TranscriptReplace { messages: Vec<Message> },
     #[serde(rename = "system")]
     System { text: String },
+    /// rlm policy fired and updated its external archive.
+    /// Additive on the wire — RPC consumers that don't
+    /// care about rlm internals can ignore this event.
+    #[serde(rename = "rlm_stats")]
+    RlmStats { archived_messages: u64 },
     #[serde(rename = "status")]
     Status {
         provider: String,
@@ -230,6 +235,9 @@ impl From<AgentEvent> for RpcEvent {
             },
             AgentEvent::TranscriptReplace { messages } => Self::TranscriptReplace { messages },
             AgentEvent::SystemMessage { text } => Self::System { text },
+            AgentEvent::RlmStatsUpdate { archived_messages } => {
+                Self::RlmStats { archived_messages }
+            }
             AgentEvent::StatusUpdate {
                 provider,
                 model_name,

@@ -196,6 +196,7 @@ fn ev_kind(e: &AgentEvent) -> &'static str {
         AgentEvent::ToolExecUpdate { .. } => "ToolExecUpdate",
         AgentEvent::TranscriptReplace { .. } => "TranscriptReplace",
         AgentEvent::SystemMessage { .. } => "SystemMessage",
+        AgentEvent::RlmStatsUpdate { .. } => "RlmStatsUpdate",
         AgentEvent::StatusUpdate { .. } => "StatusUpdate",
         AgentEvent::CompactionStart { .. } => "CompactionStart",
         AgentEvent::CompactionEnd { .. } => "CompactionEnd",

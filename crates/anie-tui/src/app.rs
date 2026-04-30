@@ -416,12 +416,21 @@ impl App {
         // the popup's lifecycle, and the set of commands is
         // already plumbed through `App::new` for pre-dispatch
         // validation.
-        let input_pane = if commands.is_empty() {
+        // Cross-session prompt history: anie persists every
+        // submitted prompt to ~/.anie/prompt_history. The
+        // input pane loads it on startup and appends on every
+        // submit, so Up arrow can walk back through prompts
+        // from earlier runs. Falls back to in-memory only if
+        // we can't determine HOME.
+        let mut input_pane = if commands.is_empty() {
             InputPane::new()
         } else {
             InputPane::new()
                 .with_autocomplete(Arc::new(CommandCompletionProvider::new(commands.clone())))
         };
+        if let Some(path) = anie_config::anie_prompt_history_path() {
+            input_pane = input_pane.with_history_path(path);
+        }
         Self {
             output_pane: OutputPane::new(),
             status_bar: StatusBarState::default(),
@@ -880,6 +889,9 @@ impl App {
             }
             AgentEvent::SystemMessage { text } => {
                 self.output_pane.add_system_message(text);
+            }
+            AgentEvent::RlmStatsUpdate { archived_messages } => {
+                self.status_bar.rlm_archived_messages = archived_messages;
             }
             AgentEvent::StatusUpdate {
                 provider,

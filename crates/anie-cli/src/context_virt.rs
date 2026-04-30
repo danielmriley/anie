@@ -425,15 +425,23 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             .unwrap_or_else(|p| p.into_inner())
             .insert(ledger_ts);
 
-        // Breadcrumb: when the policy did meaningful work
-        // (evicted from the active context or paged in
-        // relevance-scored content), surface a SystemMessage
-        // so the user sees the rlm pipeline working in the
-        // transcript. Skip the breadcrumb on no-op fires
-        // (under-ceiling, no candidates) — those would just
-        // flood the transcript.
-        if evicted_count > 0 || paged_in_count > 0 {
-            if let Some(tx) = &self.event_tx {
+        if let Some(tx) = &self.event_tx {
+            // Always emit a stats update so the status
+            // bar's `archive: N msgs` field tracks even
+            // turns where eviction didn't fire — the
+            // archive grows by 1+ messages every turn just
+            // from new assistant/tool content getting
+            // pushed into it.
+            let _ = tx
+                .send(AgentEvent::RlmStatsUpdate {
+                    archived_messages: archived_total as u64,
+                })
+                .await;
+            // Breadcrumb: only on meaningful work
+            // (evicted_count > 0 OR paged_in_count > 0). No-op
+            // fires (under-ceiling, no candidates) would
+            // otherwise flood the transcript.
+            if evicted_count > 0 || paged_in_count > 0 {
                 let _ = tx
                     .send(AgentEvent::SystemMessage {
                         text: format_breadcrumb(evicted_count, paged_in_count, archived_total),

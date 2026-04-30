@@ -41,6 +41,13 @@ struct CachedLayout {
     cursor_visual: (u16, u16),
 }
 
+/// Maximum prompt-history entries kept on disk. The whole
+/// history is held in memory while the pane is alive; the
+/// cap keeps memory + load time bounded for users who run
+/// anie for years. Older entries are dropped when the cap
+/// is exceeded.
+pub const MAX_PROMPT_HISTORY_ENTRIES: usize = 1_000;
+
 /// Multi-line input editor with simple history support.
 pub struct InputPane {
     content: String,
@@ -50,6 +57,12 @@ pub struct InputPane {
     saved_content: Option<String>,
     autocomplete: Option<AutocompleteState>,
     cached_layout: Option<CachedLayout>,
+    /// Optional path to the on-disk prompt-history file. When
+    /// `Some`, every successful submit appends a JSON-encoded
+    /// line. Loaded once at construction. `None` for tests +
+    /// for runs without a usable HOME (history is in-memory
+    /// only).
+    history_path: Option<std::path::PathBuf>,
     /// Test-only counter incremented every time
     /// `layout_lines_uncached` actually runs (i.e., a cache
     /// miss). Used by the dedupe regression tests to assert
@@ -71,9 +84,27 @@ impl InputPane {
             saved_content: None,
             autocomplete: None,
             cached_layout: None,
+            history_path: None,
             #[cfg(test)]
             layout_misses: std::cell::Cell::new(0),
         }
+    }
+
+    /// Bind a path for cross-session prompt history. On call,
+    /// reads the file (if it exists) and seeds `self.history`
+    /// with up to `MAX_PROMPT_HISTORY_ENTRIES` of the most
+    /// recent entries. Subsequent submits append to the file.
+    /// Read errors are logged-and-ignored — a missing or
+    /// malformed history file should never block startup.
+    #[must_use]
+    pub fn with_history_path(mut self, path: std::path::PathBuf) -> Self {
+        if let Ok(loaded) = load_history_file(&path) {
+            // Cap at MAX entries; keep the most recent.
+            let start = loaded.len().saturating_sub(MAX_PROMPT_HISTORY_ENTRIES);
+            self.history = loaded.into_iter().skip(start).collect();
+        }
+        self.history_path = Some(path);
+        self
     }
 
     /// Attach an autocomplete provider. Without this, the pane
@@ -404,7 +435,17 @@ impl InputPane {
         if content.trim().is_empty() {
             return InputAction::None;
         }
-        self.history.push(content.clone());
+        // Bash-style "ignoredups": skip the in-memory push +
+        // disk append when the new entry equals the most
+        // recent one. Avoids a long Up-arrow walk through
+        // duplicates after the user retries the same prompt.
+        let is_dup = self.history.last() == Some(&content);
+        if !is_dup {
+            self.history.push(content.clone());
+            if let Some(path) = &self.history_path {
+                let _ = append_history_entry(path, &content);
+            }
+        }
         self.content.clear();
         self.cursor = 0;
         self.history_index = None;
@@ -828,6 +869,52 @@ impl Default for InputPane {
     }
 }
 
+/// Read a JSON-lines prompt-history file. Each line is a
+/// JSON-encoded string (so embedded newlines + quotes
+/// survive). Malformed lines are skipped with a tracing
+/// warning rather than aborting load — partial recovery is
+/// strictly better than refusing to start.
+fn load_history_file(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut entries = Vec::new();
+    for (lineno, line) in raw.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<String>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    file = %path.display(),
+                    line = lineno + 1,
+                    "skipping malformed prompt-history entry"
+                );
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Append a single prompt to the history file as a
+/// JSON-encoded line. Best-effort: parent dir creation
+/// failures and write failures are logged and ignored — the
+/// in-memory history still works for the current session.
+fn append_history_entry(path: &std::path::Path, entry: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::to_string(entry)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
 fn previous_boundary(content: &str, cursor: usize) -> Option<usize> {
     if cursor == 0 {
         return None;
@@ -885,6 +972,119 @@ mod tests {
 
     fn type_char(pane: &mut InputPane, ch: char) {
         let _ = pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+
+    fn submit_text(pane: &mut InputPane, text: &str) {
+        for ch in text.chars() {
+            type_char(pane, ch);
+        }
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Up arrow walks back through the full submitted-prompt
+    /// history. Verifies the user-reported issue: pressing Up
+    /// repeatedly should reach every prior prompt, not stop
+    /// after one.
+    #[test]
+    fn up_arrow_walks_full_history_back_to_oldest() {
+        let mut pane = InputPane::new();
+        submit_text(&mut pane, "first");
+        submit_text(&mut pane, "second");
+        submit_text(&mut pane, "third");
+
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "third");
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "second");
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "first");
+        // One more press: clamps at the oldest.
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "first");
+    }
+
+    /// Submitting the same prompt twice in a row only stores
+    /// it once (bash-style HISTCONTROL=ignoredups). Avoids a
+    /// long Up-arrow walk through duplicates after a retry.
+    #[test]
+    fn duplicate_consecutive_submits_collapse() {
+        let mut pane = InputPane::new();
+        submit_text(&mut pane, "hello");
+        submit_text(&mut pane, "hello");
+        submit_text(&mut pane, "world");
+        // History: ["hello", "world"], not three entries.
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "world");
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "hello");
+        // No third entry — Up clamps at "hello".
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "hello");
+    }
+
+    /// Cross-session persistence: prompts submitted in one
+    /// `InputPane` reach a fresh pane bound to the same
+    /// history file via Up arrow.
+    #[test]
+    fn history_persists_across_panes_via_history_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let history_path = tmp.path().join("prompt_history");
+
+        // Session 1: submit two prompts.
+        {
+            let mut pane = InputPane::new().with_history_path(history_path.clone());
+            submit_text(&mut pane, "old prompt");
+            submit_text(&mut pane, "newer prompt");
+        }
+
+        // Session 2: fresh pane, same path.
+        let mut pane = InputPane::new().with_history_path(history_path);
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "newer prompt");
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), "old prompt");
+    }
+
+    /// Prompts containing newlines and quotes round-trip
+    /// through the JSON-encoded history file without
+    /// corruption.
+    #[test]
+    fn history_file_preserves_special_characters() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let history_path = tmp.path().join("prompt_history");
+
+        let tricky = "line one\nline \"two\"\n\nwith blanks";
+        {
+            let mut pane = InputPane::new().with_history_path(history_path.clone());
+            submit_text(&mut pane, tricky);
+        }
+
+        let mut pane = InputPane::new().with_history_path(history_path);
+        let _ = pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pane.content(), tricky);
+    }
+
+    /// Loading from disk respects MAX_PROMPT_HISTORY_ENTRIES:
+    /// only the most recent N entries are seeded into memory
+    /// even if the file holds more.
+    #[test]
+    fn history_file_load_caps_at_max_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let history_path = tmp.path().join("prompt_history");
+
+        // Pre-write MAX + 5 entries directly to the file.
+        let mut contents = String::new();
+        for i in 0..(MAX_PROMPT_HISTORY_ENTRIES + 5) {
+            contents.push_str(&format!("\"entry{i}\"\n"));
+        }
+        std::fs::write(&history_path, contents).expect("write");
+
+        let pane = InputPane::new().with_history_path(history_path);
+        assert_eq!(pane.history.len(), MAX_PROMPT_HISTORY_ENTRIES);
+        // Most-recent kept: the last entry should be the
+        // very last one we wrote.
+        let expected_last = format!("entry{}", MAX_PROMPT_HISTORY_ENTRIES + 4);
+        assert_eq!(pane.history.last().unwrap(), &expected_last);
     }
 
     /// Autocomplete now fires synchronously — every keystroke

@@ -386,6 +386,7 @@ fn event_kinds(events: &[AgentEvent]) -> Vec<&'static str> {
             AgentEvent::ToolExecEnd { .. } => "ToolExecEnd",
             AgentEvent::TranscriptReplace { .. } => "TranscriptReplace",
             AgentEvent::SystemMessage { .. } => "SystemMessage",
+            AgentEvent::RlmStatsUpdate { .. } => "RlmStatsUpdate",
             AgentEvent::StatusUpdate { .. } => "StatusUpdate",
             AgentEvent::CompactionStart { .. } => "CompactionStart",
             AgentEvent::CompactionEnd { .. } => "CompactionEnd",

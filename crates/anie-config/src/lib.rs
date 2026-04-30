@@ -428,6 +428,16 @@ pub fn anie_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".anie"))
 }
 
+/// Return `~/.anie/prompt_history` — append-only record of
+/// every prompt the user has submitted across sessions, used
+/// by the input pane's Up/Down recall (analogous to bash's
+/// `~/.bash_history`). One JSON-encoded string per line so
+/// embedded newlines + quotes survive round-trips.
+#[must_use]
+pub fn anie_prompt_history_path() -> Option<PathBuf> {
+    anie_dir().map(|dir| dir.join("prompt_history"))
+}
+
 /// Atomically write `contents` to `path`.
 ///
 /// Three guarantees, in order of strength:

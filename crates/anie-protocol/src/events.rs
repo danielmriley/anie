@@ -66,6 +66,12 @@ pub enum AgentEvent {
     TranscriptReplace { messages: Vec<Message> },
     /// A neutral controller-originated message for transcript display.
     SystemMessage { text: String },
+    /// rlm policy fired and updated its external archive.
+    /// The TUI listens for these to refresh just the
+    /// `archive: N msgs` segment of the status bar without
+    /// needing a full `StatusUpdate` (which the controller
+    /// only emits at user-action boundaries).
+    RlmStatsUpdate { archived_messages: u64 },
     /// Status-bar state changed outside provider-stream events.
     StatusUpdate {
         provider: String,
