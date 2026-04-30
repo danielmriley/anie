@@ -378,12 +378,19 @@ fn compose_system_prompt_only_augments_in_rlm_mode() {
         "message_grep should be recommended before tool_result; \
          positions {grep_pos} vs {tool_result_pos}"
     );
-    // Augment warns against id fabrication explicitly —
-    // a real-world failure mode observed during smoke
-    // testing.
+    // Augment warns against passing the literal `(id=...)`
+    // string as a tool_call_id — a real failure mode
+    // observed where qwen3.5:9b passed `[id=foo]` verbatim
+    // as the id. The augment now spells out the format
+    // unambiguously.
     assert!(
-        composed.contains("do NOT invent ids"),
-        "augment should warn against id fabrication: {composed}"
+        composed.contains("Never pass the parens or the literal string"),
+        "augment should warn against passing `(id=...)` literally: {composed}"
+    );
+    // And gives a concrete example of the entry format.
+    assert!(
+        composed.contains("(id=ollama_tool_call_8_2)"),
+        "augment should include a concrete entry example: {composed}"
     );
 }
 

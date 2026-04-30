@@ -638,10 +638,16 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> V
             .unwrap_or("args");
         let total = args.len();
         let display = total.min(TOOL_CALL_DISPLAY_CAP);
+        // Format: `<value> (id=<tool_call_id>)`. Value
+        // first because that's what the model needs to match
+        // against the user's question. The `(id=...)` suffix
+        // is the recurse-tool reference. Earlier `[id=X] Y`
+        // was misread as "the value is `[id=X]`" — qwen3.5:9b
+        // was passing the bracketed string as a tool_call_id.
         let rendered: Vec<String> = args
             .iter()
             .take(display)
-            .map(|e| format!("[id={}] {}", e.tool_call_id, e.arg_value))
+            .map(|e| format!("{} (id={})", e.arg_value, e.tool_call_id))
             .collect();
         let suffix = if total > display {
             format!(", +{} more", total - display)
@@ -824,7 +830,8 @@ impl ContextVirtualizationPolicy {
                 "    by keyword. Easiest option; needs no id.".to_string(),
                 "  - `scope.kind=tool_result`, `tool_call_id=<id>` — fetch one prior result"
                     .to_string(),
-                "    verbatim. Use the exact `[id=...]` value listed below.".to_string(),
+                "    verbatim. Each ledger entry is `<value> (id=<call_id>)`; pass the".to_string(),
+                "    `<call_id>` (without the surrounding parens) as the tool_call_id.".to_string(),
                 "  - `scope.kind=summary`, `id=<archive_id>` — fetch the gist. Cheapest."
                     .to_string(),
                 "Re-running a tool whose output is already archived wastes user time.".to_string(),
@@ -1678,13 +1685,12 @@ mod tests {
             "expected +4 more suffix when 12 entries against cap 8: {line}"
         );
         // First 8 entries appear with their ids; entry #9
-        // (page8 / tc_8) does not.
-        assert!(line.contains("[id=tc_0]"));
-        assert!(line.contains("page0"));
-        assert!(line.contains("[id=tc_7]"));
-        assert!(line.contains("page7"));
+        // (page8 / tc_8) does not. New format is
+        // `<value> (id=<call_id>)`.
+        assert!(line.contains("page0 (id=tc_0)"));
+        assert!(line.contains("page7 (id=tc_7)"));
         assert!(!line.contains("page8"));
-        assert!(!line.contains("[id=tc_8]"));
+        assert!(!line.contains("(id=tc_8)"));
     }
 
     /// New test: the rendered ledger lines surface the
@@ -1707,10 +1713,10 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
         assert!(
-            line.contains("[id=ollama_tool_call_8_2] https://weather.gov/Tallahassee"),
-            "id should appear right before its arg: {line}"
+            line.contains("https://weather.gov/Tallahassee (id=ollama_tool_call_8_2)"),
+            "value should be first, id in parens after: {line}"
         );
-        assert!(line.contains("[id=ollama_tool_call_8_3] https://weather.com/Tifton"));
+        assert!(line.contains("https://weather.com/Tifton (id=ollama_tool_call_8_3)"));
     }
 
     /// Phase F reranker integration: when an evicted
