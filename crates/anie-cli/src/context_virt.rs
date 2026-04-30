@@ -454,6 +454,124 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
     }
 }
 
+/// Maps known tool names to (label_for_ledger,
+/// arg_field_name). Tools not listed here get a generic
+/// "args" label and the entire arguments JSON is shown.
+/// The label is the plural noun the ledger uses to
+/// describe the values (`web_read targets: a, b, c`).
+const TOOL_CALL_KEYS: &[(&str, &str, &str)] = &[
+    ("web_read", "targets", "url"),
+    ("web_search", "queries", "query"),
+    ("bash", "commands", "command"),
+    ("read", "paths", "path"),
+    ("edit", "paths", "path"),
+    ("write", "paths", "path"),
+];
+
+/// Maximum displayed identity entries per tool. The ledger
+/// has a soft 500-token target; even at 8 URL strings × ~80
+/// chars × 6 tool kinds we stay well under.
+const TOOL_CALL_DISPLAY_CAP: usize = 8;
+
+/// Maximum length of a single ledger entry (URL, query,
+/// command). Anything longer gets truncated with an
+/// ellipsis. Keeps very long URLs from blowing past the
+/// ledger budget.
+const TOOL_CALL_ENTRY_MAX_CHARS: usize = 80;
+
+/// Walk the external archive's Assistant messages and
+/// return a per-tool list of unique meaningful arg values
+/// (URLs, queries, commands, paths). Used by `build_ledger`
+/// to surface tool-call identity to the model.
+fn collect_tool_call_summary(external: &ExternalContext) -> Vec<(String, Vec<String>)> {
+    let assistant_ids = external.ids_by_kind(MessageKindLabel::Assistant);
+    let mut by_tool: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+    for &id in assistant_ids {
+        let Some(Message::Assistant(a)) = external.get_by_id(id) else {
+            continue;
+        };
+        for block in &a.content {
+            let ContentBlock::ToolCall(call) = block else {
+                continue;
+            };
+            let arg_value = tool_call_arg_value(&call.name, &call.arguments);
+            let Some(arg_value) = arg_value else {
+                continue;
+            };
+            let truncated = truncate_for_ledger(&arg_value, TOOL_CALL_ENTRY_MAX_CHARS);
+            let dedupe = seen.entry(call.name.clone()).or_default();
+            if dedupe.insert(truncated.clone()) {
+                by_tool
+                    .entry(call.name.clone())
+                    .or_default()
+                    .push(truncated);
+            }
+        }
+    }
+    let mut out: Vec<(String, Vec<String>)> = by_tool.into_iter().collect();
+    // Stable display order: alphabetical by tool name.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Extract the meaningful single-string arg from a tool
+/// call's JSON arguments based on the tool name. Returns
+/// `None` for tools we don't recognize or for malformed
+/// arguments.
+fn tool_call_arg_value(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+    let field = TOOL_CALL_KEYS
+        .iter()
+        .find(|(name, _, _)| *name == tool_name)
+        .map(|(_, _, field)| *field)?;
+    arguments
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Truncate a string to `max_chars` characters (Unicode
+/// code points), appending "…" if truncated.
+fn truncate_for_ledger(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut buf: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    buf.push('…');
+    buf
+}
+
+/// Render `(tool_name, args)` pairs into ledger lines like
+/// `- web_read targets: foo, bar, baz`. Empty input yields
+/// no lines so the ledger stays compact when nothing has
+/// been called yet.
+fn render_tool_call_summary_lines(summary: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (tool_name, args) in summary {
+        if args.is_empty() {
+            continue;
+        }
+        let label = TOOL_CALL_KEYS
+            .iter()
+            .find(|(name, _, _)| *name == tool_name.as_str())
+            .map(|(_, label, _)| *label)
+            .unwrap_or("args");
+        let total = args.len();
+        let display = total.min(TOOL_CALL_DISPLAY_CAP);
+        let head: Vec<&str> = args.iter().take(display).map(String::as_str).collect();
+        let suffix = if total > display {
+            format!(", +{} more", total - display)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "- {tool_name} {label}: {}{suffix}",
+            head.join(", ")
+        ));
+    }
+    lines
+}
+
 /// Render the per-fire breadcrumb shown in the transcript
 /// when the rlm policy does meaningful work. Compact,
 /// single-line; the user reads this to confirm "yes, the
@@ -597,6 +715,19 @@ impl ContextVirtualizationPolicy {
                 ));
             }
 
+            // Tool-call identity summary (URLs / queries /
+            // commands / paths). Without this the model can
+            // see "I have 6 web_read results" but not "I
+            // already fetched engineering.fyi/codex-harness"
+            // — and re-issues the same fetch when the
+            // result text was evicted. With it, the model
+            // can short-circuit duplicate work directly from
+            // the ledger.
+            let summary = collect_tool_call_summary(&external);
+            for line in render_tool_call_summary_lines(&summary) {
+                lines.push(line);
+            }
+
             lines.push("</system-reminder>".to_string());
             lines
         };
@@ -614,9 +745,31 @@ impl ContextVirtualizationPolicy {
 mod tests {
     use super::*;
     use anie_protocol::{
-        AssistantMessage, ContentBlock, Message, StopReason, ToolResultMessage, Usage, UserMessage,
+        AssistantMessage, ContentBlock, Message, StopReason, ToolCall, ToolResultMessage, Usage,
+        UserMessage,
     };
     use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat};
+
+    /// Build an Assistant message that issues `tool_name`
+    /// with the given JSON arguments. Used by the ledger
+    /// enrichment tests to populate the archive with
+    /// tool-call identity info the model would have seen.
+    fn assistant_with_tool_call(tool_name: &str, arguments: serde_json::Value, ts: u64) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: format!("call_{ts}"),
+                name: tool_name.into(),
+                arguments,
+            })],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider: "test".into(),
+            model: "test".into(),
+            timestamp: ts,
+            reasoning_details: None,
+        })
+    }
 
     fn user(text: &str, ts: u64) -> Message {
         Message::User(UserMessage {
@@ -1200,5 +1353,163 @@ mod tests {
             ledger_text.contains("paged in for this turn"),
             "expected paged-in count in ledger: {ledger_text}"
         );
+    }
+
+    /// Tool-call summary appears in the ledger so the model
+    /// can see which URLs / queries / commands have already
+    /// been issued and avoid duplicate fetches. This is the
+    /// fix for the user-reported re-read loop.
+    #[test]
+    fn collect_tool_call_summary_lists_urls_queries_commands_paths() {
+        let store = ExternalContext::from_messages(vec![
+            assistant_with_tool_call(
+                "web_read",
+                serde_json::json!({"url": "https://engineering.fyi/codex-harness"}),
+                1,
+            ),
+            assistant_with_tool_call(
+                "web_read",
+                serde_json::json!({"url": "https://deepwiki.com/opencode/2.4"}),
+                2,
+            ),
+            // Duplicate URL — should not appear twice.
+            assistant_with_tool_call(
+                "web_read",
+                serde_json::json!({"url": "https://engineering.fyi/codex-harness"}),
+                3,
+            ),
+            assistant_with_tool_call(
+                "web_search",
+                serde_json::json!({"query": "Codex agent loop architecture"}),
+                4,
+            ),
+            assistant_with_tool_call(
+                "bash",
+                serde_json::json!({"command": "cargo test --workspace"}),
+                5,
+            ),
+            assistant_with_tool_call("read", serde_json::json!({"path": "src/main.rs"}), 6),
+        ]);
+
+        let summary = collect_tool_call_summary(&store);
+        let summary_map: HashMap<String, Vec<String>> = summary.into_iter().collect();
+
+        assert_eq!(
+            summary_map.get("web_read").map(Vec::as_slice),
+            Some(
+                &[
+                    "https://engineering.fyi/codex-harness".to_string(),
+                    "https://deepwiki.com/opencode/2.4".to_string(),
+                ][..]
+            ),
+            "web_read URLs should be deduplicated and ordered"
+        );
+        assert_eq!(
+            summary_map.get("web_search").map(Vec::as_slice),
+            Some(&["Codex agent loop architecture".to_string()][..])
+        );
+        assert_eq!(
+            summary_map.get("bash").map(Vec::as_slice),
+            Some(&["cargo test --workspace".to_string()][..])
+        );
+        assert_eq!(
+            summary_map.get("read").map(Vec::as_slice),
+            Some(&["src/main.rs".to_string()][..])
+        );
+    }
+
+    /// `truncate_for_ledger` shortens overlong values + adds
+    /// the ellipsis so a single 500-char URL doesn't blow
+    /// past the ledger token target.
+    #[test]
+    fn truncate_for_ledger_caps_long_values() {
+        let s = "a".repeat(200);
+        let truncated = truncate_for_ledger(&s, 80);
+        assert_eq!(truncated.chars().count(), 80);
+        assert!(truncated.ends_with('…'));
+        // Short values pass through unchanged.
+        assert_eq!(truncate_for_ledger("short", 80), "short");
+    }
+
+    /// Ledger output includes the URL/query lines so the
+    /// model can see what's already been fetched.
+    #[tokio::test]
+    async fn ledger_includes_tool_call_identities() {
+        let store = ExternalContext::from_messages(vec![
+            user("question about codex", 100),
+            assistant_with_tool_call(
+                "web_read",
+                serde_json::json!({"url": "https://engineering.fyi/codex"}),
+                101,
+            ),
+            tool_result("c1", "web_read", "page contents", 102),
+            assistant_with_tool_call(
+                "web_search",
+                serde_json::json!({"query": "Codex architecture"}),
+                103,
+            ),
+        ]);
+        let store = Arc::new(RwLock::new(store));
+
+        // Use under-ceiling pipeline; ledger is built either
+        // way. Pre-populate `pushed` so we don't re-archive.
+        let pushed: HashSet<u64> = (100..=103).collect();
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), pushed);
+        let context = vec![user("follow-up about codex", 200)];
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ledger_text = survivors
+            .iter()
+            .find_map(|m| {
+                if is_ledger(m) {
+                    user_text(m).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .expect("ledger present");
+
+        assert!(
+            ledger_text.contains("web_read targets:"),
+            "ledger should list web_read URLs: {ledger_text}"
+        );
+        assert!(
+            ledger_text.contains("https://engineering.fyi/codex"),
+            "ledger should include the actual URL: {ledger_text}"
+        );
+        assert!(
+            ledger_text.contains("web_search queries:"),
+            "ledger should list web_search queries: {ledger_text}"
+        );
+        assert!(
+            ledger_text.contains("Codex architecture"),
+            "ledger should include the query text: {ledger_text}"
+        );
+    }
+
+    /// Ledger caps each tool's identity list at
+    /// `TOOL_CALL_DISPLAY_CAP` and reports overflow with a
+    /// "+N more" suffix. Keeps the ledger bounded even when
+    /// the agent has fired hundreds of tool calls.
+    #[test]
+    fn render_tool_call_summary_truncates_with_more_suffix() {
+        let urls: Vec<String> = (0..12)
+            .map(|i| format!("https://example.com/page{i}"))
+            .collect();
+        let summary = vec![("web_read".to_string(), urls)];
+        let lines = render_tool_call_summary_lines(&summary);
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(
+            line.contains("+4 more"),
+            "expected +4 more suffix when 12 entries against cap 8: {line}"
+        );
+        // First 8 entries appear; entry #9 (page8) does not.
+        assert!(line.contains("page0"));
+        assert!(line.contains("page7"));
+        assert!(!line.contains("page8"));
     }
 }
