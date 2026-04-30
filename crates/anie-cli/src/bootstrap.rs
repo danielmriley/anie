@@ -109,6 +109,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: cli.harness_mode,
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {

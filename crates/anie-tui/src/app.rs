@@ -312,6 +312,11 @@ pub struct StatusBarState {
     /// Rendered in the status bar so the user always knows
     /// which profile they're running.
     pub harness_mode: String,
+    /// Total messages in the rlm policy's external archive.
+    /// Updated by the policy after every fire; the status
+    /// bar renders it in rlm mode so the user has an
+    /// ambient signal that virtualization is working.
+    pub rlm_archived_messages: u64,
     /// Cached shortened cwd for the status bar. Recomputed
     /// only when `cwd` changes between paints — avoids the
     /// `env::var` + `Vec` allocation that used to fire on
@@ -332,6 +337,7 @@ impl Default for StatusBarState {
             context_window: 0,
             cwd: String::new(),
             harness_mode: String::new(),
+            rlm_archived_messages: 0,
             cached_short_cwd: None,
         }
     }
@@ -881,6 +887,7 @@ impl App {
                 cwd,
                 session_id,
                 harness_mode,
+                rlm_archived_messages,
             } => {
                 self.status_bar.provider_name = provider;
                 self.status_bar.model_name = model_name;
@@ -890,6 +897,7 @@ impl App {
                 self.status_bar.context_window = context_window;
                 self.status_bar.cwd = cwd;
                 self.status_bar.harness_mode = harness_mode;
+                self.status_bar.rlm_archived_messages = rlm_archived_messages;
                 self.status_bar.last_known_input_tokens = None;
             }
             AgentEvent::CompactionStart { phase } => {
@@ -2266,8 +2274,18 @@ fn render_status_bar(
     } else {
         format!(" │ mode: {}", state.harness_mode)
     };
+    // In rlm mode, surface the size of the policy's
+    // external archive so the user has an ambient signal
+    // that virtualization is doing work — the number
+    // grows as the conversation progresses, even before
+    // the active context crosses the ceiling.
+    let archive_segment = if state.harness_mode == "rlm" {
+        format!(" │ archive: {} msgs", state.rlm_archived_messages)
+    } else {
+        String::new()
+    };
     let status = format!(
-        " {}{}:{}{} │ thinking: {} │ {}/{} │ {}",
+        " {}{}:{}{} │ thinking: {} │ {}/{}{} │ {}",
         if transcript_scrolled {
             "↑ history │ "
         } else {
@@ -2279,6 +2297,7 @@ fn render_status_bar(
         state.thinking,
         format_tokens(used_tokens),
         format_tokens(state.context_window),
+        archive_segment,
         short_cwd,
     );
     Paragraph::new(Line::from(Span::styled(

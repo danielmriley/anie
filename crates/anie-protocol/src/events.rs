@@ -79,6 +79,14 @@ pub enum AgentEvent {
         /// Surfaces in the TUI status bar so the user always
         /// knows which profile they're running.
         harness_mode: String,
+        /// Total messages currently in the rlm external store
+        /// (the archive the recurse tool reads from). Updated
+        /// by the policy after every fire. `0` outside rlm
+        /// mode. The TUI shows this so the user has an
+        /// ambient signal that the virtualization is doing
+        /// work (the count grows as the conversation
+        /// progresses).
+        rlm_archived_messages: u64,
     },
     /// Context compaction has started.
     CompactionStart {

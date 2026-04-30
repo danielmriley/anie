@@ -85,6 +85,7 @@ fn apply_status_event(status_bar: &mut anie_tui::StatusBarState, event: &AgentEv
         cwd,
         session_id,
         harness_mode,
+        rlm_archived_messages,
     } = event
     {
         status_bar.provider_name = provider.clone();
@@ -94,6 +95,7 @@ fn apply_status_event(status_bar: &mut anie_tui::StatusBarState, event: &AgentEv
         status_bar.context_window = *context_window;
         status_bar.cwd = cwd.clone();
         status_bar.harness_mode = harness_mode.clone();
+        status_bar.rlm_archived_messages = *rlm_archived_messages;
         status_bar.session_id = session_id.clone();
     }
 }

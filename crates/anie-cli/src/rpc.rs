@@ -174,6 +174,9 @@ enum RpcEvent {
         /// Additive on the wire — existing consumers that
         /// don't unpack this field are unaffected.
         harness_mode: String,
+        /// rlm policy's external archive size. Additive on
+        /// the wire; 0 outside rlm mode.
+        rlm_archived_messages: u64,
     },
     #[serde(rename = "compaction_start")]
     CompactionStart {
@@ -236,6 +239,7 @@ impl From<AgentEvent> for RpcEvent {
                 cwd,
                 session_id,
                 harness_mode,
+                rlm_archived_messages,
             } => Self::Status {
                 provider,
                 model: model_name,
@@ -245,6 +249,7 @@ impl From<AgentEvent> for RpcEvent {
                 cwd,
                 session_id,
                 harness_mode,
+                rlm_archived_messages,
             },
             AgentEvent::CompactionStart { phase } => Self::CompactionStart {
                 phase: phase.into(),

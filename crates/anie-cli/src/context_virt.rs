@@ -49,13 +49,16 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anie_agent::{BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse};
-use anie_protocol::{ContentBlock, Message, UserMessage, now_millis};
+use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
 use anie_session::estimate_tokens;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::external_context::{ExternalContext, MessageKindLabel};
 
@@ -253,6 +256,20 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// so successive turns don't accumulate stale ledgers.
     /// `None` until the policy injects its first ledger.
     last_ledger_ts: Mutex<Option<u64>>,
+
+    /// Optional sender for per-fire breadcrumbs to the user.
+    /// Set by the controller when building the policy so
+    /// eviction / paging events surface as `SystemMessage`s
+    /// in the transcript. `None` in tests where we exercise
+    /// the policy directly.
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+
+    /// Externally-readable snapshot of `external.len()`
+    /// after the most recent fire. The status bar reads
+    /// this without taking the `RwLock`, so the user can
+    /// see the archive growing in rlm mode without paying
+    /// for synchronization on every render.
+    external_size: Arc<AtomicUsize>,
 }
 
 impl ContextVirtualizationPolicy {
@@ -275,7 +292,28 @@ impl ContextVirtualizationPolicy {
             external,
             pushed: Mutex::new(pushed),
             last_ledger_ts: Mutex::new(None),
+            event_tx: None,
+            external_size: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Attach an event sender so the policy can emit user-
+    /// visible breadcrumbs (`SystemMessage`s) when eviction
+    /// or paging fires. The controller calls this after
+    /// constructing the policy.
+    pub(crate) fn with_event_sender(mut self, tx: mpsc::Sender<AgentEvent>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Replace the policy's internal external-size atomic
+    /// with a controller-owned one, so the status bar can
+    /// observe `external.len()` across runs without
+    /// re-plumbing per-run handles. The atomic is updated
+    /// after every successful fire.
+    pub(crate) fn with_external_size_atomic(mut self, atomic: Arc<AtomicUsize>) -> Self {
+        self.external_size = atomic;
+        self
     }
 
     /// Convenience: build the pushed-timestamps set from a
@@ -320,7 +358,10 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         // so eviction is reversible via the recurse tool.
         // Hold both guards within one sync block — no `.await`
         // between acquire and drop — so the future stays Send.
-        {
+        // Capture the post-archive size so the status-bar
+        // atomic + the breadcrumb message both see the same
+        // value.
+        let archived_total: usize = {
             let mut external = self.external.write().await;
             let mut pushed = self.pushed.lock().unwrap_or_else(|p| p.into_inner());
             for m in &working {
@@ -329,7 +370,9 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
                     external.push(m.clone());
                 }
             }
-        }
+            external.len()
+        };
+        self.external_size.store(archived_total, Ordering::Release);
 
         // Step 3: FIFO-evict from the front while over
         // ceiling and outside the pinned tail.
@@ -345,6 +388,7 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             running_total = running_total.saturating_sub(cost);
             idx += 1;
         }
+        let evicted_count = idx;
         if idx > 0 {
             working.drain(..idx);
         }
@@ -381,8 +425,50 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             .unwrap_or_else(|p| p.into_inner())
             .insert(ledger_ts);
 
+        // Breadcrumb: when the policy did meaningful work
+        // (evicted from the active context or paged in
+        // relevance-scored content), surface a SystemMessage
+        // so the user sees the rlm pipeline working in the
+        // transcript. Skip the breadcrumb on no-op fires
+        // (under-ceiling, no candidates) — those would just
+        // flood the transcript.
+        if evicted_count > 0 || paged_in_count > 0 {
+            if let Some(tx) = &self.event_tx {
+                let _ = tx
+                    .send(AgentEvent::SystemMessage {
+                        text: format_breadcrumb(evicted_count, paged_in_count, archived_total),
+                    })
+                    .await;
+            }
+        }
+
         BeforeModelResponse::ReplaceMessages(working)
     }
+}
+
+/// Render the per-fire breadcrumb shown in the transcript
+/// when the rlm policy does meaningful work. Compact,
+/// single-line; the user reads this to confirm "yes, the
+/// virtualization is doing something."
+fn format_breadcrumb(evicted: usize, paged_in: usize, archived_total: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if evicted > 0 {
+        parts.push(format!(
+            "evicted {evicted} msg{} to external store",
+            if evicted == 1 { "" } else { "s" }
+        ));
+    }
+    if paged_in > 0 {
+        parts.push(format!(
+            "paged in {paged_in} relevant msg{}",
+            if paged_in == 1 { "" } else { "s" }
+        ));
+    }
+    format!(
+        "rlm: {} (archive: {archived_total} msg{})",
+        parts.join("; "),
+        if archived_total == 1 { "" } else { "s" }
+    )
 }
 
 impl ContextVirtualizationPolicy {

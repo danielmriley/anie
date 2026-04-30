@@ -157,6 +157,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -229,6 +230,7 @@ fn controller_with_runtime_state_path(
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -267,7 +269,12 @@ fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
 
     let (controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
     // Default mode is `current` — no recurse tool, no policy.
-    let extras = build_rlm_extras(&controller.state, Arc::new(AtomicU32::new(8)), Vec::new());
+    let extras = build_rlm_extras(
+        &controller.state,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
     assert!(
         extras.tools.is_empty(),
         "current mode should not install rlm tools",
@@ -280,7 +287,12 @@ fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
     // Flip to baseline — also no recurse, no policy.
     let mut controller = controller;
     controller.state.harness_mode = crate::harness_mode::HarnessMode::Baseline;
-    let extras = build_rlm_extras(&controller.state, Arc::new(AtomicU32::new(8)), Vec::new());
+    let extras = build_rlm_extras(
+        &controller.state,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
     assert!(
         extras.tools.is_empty(),
         "baseline mode should not install rlm tools",
@@ -292,7 +304,12 @@ fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
 
     // Flip to rlm — exactly one tool (recurse) and a policy.
     controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
-    let extras = build_rlm_extras(&controller.state, Arc::new(AtomicU32::new(8)), Vec::new());
+    let extras = build_rlm_extras(
+        &controller.state,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
     assert_eq!(
         extras.tools.len(),
         1,
@@ -618,6 +635,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -662,6 +680,7 @@ fn build_state_with_registry(
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
 }
 
@@ -1511,6 +1530,7 @@ fn controller_for_context_length_test_with_cap(
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1976,6 +1996,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         command_registry,
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2111,6 +2132,7 @@ fn spawn_live_controller(
         command_registry: crate::commands::CommandRegistry::with_builtins(),
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
+        rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);

@@ -1047,6 +1047,7 @@ impl InteractiveController {
             &self.state,
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
+            Some(self.event_tx.clone()),
         );
         let agent = build_agent(&self.state, self.build_compaction_gate(), rlm_extras);
         let cancel = CancellationToken::new();
@@ -1092,6 +1093,7 @@ impl InteractiveController {
             &self.state,
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
+            Some(self.event_tx.clone()),
         );
         let agent = build_agent(&self.state, self.build_compaction_gate(), rlm_extras);
         let cancel = CancellationToken::new();
@@ -1190,6 +1192,13 @@ pub(crate) struct ControllerState {
     /// and the active-context policy). Plan
     /// `docs/rlm_2026-04-29/07_evaluation_harness.md`.
     pub(crate) harness_mode: crate::harness_mode::HarnessMode,
+    /// Atomic mirror of the rlm policy's external-store
+    /// size. The policy writes this after each fire (post-
+    /// archive); the status bar reads it via
+    /// `status_event` so the user sees the archive growing.
+    /// Always present (even in non-rlm modes, where it
+    /// stays at 0) so the field is uniform across modes.
+    pub(crate) rlm_archived_messages: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ControllerState {
@@ -1688,6 +1697,10 @@ impl ControllerState {
             cwd: self.session.cwd().display().to_string(),
             session_id: self.session.id().to_string(),
             harness_mode: self.harness_mode.label().to_string(),
+            rlm_archived_messages: self
+                .rlm_archived_messages
+                .load(std::sync::atomic::Ordering::Acquire)
+                as u64,
         }
     }
 
@@ -1887,6 +1900,7 @@ fn build_rlm_extras(
     state: &ControllerState,
     recursion_budget: Arc<AtomicU32>,
     context_snapshot: Vec<Message>,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> RlmExtras {
     if !state.harness_mode.installs_rlm_features() {
         return RlmExtras::empty();
@@ -1925,17 +1939,28 @@ fn build_rlm_extras(
     // archives, pages relevance-scored content back in, and
     // injects a per-turn ledger. The relevance budget
     // defaults to ceiling/4.
+    //
+    // The policy gets two extras for user visibility:
+    // - The shared `rlm_archived_messages` atomic so the
+    //   status bar can render archive size without locking
+    //   the store.
+    // - The mpsc sender so eviction / paging fires emit
+    //   `SystemMessage` breadcrumbs into the transcript.
     let active_ceiling = rlm_active_ceiling_tokens();
-    let policy = Arc::new(crate::context_virt::ContextVirtualizationPolicy::new(
+    let mut policy = crate::context_virt::ContextVirtualizationPolicy::new(
         active_ceiling,
         rlm_keep_last_n(),
         rlm_relevance_budget_tokens(active_ceiling),
         store,
         pushed_set,
-    ));
+    )
+    .with_external_size_atomic(Arc::clone(&state.rlm_archived_messages));
+    if let Some(tx) = event_tx {
+        policy = policy.with_event_sender(tx);
+    }
     RlmExtras {
         tools: vec![recurse_tool],
-        policy: Some(policy),
+        policy: Some(Arc::new(policy)),
     }
 }
 
