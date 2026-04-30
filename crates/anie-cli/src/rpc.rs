@@ -170,6 +170,10 @@ enum RpcEvent {
         context_window: u64,
         cwd: String,
         session_id: String,
+        /// Harness-mode label ("current" | "baseline" | "rlm").
+        /// Additive on the wire — existing consumers that
+        /// don't unpack this field are unaffected.
+        harness_mode: String,
     },
     #[serde(rename = "compaction_start")]
     CompactionStart {
@@ -231,6 +235,7 @@ impl From<AgentEvent> for RpcEvent {
                 context_window,
                 cwd,
                 session_id,
+                harness_mode,
             } => Self::Status {
                 provider,
                 model: model_name,
@@ -239,6 +244,7 @@ impl From<AgentEvent> for RpcEvent {
                 context_window,
                 cwd,
                 session_id,
+                harness_mode,
             },
             AgentEvent::CompactionStart { phase } => Self::CompactionStart {
                 phase: phase.into(),

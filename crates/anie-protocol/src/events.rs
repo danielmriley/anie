@@ -75,6 +75,10 @@ pub enum AgentEvent {
         context_window: u64,
         cwd: String,
         session_id: String,
+        /// Harness-mode label ("current" | "baseline" | "rlm").
+        /// Surfaces in the TUI status bar so the user always
+        /// knows which profile they're running.
+        harness_mode: String,
     },
     /// Context compaction has started.
     CompactionStart {

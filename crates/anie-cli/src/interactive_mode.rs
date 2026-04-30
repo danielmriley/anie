@@ -84,6 +84,7 @@ fn apply_status_event(status_bar: &mut anie_tui::StatusBarState, event: &AgentEv
         context_window,
         cwd,
         session_id,
+        harness_mode,
     } = event
     {
         status_bar.provider_name = provider.clone();
@@ -92,6 +93,7 @@ fn apply_status_event(status_bar: &mut anie_tui::StatusBarState, event: &AgentEv
         status_bar.estimated_context_tokens = *estimated_context_tokens;
         status_bar.context_window = *context_window;
         status_bar.cwd = cwd.clone();
+        status_bar.harness_mode = harness_mode.clone();
         status_bar.session_id = session_id.clone();
     }
 }

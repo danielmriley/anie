@@ -1687,6 +1687,7 @@ impl ControllerState {
             context_window: self.config.effective_ollama_context_window(),
             cwd: self.session.cwd().display().to_string(),
             session_id: self.session.id().to_string(),
+            harness_mode: self.harness_mode.label().to_string(),
         }
     }
 

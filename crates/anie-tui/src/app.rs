@@ -308,6 +308,10 @@ pub struct StatusBarState {
     pub context_window: u64,
     /// Current working directory label.
     pub cwd: String,
+    /// Harness-mode label ("current" | "baseline" | "rlm").
+    /// Rendered in the status bar so the user always knows
+    /// which profile they're running.
+    pub harness_mode: String,
     /// Cached shortened cwd for the status bar. Recomputed
     /// only when `cwd` changes between paints — avoids the
     /// `env::var` + `Vec` allocation that used to fire on
@@ -327,6 +331,7 @@ impl Default for StatusBarState {
             estimated_context_tokens: 0,
             context_window: 0,
             cwd: String::new(),
+            harness_mode: String::new(),
             cached_short_cwd: None,
         }
     }
@@ -875,6 +880,7 @@ impl App {
                 context_window,
                 cwd,
                 session_id,
+                harness_mode,
             } => {
                 self.status_bar.provider_name = provider;
                 self.status_bar.model_name = model_name;
@@ -883,6 +889,7 @@ impl App {
                 self.status_bar.estimated_context_tokens = estimated_context_tokens;
                 self.status_bar.context_window = context_window;
                 self.status_bar.cwd = cwd;
+                self.status_bar.harness_mode = harness_mode;
                 self.status_bar.last_known_input_tokens = None;
             }
             AgentEvent::CompactionStart { phase } => {
@@ -2248,8 +2255,19 @@ fn render_status_bar(
     // shortened_cwd accessor takes &mut self and the
     // remaining state reads inside format! are immutable.
     let short_cwd = state.shortened_cwd().to_string();
+    // The mode segment lives between provider:model and the
+    // thinking label so it stays visible even on narrow
+    // terminals (cwd at the tail truncates first). Empty
+    // string when no StatusUpdate has populated the field
+    // yet — rare; the controller emits one early in the
+    // run.
+    let mode_segment = if state.harness_mode.is_empty() {
+        String::new()
+    } else {
+        format!(" │ mode: {}", state.harness_mode)
+    };
     let status = format!(
-        " {}{}:{} │ thinking: {} │ {}/{} │ {}",
+        " {}{}:{}{} │ thinking: {} │ {}/{} │ {}",
         if transcript_scrolled {
             "↑ history │ "
         } else {
@@ -2257,6 +2275,7 @@ fn render_status_bar(
         },
         state.provider_name,
         state.model_name,
+        mode_segment,
         state.thinking,
         format_tokens(used_tokens),
         format_tokens(state.context_window),
