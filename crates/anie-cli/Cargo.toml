@@ -57,5 +57,6 @@ anie-tui.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+temp-env.workspace = true
 anie-provider = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }

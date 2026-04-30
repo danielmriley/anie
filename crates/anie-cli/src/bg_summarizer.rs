@@ -53,11 +53,25 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::external_context::{ExternalContext, MessageId};
 
-/// Per-call timeout for the LLM-driven summarizer. Keeps a
-/// stuck or slow provider call from blocking the worker
-/// queue indefinitely. Generous: small models on local
-/// Ollama can take 30+s for a 400-char summary.
-const LLM_SUMMARIZER_TIMEOUT_SECS: u64 = 90;
+/// Default per-call timeout for the LLM-driven summarizer.
+/// Keeps a stuck or slow provider call from blocking the
+/// worker queue indefinitely. Generous: small models on
+/// local Ollama can take 30+s for a 400-char summary, and
+/// large MoE models (qwen3.6:latest, 36B) frequently exceed
+/// 90s. Operators tune via `ANIE_SUMMARIZER_TIMEOUT_SECS`.
+const DEFAULT_LLM_SUMMARIZER_TIMEOUT_SECS: u64 = 180;
+
+/// Read the LLM-summarizer timeout from
+/// `ANIE_SUMMARIZER_TIMEOUT_SECS`, falling back to
+/// [`DEFAULT_LLM_SUMMARIZER_TIMEOUT_SECS`] when unset or
+/// unparseable. Set to a generous value (e.g. 600) for big
+/// local models that take minutes per summary.
+fn llm_summarizer_timeout_secs() -> u64 {
+    std::env::var("ANIE_SUMMARIZER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_LLM_SUMMARIZER_TIMEOUT_SECS)
+}
 
 /// System prompt used by the LLM-driven summarizer. Short,
 /// directive, model-agnostic. Asks for a 3-5 sentence
@@ -103,29 +117,91 @@ pub(crate) trait Summarizer: Send + Sync {
 
 /// Baseline summarizer: keep the first text block, truncate
 /// to `SUMMARY_MAX_CHARS` characters, append an ellipsis if
-/// truncated. Useful starting point and a well-defined
-/// fallback for LLM-summarizer failures. Future work can
-/// plug in a real model-driven summarizer.
+/// truncated. For Assistant messages whose only content is
+/// `ToolCall` blocks (no text), synthesizes a placeholder
+/// summary describing the tool calls instead of erroring —
+/// otherwise tool-orchestrating turns would never get
+/// summaries and the recurse-by-summary path would miss
+/// them.
 pub(crate) struct HeadTruncationSummarizer;
 
 #[async_trait]
 impl Summarizer for HeadTruncationSummarizer {
     async fn summarize(&self, message: &Message) -> Result<String, String> {
-        let text = first_text(message).unwrap_or("");
-        if text.is_empty() {
-            return Err("message has no text content to summarize".into());
+        if let Some(text) = first_text(message) {
+            if !text.is_empty() {
+                let count = text.chars().count();
+                if count <= SUMMARY_MAX_CHARS {
+                    return Ok(text.to_string());
+                }
+                let mut buf: String = text
+                    .chars()
+                    .take(SUMMARY_MAX_CHARS.saturating_sub(1))
+                    .collect();
+                buf.push('…');
+                return Ok(buf);
+            }
         }
-        let count = text.chars().count();
-        if count <= SUMMARY_MAX_CHARS {
-            return Ok(text.to_string());
+        // Fall through: no text body. If it's an Assistant
+        // with tool calls, synthesize a placeholder so the
+        // turn shows up in summary scope.
+        if let Some(synth) = synthesize_tool_call_summary(message) {
+            return Ok(synth);
         }
-        let mut buf: String = text
-            .chars()
-            .take(SUMMARY_MAX_CHARS.saturating_sub(1))
-            .collect();
-        buf.push('…');
-        Ok(buf)
+        Err("message has no text content to summarize".into())
     }
+}
+
+/// Synthesize a "[assistant called tool X(args)]" line for
+/// Assistant messages whose only content is `ToolCall`
+/// blocks. Returns `None` for any other message kind.
+fn synthesize_tool_call_summary(message: &Message) -> Option<String> {
+    let Message::Assistant(assistant) = message else {
+        return None;
+    };
+    let tool_calls: Vec<&anie_protocol::ToolCall> = assistant
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .collect();
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for call in tool_calls {
+        // Pull a representative arg if we can recognize the
+        // tool — same set the ledger uses (web_read.url,
+        // web_search.query, bash.command, read.path, etc).
+        // Falls through to a bare "name()" otherwise.
+        let arg = call
+            .arguments
+            .get("url")
+            .or_else(|| call.arguments.get("query"))
+            .or_else(|| call.arguments.get("command"))
+            .or_else(|| call.arguments.get("path"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.chars().take(80).collect::<String>())
+            .unwrap_or_default();
+        if arg.is_empty() {
+            parts.push(format!("{}()", call.name));
+        } else {
+            parts.push(format!("{}({arg})", call.name));
+        }
+    }
+    let joined = parts.join("; ");
+    let header = "[assistant tool calls] ";
+    let max_body = SUMMARY_MAX_CHARS.saturating_sub(header.chars().count());
+    let body: String = if joined.chars().count() <= max_body {
+        joined
+    } else {
+        let mut clipped: String = joined.chars().take(max_body.saturating_sub(1)).collect();
+        clipped.push('…');
+        clipped
+    };
+    Some(format!("{header}{body}"))
 }
 
 /// Provider-driven summarizer. Issues a single non-tool
@@ -240,12 +316,10 @@ impl LlmSummarizer {
             }
             Ok(buf)
         };
-        let buf = tokio::time::timeout(
-            Duration::from_secs(LLM_SUMMARIZER_TIMEOUT_SECS),
-            collect_fut,
-        )
-        .await
-        .map_err(|_| format!("timed out after {LLM_SUMMARIZER_TIMEOUT_SECS}s"))??;
+        let timeout_secs = llm_summarizer_timeout_secs();
+        let buf = tokio::time::timeout(Duration::from_secs(timeout_secs), collect_fut)
+            .await
+            .map_err(|_| format!("timed out after {timeout_secs}s"))??;
 
         let trimmed = buf.trim().to_string();
         if trimmed.is_empty() {
@@ -406,13 +480,85 @@ mod tests {
         assert_eq!(summary, "page contents");
     }
 
-    /// Empty content returns an error rather than an empty
-    /// summary — caller (the worker) logs and skips.
+    /// Empty content (no blocks at all) returns an error
+    /// rather than an empty summary — caller (the worker)
+    /// logs and skips. Tool-call-only Assistant messages
+    /// take a different path: see the synthesizer test
+    /// below.
     #[tokio::test]
     async fn head_truncation_errors_on_empty_content() {
         let summarizer = HeadTruncationSummarizer;
         let result = summarizer.summarize(&assistant_no_text()).await;
         assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    /// `ANIE_SUMMARIZER_TIMEOUT_SECS` overrides the
+    /// default. Verifies env-var parsing + fallback.
+    #[test]
+    fn llm_summarizer_timeout_reads_env_var() {
+        // Use temp_env to scope the env var change.
+        temp_env::with_var("ANIE_SUMMARIZER_TIMEOUT_SECS", Some("42"), || {
+            assert_eq!(llm_summarizer_timeout_secs(), 42);
+        });
+        // Unparseable falls back to default.
+        temp_env::with_var("ANIE_SUMMARIZER_TIMEOUT_SECS", Some("not-a-number"), || {
+            assert_eq!(
+                llm_summarizer_timeout_secs(),
+                DEFAULT_LLM_SUMMARIZER_TIMEOUT_SECS
+            );
+        });
+        // Unset falls back to default. `with_var_unset`
+        // is the typed helper for the unset case (so we
+        // don't have to spell out the closure's never-used
+        // value-type parameter).
+        temp_env::with_var_unset("ANIE_SUMMARIZER_TIMEOUT_SECS", || {
+            assert_eq!(
+                llm_summarizer_timeout_secs(),
+                DEFAULT_LLM_SUMMARIZER_TIMEOUT_SECS
+            );
+        });
+    }
+
+    /// Assistant message whose content is only `ToolCall`
+    /// blocks (no text body) gets a synthesized
+    /// "[assistant tool calls] name(arg)" summary instead
+    /// of erroring. Without this, tool-orchestrating turns
+    /// would never get summaries and the recurse-by-summary
+    /// scope would silently miss them.
+    #[tokio::test]
+    async fn head_truncation_synthesizes_tool_call_only_assistants() {
+        use anie_protocol::ToolCall;
+        let assistant = Message::Assistant(AssistantMessage {
+            content: vec![
+                ContentBlock::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "web_read".into(),
+                    arguments: serde_json::json!({"url": "https://example.com/page"}),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "c2".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "ls -la"}),
+                }),
+            ],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider: "test".into(),
+            model: "test".into(),
+            timestamp: now_millis(),
+            reasoning_details: None,
+        });
+        let summary = HeadTruncationSummarizer
+            .summarize(&assistant)
+            .await
+            .expect("should synthesize");
+        assert!(
+            summary.starts_with("[assistant tool calls]"),
+            "expected synth header; got {summary}"
+        );
+        assert!(summary.contains("web_read(https://example.com/page)"));
+        assert!(summary.contains("bash(ls -la)"));
     }
 
     /// LlmSummarizer integration: feed a scripted mock
