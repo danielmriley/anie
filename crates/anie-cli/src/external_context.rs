@@ -235,6 +235,18 @@ impl ExternalContext {
         self.messages.iter().map(|s| &s.message)
     }
 
+    /// Like `iter` but also exposes each entry's stable id
+    /// and optional summary. Used by the relevance reranker
+    /// to substitute a summary for the full body when the
+    /// full body wouldn't fit under the budget.
+    pub(crate) fn iter_with_meta(
+        &self,
+    ) -> impl Iterator<Item = (MessageId, &Message, Option<&str>)> {
+        self.messages
+            .iter()
+            .map(|s| (s.id, &s.message, s.summary.as_deref()))
+    }
+
     /// Look up the message ID for a `tool_call_id`. None
     /// when the id isn't known to the store. Used by
     /// `RecurseScope::ToolResult`.

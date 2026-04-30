@@ -1914,16 +1914,20 @@ fn build_rlm_extras(
     let store = crate::external_context::ExternalContext::from_messages(context_snapshot);
     let store = Arc::new(tokio::sync::RwLock::new(store));
 
-    // Phase F: spawn the background summarizer. The default
-    // `HeadTruncationSummarizer` is a fast, deterministic
-    // baseline that just keeps the head of the message
-    // text. A future commit will plug in an LLM-driven
-    // summarizer (one-off Provider call) without touching
-    // the worker's signature. Skipping this means archive
-    // entries stay un-summarized — recurse still returns
-    // full bodies.
+    // Phase F: spawn the background summarizer. Production
+    // uses the LLM-driven `LlmSummarizer` which issues a
+    // single one-off Provider stream against the run's
+    // current model. On any failure (timeout, provider
+    // error, empty output) it falls back to head-
+    // truncation, so archive entries always end up with
+    // *some* summary.
     let summarizer: Arc<dyn crate::bg_summarizer::Summarizer> =
-        Arc::new(crate::bg_summarizer::HeadTruncationSummarizer);
+        Arc::new(crate::bg_summarizer::LlmSummarizer::new(
+            Arc::clone(&state.provider_registry),
+            state.config.current_model().clone(),
+            Arc::clone(&state.request_options_resolver),
+            state.config.active_ollama_num_ctx_override(),
+        ));
     let summarizer_tx = crate::bg_summarizer::spawn_worker(summarizer, Arc::clone(&store));
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
         Arc::clone(&store),

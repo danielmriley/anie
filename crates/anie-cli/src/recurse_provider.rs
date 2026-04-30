@@ -143,6 +143,19 @@ impl ContextProvider for ControllerContextProvider {
                     timestamp: now_millis(),
                 })])
             }
+            RecurseScope::Summary { id } => {
+                let store = self.store.read().await;
+                let summary = store.get_summary(*id).ok_or_else(|| {
+                    anyhow!(
+                        "RecurseScope::Summary id `{id}` is not summarized yet (or out of range)"
+                    )
+                })?;
+                let body = format!("[summary of archive entry {id}]\n\n{summary}");
+                Ok(vec![Message::User(UserMessage {
+                    content: vec![ContentBlock::Text { text: body }],
+                    timestamp: now_millis(),
+                })])
+            }
         }
     }
 }
@@ -426,6 +439,70 @@ mod tests {
         assert!(
             msg.contains("invalid regex"),
             "error should mention regex invalidity; got: {msg}",
+        );
+    }
+
+    /// Phase F: `RecurseScope::Summary` returns the
+    /// archived entry's summary as a single User message
+    /// with a `[summary of archive entry N]` header.
+    #[tokio::test]
+    async fn summary_scope_returns_stored_summary() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            user_message("first"),
+            user_message("second"),
+        ])));
+        store
+            .write()
+            .await
+            .set_summary(1, "second message summary".to_string());
+        let provider = ControllerContextProvider::new(Arc::clone(&store));
+
+        let resolved = provider
+            .resolve(&RecurseScope::Summary { id: 1 })
+            .await
+            .expect("should resolve");
+        assert_eq!(resolved.len(), 1);
+        let Message::User(u) = &resolved[0] else {
+            panic!("expected User, got {:?}", resolved[0]);
+        };
+        let ContentBlock::Text { text } = &u.content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("[summary of archive entry 1]"));
+        assert!(text.contains("second message summary"));
+    }
+
+    /// `RecurseScope::Summary` errors when the entry has
+    /// no summary attached (background worker hasn't
+    /// caught up, or the entry is below the size
+    /// threshold).
+    #[tokio::test]
+    async fn summary_scope_errors_when_no_summary_attached() {
+        let provider = provider_with_context(vec![user_message("only")]);
+        let err = provider
+            .resolve(&RecurseScope::Summary { id: 0 })
+            .await
+            .expect_err("missing summary should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not summarized"),
+            "error should mention missing summary; got: {msg}",
+        );
+    }
+
+    /// `RecurseScope::Summary` with an out-of-range id
+    /// errors cleanly (same path as missing summary).
+    #[tokio::test]
+    async fn summary_scope_errors_when_id_out_of_range() {
+        let provider = provider_with_context(vec![user_message("zero")]);
+        let err = provider
+            .resolve(&RecurseScope::Summary { id: 99 })
+            .await
+            .expect_err("out-of-range id should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("99"),
+            "error should mention the bad id; got: {msg}",
         );
     }
 }

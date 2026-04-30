@@ -15,13 +15,17 @@
 //! current turn — fitting more relevant matches under the
 //! budget.
 //!
-//! Default `Summarizer` implementation: [`HeadTruncationSummarizer`].
-//! It keeps the first N characters of the first text block
-//! and appends an ellipsis. Cheap, deterministic, and a
-//! useful baseline when full content exceeds the relevance
-//! budget. A future commit will plug in an LLM-driven
-//! summarizer (one-off provider call) without touching the
-//! trait surface.
+//! Two `Summarizer` implementations:
+//! - [`LlmSummarizer`] — production default. Issues one
+//!   non-tool streaming call against the run's configured
+//!   provider/model with a short system prompt asking for
+//!   a 3-5 sentence summary. On any failure (timeout,
+//!   provider error, empty output) it falls back to head-
+//!   truncation so the entry still gets *some* summary.
+//! - [`HeadTruncationSummarizer`] — deterministic baseline:
+//!   keep the first `SUMMARY_MAX_CHARS` characters of the
+//!   first text block. Used as the fallback path inside
+//!   `LlmSummarizer` and as a stand-alone option in tests.
 //!
 //! Lifecycle:
 //! 1. Controller spawns the worker on rlm-mode init,
@@ -36,13 +40,32 @@
 //! 4. Worker exits when the sender is dropped (controller
 //!    teardown).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use anie_protocol::{ContentBlock, Message};
+use anie_protocol::{ContentBlock, Message, UserMessage, now_millis};
+use anie_provider::{
+    LlmContext, Model, ProviderEvent, ProviderRegistry, RequestOptionsResolver, StreamOptions,
+    ThinkingLevel,
+};
 use async_trait::async_trait;
+use futures::StreamExt;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::external_context::{ExternalContext, MessageId};
+
+/// Per-call timeout for the LLM-driven summarizer. Keeps a
+/// stuck or slow provider call from blocking the worker
+/// queue indefinitely. Generous: small models on local
+/// Ollama can take 30+s for a 400-char summary.
+const LLM_SUMMARIZER_TIMEOUT_SECS: u64 = 90;
+
+/// System prompt used by the LLM-driven summarizer. Short,
+/// directive, model-agnostic. Asks for a 3-5 sentence
+/// summary so the result fits comfortably under
+/// `SUMMARY_MAX_CHARS` for most providers.
+const LLM_SUMMARIZER_SYSTEM_PROMPT: &str = "You produce concise summaries of conversation messages. \
+Output a 3-5 sentence summary capturing the most important points: subject, key facts, decisions, URLs, and relevant numbers. \
+Output only the summary text — no preamble, no markdown headers, no quoting. Keep it under 400 characters.";
 
 /// Soft cap for summary length in characters. The default
 /// summarizer truncates to this; a real LLM summarizer
@@ -102,6 +125,164 @@ impl Summarizer for HeadTruncationSummarizer {
             .collect();
         buf.push('…');
         Ok(buf)
+    }
+}
+
+/// Provider-driven summarizer. Issues a single non-tool
+/// streaming call against the run's configured provider /
+/// model, asking for a short summary. Falls back to
+/// `HeadTruncationSummarizer` semantics on any error
+/// (timeout, provider failure, empty output) so the
+/// worker still produces *something* — partial progress
+/// beats none.
+pub(crate) struct LlmSummarizer {
+    provider_registry: Arc<ProviderRegistry>,
+    model: Model,
+    request_options_resolver: Arc<dyn RequestOptionsResolver>,
+    /// Optional override for Ollama's `num_ctx` so summary
+    /// calls inherit whatever the user set on the parent.
+    /// `None` falls back to `Model.context_window`.
+    num_ctx_override: Option<u64>,
+}
+
+impl LlmSummarizer {
+    pub(crate) fn new(
+        provider_registry: Arc<ProviderRegistry>,
+        model: Model,
+        request_options_resolver: Arc<dyn RequestOptionsResolver>,
+        num_ctx_override: Option<u64>,
+    ) -> Self {
+        Self {
+            provider_registry,
+            model,
+            request_options_resolver,
+            num_ctx_override,
+        }
+    }
+
+    async fn summarize_via_llm(&self, message: &Message) -> Result<String, String> {
+        let text = first_text(message)
+            .ok_or_else(|| "message has no text content to summarize".to_string())?;
+        if text.is_empty() {
+            return Err("message has no text content to summarize".into());
+        }
+
+        // Build a one-shot user-message context with the
+        // body to summarize wrapped so the model knows what
+        // it's processing.
+        let user_prompt = format!("Summarize this message:\n\n{text}");
+        let prompt_message = Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: user_prompt }],
+            timestamp: now_millis(),
+        });
+        let prompt_slice = std::slice::from_ref(&prompt_message);
+
+        // Resolve auth + provider routing.
+        let resolved = self
+            .request_options_resolver
+            .resolve(&self.model, prompt_slice)
+            .await
+            .map_err(|e| format!("resolver: {e}"))?;
+        let mut model = self.model.clone();
+        if let Some(base_url) = resolved.base_url_override {
+            model.base_url = base_url;
+        }
+
+        let provider = self
+            .provider_registry
+            .get(&model.api)
+            .ok_or_else(|| format!("no provider registered for {:?}", model.api))?;
+
+        let llm_context = LlmContext {
+            system_prompt: LLM_SUMMARIZER_SYSTEM_PROMPT.to_string(),
+            messages: provider.convert_messages(prompt_slice),
+            tools: Vec::new(),
+        };
+        let mut options = StreamOptions {
+            api_key: resolved.api_key,
+            headers: resolved.headers,
+            num_ctx_override: self.num_ctx_override,
+            thinking: ThinkingLevel::Off,
+            ..StreamOptions::default()
+        };
+        // Cap output tokens to roughly the summary budget.
+        // Tokenization is provider-specific, so this is an
+        // upper bound — we still trim post-hoc.
+        options.max_tokens = Some((SUMMARY_MAX_CHARS as u64) / 2 + 128);
+
+        // Issue the call and consume the stream into a
+        // single string. Bound the whole thing in a
+        // timeout so a stuck provider can't hang the
+        // worker.
+        let stream_result = provider.stream(&model, llm_context, options);
+        let mut stream = stream_result.map_err(|e| format!("stream init: {e}"))?;
+        let collect_fut = async {
+            let mut buf = String::new();
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(ProviderEvent::TextDelta(text)) => buf.push_str(&text),
+                    Ok(ProviderEvent::Done(assistant)) => {
+                        // If we got no deltas (some providers
+                        // only deliver content on Done), pull
+                        // the final assistant text.
+                        if buf.is_empty() {
+                            for block in &assistant.content {
+                                if let ContentBlock::Text { text } = block {
+                                    buf.push_str(text);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(format!("stream: {e}")),
+                }
+            }
+            Ok(buf)
+        };
+        let buf = tokio::time::timeout(
+            Duration::from_secs(LLM_SUMMARIZER_TIMEOUT_SECS),
+            collect_fut,
+        )
+        .await
+        .map_err(|_| format!("timed out after {LLM_SUMMARIZER_TIMEOUT_SECS}s"))??;
+
+        let trimmed = buf.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("provider returned empty summary".into());
+        }
+        // Defense in depth: cap the summary at
+        // SUMMARY_MAX_CHARS in case the model ignored the
+        // length instruction.
+        if trimmed.chars().count() > SUMMARY_MAX_CHARS {
+            let mut clipped: String = trimmed
+                .chars()
+                .take(SUMMARY_MAX_CHARS.saturating_sub(1))
+                .collect();
+            clipped.push('…');
+            return Ok(clipped);
+        }
+        Ok(trimmed)
+    }
+}
+
+#[async_trait]
+impl Summarizer for LlmSummarizer {
+    async fn summarize(&self, message: &Message) -> Result<String, String> {
+        // Try the LLM first; on any failure, fall back to
+        // head-truncation so the entry still gets *some*
+        // summary. Logged at warn-level so operators can
+        // tell why the provider path didn't produce.
+        match self.summarize_via_llm(message).await {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "LLM summarizer failed; falling back to head truncation",
+                );
+                HeadTruncationSummarizer.summarize(message).await
+            }
+        }
     }
 }
 
@@ -232,6 +413,139 @@ mod tests {
         let summarizer = HeadTruncationSummarizer;
         let result = summarizer.summarize(&assistant_no_text()).await;
         assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    /// LlmSummarizer integration: feed a scripted mock
+    /// provider that emits two TextDelta chunks and Done;
+    /// expect the summary to be the concatenation of the
+    /// two chunks (trimmed). Verifies the streaming
+    /// consumption + the trim/cap path.
+    #[tokio::test]
+    async fn llm_summarizer_collects_text_deltas() {
+        use anie_provider::{
+            ApiKind, CostPerMillion, ModelCompat, ProviderError, ProviderEvent, ProviderRegistry,
+            ResolvedRequestOptions,
+            mock::{MockProvider, MockStreamScript},
+        };
+
+        struct StaticResolver;
+        #[async_trait]
+        impl RequestOptionsResolver for StaticResolver {
+            async fn resolve(
+                &self,
+                _model: &Model,
+                _context: &[Message],
+            ) -> Result<ResolvedRequestOptions, ProviderError> {
+                Ok(ResolvedRequestOptions::default())
+            }
+        }
+
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: " final ".into(),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock".into(),
+            timestamp: now_millis(),
+            reasoning_details: None,
+        };
+        let script = MockStreamScript::new(vec![
+            Ok(ProviderEvent::TextDelta("Concise ".into())),
+            Ok(ProviderEvent::TextDelta("summary.".into())),
+            Ok(ProviderEvent::Done(assistant)),
+        ]);
+
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            ApiKind::OpenAICompletions,
+            Box::new(MockProvider::new(vec![script])),
+        );
+
+        let model = Model {
+            id: "mock".into(),
+            name: "mock".into(),
+            provider: "mock".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "http://localhost".into(),
+            context_window: 8_192,
+            max_tokens: 1_024,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        };
+
+        let summarizer =
+            LlmSummarizer::new(Arc::new(registry), model, Arc::new(StaticResolver), None);
+        let body = "Some long body that needs summarizing for testing.";
+        let summary = summarizer
+            .summarize(&user_message(body))
+            .await
+            .expect("summarize ok");
+        assert_eq!(summary, "Concise summary.");
+    }
+
+    /// LlmSummarizer fallback: when the provider stream
+    /// returns an error, summarize() falls back to head-
+    /// truncation rather than failing.
+    #[tokio::test]
+    async fn llm_summarizer_falls_back_on_provider_error() {
+        use anie_provider::{
+            ApiKind, CostPerMillion, ModelCompat, ProviderError, ProviderRegistry,
+            ResolvedRequestOptions,
+            mock::{MockProvider, MockStreamScript},
+        };
+
+        struct StaticResolver;
+        #[async_trait]
+        impl RequestOptionsResolver for StaticResolver {
+            async fn resolve(
+                &self,
+                _model: &Model,
+                _context: &[Message],
+            ) -> Result<ResolvedRequestOptions, ProviderError> {
+                Ok(ResolvedRequestOptions::default())
+            }
+        }
+
+        let script =
+            MockStreamScript::from_error(ProviderError::Auth("test-mode forced error".into()));
+        let mut registry = ProviderRegistry::new();
+        registry.register(
+            ApiKind::OpenAICompletions,
+            Box::new(MockProvider::new(vec![script])),
+        );
+
+        let model = Model {
+            id: "mock".into(),
+            name: "mock".into(),
+            provider: "mock".into(),
+            api: ApiKind::OpenAICompletions,
+            base_url: "http://localhost".into(),
+            context_window: 8_192,
+            max_tokens: 1_024,
+            supports_reasoning: false,
+            reasoning_capabilities: None,
+            supports_images: false,
+            cost_per_million: CostPerMillion::zero(),
+            replay_capabilities: None,
+            compat: ModelCompat::None,
+        };
+
+        let summarizer =
+            LlmSummarizer::new(Arc::new(registry), model, Arc::new(StaticResolver), None);
+        let body = "Some content the provider can't summarize for us.";
+        let summary = summarizer
+            .summarize(&user_message(body))
+            .await
+            .expect("fallback should succeed");
+        // Head-truncation kicks in: short body returns as-is.
+        assert_eq!(summary, body);
     }
 
     /// Worker integration: enqueueing a request results in

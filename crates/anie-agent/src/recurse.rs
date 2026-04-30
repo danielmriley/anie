@@ -81,6 +81,17 @@ pub enum RecurseScope {
         /// run's working directory.
         path: String,
     },
+    /// Phase F: the summarized form of one archive entry,
+    /// addressed by its stable `MessageId`. The resolver
+    /// returns the message's summary as a single
+    /// `Message::User`, or an error if the entry isn't yet
+    /// summarized. Far cheaper than fetching the full body
+    /// when the model only needs an outline.
+    Summary {
+        /// Stable identifier from the external archive (the
+        /// same id surfaced in the ledger).
+        id: usize,
+    },
 }
 
 impl RecurseScope {
@@ -95,6 +106,7 @@ impl RecurseScope {
             Self::MessageGrep { .. } => "message_grep",
             Self::ToolResult { .. } => "tool_result",
             Self::File { .. } => "file",
+            Self::Summary { .. } => "summary",
         }
     }
 }
@@ -200,5 +212,6 @@ mod tests {
             .kind(),
             "file"
         );
+        assert_eq!(RecurseScope::Summary { id: 7 }.kind(), "summary");
     }
 }

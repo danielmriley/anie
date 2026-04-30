@@ -91,7 +91,7 @@ impl Tool for RecurseTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "recurse".into(),
-            description: "Invoke a focused sub-agent over a scoped slice of context to answer a sub-query, returning the sub-agent's final answer as text. Use this when you need to navigate prior conversation, prior tool results, or external files without loading them all into your active context. The sub-agent runs in isolation: it sees only the messages selected by `scope` plus your `query`, and its output is summarized into a single tool-result block. Available scope kinds: `message_range` ({start, end} half-open indices into your prior context), `message_grep` ({pattern} regex over message content), `tool_result` ({tool_call_id} one specific prior tool result), `file` ({path} file contents on disk). Recursion has a per-run budget and a depth limit; when exhausted, the tool errors and you should answer from the active context.".into(),
+            description: "Invoke a focused sub-agent over a scoped slice of context to answer a sub-query, returning the sub-agent's final answer as text. Use this when you need to navigate prior conversation, prior tool results, or external files without loading them all into your active context. The sub-agent runs in isolation: it sees only the messages selected by `scope` plus your `query`, and its output is summarized into a single tool-result block. Available scope kinds: `message_range` ({start, end} half-open indices into your prior context), `message_grep` ({pattern} regex over message content), `tool_result` ({tool_call_id} one specific prior tool result), `file` ({path} file contents on disk), `summary` ({id} short summary of one archive entry — much cheaper than fetching the full body). Recursion has a per-run budget and a depth limit; when exhausted, the tool errors and you should answer from the active context.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -105,14 +105,15 @@ impl Tool for RecurseTool {
                         "properties": {
                             "kind": {
                                 "type": "string",
-                                "enum": ["message_range", "message_grep", "tool_result", "file"],
-                                "description": "Discriminator selecting one of the four scope variants.",
+                                "enum": ["message_range", "message_grep", "tool_result", "file", "summary"],
+                                "description": "Discriminator selecting one of the five scope variants.",
                             },
                             "start": {"type": "integer", "description": "message_range: inclusive lower bound (>= 0)."},
                             "end": {"type": "integer", "description": "message_range: exclusive upper bound (>= start)."},
                             "pattern": {"type": "string", "description": "message_grep: regex pattern."},
                             "tool_call_id": {"type": "string", "description": "tool_result: id of the prior tool call."},
                             "path": {"type": "string", "description": "file: path on disk; relative paths resolve against the run cwd."},
+                            "id": {"type": "integer", "description": "summary: stable archive entry id (the same id surfaced when needed). Returns the entry's summary as a single user message; errors when the entry isn't summarized yet."},
                         },
                         "required": ["kind"],
                     },
@@ -309,6 +310,14 @@ fn parse_scope(value: &serde_json::Value) -> Result<RecurseScope, ToolError> {
             Ok(RecurseScope::File {
                 path: path.to_string(),
             })
+        }
+        "summary" => {
+            let id = value
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ToolError::ExecutionFailed("summary missing `id`".into()))?
+                as usize;
+            Ok(RecurseScope::Summary { id })
         }
         other => Err(ToolError::ExecutionFailed(format!(
             "unknown scope kind: {other}",

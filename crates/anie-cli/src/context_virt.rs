@@ -1,6 +1,6 @@
 //! Context-virtualization policy.
 //!
-//! Phases C + D + E of
+//! Phases C + D + E + F of
 //! `docs/rlm_2026-04-29/06_phased_implementation.md`.
 //!
 //! [`ContextVirtualizationPolicy`] is a [`BeforeModelPolicy`]
@@ -29,8 +29,11 @@
 //! 3-char minimum, common stopwords filtered); each evicted
 //! message is tokenized the same way; score is the size of
 //! the token-set intersection. Tie-break by recency. Cheap
-//! enough to run on every fire; embedding-based scoring is
-//! a follow-up (Phase F or later).
+//! enough to run on every fire. When a candidate's full
+//! body wouldn't fit under the budget, the reranker falls
+//! back to the Phase-F summary (if one's been written)
+//! before skipping — fitting more relevant matches into
+//! the same budget at lossy fidelity.
 //!
 //! Identity / dedup: messages are tracked by `timestamp`. The
 //! agent loop generates one message per `now_millis()`
@@ -188,6 +191,18 @@ fn current_prompt_tokens(working: &[Message]) -> Option<HashSet<String>> {
         }
     }
     None
+}
+
+/// One candidate the relevance reranker is considering for
+/// paging back in. Carries the score (intersection size with
+/// prompt tokens), the archive entry's stable id (for the
+/// summary-fallback annotation), the full message body, and
+/// the optional pre-computed summary.
+struct RelevanceCandidate {
+    score: usize,
+    id: crate::external_context::MessageId,
+    message: Message,
+    summary: Option<String>,
 }
 
 /// Score a candidate message against tokenized prompt
@@ -659,16 +674,28 @@ impl ContextVirtualizationPolicy {
 
         // Take a snapshot of evicted candidates outside any
         // lock so we don't hold the read guard while
-        // scoring.
+        // scoring. For each candidate also clone its summary
+        // (if one's been written) so the budget loop can
+        // fall back to summary form when the full body
+        // wouldn't fit.
         let working_ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
-        let mut candidates: Vec<(usize, Message)> = {
+        let mut candidates: Vec<RelevanceCandidate> = {
             let external = self.external.read().await;
             external
-                .iter()
-                .filter(|m| !working_ts.contains(&message_timestamp(m)))
-                .filter_map(|m| {
+                .iter_with_meta()
+                .filter(|(_, m, _)| !working_ts.contains(&message_timestamp(m)))
+                .filter_map(|(id, m, summary)| {
                     let s = score_message(&prompt_tokens, m);
-                    if s == 0 { None } else { Some((s, m.clone())) }
+                    if s == 0 {
+                        None
+                    } else {
+                        Some(RelevanceCandidate {
+                            score: s,
+                            id,
+                            message: m.clone(),
+                            summary: summary.map(str::to_string),
+                        })
+                    }
                 })
                 .collect()
         };
@@ -682,20 +709,46 @@ impl ContextVirtualizationPolicy {
         // assumes more-recent matches are likelier to be
         // relevant.
         candidates.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| message_timestamp(&b.1).cmp(&message_timestamp(&a.1)))
+            b.score
+                .cmp(&a.score)
+                .then_with(|| message_timestamp(&b.message).cmp(&message_timestamp(&a.message)))
         });
 
         let mut budget = self.relevance_budget_tokens;
         let mut paged = 0;
-        for (_score, m) in candidates {
-            let cost = estimate_tokens(&m);
-            if cost > budget {
-                continue;
+        for candidate in candidates {
+            let RelevanceCandidate {
+                id,
+                message,
+                summary,
+                ..
+            } = candidate;
+            // Prefer the full body when it fits. Fall back
+            // to the summary if it doesn't and a summary is
+            // available — this is the Phase F payoff for the
+            // reranker. Skip entirely otherwise.
+            let full_cost = estimate_tokens(&message);
+            if full_cost <= budget {
+                budget = budget.saturating_sub(full_cost);
+                working.push(message);
+                paged += 1;
+            } else if let Some(summary_text) = summary {
+                let summary_message = Message::User(UserMessage {
+                    content: vec![ContentBlock::Text {
+                        text: format!(
+                            "[summary of archive entry {id} — full body paged out]\n\n{summary_text}"
+                        ),
+                    }],
+                    timestamp: message_timestamp(&message),
+                });
+                let summary_cost = estimate_tokens(&summary_message);
+                if summary_cost > budget {
+                    continue;
+                }
+                budget = budget.saturating_sub(summary_cost);
+                working.push(summary_message);
+                paged += 1;
             }
-            budget = budget.saturating_sub(cost);
-            working.push(m);
-            paged += 1;
             if budget == 0 {
                 break;
             }
@@ -1566,5 +1619,74 @@ mod tests {
         assert!(line.contains("page0"));
         assert!(line.contains("page7"));
         assert!(!line.contains("page8"));
+    }
+
+    /// Phase F reranker integration: when an evicted
+    /// candidate's full body is too large for the relevance
+    /// budget but its summary fits, the reranker pages the
+    /// summary in instead of skipping the candidate
+    /// entirely. The summary message gets a clear header
+    /// so the model knows it's looking at a summary rather
+    /// than the original.
+    #[tokio::test]
+    async fn reranker_falls_back_to_summary_when_full_body_too_big() {
+        // Build a large message that exceeds the relevance
+        // budget. Repeat a keyword the prompt will match.
+        let huge_text: String = "relevant_keyword data ".repeat(200);
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            &huge_text, 1,
+        )])));
+        store
+            .write()
+            .await
+            .set_summary(0, "concise summary text".to_string());
+
+        // Tight budget — full body won't fit, summary
+        // will. Active context references the keyword so
+        // the reranker scores the candidate.
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            150, // budget tight enough that huge body skips, summary fits
+            Arc::clone(&store),
+            HashSet::from([1u64]), // skip re-archive
+        );
+        let context = vec![user("looking for relevant_keyword info", 200)];
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+
+        // The summary should be paged in, not the huge
+        // body. Find a User message containing the
+        // "[summary of archive entry" header.
+        let has_summary = survivors.iter().any(|m| match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => {
+                    text.starts_with("[summary of archive entry")
+                        && text.contains("concise summary text")
+                }
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(
+            has_summary,
+            "expected summary fallback in survivors; got {survivors:?}"
+        );
+        // The huge body should NOT be in survivors —
+        // budget too tight.
+        let has_huge = survivors.iter().any(|m| match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => text.contains(&huge_text),
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(
+            !has_huge,
+            "huge body should not have been paged in alongside the summary"
+        );
     }
 }
