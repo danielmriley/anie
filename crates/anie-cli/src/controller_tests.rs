@@ -365,6 +365,26 @@ fn compose_system_prompt_only_augments_in_rlm_mode() {
         composed.contains("scope.kind=tool_result"),
         "augment must name the recurse scope kinds"
     );
+    // message_grep should be listed FIRST (no id needed,
+    // easiest to use without inventing identifiers).
+    let grep_pos = composed
+        .find("scope.kind=message_grep")
+        .expect("message_grep should appear");
+    let tool_result_pos = composed
+        .find("scope.kind=tool_result")
+        .expect("tool_result should appear");
+    assert!(
+        grep_pos < tool_result_pos,
+        "message_grep should be recommended before tool_result; \
+         positions {grep_pos} vs {tool_result_pos}"
+    );
+    // Augment warns against id fabrication explicitly —
+    // a real-world failure mode observed during smoke
+    // testing.
+    assert!(
+        composed.contains("do NOT invent ids"),
+        "augment should warn against id fabrication: {composed}"
+    );
 }
 
 #[test]

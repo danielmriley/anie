@@ -538,12 +538,29 @@ const TOOL_CALL_DISPLAY_CAP: usize = 8;
 const TOOL_CALL_ENTRY_MAX_CHARS: usize = 80;
 
 /// Walk the external archive's Assistant messages and
-/// return a per-tool list of unique meaningful arg values
-/// (URLs, queries, commands, paths). Used by `build_ledger`
-/// to surface tool-call identity to the model.
-fn collect_tool_call_summary(external: &ExternalContext) -> Vec<(String, Vec<String>)> {
+/// One tool-call entry: the tool's `tool_call_id` (real
+/// runtime id, e.g. `ollama_tool_call_8_2`) plus its
+/// representative argument value (URL, query, command,
+/// path). Surfacing the id alongside the arg is what makes
+/// `RecurseScope::ToolResult { tool_call_id }` actually
+/// usable — without the id, the model has to guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolCallEntry {
+    pub tool_call_id: String,
+    pub arg_value: String,
+}
+
+/// Walk the external archive's Assistant messages and
+/// return a per-tool list of unique tool-call entries
+/// (id + meaningful arg). Used by `build_ledger` to
+/// surface tool-call identity to the model.
+fn collect_tool_call_summary(external: &ExternalContext) -> Vec<(String, Vec<ToolCallEntry>)> {
     let assistant_ids = external.ids_by_kind(MessageKindLabel::Assistant);
-    let mut by_tool: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_tool: HashMap<String, Vec<ToolCallEntry>> = HashMap::new();
+    // Dedup by (tool_name, arg_value) so the same URL
+    // fetched twice doesn't appear twice. The retained
+    // entry keeps the *first* tool_call_id seen — that's
+    // the canonical reference for that arg.
     let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for &id in assistant_ids {
         let Some(Message::Assistant(a)) = external.get_by_id(id) else {
@@ -563,11 +580,14 @@ fn collect_tool_call_summary(external: &ExternalContext) -> Vec<(String, Vec<Str
                 by_tool
                     .entry(call.name.clone())
                     .or_default()
-                    .push(truncated);
+                    .push(ToolCallEntry {
+                        tool_call_id: call.id.clone(),
+                        arg_value: truncated,
+                    });
             }
         }
     }
-    let mut out: Vec<(String, Vec<String>)> = by_tool.into_iter().collect();
+    let mut out: Vec<(String, Vec<ToolCallEntry>)> = by_tool.into_iter().collect();
     // Stable display order: alphabetical by tool name.
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -599,11 +619,13 @@ fn truncate_for_ledger(s: &str, max_chars: usize) -> String {
     buf
 }
 
-/// Render `(tool_name, args)` pairs into ledger lines like
-/// `- web_read targets: foo, bar, baz`. Empty input yields
-/// no lines so the ledger stays compact when nothing has
-/// been called yet.
-fn render_tool_call_summary_lines(summary: &[(String, Vec<String>)]) -> Vec<String> {
+/// Render `(tool_name, entries)` pairs into ledger lines
+/// like `- web_read targets: [id=ollama_tc_8_2] foo,
+/// [id=ollama_tc_8_3] bar`. Each entry surfaces the
+/// `tool_call_id` so `RecurseScope::ToolResult` is
+/// directly usable. Empty input yields no lines so the
+/// ledger stays compact when nothing has been called yet.
+fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> Vec<String> {
     let mut lines = Vec::new();
     for (tool_name, args) in summary {
         if args.is_empty() {
@@ -616,7 +638,11 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<String>)]) -> Vec<Stri
             .unwrap_or("args");
         let total = args.len();
         let display = total.min(TOOL_CALL_DISPLAY_CAP);
-        let head: Vec<&str> = args.iter().take(display).map(String::as_str).collect();
+        let rendered: Vec<String> = args
+            .iter()
+            .take(display)
+            .map(|e| format!("[id={}] {}", e.tool_call_id, e.arg_value))
+            .collect();
         let suffix = if total > display {
             format!(", +{} more", total - display)
         } else {
@@ -624,7 +650,7 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<String>)]) -> Vec<Stri
         };
         lines.push(format!(
             "- {tool_name} {label}: {}{suffix}",
-            head.join(", ")
+            rendered.join(", ")
         ));
     }
     lines
@@ -791,16 +817,16 @@ impl ContextVirtualizationPolicy {
                 "Before issuing a new tool call, scan the lists below.".to_string(),
                 "If the URL, query, command, or path you're about to use is already listed,"
                     .to_string(),
-                "the result is in the archive — do NOT re-run the tool. Instead use one of:"
+                "the result is in the archive — do NOT re-run the tool. Use `recurse` instead:"
                     .to_string(),
-                "  - `recurse` with `scope.kind=tool_result`, `tool_call_id=<id>` to fetch a"
+                "  - `scope.kind=message_grep`, `pattern=<regex>` — search archived messages"
                     .to_string(),
-                "    specific prior result verbatim;".to_string(),
-                "  - `recurse` with `scope.kind=summary`, `id=<archive_id>` for the gist;"
+                "    by keyword. Easiest option; needs no id.".to_string(),
+                "  - `scope.kind=tool_result`, `tool_call_id=<id>` — fetch one prior result"
                     .to_string(),
-                "  - `recurse` with `scope.kind=message_grep`, `pattern=<regex>` to search"
+                "    verbatim. Use the exact `[id=...]` value listed below.".to_string(),
+                "  - `scope.kind=summary`, `id=<archive_id>` — fetch the gist. Cheapest."
                     .to_string(),
-                "    archived messages by keyword.".to_string(),
                 "Re-running a tool whose output is already archived wastes user time.".to_string(),
                 String::new(),
             ];
@@ -1531,30 +1557,32 @@ mod tests {
         ]);
 
         let summary = collect_tool_call_summary(&store);
-        let summary_map: HashMap<String, Vec<String>> = summary.into_iter().collect();
+        let summary_map: HashMap<String, Vec<ToolCallEntry>> = summary.into_iter().collect();
 
+        // Entries surface the tool_call_id (assigned by
+        // `assistant_with_tool_call` test helper as
+        // "call_<ts>") plus the truncated arg value.
+        let web_read = summary_map.get("web_read").expect("web_read entries");
+        assert_eq!(web_read.len(), 2, "duplicate URL must dedupe");
+        assert_eq!(web_read[0].tool_call_id, "call_1");
         assert_eq!(
-            summary_map.get("web_read").map(Vec::as_slice),
-            Some(
-                &[
-                    "https://engineering.fyi/codex-harness".to_string(),
-                    "https://deepwiki.com/opencode/2.4".to_string(),
-                ][..]
-            ),
-            "web_read URLs should be deduplicated and ordered"
+            web_read[0].arg_value,
+            "https://engineering.fyi/codex-harness"
         );
-        assert_eq!(
-            summary_map.get("web_search").map(Vec::as_slice),
-            Some(&["Codex agent loop architecture".to_string()][..])
-        );
-        assert_eq!(
-            summary_map.get("bash").map(Vec::as_slice),
-            Some(&["cargo test --workspace".to_string()][..])
-        );
-        assert_eq!(
-            summary_map.get("read").map(Vec::as_slice),
-            Some(&["src/main.rs".to_string()][..])
-        );
+        assert_eq!(web_read[1].tool_call_id, "call_2");
+        assert_eq!(web_read[1].arg_value, "https://deepwiki.com/opencode/2.4");
+
+        let web_search = summary_map.get("web_search").expect("web_search entries");
+        assert_eq!(web_search[0].tool_call_id, "call_4");
+        assert_eq!(web_search[0].arg_value, "Codex agent loop architecture");
+
+        let bash = summary_map.get("bash").expect("bash entries");
+        assert_eq!(bash[0].tool_call_id, "call_5");
+        assert_eq!(bash[0].arg_value, "cargo test --workspace");
+
+        let read = summary_map.get("read").expect("read entries");
+        assert_eq!(read[0].tool_call_id, "call_6");
+        assert_eq!(read[0].arg_value, "src/main.rs");
     }
 
     /// `truncate_for_ledger` shortens overlong values + adds
@@ -1635,10 +1663,13 @@ mod tests {
     /// the agent has fired hundreds of tool calls.
     #[test]
     fn render_tool_call_summary_truncates_with_more_suffix() {
-        let urls: Vec<String> = (0..12)
-            .map(|i| format!("https://example.com/page{i}"))
+        let entries: Vec<ToolCallEntry> = (0..12)
+            .map(|i| ToolCallEntry {
+                tool_call_id: format!("tc_{i}"),
+                arg_value: format!("https://example.com/page{i}"),
+            })
             .collect();
-        let summary = vec![("web_read".to_string(), urls)];
+        let summary = vec![("web_read".to_string(), entries)];
         let lines = render_tool_call_summary_lines(&summary);
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
@@ -1646,10 +1677,40 @@ mod tests {
             line.contains("+4 more"),
             "expected +4 more suffix when 12 entries against cap 8: {line}"
         );
-        // First 8 entries appear; entry #9 (page8) does not.
+        // First 8 entries appear with their ids; entry #9
+        // (page8 / tc_8) does not.
+        assert!(line.contains("[id=tc_0]"));
         assert!(line.contains("page0"));
+        assert!(line.contains("[id=tc_7]"));
         assert!(line.contains("page7"));
         assert!(!line.contains("page8"));
+        assert!(!line.contains("[id=tc_8]"));
+    }
+
+    /// New test: the rendered ledger lines surface the
+    /// `tool_call_id` so the model can use
+    /// `RecurseScope::ToolResult` without inventing ids.
+    #[test]
+    fn render_tool_call_summary_includes_real_tool_call_ids() {
+        let entries = vec![
+            ToolCallEntry {
+                tool_call_id: "ollama_tool_call_8_2".into(),
+                arg_value: "https://weather.gov/Tallahassee".into(),
+            },
+            ToolCallEntry {
+                tool_call_id: "ollama_tool_call_8_3".into(),
+                arg_value: "https://weather.com/Tifton".into(),
+            },
+        ];
+        let summary = vec![("web_read".to_string(), entries)];
+        let lines = render_tool_call_summary_lines(&summary);
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(
+            line.contains("[id=ollama_tool_call_8_2] https://weather.gov/Tallahassee"),
+            "id should appear right before its arg: {line}"
+        );
+        assert!(line.contains("[id=ollama_tool_call_8_3] https://weather.com/Tifton"));
     }
 
     /// Phase F reranker integration: when an evicted
