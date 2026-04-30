@@ -1,25 +1,36 @@
 //! Context-virtualization policy.
 //!
-//! Phases C + D of
+//! Phases C + D + E of
 //! `docs/rlm_2026-04-29/06_phased_implementation.md`.
 //!
 //! [`ContextVirtualizationPolicy`] is a [`BeforeModelPolicy`]
-//! that enforces a configurable active-context token ceiling
-//! AND injects a per-turn ledger telling the model what's
-//! externally available. When the run's active context
-//! exceeds the ceiling, the policy evicts oldest messages —
-//! pinning the last N — until the surviving subset is under
-//! ceiling, archives the full snapshot to the shared
-//! [`ExternalContext`] store so the recurse tool can read
-//! evicted content, builds a structured ledger summarizing
-//! the external state, and returns
-//! `BeforeModelResponse::ReplaceMessages(survivors + ledger)`.
+//! that enforces a configurable active-context token ceiling,
+//! pages relevant evicted content back in for the current
+//! turn, and injects a per-turn ledger telling the model
+//! what's externally available. When the run's active context
+//! exceeds the ceiling, the policy: (1) evicts oldest
+//! messages pinning the last N; (2) archives every snapshot
+//! message to the shared [`ExternalContext`] so the recurse
+//! tool can still reach evicted content; (3) scores evicted
+//! content against the current user prompt via keyword
+//! overlap and pages back in the highest-scoring messages
+//! within `relevance_budget_tokens`; (4) builds a structured
+//! ledger; (5) returns
+//! `BeforeModelResponse::ReplaceMessages(working + ledger)`.
 //!
 //! The ledger is a `User` message wrapped in
 //! `<system-reminder>` tags — universally compatible with
 //! every provider, recognized by the model as a system note
 //! rather than a user prompt. The previous turn's ledger is
 //! stripped before injecting a new one (no accumulation).
+//!
+//! Relevance reranker: keyword overlap. The current user
+//! prompt is tokenized (lowercase, alphanumeric split,
+//! 3-char minimum, common stopwords filtered); each evicted
+//! message is tokenized the same way; score is the size of
+//! the token-set intersection. Tie-break by recency. Cheap
+//! enough to run on every fire; embedding-based scoring is
+//! a follow-up (Phase F or later).
 //!
 //! Identity / dedup: messages are tracked by `timestamp`. The
 //! agent loop generates one message per `now_millis()`
@@ -30,11 +41,11 @@
 //!
 //! Default behavior: with `active_ceiling_tokens = u64::MAX`
 //! the policy is effectively a noop — it returns `Continue`
-//! on every call (no ledger, no eviction). The controller
-//! installs the policy in `--harness-mode=rlm`; default
-//! builds keep the noop policy. Setting
+//! on every call (no ledger, no eviction, no paging). The
+//! controller installs the policy in `--harness-mode=rlm`;
+//! default builds keep the noop policy. Setting
 //! `ANIE_ACTIVE_CEILING_TOKENS` to a finite value turns on
-//! both eviction *and* ledger injection.
+//! the full eviction + ledger + relevance pipeline.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -58,6 +69,141 @@ fn message_timestamp(m: &Message) -> u64 {
     }
 }
 
+/// Common English stopwords we drop during tokenization so
+/// they don't dominate keyword overlap. Small fixed set; the
+/// reranker's job is to find topical matches, not common
+/// connective tissue. Kept short on purpose — every word
+/// here is one that appears in nearly every message.
+const STOPWORDS: &[&str] = &[
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "from",
+    "are",
+    "was",
+    "were",
+    "have",
+    "has",
+    "had",
+    "but",
+    "not",
+    "you",
+    "your",
+    "all",
+    "any",
+    "can",
+    "will",
+    "would",
+    "should",
+    "could",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "which",
+    "who",
+    "into",
+    "out",
+    "over",
+    "under",
+    "between",
+    "through",
+    "during",
+    "before",
+    "after",
+    "again",
+    "then",
+    "once",
+    "here",
+    "there",
+    "more",
+    "most",
+    "some",
+    "such",
+    "only",
+    "own",
+    "same",
+    "than",
+    "too",
+    "very",
+    "just",
+    "now",
+    "also",
+    "about",
+    "they",
+    "them",
+    "their",
+    "its",
+    "itself",
+    "been",
+    "being",
+    "ourselves",
+];
+
+/// Tokenize text for keyword-overlap scoring: lowercase,
+/// split on non-alphanumeric, drop short tokens, drop
+/// stopwords. Returns a `HashSet` so intersection size
+/// is the score.
+fn tokenize(s: &str) -> HashSet<String> {
+    s.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3 && !STOPWORDS.contains(t))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// First text block in a content vector, if any. The
+/// reranker only scores the textual portion; tool inputs /
+/// outputs / images get summarized to "" (zero score) for
+/// v1.
+fn first_text(blocks: &[ContentBlock]) -> Option<&str> {
+    for b in blocks {
+        if let ContentBlock::Text { text } = b {
+            return Some(text.as_str());
+        }
+    }
+    None
+}
+
+/// Tokenize the most recent `User` message in `working` —
+/// our proxy for "the model's current request." Returns
+/// `None` when no user message has any text content (rare;
+/// e.g., images-only) so the reranker can short-circuit.
+fn current_prompt_tokens(working: &[Message]) -> Option<HashSet<String>> {
+    for m in working.iter().rev() {
+        if let Message::User(u) = m {
+            if let Some(text) = first_text(&u.content) {
+                let toks = tokenize(text);
+                if !toks.is_empty() {
+                    return Some(toks);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Score a candidate message against tokenized prompt
+/// keywords. The score is the size of the intersection of
+/// the prompt's tokens and the message's tokens. Tool
+/// results, assistants, and users all contribute their
+/// first text block; custom messages get score 0.
+fn score_message(prompt_tokens: &HashSet<String>, m: &Message) -> usize {
+    let text = match m {
+        Message::User(u) => first_text(&u.content),
+        Message::Assistant(a) => first_text(&a.content),
+        Message::ToolResult(t) => first_text(&t.content),
+        Message::Custom(_) => None,
+    };
+    let Some(text) = text else { return 0 };
+    let msg_tokens = tokenize(text);
+    prompt_tokens.intersection(&msg_tokens).count()
+}
+
 /// Active-context ceiling + FIFO eviction policy.
 ///
 /// Holds a shared handle to the `ExternalContext` store so
@@ -79,6 +225,15 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// over budget but the policy stops evicting (we'd rather
     /// be over ceiling than blind to the current turn).
     keep_last_n: usize,
+
+    /// Token budget for relevance-based paging-in (Phase E).
+    /// Sits *on top* of `active_ceiling_tokens`: after
+    /// FIFO eviction lands `working` at ≤ ceiling, the
+    /// reranker may add up to this many tokens of
+    /// keyword-relevant evicted content. Set to 0 to disable
+    /// paging entirely (FIFO-only behavior, equivalent to
+    /// pure Phase C).
+    relevance_budget_tokens: u64,
 
     /// Shared with the recurse tool's
     /// `ControllerContextProvider` so evicted messages are
@@ -109,12 +264,14 @@ impl ContextVirtualizationPolicy {
     pub(crate) fn new(
         active_ceiling_tokens: u64,
         keep_last_n: usize,
+        relevance_budget_tokens: u64,
         external: Arc<RwLock<ExternalContext>>,
         pushed: HashSet<u64>,
     ) -> Self {
         Self {
             active_ceiling_tokens,
             keep_last_n,
+            relevance_budget_tokens,
             external,
             pushed: Mutex::new(pushed),
             last_ledger_ts: Mutex::new(None),
@@ -192,11 +349,22 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             working.drain(..idx);
         }
 
+        // Step 3.5: relevance-based paging-in. Score every
+        // evicted message against the current prompt's
+        // keywords; page back the highest scorers within
+        // `relevance_budget_tokens`. This budget overlays on
+        // top of the active ceiling so total send is at
+        // most `active_ceiling + relevance_budget`. After
+        // adding, sort working by timestamp so paged-in
+        // messages land at their original chronological
+        // position.
+        let paged_in_count = self.page_in_relevant(&mut working).await;
+
         // Step 4: build the ledger from current external
         // state and append it. The ledger sits at the very
         // end of working, right before the model generates,
         // so it's maximally visible to the model.
-        let ledger = self.build_ledger(working.len()).await;
+        let ledger = self.build_ledger(working.len(), paged_in_count).await;
         let ledger_ts = message_timestamp(&ledger);
         working.push(ledger);
 
@@ -218,12 +386,81 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
 }
 
 impl ContextVirtualizationPolicy {
+    /// Score evicted messages against the current prompt's
+    /// keywords and append the highest-scoring ones to
+    /// `working`, up to `relevance_budget_tokens`. Returns
+    /// the number of messages paged in (used by the ledger).
+    /// Re-sorts `working` by timestamp at the end so paged-
+    /// in content lands at its original chronological
+    /// position rather than at the back where it was just
+    /// pushed.
+    async fn page_in_relevant(&self, working: &mut Vec<Message>) -> usize {
+        if self.relevance_budget_tokens == 0 {
+            return 0;
+        }
+        let Some(prompt_tokens) = current_prompt_tokens(working) else {
+            return 0;
+        };
+
+        // Take a snapshot of evicted candidates outside any
+        // lock so we don't hold the read guard while
+        // scoring.
+        let working_ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
+        let mut candidates: Vec<(usize, Message)> = {
+            let external = self.external.read().await;
+            external
+                .iter()
+                .filter(|m| !working_ts.contains(&message_timestamp(m)))
+                .filter_map(|m| {
+                    let s = score_message(&prompt_tokens, m);
+                    if s == 0 { None } else { Some((s, m.clone())) }
+                })
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Sort by score descending; tie-break by recency
+        // (later timestamps preferred). The reranker
+        // assumes more-recent matches are likelier to be
+        // relevant.
+        candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| message_timestamp(&b.1).cmp(&message_timestamp(&a.1)))
+        });
+
+        let mut budget = self.relevance_budget_tokens;
+        let mut paged = 0;
+        for (_score, m) in candidates {
+            let cost = estimate_tokens(&m);
+            if cost > budget {
+                continue;
+            }
+            budget = budget.saturating_sub(cost);
+            working.push(m);
+            paged += 1;
+            if budget == 0 {
+                break;
+            }
+        }
+
+        if paged > 0 {
+            // Stable sort by timestamp so paged-in content
+            // lands in chronological order alongside the
+            // surviving FIFO content.
+            working.sort_by_key(message_timestamp);
+        }
+        paged
+    }
+
     /// Build the structured ledger as a `User` message
     /// wrapped in `<system-reminder>` tags. Counts come from
     /// the shared `ExternalContext` indexes; tool-result
     /// breakdown is sorted by frequency and capped at 8 names
     /// to keep the ledger bounded (target ≤500 tokens).
-    async fn build_ledger(&self, active_len: usize) -> Message {
+    async fn build_ledger(&self, active_len: usize, paged_in_count: usize) -> Message {
         let lines = {
             let external = self.external.read().await;
             let total = external.len();
@@ -234,6 +471,12 @@ impl ContextVirtualizationPolicy {
                 "external context — call the recurse tool to access evicted content".to_string(),
                 format!("- {total} total messages ({evicted} evicted, {active_len} active)"),
             ];
+
+            if paged_in_count > 0 {
+                lines.push(format!(
+                    "- {paged_in_count} relevant prior messages paged in for this turn"
+                ));
+            }
 
             // Tool-result breakdown by tool name. Walk the
             // ToolResult ID list once, count per tool name.
@@ -346,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn ceiling_unlimited_returns_continue() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let policy = ContextVirtualizationPolicy::new(u64::MAX, 4, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(u64::MAX, 4, 0, store, HashSet::new());
         let context: Vec<Message> = (0..20).map(|i| user("hello", i as u64)).collect();
         let response = policy.before_model(sample_request(&context)).await;
         assert_eq!(response, BeforeModelResponse::Continue);
@@ -361,7 +604,7 @@ mod tests {
     async fn under_ceiling_keeps_all_messages_and_appends_ledger() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         // 10_000-token ceiling, content is tiny.
-        let policy = ContextVirtualizationPolicy::new(10_000, 4, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(10_000, 4, 0, store, HashSet::new());
         let context = vec![user("hi", 1), assistant("hello", 2)];
         let response = policy.before_model(sample_request(&context)).await;
 
@@ -390,7 +633,7 @@ mod tests {
             .map(|i| user(&format!("msg{i}"), i as u64))
             .collect();
         // Ceiling = 5 tokens; keep_last_n = 3.
-        let policy = ContextVirtualizationPolicy::new(5, 3, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 3, 0, store, HashSet::new());
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -418,7 +661,7 @@ mod tests {
         // The pinned tail (5 messages) will be over the
         // ceiling but the policy refuses to evict pinned
         // messages.
-        let policy = ContextVirtualizationPolicy::new(1, 5, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(1, 5, 0, store, HashSet::new());
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -442,7 +685,7 @@ mod tests {
         let context: Vec<Message> = (0..8)
             .map(|i| user(&format!("msg{i}"), 100 + i as u64))
             .collect();
-        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&store), HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), HashSet::new());
         let _ = policy.before_model(sample_request(&context)).await;
         let external = store.read().await;
         // Every original message landed in external (or was
@@ -465,7 +708,7 @@ mod tests {
         // Pre-populated dedup set matching the snapshot
         // currently in the store.
         let pushed = ContextVirtualizationPolicy::pushed_set_from_snapshot(&context);
-        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&external), pushed);
+        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&external), pushed);
         let _ = policy.before_model(sample_request(&context)).await;
         let external = external.read().await;
         // Length unchanged: 5 from pre-population, 0
@@ -488,7 +731,7 @@ mod tests {
             assistant("ack2", 6),
             user("third", 7),
         ];
-        let policy = ContextVirtualizationPolicy::new(5, 2, Arc::clone(&store), HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), HashSet::new());
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -516,7 +759,7 @@ mod tests {
     async fn ledger_replaced_each_turn_no_accumulation() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, HashSet::new());
 
         // Fire 1: ledger appended.
         let r1 = policy.before_model(sample_request(&context)).await;
@@ -553,7 +796,7 @@ mod tests {
             tool_result("c3", "read", "file", 4),
             assistant("ack", 5),
         ];
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, HashSet::new());
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -583,7 +826,7 @@ mod tests {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
         let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, Arc::clone(&store), HashSet::new());
+            ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), HashSet::new());
         let _ = policy.before_model(sample_request(&context)).await;
         // External: 3 originals, 0 ledgers.
         assert_eq!(store.read().await.len(), 3);
@@ -601,5 +844,267 @@ mod tests {
             },
             _ => false,
         }
+    }
+
+    fn user_text(m: &Message) -> Option<&str> {
+        match m {
+            Message::User(u) => match u.content.first()? {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Tokenizer drops common stopwords + sub-3-char tokens
+    /// + collapses to lowercase.
+    ///
+    /// Tokens differing only in case land in the same bucket;
+    /// "the" is filtered.
+    #[test]
+    fn tokenize_filters_stopwords_and_short_tokens() {
+        let toks = tokenize("The quick brown fox jumps over the lazy dog");
+        // "the", "over" → stopwords; "fox", "dog" → kept.
+        assert!(!toks.contains("the"));
+        assert!(!toks.contains("over"));
+        assert!(toks.contains("quick"));
+        assert!(toks.contains("brown"));
+        assert!(toks.contains("fox"));
+        assert!(toks.contains("dog"));
+        assert!(toks.contains("jumps"));
+        assert!(toks.contains("lazy"));
+    }
+
+    /// Tokenizer is case-insensitive and splits on
+    /// non-alphanumerics.
+    #[test]
+    fn tokenize_normalizes_case_and_splits_punctuation() {
+        let toks = tokenize("Tallahassee, FL — weather forecast?");
+        assert!(toks.contains("tallahassee"));
+        assert!(toks.contains("weather"));
+        assert!(toks.contains("forecast"));
+    }
+
+    /// `score_message`: intersection size between prompt
+    /// tokens and message tokens. Stopwords don't count.
+    #[test]
+    fn score_message_returns_intersection_size() {
+        let prompt_tokens = tokenize("weather forecast Tallahassee");
+        let m = user("the weather in Tallahassee is sunny", 1);
+        // "weather" + "tallahassee" overlap; "the" is a
+        // stopword.
+        assert_eq!(score_message(&prompt_tokens, &m), 2);
+        let unrelated = user("hello world friends", 1);
+        assert_eq!(score_message(&prompt_tokens, &unrelated), 0);
+    }
+
+    /// Phase E: with `relevance_budget_tokens = 0`, the
+    /// policy never pages in. Equivalent to Phase C
+    /// behavior. Sets up an evicted message that would be
+    /// highly relevant; verifies it stays evicted.
+    #[tokio::test]
+    async fn relevance_budget_zero_disables_paging() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context: Vec<Message> = (0..6)
+            .map(|i| user(&format!("evictable msg{i}"), i as u64))
+            .chain([user("weather forecast for Tallahassee tomorrow", 100)])
+            .collect();
+        // Budget = 0; ceiling = 5 forces eviction.
+        let policy = ContextVirtualizationPolicy::new(5, 1, 0, store, HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        // Expected: pinned tail (1 most-recent) + ledger.
+        // No paging happened — survivors.len() == 2.
+        assert_eq!(survivors.len(), 2);
+    }
+
+    /// Phase E: with a relevance budget, evicted messages
+    /// matching the prompt's keywords get paged back in.
+    /// Sets up a 10-message context with a topical
+    /// keyword-match buried in the front; tight ceiling
+    /// evicts it; relevance budget pages it back in.
+    #[tokio::test]
+    async fn paged_in_messages_match_prompt_keywords() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        // The buried message contains the keyword
+        // "Tallahassee"; the rest are unrelated chatter
+        // that should not match.
+        let mut context: Vec<Message> = vec![
+            user(
+                "here's a long discussion about Tallahassee weather patterns",
+                1,
+            ),
+            user("filler about pets", 2),
+            user("filler about food", 3),
+            user("filler about music", 4),
+            user("filler about books", 5),
+            user("filler about movies", 6),
+            user("filler about sports", 7),
+        ];
+        // Current prompt — last user message — asks about
+        // Tallahassee.
+        context.push(user("what's the weather in Tallahassee tomorrow?", 100));
+
+        // Tight ceiling forces eviction of message 1; budget
+        // big enough to page it back.
+        let policy = ContextVirtualizationPolicy::new(5, 1, 50, Arc::clone(&store), HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+
+        // Find the Tallahassee message in survivors. With
+        // FIFO+keep_last_n=1 alone it would be evicted; the
+        // reranker should have paged it back in.
+        let has_tallahassee_match = survivors.iter().any(|m| {
+            user_text(m)
+                .map(|t| t.contains("Tallahassee weather patterns"))
+                .unwrap_or(false)
+        });
+        assert!(
+            has_tallahassee_match,
+            "relevance reranker should have paged in the Tallahassee message"
+        );
+    }
+
+    /// Phase E: paging-in respects the budget. Many
+    /// matching candidates, small budget — only the highest
+    /// scorers fit. Sum of paged-in message tokens ≤ budget.
+    #[tokio::test]
+    async fn paged_in_respects_budget() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let mut context: Vec<Message> = (0..10)
+            .map(|i| user(&format!("weather report number {i}"), i as u64))
+            .collect();
+        context.push(user("what's the weather like?", 100));
+
+        let budget = 6_u64;
+        let policy =
+            ContextVirtualizationPolicy::new(2, 1, budget, Arc::clone(&store), HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        // Identify paged-in messages: present in survivors
+        // and in the original context's evictable region
+        // (positions 0..10), excluding the pinned tail
+        // (position 10) and the ledger.
+        let pinned_tail_ts = message_timestamp(&context[10]);
+        let paged_in: Vec<&Message> = survivors
+            .iter()
+            .filter(|m| !is_ledger(m) && message_timestamp(m) != pinned_tail_ts)
+            .collect();
+        let paged_tokens: u64 = paged_in
+            .iter()
+            .map(|m| estimate_tokens(m))
+            .fold(0, u64::saturating_add);
+        assert!(
+            paged_tokens <= budget,
+            "paged-in tokens ({paged_tokens}) exceeded budget ({budget}); \
+             {} message(s) were paged in",
+            paged_in.len()
+        );
+        // Sanity: at least one was paged in (otherwise the
+        // test isn't exercising the path).
+        assert!(!paged_in.is_empty(), "expected at least one paged-in");
+    }
+
+    /// Phase E: paging-in does not duplicate messages that
+    /// are already in `working`. The reranker filters
+    /// candidates by timestamp absence in working.
+    #[tokio::test]
+    async fn paged_in_excludes_active_context() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        // All 5 messages contain "weather" (high score
+        // candidates). With keep_last_n = 5 and ceiling
+        // 10_000, no eviction triggers, so ALL 5 are
+        // already in working.
+        let context: Vec<Message> = (0..5)
+            .map(|i| user(&format!("weather weather {i}"), i as u64))
+            .chain([user("what's the weather?", 100)])
+            .collect();
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 6, 1_000, Arc::clone(&store), HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        // Survivors count = original count + ledger; no
+        // duplicates (no message appears twice).
+        assert_eq!(survivors.len(), context.len() + 1);
+        let originals: Vec<&Message> = survivors.iter().filter(|m| !is_ledger(m)).collect();
+        let ts_set: HashSet<u64> = originals.iter().map(|m| message_timestamp(m)).collect();
+        assert_eq!(
+            ts_set.len(),
+            originals.len(),
+            "no message should appear twice in working"
+        );
+    }
+
+    /// Phase E: paged-in messages land in chronological
+    /// order. After paging, working is sorted by
+    /// timestamp — the model sees a coherent timeline
+    /// rather than reranker output bolted on at the back.
+    #[tokio::test]
+    async fn paged_in_chronologically_ordered() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let mut context: Vec<Message> = (0..8)
+            .map(|i| user(&format!("topic{i} weather"), i as u64))
+            .collect();
+        context.push(user("weather question", 100));
+
+        let policy =
+            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let originals: Vec<&Message> = survivors.iter().filter(|m| !is_ledger(m)).collect();
+        // Timestamps in originals must be non-decreasing.
+        for w in originals.windows(2) {
+            let a = message_timestamp(w[0]);
+            let b = message_timestamp(w[1]);
+            assert!(a <= b, "timestamps out of order: {a} appeared before {b}");
+        }
+    }
+
+    /// Phase E: ledger reports the paged-in count when
+    /// non-zero.
+    #[tokio::test]
+    async fn ledger_reports_paged_in_count() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let mut context: Vec<Message> = (0..6)
+            .map(|i| user(&format!("weather chat {i}"), i as u64))
+            .collect();
+        context.push(user("weather!", 100));
+
+        let policy =
+            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), HashSet::new());
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ledger_text = survivors
+            .iter()
+            .find_map(|m| {
+                if is_ledger(m) {
+                    user_text(m).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .expect("ledger present");
+        assert!(
+            ledger_text.contains("paged in for this turn"),
+            "expected paged-in count in ledger: {ledger_text}"
+        );
     }
 }

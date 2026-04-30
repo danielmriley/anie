@@ -1834,6 +1834,29 @@ fn rlm_keep_last_n() -> usize {
         .unwrap_or(6)
 }
 
+/// Read the relevance-budget override from
+/// `ANIE_RELEVANCE_BUDGET_TOKENS`. This is the Phase E
+/// budget for keyword-relevant content paged back in for
+/// the current turn (overlays on top of the active
+/// ceiling). Default is `active_ceiling / 4` so a tightly-
+/// budgeted run gets a proportional reranker headroom; set
+/// to 0 to disable paging entirely.
+fn rlm_relevance_budget_tokens(active_ceiling_tokens: u64) -> u64 {
+    if let Some(parsed) = std::env::var("ANIE_RELEVANCE_BUDGET_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        return parsed;
+    }
+    if active_ceiling_tokens == u64::MAX {
+        // Noop install — relevance is dead code in this
+        // path anyway; choose 0 to make the value
+        // self-documenting.
+        return 0;
+    }
+    active_ceiling_tokens / 4
+}
+
 /// Build the per-run extras (recurse tool + virtualization
 /// policy) injected into the agent loop when
 /// `--harness-mode=rlm`. Returns an empty `RlmExtras` for any
@@ -1847,7 +1870,7 @@ fn rlm_keep_last_n() -> usize {
 ///
 /// Plan: `docs/rlm_2026-04-29/02_recurse_tool.md` and
 /// `docs/rlm_2026-04-29/06_phased_implementation.md`
-/// Phases A + B + C.
+/// Phases A + B + C + D + E.
 fn build_rlm_extras(
     state: &ControllerState,
     recursion_budget: Arc<AtomicU32>,
@@ -1883,12 +1906,18 @@ fn build_rlm_extras(
         0, // top-level depth
         RECURSION_MAX_DEPTH,
     ));
-    // Phase C: install the active-ceiling policy. With the
-    // env var unset, ceiling = u64::MAX → policy returns
-    // Continue on every fire (default behavior preserved).
+    // Phases C + D + E: install the active-ceiling policy.
+    // With the env var unset, ceiling = u64::MAX → policy
+    // returns Continue on every fire (default behavior
+    // preserved). With a finite ceiling, the policy evicts,
+    // archives, pages relevance-scored content back in, and
+    // injects a per-turn ledger. The relevance budget
+    // defaults to ceiling/4.
+    let active_ceiling = rlm_active_ceiling_tokens();
     let policy = Arc::new(crate::context_virt::ContextVirtualizationPolicy::new(
-        rlm_active_ceiling_tokens(),
+        active_ceiling,
         rlm_keep_last_n(),
+        rlm_relevance_budget_tokens(active_ceiling),
         store,
         pushed_set,
     ));
