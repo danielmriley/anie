@@ -85,6 +85,13 @@ pub(crate) struct StoredMessage {
     /// reranker can page summaries in cheaply when the full
     /// content wouldn't fit under the budget.
     pub summary: Option<String>,
+    /// Optional Plan-08 embedding vector, written by the
+    /// background embed worker after archive. The relevance
+    /// reranker uses this for cosine-similarity scoring
+    /// when configured; when absent (worker behind, or no
+    /// embedder installed), the reranker falls back to
+    /// keyword overlap for that candidate.
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Indexed store of messages. Owns its messages; clones
@@ -148,6 +155,7 @@ impl ExternalContext {
             id,
             message,
             summary: None,
+            embedding: None,
         });
         id
     }
@@ -181,6 +189,40 @@ impl ExternalContext {
     #[must_use]
     pub(crate) fn summary_count(&self) -> usize {
         self.messages.iter().filter(|s| s.summary.is_some()).count()
+    }
+
+    /// Attach an embedding vector to an existing stored
+    /// message. Idempotent — replaces the previous vector
+    /// if any. Used by the Plan-08 background embedder
+    /// worker. No-op when `id` is out of bounds.
+    #[allow(dead_code)] // wired up in PR 08.2 (worker) / 08.3 (reranker).
+    pub(crate) fn set_embedding(&mut self, id: MessageId, embedding: Vec<f32>) {
+        if let Some(stored) = self.messages.get_mut(id) {
+            stored.embedding = Some(embedding);
+        }
+    }
+
+    /// Borrow the optional embedding attached to `id`.
+    /// Returns the slice or `None` if the entry hasn't
+    /// been embedded (worker not yet caught up, or no
+    /// embedder configured for this run).
+    #[must_use]
+    #[allow(dead_code)] // wired up in PR 08.3 (reranker).
+    pub(crate) fn get_embedding(&self, id: MessageId) -> Option<&[f32]> {
+        self.messages.get(id).and_then(|s| s.embedding.as_deref())
+    }
+
+    /// Number of stored messages that currently have an
+    /// embedding attached. Surfaces in the ledger when
+    /// non-zero so the operator can confirm the embedder
+    /// is keeping up.
+    #[must_use]
+    #[allow(dead_code)] // wired up in PR 08.3 (ledger).
+    pub(crate) fn embedding_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|s| s.embedding.is_some())
+            .count()
     }
 
     /// Number of stored messages. `#[allow(dead_code)]` —
