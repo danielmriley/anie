@@ -991,6 +991,12 @@ impl InteractiveController {
             provider = %self.state.config.current_model().provider,
             model = %self.state.config.current_model().id,
             thinking = %format_thinking(self.state.config.current_thinking()),
+            harness_mode = self.state.harness_mode.label(),
+            rlm_active_ceiling_tokens = if self.state.harness_mode.installs_rlm_features() {
+                rlm_active_ceiling_tokens()
+            } else {
+                u64::MAX
+            },
             "starting interactive run"
         );
         // A fresh user prompt supersedes any pending retry from

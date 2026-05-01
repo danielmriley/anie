@@ -77,6 +77,7 @@ use anie_agent::{BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse};
 use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
 use anie_session::estimate_tokens;
 use tokio::sync::{RwLock, mpsc};
+use tracing::{debug, info};
 
 use crate::external_context::{ExternalContext, MessageKindLabel};
 
@@ -385,6 +386,10 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         // behavior to NoopBeforeModelPolicy. Operators flip
         // this on by setting `ANIE_ACTIVE_CEILING_TOKENS`.
         if self.active_ceiling_tokens == u64::MAX {
+            debug!(
+                target: "anie_cli::context_virt",
+                "rlm policy fire skipped (ceiling=u64::MAX, noop fast path)"
+            );
             return BeforeModelResponse::Continue;
         }
 
@@ -527,6 +532,27 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(ledger_ts);
+
+        // Tracing: a single info-level line per fire so
+        // operators tailing the log can reconstruct what
+        // the policy did each turn without sifting through
+        // the TUI's transcript. Goes alongside the
+        // `RlmStatsUpdate` event below — TUI and log are
+        // independent surfaces for the same data.
+        let active_tokens: u64 = working
+            .iter()
+            .map(estimate_tokens)
+            .fold(0u64, u64::saturating_add);
+        info!(
+            target: "anie_cli::context_virt",
+            archived_total,
+            evicted = evicted_count,
+            paged_in = paged_in_count,
+            active_tokens,
+            ceiling = self.active_ceiling_tokens,
+            keep_last_n = self.keep_last_n,
+            "rlm policy fire"
+        );
 
         if let Some(tx) = &self.event_tx {
             // Always emit a stats update so the status
