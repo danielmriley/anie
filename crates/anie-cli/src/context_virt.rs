@@ -191,6 +191,20 @@ fn first_text(blocks: &[ContentBlock]) -> Option<&str> {
     None
 }
 
+/// Convenience for whole messages: returns the first
+/// text block of the message's content. Used by the
+/// archive-time embed enqueue path. Custom messages
+/// have no surface text (their payload is opaque
+/// JSON).
+fn first_text_of(m: &Message) -> Option<&str> {
+    match m {
+        Message::User(u) => first_text(&u.content),
+        Message::Assistant(a) => first_text(&a.content),
+        Message::ToolResult(t) => first_text(&t.content),
+        Message::Custom(_) => None,
+    }
+}
+
 /// Tokenize the most recent `User` message in `working` —
 /// our proxy for "the model's current request." Returns
 /// `None` when no user message has any text content (rare;
@@ -210,15 +224,44 @@ fn current_prompt_tokens(working: &[Message]) -> Option<HashSet<String>> {
 }
 
 /// One candidate the relevance reranker is considering for
-/// paging back in. Carries the score (intersection size with
-/// prompt tokens), the archive entry's stable id (for the
-/// summary-fallback annotation), the full message body, and
-/// the optional pre-computed summary.
+/// paging back in. Carries the score (cosine similarity
+/// when embeddings are available, keyword-overlap intersection
+/// size cast to f32 otherwise), the archive entry's stable id
+/// (for the summary-fallback annotation), the full message
+/// body, and the optional pre-computed summary.
 struct RelevanceCandidate {
-    score: usize,
+    /// Cosine similarity in [-1, 1] when scored by
+    /// embedding; intersection-size as f32 when scored by
+    /// keyword overlap. Higher is better for both — we
+    /// can sort uniformly without normalizing because the
+    /// fallback only fires per-candidate (we never mix
+    /// scores in the same sort).
+    score: f32,
     id: crate::external_context::MessageId,
     message: Message,
     summary: Option<String>,
+}
+
+/// Score a candidate using the best available signal. If
+/// both the prompt and the candidate have embeddings,
+/// returns cosine similarity (range [-1, 1]). Otherwise
+/// falls back to keyword overlap (intersection size cast
+/// to f32, range [0, ∞)). The two scales aren't
+/// commensurate but they only ever appear in the same
+/// sort when the run is mid-warmup (some candidates
+/// embedded, some not) — both are "higher is better" so
+/// the relative ordering remains useful in either
+/// regime.
+fn score_candidate(
+    prompt_embed: Option<&[f32]>,
+    prompt_tokens: &HashSet<String>,
+    candidate_embed: Option<&[f32]>,
+    candidate_message: &Message,
+) -> f32 {
+    if let (Some(p), Some(c)) = (prompt_embed, candidate_embed) {
+        return crate::embedder::cosine_similarity(p, c);
+    }
+    score_message(prompt_tokens, candidate_message) as f32
 }
 
 /// Score a candidate message against tokenized prompt
@@ -308,6 +351,29 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// the size threshold. `None` in tests + when the
     /// summarizer is disabled.
     summarizer_tx: Option<mpsc::Sender<crate::bg_summarizer::SummaryRequest>>,
+
+    /// Optional Plan-08 embedder used to embed the
+    /// prompt at fire time. When set, the reranker scores
+    /// candidates with cached embeddings via cosine
+    /// similarity instead of keyword overlap. `None`
+    /// preserves the existing keyword-only behavior.
+    embedder: Option<Arc<dyn crate::embedder::Embedder>>,
+
+    /// Optional Plan-08 background embed worker handle.
+    /// When set, the policy enqueues an `EmbedRequest`
+    /// for each newly-archived message above the size
+    /// threshold, mirroring the summarizer flow. The
+    /// worker writes embeddings back into the store; the
+    /// reranker reads them next turn.
+    embed_tx: Option<mpsc::Sender<crate::bg_embedder::EmbedRequest>>,
+
+    /// Per-fire cache for the prompt embedding. Keyed by
+    /// the latest User message's timestamp; reused when
+    /// the same prompt drives multiple fires within a
+    /// turn (which happens whenever the loop spins more
+    /// than one ModelTurn step). Avoids re-embedding the
+    /// same prompt on every fire.
+    cached_prompt_embed: tokio::sync::Mutex<Option<(u64, Vec<f32>)>>,
 }
 
 impl ContextVirtualizationPolicy {
@@ -333,7 +399,28 @@ impl ContextVirtualizationPolicy {
             event_tx: None,
             external_size: Arc::new(AtomicUsize::new(0)),
             summarizer_tx: None,
+            embedder: None,
+            embed_tx: None,
+            cached_prompt_embed: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Attach a Plan-08 embedder + background worker. The
+    /// reranker will score candidates with cosine
+    /// similarity against the prompt's embedding when
+    /// both the prompt and a candidate have embeddings;
+    /// otherwise it falls back to keyword overlap for
+    /// that candidate. The worker tx is held separately
+    /// so the policy can enqueue archive entries for
+    /// async embedding.
+    pub(crate) fn with_embedder(
+        mut self,
+        embedder: Arc<dyn crate::embedder::Embedder>,
+        tx: mpsc::Sender<crate::bg_embedder::EmbedRequest>,
+    ) -> Self {
+        self.embedder = Some(embedder);
+        self.embed_tx = Some(tx);
+        self
     }
 
     /// Attach a Phase-F background summarizer queue. The
@@ -436,21 +523,41 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         };
         self.external_size.store(archived_total, Ordering::Release);
 
-        // Step 2.5 (Phase F): fan newly-archived messages
-        // out to the background summarizer if one's wired
-        // up. Skip messages below the size threshold —
-        // they don't benefit from summarization. The queue
-        // is bounded; if the worker is behind, `try_send`
-        // returns Full and we drop the request rather than
-        // blocking the model turn.
-        if let Some(tx) = &self.summarizer_tx {
-            for (id, message) in newly_archived {
-                if estimate_tokens(&message) < crate::bg_summarizer::SUMMARIZE_MIN_TOKENS {
-                    continue;
+        // Step 2.5 (Phase F + Plan 08): fan newly-archived
+        // messages out to background workers if any are
+        // wired up. Summarizer + embedder share the same
+        // archive but are independent workers; we walk the
+        // newly-archived list once and dispatch to each
+        // worker that's configured. Skip messages below the
+        // size threshold — they don't benefit from
+        // summarization or embedding (keyword overlap is
+        // adequate for short texts).
+        let summarize_min = crate::bg_summarizer::SUMMARIZE_MIN_TOKENS;
+        let embed_min = crate::bg_embedder::EMBED_MIN_TOKENS;
+        for (id, message) in &newly_archived {
+            let cost = estimate_tokens(message);
+            if let Some(tx) = &self.summarizer_tx {
+                if cost >= summarize_min {
+                    let _ = tx.try_send(crate::bg_summarizer::SummaryRequest {
+                        id: *id,
+                        message: message.clone(),
+                    });
                 }
-                let _ = tx.try_send(crate::bg_summarizer::SummaryRequest { id, message });
+            }
+            if let Some(tx) = &self.embed_tx {
+                if cost >= embed_min {
+                    if let Some(text) = first_text_of(message) {
+                        let _ = tx.try_send(crate::bg_embedder::EmbedRequest {
+                            id: *id,
+                            text: text.to_string(),
+                        });
+                    }
+                }
             }
         }
+        // Drop newly_archived; we no longer need to hold
+        // the clones.
+        drop(newly_archived);
 
         // Capture the latest User message's timestamp before
         // eviction. The user's current directive must always
@@ -767,6 +874,45 @@ impl ContextVirtualizationPolicy {
     /// in content lands at its original chronological
     /// position rather than at the back where it was just
     /// pushed.
+    /// Embed the latest user prompt in `working`, caching
+    /// per-turn keyed by the prompt's timestamp. Returns
+    /// `None` when no embedder is configured, when the
+    /// prompt has no text, or when the embed call fails
+    /// (logged at warn-level by the caller's fallback
+    /// path).
+    async fn cached_or_compute_prompt_embedding(&self, working: &[Message]) -> Option<Vec<f32>> {
+        let embedder = self.embedder.as_ref()?;
+        // Find the latest user message + its timestamp.
+        let (text, ts) = working.iter().rev().find_map(|m| match m {
+            Message::User(u) => first_text(&u.content).map(|t| (t.to_string(), u.timestamp)),
+            _ => None,
+        })?;
+        // Cache hit: same timestamp as last fire.
+        {
+            let cache = self.cached_prompt_embed.lock().await;
+            if let Some((cached_ts, vec)) = cache.as_ref() {
+                if *cached_ts == ts {
+                    return Some(vec.clone());
+                }
+            }
+        }
+        // Miss: embed and store.
+        match embedder.embed(&text).await {
+            Ok(vec) => {
+                *self.cached_prompt_embed.lock().await = Some((ts, vec.clone()));
+                Some(vec)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "anie_cli::context_virt",
+                    %error,
+                    "prompt embed failed; reranker falling back to keyword overlap"
+                );
+                None
+            }
+        }
+    }
+
     async fn page_in_relevant(&self, working: &mut Vec<Message>) -> usize {
         if self.relevance_budget_tokens == 0 {
             return 0;
@@ -775,21 +921,29 @@ impl ContextVirtualizationPolicy {
             return 0;
         };
 
+        // Plan-08: if an embedder is configured, embed the
+        // prompt once per turn (cached by latest-user-msg
+        // timestamp) and use cosine similarity for
+        // scoring when a candidate has a cached
+        // embedding. Falls back to keyword overlap per-
+        // candidate when either side is missing
+        // embeddings.
+        let prompt_embed = self.cached_or_compute_prompt_embedding(working).await;
+
         // Take a snapshot of evicted candidates outside any
         // lock so we don't hold the read guard while
         // scoring. For each candidate also clone its summary
-        // (if one's been written) so the budget loop can
-        // fall back to summary form when the full body
-        // wouldn't fit.
+        // and embedding so the budget loop can fall back to
+        // summary form / keyword overlap as needed.
         let working_ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
         let mut candidates: Vec<RelevanceCandidate> = {
             let external = self.external.read().await;
             external
                 .iter_with_meta()
-                .filter(|(_, m, _)| !working_ts.contains(&message_timestamp(m)))
-                .filter_map(|(id, m, summary)| {
-                    let s = score_message(&prompt_tokens, m);
-                    if s == 0 {
+                .filter(|(_, m, _, _)| !working_ts.contains(&message_timestamp(m)))
+                .filter_map(|(id, m, summary, embedding)| {
+                    let s = score_candidate(prompt_embed.as_deref(), &prompt_tokens, embedding, m);
+                    if s <= 0.0 {
                         None
                     } else {
                         Some(RelevanceCandidate {
@@ -808,12 +962,14 @@ impl ContextVirtualizationPolicy {
         }
 
         // Sort by score descending; tie-break by recency
-        // (later timestamps preferred). The reranker
-        // assumes more-recent matches are likelier to be
-        // relevant.
+        // (later timestamps preferred). NaN guard: if a
+        // score ever ends up NaN (shouldn't with our
+        // cosine guards), treat it as Equal so the sort
+        // stays total.
         candidates.sort_by(|a, b| {
             b.score
-                .cmp(&a.score)
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| message_timestamp(&b.message).cmp(&message_timestamp(&a.message)))
         });
 
@@ -924,6 +1080,16 @@ impl ContextVirtualizationPolicy {
             if summarized > 0 {
                 lines.push(format!(
                     "- {summarized} archive entries have summaries available"
+                ));
+            }
+
+            // Plan 08: report embedded count too. Mostly
+            // operator-facing — confirms the embed worker
+            // is keeping up with archive growth.
+            let embedded = external.embedding_count();
+            if embedded > 0 {
+                lines.push(format!(
+                    "- {embedded} archive entries have embeddings (semantic relevance)"
                 ));
             }
 
@@ -1903,5 +2069,162 @@ mod tests {
             !has_huge,
             "huge body should not have been paged in alongside the summary"
         );
+    }
+
+    /// Plan 08: when the policy has an embedder + the
+    /// candidate has a cached embedding, the reranker
+    /// scores by cosine similarity. Verify a high-cosine
+    /// candidate gets paged in even when its keyword
+    /// overlap with the prompt is zero.
+    #[tokio::test]
+    async fn reranker_prefers_high_cosine_similarity() {
+        use crate::bg_embedder::EmbedRequest;
+
+        // Build store with one candidate. Its content has
+        // no keyword overlap with the prompt, but its
+        // embedding will match the prompt's exactly.
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "zero keyword overlap content xyz",
+            1,
+        )])));
+        // Pre-set the embedding directly (skip the
+        // worker) so the test is deterministic.
+        store.write().await.set_embedding(0, vec![1.0, 0.0, 0.0]);
+
+        // Stub embedder: prompt embeds to the same
+        // vector as the candidate.
+        struct StubEmbedder;
+        #[async_trait::async_trait]
+        impl crate::embedder::Embedder for StubEmbedder {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+                Ok(vec![1.0, 0.0, 0.0])
+            }
+            fn dim(&self) -> usize {
+                3
+            }
+        }
+        let embedder: Arc<dyn crate::embedder::Embedder> = Arc::new(StubEmbedder);
+        let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
+
+        let pushed = HashSet::from([1u64]);
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), pushed)
+                .with_embedder(embedder, tx);
+
+        // Active context's prompt has no keyword overlap
+        // with the candidate. With keyword scoring this
+        // would page in nothing; with embedding cosine=1
+        // it should page in.
+        let context = vec![user("totally different abc query", 100)];
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let has_candidate = survivors.iter().any(|m| match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => text.contains("zero keyword overlap"),
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(
+            has_candidate,
+            "embedding cosine=1 candidate should have been paged in: {survivors:?}"
+        );
+    }
+
+    /// Plan 08: when the candidate has no cached
+    /// embedding (worker behind), fall back to keyword
+    /// overlap for that candidate even if other
+    /// candidates use embeddings. Verifies the per-
+    /// candidate fallback works.
+    #[tokio::test]
+    async fn reranker_falls_back_to_keyword_when_no_embedding() {
+        use crate::bg_embedder::EmbedRequest;
+
+        // Two candidates: one embedded, one not. Prompt
+        // has keyword overlap with the unembedded one.
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            user("foo bar baz quux", 1), // unembedded, keyword "quux" matches prompt
+            user("entirely unrelated content here", 2), // embedded
+        ])));
+        store.write().await.set_embedding(1, vec![1.0, 0.0, 0.0]);
+
+        struct OrthogonalEmbedder;
+        #[async_trait::async_trait]
+        impl crate::embedder::Embedder for OrthogonalEmbedder {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+                // Orthogonal to candidate 1's embedding.
+                Ok(vec![0.0, 1.0, 0.0])
+            }
+            fn dim(&self) -> usize {
+                3
+            }
+        }
+        let embedder: Arc<dyn crate::embedder::Embedder> = Arc::new(OrthogonalEmbedder);
+        let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
+
+        let pushed = HashSet::from([1u64, 2u64]);
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), pushed)
+                .with_embedder(embedder, tx);
+
+        let context = vec![user("looking for quux", 100)];
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        // Candidate 0 (foo bar baz quux) should be paged
+        // in by keyword fallback (orthogonal embedding
+        // means cosine=0 for the embedded candidate).
+        let has_keyword_match = survivors.iter().any(|m| match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => text.contains("foo bar baz quux"),
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(
+            has_keyword_match,
+            "keyword-overlap candidate should fall through despite presence of embeddings: {survivors:?}"
+        );
+    }
+
+    /// Plan 08: when no embedder is configured, behavior
+    /// matches the pre-08 keyword-overlap reranker
+    /// exactly. Same setup as
+    /// `paged_in_messages_match_prompt_keywords` but
+    /// double-checked with this guard.
+    #[tokio::test]
+    async fn reranker_falls_back_to_keyword_when_embedder_unconfigured() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "relevant_keyword content here",
+            1,
+        )])));
+        // No `with_embedder` call → reranker uses
+        // keyword overlap exclusively.
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            2,
+            10_000,
+            Arc::clone(&store),
+            HashSet::from([1u64]),
+        );
+        let context = vec![user("looking for relevant_keyword", 100)];
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let has_candidate = survivors.iter().any(|m| match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => text.contains("relevant_keyword"),
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(has_candidate, "keyword-only path should still page in");
     }
 }

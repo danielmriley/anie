@@ -1914,6 +1914,52 @@ fn rlm_relevance_budget_tokens(active_ceiling_tokens: u64) -> u64 {
     active_ceiling_tokens / 4
 }
 
+/// Default embedding dimensionality. nomic-embed-text
+/// returns 768; this is a sanity-check value. Wrong
+/// values don't break anything — they just disable a
+/// dim mismatch warning we might add later.
+const DEFAULT_EMBEDDING_DIM: usize = 768;
+
+/// Build the optional Plan-08 embedder + worker. Returns
+/// `None` when `ANIE_EMBEDDING_MODEL` is unset (default —
+/// preserves keyword-only behavior) or when the parent's
+/// provider isn't Ollama (the only embedding backend
+/// shipped today). Otherwise returns the embedder Arc +
+/// the worker's mpsc Sender.
+fn build_embedder(
+    state: &ControllerState,
+    store: Arc<tokio::sync::RwLock<crate::external_context::ExternalContext>>,
+) -> Option<(
+    Arc<dyn crate::embedder::Embedder>,
+    mpsc::Sender<crate::bg_embedder::EmbedRequest>,
+)> {
+    let model_name = std::env::var("ANIE_EMBEDDING_MODEL").ok()?;
+    if model_name.trim().is_empty() {
+        return None;
+    }
+    // Today only Ollama is supported. The parent's
+    // current model carries the base_url we point the
+    // embedder at — embeddings come from the same
+    // Ollama instance the chat does.
+    let parent_model = state.config.current_model();
+    if parent_model.api != anie_provider::ApiKind::OllamaChatApi {
+        warn!(
+            target: "anie_cli::controller",
+            api = ?parent_model.api,
+            "ANIE_EMBEDDING_MODEL set but parent provider is not Ollama; skipping embedder"
+        );
+        return None;
+    }
+    let embedder: Arc<dyn crate::embedder::Embedder> =
+        Arc::new(crate::embedder::OllamaEmbedder::new(
+            parent_model.base_url.clone(),
+            model_name,
+            DEFAULT_EMBEDDING_DIM,
+        ));
+    let tx = crate::bg_embedder::spawn_embed_worker(Arc::clone(&embedder), store);
+    Some((embedder, tx))
+}
+
 /// Build the per-run extras (recurse tool + virtualization
 /// policy) injected into the agent loop when
 /// `--harness-mode=rlm`. Returns an empty `RlmExtras` for any
@@ -1961,6 +2007,16 @@ fn build_rlm_extras(
             state.config.active_ollama_num_ctx_override(),
         ));
     let summarizer_tx = crate::bg_summarizer::spawn_worker(summarizer, Arc::clone(&store));
+
+    // Plan 08: optionally spawn the background embedder.
+    // Reads `ANIE_EMBEDDING_MODEL` to decide whether to
+    // wire it up. When set + the parent is an Ollama
+    // provider, we spin up an OllamaEmbedder pointed at
+    // the same base_url. Failures during the actual embed
+    // call are handled in-worker (logged, entry stays
+    // unembedded → reranker falls back to keyword).
+    let embed_handle = build_embedder(state, Arc::clone(&store));
+
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
         Arc::clone(&store),
     ));
@@ -2005,6 +2061,9 @@ fn build_rlm_extras(
     .with_summarizer(summarizer_tx);
     if let Some(tx) = event_tx {
         policy = policy.with_event_sender(tx);
+    }
+    if let Some((embedder, embed_tx)) = embed_handle {
+        policy = policy.with_embedder(embedder, embed_tx);
     }
     RlmExtras {
         tools: vec![recurse_tool],

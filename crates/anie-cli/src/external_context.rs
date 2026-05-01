@@ -277,16 +277,23 @@ impl ExternalContext {
         self.messages.iter().map(|s| &s.message)
     }
 
-    /// Like `iter` but also exposes each entry's stable id
-    /// and optional summary. Used by the relevance reranker
-    /// to substitute a summary for the full body when the
-    /// full body wouldn't fit under the budget.
+    /// Like `iter` but also exposes each entry's stable id,
+    /// optional summary, and optional embedding. Used by
+    /// the relevance reranker to (1) substitute a summary
+    /// for the full body when the body wouldn't fit under
+    /// the budget, and (2) score by cosine similarity when
+    /// embeddings are available.
     pub(crate) fn iter_with_meta(
         &self,
-    ) -> impl Iterator<Item = (MessageId, &Message, Option<&str>)> {
-        self.messages
-            .iter()
-            .map(|s| (s.id, &s.message, s.summary.as_deref()))
+    ) -> impl Iterator<Item = (MessageId, &Message, Option<&str>, Option<&[f32]>)> {
+        self.messages.iter().map(|s| {
+            (
+                s.id,
+                &s.message,
+                s.summary.as_deref(),
+                s.embedding.as_deref(),
+            )
+        })
     }
 
     /// Look up the message ID for a `tool_call_id`. None

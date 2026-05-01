@@ -79,6 +79,14 @@ work lands.
 |---|---|---|
 | 11 | background summarizer worker; `Summarizer` trait with `HeadTruncationSummarizer` baseline; ledger reports summary count | `6675b68` |
 
+## Plan 08 — embedding-based reranker (rlm/19–21 on `dev_rlm`)
+
+| Sub | What | Commit |
+|---|---|---|
+| 08.1 | `Embedder` trait + `OllamaEmbedder` + `cosine_similarity` | `d8e81b7` |
+| 08.2 | embedding cache on `StoredMessage` + background embed worker | `08180d8` |
+| 08.3 | reranker uses cosine-similarity when available; keyword fallback per-candidate; `ANIE_EMBEDDING_MODEL` opt-in | (this commit) |
+
 ## Ordering rationale
 
 - **Plan 01 lands on main first** because it's bounded,
