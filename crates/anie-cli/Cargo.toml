@@ -34,6 +34,7 @@ async-trait.workspace = true
 futures.workspace = true
 rand.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -58,5 +59,6 @@ anie-tui.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 temp-env.workspace = true
+httpmock.workspace = true
 anie-provider = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }
