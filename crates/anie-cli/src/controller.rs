@@ -1812,11 +1812,30 @@ fn build_agent(
         Arc::clone(&state.request_options_resolver),
     )
     .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
-    .with_compaction_gate(compaction_gate);
+    .with_compaction_gate(compaction_gate)
+    .with_wrap_failed_tool_results(should_wrap_failed_tool_results(state));
     if let Some(policy) = rlm_extras.policy {
         config = config.with_before_model_policy(policy);
     }
     AgentLoop::new(Arc::clone(&state.provider_registry), tool_registry, config)
+}
+
+/// PR 1 of `docs/harness_mitigations_2026-05-01/`. Enable
+/// the failed-tool-result wrapper in `--harness-mode=rlm` by
+/// default. `ANIE_DISABLE_FAIL_REVERIFY=1` turns it off for
+/// smoke-test bisection.
+fn should_wrap_failed_tool_results(state: &ControllerState) -> bool {
+    if !state.harness_mode.installs_rlm_features() {
+        return false;
+    }
+    !env_flag_enabled("ANIE_DISABLE_FAIL_REVERIFY")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 /// rlm-mode system-prompt augment. Establishes the policy

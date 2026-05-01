@@ -379,6 +379,12 @@ pub struct AgentLoopConfig {
     /// virtual call per turn with no behavioral change. Plan
     /// `docs/repl_agent_loop/07_first_policy_boundary.md`.
     before_model_policy: Arc<dyn BeforeModelPolicy>,
+    /// When true, prepend a directive to any tool result that
+    /// completes with `is_error = true`, instructing the model
+    /// to verify the failure (re-read the file, re-run the
+    /// command) before claiming success. Defaults to `false`.
+    /// PR 1 of `docs/harness_mitigations_2026-05-01/`.
+    wrap_failed_tool_results: bool,
 }
 
 impl AgentLoopConfig {
@@ -404,7 +410,21 @@ impl AgentLoopConfig {
             after_tool_call_hook: None,
             compaction_gate: None,
             before_model_policy: Arc::new(NoopBeforeModelPolicy),
+            wrap_failed_tool_results: false,
         }
+    }
+
+    /// Toggle the failed-tool-result wrapper. When enabled,
+    /// any tool result completing with `is_error == true` has
+    /// a re-verification directive prepended to its content
+    /// blocks before reaching the model. Defaults to off so
+    /// frontier models that already self-verify aren't
+    /// burdened with the directive. PR 1 of
+    /// `docs/harness_mitigations_2026-05-01/`.
+    #[must_use]
+    pub fn with_wrap_failed_tool_results(mut self, enabled: bool) -> Self {
+        self.wrap_failed_tool_results = enabled;
+        self
     }
 
     /// Install a [`BeforeModelPolicy`] that the loop consults at
@@ -1523,6 +1543,10 @@ impl AgentLoop {
             }
         }
 
+        if is_error && self.config.wrap_failed_tool_results {
+            wrap_failed_tool_result(&tool_call.name, &mut result);
+        }
+
         attach_tool_invocation_details(&tool_call, &mut result.details);
 
         send_event(
@@ -1901,6 +1925,52 @@ fn tool_result_message(
         is_error,
         timestamp: now_millis(),
     }
+}
+
+/// Prepend a re-verification directive to a failed tool
+/// result, instructing the model to re-read or re-run before
+/// claiming success. The directive text varies by tool name:
+/// `edit`/`write` failures push the model toward `read`;
+/// `bash` failures push it toward re-running with diagnostics;
+/// `web_*` failures push it toward retrying with different
+/// arguments; everything else gets a generic re-verify line.
+///
+/// PR 1 of `docs/harness_mitigations_2026-05-01/`. Original
+/// content is preserved verbatim — the directive is a
+/// prepended `Text` block, not a replacement.
+fn wrap_failed_tool_result(tool_name: &str, result: &mut ToolResult) {
+    let directive = failure_directive_for(tool_name);
+    let mut wrapped = Vec::with_capacity(result.content.len() + 1);
+    wrapped.push(ContentBlock::Text { text: directive });
+    wrapped.append(&mut result.content);
+    result.content = wrapped;
+}
+
+fn failure_directive_for(tool_name: &str) -> String {
+    let action = match tool_name {
+        "edit" | "write" => {
+            "re-read the affected file with the `read` tool to confirm \
+             its current state before retrying or claiming success"
+        }
+        "bash" => {
+            "re-run the failing command (or a diagnostic variant — \
+             e.g. inspect the binary, check exit codes, run with verbose \
+             flags) and examine the actual output before claiming success"
+        }
+        name if name.starts_with("web_") => {
+            "try a different URL or query — do not assume the original \
+             target succeeded"
+        }
+        _ => {
+            "re-verify the underlying state before claiming success — \
+             do not skip past this failure"
+        }
+    };
+    format!(
+        "[harness note] The previous tool call FAILED. Before claiming \
+         success or moving on, you MUST {action}. The original error \
+         follows:\n---\n"
+    )
 }
 
 fn apply_tool_result_override(
@@ -2578,5 +2648,117 @@ mod tests {
         let result = state.into_result();
         assert_eq!(result.final_context, replacement);
         assert!(result.generated_messages.is_empty());
+    }
+
+    // ---- PR 1: failed-tool-result wrapping ----
+    //
+    // Tests for `wrap_failed_tool_result` and
+    // `failure_directive_for`. These exercise the directive-
+    // dispatch logic and the content-prepend invariants. The
+    // end-to-end "feature is on in rlm mode" wiring is
+    // covered by controller-level smoke; here we only assert
+    // the unit-level guarantees PR 1 promises.
+    use anie_protocol::ToolResult;
+
+    fn text_result(text: &str) -> ToolResult {
+        ToolResult {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            details: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn wrap_failed_tool_result_prepends_directive_for_edit() {
+        let mut result = text_result("Edit failed: file not found");
+        super::wrap_failed_tool_result("edit", &mut result);
+
+        assert_eq!(result.content.len(), 2);
+        match &result.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.starts_with("[harness note]"), "{text}");
+                assert!(text.contains("re-read the affected file"), "{text}");
+            }
+            other => panic!("expected directive Text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_failed_tool_result_keeps_original_content_intact() {
+        let original_text = "Edit failed: file not found";
+        let mut result = text_result(original_text);
+        super::wrap_failed_tool_result("edit", &mut result);
+
+        // Original block must be the second one, byte-identical.
+        match &result.content[1] {
+            ContentBlock::Text { text } => assert_eq!(text, original_text),
+            other => panic!("expected original Text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_failed_tool_result_dispatches_by_tool_name() {
+        let bash = super::failure_directive_for("bash");
+        let edit = super::failure_directive_for("edit");
+        let write = super::failure_directive_for("write");
+        let web_search = super::failure_directive_for("web_search");
+        let web_read = super::failure_directive_for("web_read");
+        let unknown = super::failure_directive_for("recurse");
+
+        assert!(
+            bash.contains("re-run the failing command"),
+            "bash directive should reference re-run"
+        );
+        assert!(
+            edit.contains("re-read the affected file"),
+            "edit directive should reference re-read"
+        );
+        assert!(
+            write.contains("re-read the affected file"),
+            "write shares the edit directive"
+        );
+        assert!(
+            web_search.contains("different URL or query"),
+            "web_search uses the web bucket"
+        );
+        assert!(
+            web_read.contains("different URL or query"),
+            "web_read uses the web bucket"
+        );
+        assert!(
+            unknown.contains("re-verify the underlying state"),
+            "unknown tool falls back to generic"
+        );
+    }
+
+    #[test]
+    fn wrap_failed_tool_result_preserves_multi_block_content() {
+        let mut result = ToolResult {
+            content: vec![
+                ContentBlock::Text { text: "first".into() },
+                ContentBlock::Text { text: "second".into() },
+            ],
+            details: serde_json::Value::Null,
+        };
+        super::wrap_failed_tool_result("bash", &mut result);
+
+        // 1 directive + 2 originals.
+        assert_eq!(result.content.len(), 3);
+        match (&result.content[1], &result.content[2]) {
+            (ContentBlock::Text { text: a }, ContentBlock::Text { text: b }) => {
+                assert_eq!(a, "first");
+                assert_eq!(b, "second");
+            }
+            other => panic!("originals not preserved: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failure_directive_text_mentions_failure_and_verbatim_marker() {
+        let directive = super::failure_directive_for("bash");
+        assert!(directive.contains("FAILED"));
+        assert!(
+            directive.ends_with("---\n"),
+            "directive should end with a separator marking the verbatim error"
+        );
     }
 }
