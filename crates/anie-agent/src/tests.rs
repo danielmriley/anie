@@ -651,6 +651,139 @@ async fn tool_not_found_returns_error_result() {
     assert_eq!(tool_result.tool_name, "missing");
 }
 
+/// PR 2 of `docs/harness_mitigations_2026-05-01/`. Drives a
+/// model that calls a missing tool with identical args three
+/// times in a row. With `failure_loop_threshold = 2`, the
+/// detector should fire exactly one `SystemMessage` warning
+/// (throttled — the third call doesn't re-warn) and the run
+/// should reach `AgentEnd` (observability-only, no abort).
+#[tokio::test]
+async fn failure_loop_detector_emits_warning_without_aborting() {
+    let mut provider_registry = ProviderRegistry::new();
+    let scripts = vec![
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            "call_a",
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )])),
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            "call_b",
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )])),
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            "call_c",
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )])),
+        MockStreamScript::from_message(final_assistant("done")),
+    ];
+    provider_registry.register(ApiKind::OpenAICompletions, Box::new(MockProvider::new(scripts)));
+
+    let agent = AgentLoop::new(
+        Arc::new(provider_registry),
+        Arc::new(ToolRegistry::new()),
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_failure_loop_threshold(Some(2)),
+    );
+
+    let (result, events) = collect_run(
+        agent,
+        vec![user_prompt("trigger the loop")],
+        Vec::new(),
+    )
+    .await;
+
+    let loop_warnings: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::SystemMessage { text } if text.contains("[loop warning]") => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        loop_warnings.len(),
+        1,
+        "detector should fire exactly one warning (throttle), got: {loop_warnings:?}"
+    );
+    assert!(
+        loop_warnings[0].contains("missing"),
+        "warning should name the looping tool: {loop_warnings:?}"
+    );
+    // Run completed normally — observability-only, no abort.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+        "agent should still reach AgentEnd despite the loop"
+    );
+    let _ = result;
+}
+
+/// PR 2 of `docs/harness_mitigations_2026-05-01/`. With no
+/// threshold installed, the detector is silent — confirms
+/// the gate (default off) doesn't accidentally fire.
+#[tokio::test]
+async fn failure_loop_detector_silent_when_threshold_unset() {
+    let mut provider_registry = ProviderRegistry::new();
+    let scripts = vec![
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            "call_a",
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )])),
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            "call_b",
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )])),
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            "call_c",
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )])),
+        MockStreamScript::from_message(final_assistant("done")),
+    ];
+    provider_registry.register(ApiKind::OpenAICompletions, Box::new(MockProvider::new(scripts)));
+
+    let agent = AgentLoop::new(
+        Arc::new(provider_registry),
+        Arc::new(ToolRegistry::new()),
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        ),
+    );
+
+    let (_result, events) =
+        collect_run(agent, vec![user_prompt("no detector")], Vec::new()).await;
+
+    let loop_warnings: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::SystemMessage { text } if text.contains("[loop warning]") => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        loop_warnings.is_empty(),
+        "no warning expected when threshold is None: {loop_warnings:?}"
+    );
+}
+
 #[tokio::test]
 async fn tool_argument_validation_failure_skips_execution() {
     let tool = string_arg_tool();

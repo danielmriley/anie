@@ -1813,7 +1813,8 @@ fn build_agent(
     )
     .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
     .with_compaction_gate(compaction_gate)
-    .with_wrap_failed_tool_results(should_wrap_failed_tool_results(state));
+    .with_wrap_failed_tool_results(should_wrap_failed_tool_results(state))
+    .with_failure_loop_threshold(failure_loop_threshold(state));
     if let Some(policy) = rlm_extras.policy {
         config = config.with_before_model_policy(policy);
     }
@@ -1836,6 +1837,26 @@ fn env_flag_enabled(name: &str) -> bool {
         std::env::var(name).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+/// PR 2 of `docs/harness_mitigations_2026-05-01/`. Returns
+/// the failure-loop strike threshold to install. `None`
+/// disables detection. Defaults to `3` in
+/// `--harness-mode=rlm`; `ANIE_FAILURE_LOOP_WARN_AT=<n>`
+/// overrides the threshold; `ANIE_DISABLE_LOOP_DETECTOR=1`
+/// disables entirely.
+fn failure_loop_threshold(state: &ControllerState) -> Option<u32> {
+    if !state.harness_mode.installs_rlm_features() {
+        return None;
+    }
+    if env_flag_enabled("ANIE_DISABLE_LOOP_DETECTOR") {
+        return None;
+    }
+    let parsed = std::env::var("ANIE_FAILURE_LOOP_WARN_AT")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|n| *n > 0);
+    Some(parsed.unwrap_or(anie_agent::DEFAULT_FAILURE_LOOP_THRESHOLD))
 }
 
 /// rlm-mode system-prompt augment. Establishes the policy

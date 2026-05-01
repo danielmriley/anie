@@ -385,6 +385,13 @@ pub struct AgentLoopConfig {
     /// command) before claiming success. Defaults to `false`.
     /// PR 1 of `docs/harness_mitigations_2026-05-01/`.
     wrap_failed_tool_results: bool,
+    /// When `Some(n)`, install a [`FailureLoopDetector`] with
+    /// threshold `n`. After `n` consecutive same-args failures
+    /// from the same tool the loop emits a `tracing::info!`
+    /// log and a `SystemMessage` event for the transcript.
+    /// Observability-only: the detector never aborts the run.
+    /// PR 2 of `docs/harness_mitigations_2026-05-01/`.
+    failure_loop_threshold: Option<u32>,
 }
 
 impl AgentLoopConfig {
@@ -411,7 +418,17 @@ impl AgentLoopConfig {
             compaction_gate: None,
             before_model_policy: Arc::new(NoopBeforeModelPolicy),
             wrap_failed_tool_results: false,
+            failure_loop_threshold: None,
         }
+    }
+
+    /// Install a [`FailureLoopDetector`] with the given strike
+    /// threshold. `None` (default) disables detection.
+    /// PR 2 of `docs/harness_mitigations_2026-05-01/`.
+    #[must_use]
+    pub fn with_failure_loop_threshold(mut self, threshold: Option<u32>) -> Self {
+        self.failure_loop_threshold = threshold;
+        self
     }
 
     /// Toggle the failed-tool-result wrapper. When enabled,
@@ -747,6 +764,11 @@ pub struct AgentLoop {
     provider_registry: Arc<ProviderRegistry>,
     tool_registry: Arc<ToolRegistry>,
     config: AgentLoopConfig,
+    /// PR 2 of `docs/harness_mitigations_2026-05-01/`.
+    /// Wrapped in `Mutex` so parallel-mode tool execution can
+    /// share it. None when `config.failure_loop_threshold` is
+    /// `None`.
+    failure_loop_detector: Option<std::sync::Mutex<crate::failure_loop::FailureLoopDetector>>,
 }
 
 impl AgentLoop {
@@ -757,10 +779,14 @@ impl AgentLoop {
         tool_registry: Arc<ToolRegistry>,
         config: AgentLoopConfig,
     ) -> Self {
+        let failure_loop_detector = config.failure_loop_threshold.map(|threshold| {
+            std::sync::Mutex::new(crate::failure_loop::FailureLoopDetector::new(threshold))
+        });
         Self {
             provider_registry,
             tool_registry,
             config,
+            failure_loop_detector,
         }
     }
 
@@ -1445,16 +1471,7 @@ impl AgentLoop {
 
         let Some(tool) = self.tool_registry.get(&tool_call.name) else {
             let result = error_tool_result(format!("Tool not found: {}", tool_call.name));
-            send_event(
-                event_tx,
-                AgentEvent::ToolExecEnd {
-                    call_id: tool_call.id.clone(),
-                    result: result.clone(),
-                    is_error: true,
-                },
-            )
-            .await;
-            return tool_result_message(&tool_call, result, true);
+            return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
         };
 
         // Fetch the precompiled validator from the registry.
@@ -1471,16 +1488,7 @@ impl AgentLoop {
         };
         if let Err(message) = validation_result {
             let result = error_tool_result(message);
-            send_event(
-                event_tx,
-                AgentEvent::ToolExecEnd {
-                    call_id: tool_call.id.clone(),
-                    result: result.clone(),
-                    is_error: true,
-                },
-            )
-            .await;
-            return tool_result_message(&tool_call, result, true);
+            return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
         }
 
         if let Some(hook) = &self.config.before_tool_call_hook {
@@ -1491,16 +1499,7 @@ impl AgentLoop {
                 BeforeToolCallResult::Allow => {}
                 BeforeToolCallResult::Block { reason } => {
                     let result = error_tool_result(reason);
-                    send_event(
-                        event_tx,
-                        AgentEvent::ToolExecEnd {
-                            call_id: tool_call.id.clone(),
-                            result: result.clone(),
-                            is_error: true,
-                        },
-                    )
-                    .await;
-                    return tool_result_message(&tool_call, result, true);
+                    return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
                 }
             }
         }
@@ -1547,6 +1546,8 @@ impl AgentLoop {
             wrap_failed_tool_result(&tool_call.name, &mut result);
         }
 
+        self.observe_failure_loop(&tool_call, is_error, event_tx).await;
+
         attach_tool_invocation_details(&tool_call, &mut result.details);
 
         send_event(
@@ -1560,6 +1561,78 @@ impl AgentLoop {
         .await;
 
         tool_result_message(&tool_call, result, is_error)
+    }
+
+    /// PR 1 + PR 2 of `docs/harness_mitigations_2026-05-01/`.
+    /// Shared epilogue for the synthesized-failure paths
+    /// (missing tool, validation error, before-hook block).
+    /// Each of those paths bypasses the real-tool execution
+    /// path, but they're still genuine failures the model
+    /// might loop on — apply the same wrap + observe + emit
+    /// sequence as the normal error path.
+    async fn finalize_synthetic_failure(
+        &self,
+        tool_call: &ToolCall,
+        mut result: ToolResult,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> ToolResultMessage {
+        if self.config.wrap_failed_tool_results {
+            wrap_failed_tool_result(&tool_call.name, &mut result);
+        }
+        self.observe_failure_loop(tool_call, true, event_tx).await;
+        send_event(
+            event_tx,
+            AgentEvent::ToolExecEnd {
+                call_id: tool_call.id.clone(),
+                result: result.clone(),
+                is_error: true,
+            },
+        )
+        .await;
+        tool_result_message(tool_call, result, true)
+    }
+
+    /// PR 2 of `docs/harness_mitigations_2026-05-01/`. Feed
+    /// the result into the failure-loop detector (if
+    /// installed). When a new threshold-crossing is detected,
+    /// emit a `tracing::info!` log and a `SystemMessage`
+    /// event so the loop is visible in logs and the
+    /// transcript. Observability-only: never aborts the run.
+    async fn observe_failure_loop(
+        &self,
+        tool_call: &ToolCall,
+        is_error: bool,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let Some(detector) = &self.failure_loop_detector else {
+            return;
+        };
+        // Lock briefly; `observe` is allocation-light and
+        // returns before any await. Poison: another thread
+        // panicked while observing — recover the inner state
+        // rather than propagate.
+        let warning = match detector.lock() {
+            Ok(mut guard) => guard.observe(&tool_call.name, &tool_call.arguments, is_error),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .observe(&tool_call.name, &tool_call.arguments, is_error),
+        };
+        let Some(strikes) = warning else {
+            return;
+        };
+        tracing::info!(
+            target: "anie_agent::failure_loop",
+            tool = tool_call.name.as_str(),
+            strikes = strikes,
+            "failure_loop_detected"
+        );
+        let message = format!(
+            "[loop warning] tool `{tool}` failed {strikes} times in a row \
+             with the same arguments. Investigate the underlying error \
+             before retrying.",
+            tool = tool_call.name,
+        );
+        send_event(event_tx, AgentEvent::SystemMessage { text: message }).await;
     }
 
     /// Build the per-execution tool context for this run.
