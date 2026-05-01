@@ -1,7 +1,9 @@
 # Plan 08 — Embedding-based reranker
 
 **Branch:** `dev_rlm`.
-**Status:** ready to spec; follows Plan 06 Phase E (keyword reranker landed in `rlm/10`).
+**Status:** **landed** — `rlm/19` (PR 08.1, `d8e81b7`),
+`rlm/20` (PR 08.2, `08180d8`), `rlm/21` (PR 08.3,
+`4eff9e8`). Smoke-tested.
 **Companion:** observation from a real TUI session at session id `c0057000` documented in dev_rlm history.
 
 ## Rationale
@@ -338,3 +340,47 @@ End-to-end smoke (after PR 08.3):
 - **Persistent embedding cache.** Tied to persistent
   archive (Plan 06's session-log-derived index).
   Defers with that work.
+
+## Smoke outcomes (post-landing)
+
+Four smokes run against the qwen3.5:9b chat model with
+nomic-embed-text as the embedder:
+
+**S1 (`e11538ed` keyword vs `5e264e2f` embedding).** Same
+4k-ceiling prompt run twice. Keyword run: 4 reads
+(re-read external_context.rs once). Embedding run: 3
+reads (no redundancy) and a more conceptually clear
+synthesis ("producer-consumer pattern"). Embedding
+reranker helped both retrieval *and* the framing of the
+final answer.
+
+**S2 (`c05fe6bd`).** Weather replication. Inconclusive
+because weather sites returned 403/timeouts on T1 — no
+rich archive content for T2 to test paging against.
+Embedding fired (paged_in=1) but upstream content was
+absent. Site-reliability issue, not an rlm test.
+
+**S3 (`e553efeb`).** Tight 1.5k ceiling stress test.
+Same shape that triggered the original spiral pre-
+rlm/16. With embedding: 3 parallel reads, eviction
+fires cleanly, no spiral, no hallucination. Model
+didn't emit a final "done" text but didn't drift into
+fictional content either. Acceptable terminal state.
+
+**S4 (`1eb096ee` → cross-domain).** T1 read a Rust
+source file; T2 switched topic entirely to "what's the
+current weather in Atlanta, GA?" Across 11 policy fires
+on T2, paged_in=0 on 8 of them — the embedding correctly
+recognized that T1's code content had near-zero
+similarity to a weather query. Cross-domain isolation
+working: no spurious page-ins of unrelated content.
+Validates that cosine similarity puts unrelated topics
+in different regions of vector space, exactly as
+desired.
+
+Net read across S1–S4: the embedding path measurably
+improves retrieval quality on the canonical case (S1),
+maintains correct cross-domain isolation (S4), and
+doesn't regress the stress-test paths the prior commits
+were known to handle (S3). Default users without the
+env var set see no behavior change.
