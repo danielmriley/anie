@@ -274,6 +274,7 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
             },
             Some("[list|<id>]"),
         ),
+        SlashCommandInfo::builtin("skills", "List installed skills"),
         SlashCommandInfo::builtin("tools", "List active tools"),
         SlashCommandInfo::builtin("onboard", "Reopen the onboarding flow"),
         SlashCommandInfo::builtin("providers", "Manage configured providers"),
@@ -415,6 +416,17 @@ mod tests {
         assert_eq!(groups[0].0, SourceKey::Builtin);
         assert_eq!(groups[1].0, SourceKey::Extension);
         assert_eq!(groups[1].1.len(), 2);
+    }
+
+    /// PR 4 of `docs/skills_2026-05-02/`. Pin that the
+    /// `/skills` builtin is registered so the slash-command
+    /// dispatcher recognizes it.
+    #[test]
+    fn skills_command_registered_as_no_arg_builtin() {
+        let registry = CommandRegistry::with_builtins();
+        let info = registry.lookup("skills").expect("skills builtin");
+        assert_eq!(info.summary, "List installed skills");
+        assert!(matches!(info.arguments, ArgumentSpec::None));
     }
 
     #[test]

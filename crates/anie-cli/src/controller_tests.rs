@@ -416,6 +416,92 @@ fn compose_system_prompt_only_augments_in_rlm_mode() {
     );
 }
 
+/// PR 4 of `docs/skills_2026-05-02/`. The `/skills`
+/// command lists every registered skill with its source
+/// label, plus an `Active in this run:` summary when the
+/// active set is non-empty. Hidden skills
+/// (disable_model_invocation) are listed with a
+/// `[..., hidden]` tag so the user can see they exist
+/// but the model can't auto-invoke them.
+#[test]
+fn render_skills_listing_includes_all_skills_with_source_labels() {
+    use crate::skills::{SkillRegistry, SkillSource};
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("skills");
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::write(
+        root.join("alpha.md"),
+        "---\nname: alpha\ndescription: Alpha skill.\n---\nbody\n",
+    )
+    .expect("write alpha");
+    fs::write(
+        root.join("hidden-one.md"),
+        "---\nname: hidden-one\ndescription: Hidden skill.\ndisable_model_invocation: true\n---\nbody\n",
+    )
+    .expect("write hidden");
+
+    let mut registry = SkillRegistry::empty();
+    registry.absorb_root_for_test(&root, SkillSource::Bundled);
+    let active = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
+    let listing = crate::controller::render_skills_listing(&registry, &active);
+    assert!(listing.starts_with("Available skills:"), "{listing}");
+    assert!(listing.contains("alpha"), "{listing}");
+    assert!(listing.contains("hidden-one"), "{listing}");
+    assert!(listing.contains("[bundled]"), "{listing}");
+    assert!(listing.contains("[bundled, hidden]"), "{listing}");
+    assert!(
+        !listing.contains("Active in this run:"),
+        "no active skills → no summary line: {listing}"
+    );
+}
+
+#[test]
+fn render_skills_listing_appends_active_summary_when_set_nonempty() {
+    use crate::skills::{SkillRegistry, SkillSource};
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("skills");
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::write(
+        root.join("first.md"),
+        "---\nname: first\ndescription: First.\n---\nbody\n",
+    )
+    .expect("write first");
+    fs::write(
+        root.join("second.md"),
+        "---\nname: second\ndescription: Second.\n---\nbody\n",
+    )
+    .expect("write second");
+
+    let mut registry = SkillRegistry::empty();
+    registry.absorb_root_for_test(&root, SkillSource::Bundled);
+    let mut set = std::collections::HashSet::new();
+    set.insert("first".to_string());
+    set.insert("second".to_string());
+    let active = std::sync::Arc::new(std::sync::RwLock::new(set));
+
+    let listing = crate::controller::render_skills_listing(&registry, &active);
+    assert!(
+        listing.contains("Active in this run: first, second"),
+        "{listing}"
+    );
+}
+
+#[test]
+fn render_skills_listing_handles_empty_registry() {
+    use crate::skills::SkillRegistry;
+    let registry = SkillRegistry::empty();
+    let active = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+    let listing = crate::controller::render_skills_listing(&registry, &active);
+    assert_eq!(listing, "No skills are currently registered.");
+}
+
 /// PR 1 of `docs/skills_2026-05-02/`. When the skill
 /// registry is empty, the base prompt has no skill catalog
 /// section — keeps the prompt narrow when no skills are

@@ -272,6 +272,9 @@ pub enum UiAction {
     SwitchSession(String),
     /// Show registered tools.
     ShowTools,
+    /// Show installed skills (catalog + active set).
+    /// PR 4 of `docs/skills_2026-05-02/`.
+    ShowSkills,
     /// Show slash-command help.
     ShowHelp,
     /// Request the current controller state.
@@ -2492,6 +2495,7 @@ fn fixed_noarg_action(name: &str) -> Option<UiAction> {
         "diff" => UiAction::ShowDiff,
         "new" => UiAction::NewSession,
         "tools" => UiAction::ShowTools,
+        "skills" => UiAction::ShowSkills,
         "state" => UiAction::ShowState,
         "help" => UiAction::ShowHelp,
         "reload" => UiAction::ReloadConfig {

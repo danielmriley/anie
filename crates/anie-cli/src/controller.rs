@@ -889,6 +889,13 @@ impl InteractiveController {
                 };
                 self.send_system_message(&body).await;
             }
+            UiAction::ShowSkills => {
+                let body = render_skills_listing(
+                    &self.state.skill_registry,
+                    &self.state.active_skills,
+                );
+                self.send_system_message(&body).await;
+            }
             UiAction::ShowHelp => {
                 let help = self.state.command_registry.format_help();
                 self.send_system_message(&help).await;
@@ -1182,11 +1189,9 @@ pub(crate) struct ControllerState {
     /// prompt as a catalog (name + description, no body).
     pub(crate) skill_registry: Arc<crate::skills::SkillRegistry>,
     /// Set of skills the agent has loaded this run via the
-    /// `skill` tool. PR 2 of `docs/skills_2026-05-02/`.
-    /// PR 4 (TUI surfacing) will read this to render the
-    /// active-skills status-bar segment; until then the
-    /// field is write-only on the SkillTool side.
-    #[allow(dead_code)]
+    /// `skill` tool. PR 2 of `docs/skills_2026-05-02/`
+    /// installs it; PR 4 reads it from the `/skills`
+    /// slash-command handler.
     pub(crate) active_skills: crate::skill_tool::ActiveSkills,
     pub(crate) request_options_resolver: Arc<dyn RequestOptionsResolver>,
     pub(crate) prompt_cache: SystemPromptCache,
@@ -1878,6 +1883,56 @@ fn failure_loop_threshold(state: &ControllerState) -> Option<u32> {
         .and_then(|raw| raw.parse::<u32>().ok())
         .filter(|n| *n > 0);
     Some(parsed.unwrap_or(anie_agent::DEFAULT_FAILURE_LOOP_THRESHOLD))
+}
+
+/// PR 4 of `docs/skills_2026-05-02/`. Format the
+/// `/skills` slash-command output: catalog of registered
+/// skills with source labels, plus the active-in-this-run
+/// set when non-empty. Disable_model_invocation skills
+/// are still listed (the user may want to load them via
+/// slash command in a follow-up PR) but marked
+/// `[bundled, hidden]` so the user sees they're
+/// model-invisible.
+pub(crate) fn render_skills_listing(
+    registry: &crate::skills::SkillRegistry,
+    active: &crate::skill_tool::ActiveSkills,
+) -> String {
+    if registry.is_empty() {
+        return "No skills are currently registered.".to_string();
+    }
+    let mut out = String::from("Available skills:\n");
+    let max_name_len = registry
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(0);
+    for skill in registry.iter() {
+        let mut tags: Vec<&str> = vec![skill.source.label()];
+        if skill.disable_model_invocation {
+            tags.push("hidden");
+        }
+        let tag_block = format!("[{}]", tags.join(", "));
+        out.push_str(&format!(
+            "  {name:<width$}  {tag}\n    {desc}\n",
+            name = skill.name,
+            width = max_name_len,
+            tag = tag_block,
+            desc = skill.description.replace('\n', " "),
+        ));
+    }
+    let active_set = match active.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if !active_set.is_empty() {
+        let mut names: Vec<String> = active_set.into_iter().collect();
+        names.sort();
+        out.push_str(&format!(
+            "\nActive in this run: {}",
+            names.join(", ")
+        ));
+    }
+    out
 }
 
 /// rlm-mode system-prompt augment. Establishes the policy
