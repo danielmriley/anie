@@ -212,6 +212,12 @@ impl Tool for RecurseTool {
                 // intentionally drop; opaque sub-call
             }
         });
+        // PR 3 of `docs/rlm_subagents_2026-05-01/`: capture
+        // the sub-agent's wall-clock + token spend so the
+        // parent (and any TUI / logging layer downstream) can
+        // see how much each recurse cost. Observability-only —
+        // no caps, no abort.
+        let started_at = std::time::Instant::now();
         let mut machine = sub_agent
             .start_run_machine(vec![user_prompt], messages, &sub_event_tx)
             .await;
@@ -219,6 +225,7 @@ impl Tool for RecurseTool {
             machine.next_step(&sub_event_tx, &cancel).await;
         }
         let sub_result = machine.finish(&sub_event_tx).await;
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
         drop(sub_event_tx);
         let _ = drain_task.await;
 
@@ -228,9 +235,10 @@ impl Tool for RecurseTool {
             )));
         }
 
-        // 6. Extract final assistant text.
+        // 6. Extract final assistant text + tally usage.
         let final_text = extract_final_assistant_text(&sub_result.generated_messages)
             .unwrap_or_else(|| "(sub-agent produced no visible answer)".to_string());
+        let stats = SubAgentStats::from_messages(&sub_result.generated_messages, elapsed_ms);
 
         let details = serde_json::json!({
             "tool": "recurse",
@@ -239,14 +247,69 @@ impl Tool for RecurseTool {
             "sub_call_message_count": sub_result.generated_messages.len(),
             "budget_remaining_after": budget_remaining,
             "max_depth": self.max_depth,
+            "sub_agent_elapsed_ms": stats.elapsed_ms,
+            "sub_agent_input_tokens": stats.input_tokens,
+            "sub_agent_output_tokens": stats.output_tokens,
+            "sub_agent_total_tokens": stats.total_tokens(),
+            "sub_agent_tool_calls": stats.tool_calls,
+            "sub_agent_cost_total": stats.cost_total,
         });
         info!(
             call_id,
             sub_call_message_count = sub_result.generated_messages.len(),
             budget_remaining,
+            elapsed_ms = stats.elapsed_ms,
+            input_tokens = stats.input_tokens,
+            output_tokens = stats.output_tokens,
+            tool_calls = stats.tool_calls,
             "recurse done"
         );
         Ok(text_result(final_text, details))
+    }
+}
+
+/// PR 3 of `docs/rlm_subagents_2026-05-01/`. Aggregate
+/// resource stats for one sub-agent run.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct SubAgentStats {
+    elapsed_ms: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    /// Number of tool calls the sub-agent made (counted as
+    /// `Message::ToolResult` entries — one per completed
+    /// tool call).
+    tool_calls: u32,
+    cost_total: f64,
+}
+
+impl SubAgentStats {
+    fn from_messages(messages: &[Message], elapsed_ms: u64) -> Self {
+        let mut stats = Self {
+            elapsed_ms,
+            ..Self::default()
+        };
+        for message in messages {
+            match message {
+                Message::Assistant(assistant) => {
+                    stats.input_tokens += assistant.usage.input_tokens;
+                    stats.output_tokens += assistant.usage.output_tokens;
+                    stats.cache_read_tokens += assistant.usage.cache_read_tokens;
+                    stats.cache_write_tokens += assistant.usage.cache_write_tokens;
+                    stats.cost_total += assistant.usage.cost.total;
+                }
+                Message::ToolResult(_) => {
+                    stats.tool_calls = stats.tool_calls.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        stats
+    }
+
+    fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
     }
 }
 
@@ -693,5 +756,115 @@ mod tests {
         .await
         .expect("ok");
         assert_eq!(*seen_contexts.lock().unwrap(), vec![2]);
+    }
+
+    // ---- PR 3: SubAgentStats ----
+
+    use anie_protocol::{Cost, ToolResultMessage};
+
+    fn assistant_with_usage(text: &str, input: u64, output: u64) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: None,
+                cost: Cost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    total: 0.5,
+                },
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "mock".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        })
+    }
+
+    fn dummy_tool_result(call_id: &str) -> Message {
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: call_id.into(),
+            tool_name: "bash".into(),
+            content: vec![ContentBlock::Text { text: "out".into() }],
+            details: serde_json::Value::Null,
+            is_error: false,
+            timestamp: 1,
+        })
+    }
+
+    #[test]
+    fn sub_agent_stats_sums_assistant_usage_across_messages() {
+        let messages = vec![
+            assistant_with_usage("first", 100, 50),
+            assistant_with_usage("second", 200, 75),
+        ];
+        let stats = SubAgentStats::from_messages(&messages, 1234);
+        assert_eq!(stats.input_tokens, 300);
+        assert_eq!(stats.output_tokens, 125);
+        assert_eq!(stats.total_tokens(), 425);
+        assert_eq!(stats.elapsed_ms, 1234);
+        assert!((stats.cost_total - 1.0).abs() < 1e-9, "two 0.5 messages");
+    }
+
+    #[test]
+    fn sub_agent_stats_counts_tool_results_as_tool_calls() {
+        let messages = vec![
+            assistant_with_usage("plan", 50, 25),
+            dummy_tool_result("c1"),
+            dummy_tool_result("c2"),
+            assistant_with_usage("answer", 30, 10),
+            dummy_tool_result("c3"),
+        ];
+        let stats = SubAgentStats::from_messages(&messages, 0);
+        assert_eq!(stats.tool_calls, 3);
+        assert_eq!(stats.input_tokens, 80);
+        assert_eq!(stats.output_tokens, 35);
+    }
+
+    #[test]
+    fn sub_agent_stats_empty_messages_zero_tokens() {
+        let stats = SubAgentStats::from_messages(&[], 999);
+        assert_eq!(stats.input_tokens, 0);
+        assert_eq!(stats.output_tokens, 0);
+        assert_eq!(stats.tool_calls, 0);
+        assert_eq!(stats.elapsed_ms, 999);
+    }
+
+    /// Verify the recurse tool surfaces the stats in its
+    /// result `details` so downstream consumers (controller,
+    /// TUI, smoke logs) can read them.
+    #[tokio::test]
+    async fn recurse_result_details_include_sub_agent_stats() {
+        let (tool, _, _) = build_recurse_tool("ok", vec![], 8, 0, 4);
+        let result = run_tool(
+            &tool,
+            serde_json::json!({"query": "q", "scope": {"kind": "message_range", "start": 0, "end": 0}}),
+        )
+        .await
+        .expect("ok");
+        // The mock sub-agent has no token accounting (Usage
+        // defaults to zero), but the keys must be present so
+        // future tools can rely on the schema.
+        for key in [
+            "sub_agent_elapsed_ms",
+            "sub_agent_input_tokens",
+            "sub_agent_output_tokens",
+            "sub_agent_total_tokens",
+            "sub_agent_tool_calls",
+            "sub_agent_cost_total",
+        ] {
+            assert!(
+                result.details.get(key).is_some(),
+                "details missing `{key}`: {:?}",
+                result.details
+            );
+        }
     }
 }
