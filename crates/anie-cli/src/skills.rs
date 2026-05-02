@@ -231,6 +231,14 @@ impl SkillRegistry {
         }
     }
 
+    /// Test-only entry point for inserting skills from a
+    /// specific root with a specific source. Production code
+    /// should use [`Self::discover`].
+    #[cfg(test)]
+    pub(crate) fn absorb_root_for_test(&mut self, root: &Path, source: SkillSource) {
+        self.absorb_root(root, source);
+    }
+
     fn absorb_root(&mut self, root: &Path, source: SkillSource) {
         if !root.is_dir() {
             return;

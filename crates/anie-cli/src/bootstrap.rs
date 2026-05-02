@@ -91,6 +91,30 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
     if !skill_registry.is_empty() {
         info!(skills = skill_registry.len(), "loaded skills from disk");
     }
+    let active_skills: crate::skill_tool::ActiveSkills = Arc::new(std::sync::RwLock::new(
+        std::collections::HashSet::new(),
+    ));
+    // PR 2 of `docs/skills_2026-05-02/`: register the `skill`
+    // tool when the registry has at least one skill. Without
+    // skills the tool would be advertised in the catalog with
+    // nothing to load, which is just noise.
+    let tool_registry = if skill_registry.is_empty() {
+        tool_registry
+    } else {
+        // ToolRegistry isn't Clone; rebuild via the same
+        // pattern build_agent uses for rlm extras.
+        let mut new_registry = anie_agent::ToolRegistry::new();
+        for def in tool_registry.definitions() {
+            if let Some(tool) = tool_registry.get(&def.name) {
+                new_registry.register(tool);
+            }
+        }
+        new_registry.register(Arc::new(crate::skill_tool::SkillTool::new(
+            Arc::clone(&skill_registry),
+            Arc::clone(&active_skills),
+        )));
+        Arc::new(new_registry)
+    };
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
@@ -108,6 +132,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         provider_registry,
         tool_registry,
         skill_registry,
+        active_skills,
         request_options_resolver,
         prompt_cache,
         retry_config: RetryConfig::default(),

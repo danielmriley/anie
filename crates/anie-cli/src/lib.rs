@@ -26,6 +26,7 @@ mod retry_policy;
 mod rpc;
 mod runtime;
 mod runtime_state;
+mod skill_tool;
 mod skills;
 mod user_error;
 
