@@ -724,6 +724,38 @@ mod tests {
         assert!(body.starts_with("body"));
     }
 
+    /// PR 3 of `docs/skills_2026-05-02/`. Pin that the four
+    /// initial bundled skills load correctly via the
+    /// CARGO_MANIFEST_DIR-based bundled-root discovery, and
+    /// that all of them appear in the agent-facing catalog.
+    #[test]
+    fn bundled_skills_load_from_manifest_dir() {
+        let bundled = bundled_skills_root().expect(
+            "CARGO_MANIFEST_DIR/skills should resolve to a real directory in tests",
+        );
+        assert!(
+            bundled.is_dir(),
+            "bundled skills root not found at {}",
+            bundled.display()
+        );
+        let mut registry = SkillRegistry::empty();
+        registry.absorb_root(&bundled, SkillSource::Bundled);
+        let names: Vec<String> = registry.iter().map(|s| s.name.clone()).collect();
+        for expected in [
+            "cpp-rule-of-five",
+            "decompose-multi-constraint-task",
+            "use-recurse-for-archive-lookup",
+            "verify-after-edit",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "bundled skill `{expected}` missing; got {names:?}"
+            );
+        }
+        // All four are agent-invocable (no disable_model_invocation).
+        assert_eq!(registry.catalog().len(), 4);
+    }
+
     #[test]
     fn split_frontmatter_strips_bom() {
         let raw = "\u{feff}---\nname: test\ndescription: x\n---\nbody\n";

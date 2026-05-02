@@ -98,7 +98,7 @@ run doesn't pressure the active ceiling.
 |---|---|---|---|
 | 1 | [01_skill_discovery_and_registry.md](01_skill_discovery_and_registry.md) | Read skills from disk (bundled/user/project), parse frontmatter, build a `SkillRegistry`. Surface in the system prompt as a catalog (name + description, NOT body). | **shipped** (`ff0f7ac`) |
 | 2 | [02_skill_tool.md](02_skill_tool.md) | A new `skill` tool: arg `name`, returns the body of the skill as a `<system-reminder>` injection. | **shipped** (this commit) |
-| 3 | [03_bundled_skills.md](03_bundled_skills.md) | Initial set of bundled skills addressing the 2026-05-01/05-02 smoke findings: `use_recurse_for_archive_lookup`, `cpp_rule_of_five`, `verify_after_edit`, `decompose_multi_constraint_task`. | planned |
+| 3 | [03_bundled_skills.md](03_bundled_skills.md) | Initial set of bundled skills addressing the 2026-05-01/05-02 smoke findings: `use-recurse-for-archive-lookup`, `cpp-rule-of-five`, `verify-after-edit`, `decompose-multi-constraint-task`. (Names use hyphens — kebab-case enforced by `validate_skill_name`.) | **shipped** (this commit) |
 | 4 | [04_tui_skill_visibility.md](04_tui_skill_visibility.md) | Status-bar segment showing currently-active skills; `/skills` slash command listing the catalog. | planned |
 | 5 | [05_smoke_validation.md](05_smoke_validation.md) | Re-run the 11-turn smoke with skills enabled. Measure: does the model load `cpp_rule_of_five` autonomously when writing the DLL? Does it reach for `use_recurse_for_archive_lookup` instead of re-fetching? | planned |
 
