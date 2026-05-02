@@ -55,8 +55,8 @@ they didn't make small-model reasoning **deeper**.
 | 1 | [01_depth_observability.md](01_depth_observability.md) | Track recurse depth on `RecurseScope`. Log + surface in TUI. No abort. **Shipped:** depth tracking already in place pre-PR (SubAgentBuildContext.depth + RecurseTool.depth fields); this PR added the threshold-warning emission via a new `RecurseDepthDetector` in `anie-agent::recurse_depth`, mirroring the failure_loop pattern. Default threshold 5, `ANIE_RECURSE_DEPTH_WARN_AT` overrides, `ANIE_DISABLE_RECURSE_DEPTH_WARN=1` disables. Status-bar segment scoped out (deferred). |
 | 2 | [02_tool_inheritance.md](02_tool_inheritance.md) | Sub-agents inherit a filtered tool registry (bash, read, edit, write, web_*; recurse gated by depth). **Shipped:** ControllerSubAgentFactory now takes `parent_tools: Arc<ToolRegistry>` + `recurse_inherit_limit: u8`. Filter inherits `bash`, `read`, `edit`, `write`, `grep`, `find`, `ls`, `web_search`, `web_read`, `skill` always; `recurse` only at `depth < limit` (default 3). Unknown future tools default to NOT-inherit (forces deliberate decision). |
 | 3 | [03_resource_observability.md](03_resource_observability.md) | Track per-sub-agent token spend + wall-clock; bubble to parent. Log + TUI. No abort. **Shipped:** SubAgentStats aggregates input/output/cache tokens, tool calls, cost, and wall-clock from sub-agent's generated messages. Surfaced in recurse tool's `result.details` under `sub_agent_*` keys + info!-level log. |
-| 4 | [04_decompose_and_recurse.md](04_decompose_and_recurse.md) | Optional pre-loop decomposition pass (one-shot LLM call producing sub-task list). Each sub-task can spawn its own recurse. Behind `ANIE_DECOMPOSE=1`. |
-| 5 | [05_parallel_recurse_voting.md](05_parallel_recurse_voting.md) | Optional N-way parallel recurse for hard sub-problems. Vote consolidation via critic pass. Behind `ANIE_RECURSE_PARALLEL=N`. |
+| 4 | [04_decompose_and_recurse.md](04_decompose_and_recurse.md) | Optional pre-loop decomposition pass (one-shot LLM call producing sub-task list). Plan injected as `<system-reminder source="decompose">` leading message. Behind `ANIE_DECOMPOSE=1`. **Shipped:** Decomposer struct, controller hook in start_prompt_run, best-effort failure handling, NO_PLAN_NEEDED sentinel. |
+| 5 | [05_parallel_decomposition.md](05_parallel_decomposition.md) | **REVISED:** parallel execution of independent sub-tasks from PR 4's plan (was originally voting + critic; rejected as wasteful). Sub-tasks marked as independent run concurrently in topological rounds; results compose mechanically. Behind `ANIE_PARALLEL_DECOMPOSE=N`. |
 | 6 | [06_smoke_validation.md](06_smoke_validation.md) | Re-run the 11-turn protocol with all features enabled; document deltas in `smoke_protocol_2026-05-01.md`. |
 
 PRs 1–3 are infrastructure. PRs 4–5 are the actual
@@ -105,7 +105,7 @@ self-contained. PR 2 implements the filter; depth-aware
 re-enable of `recurse` lands in PR 4 (decompose) where it
 becomes intentional.
 
-### Why ANIE flags for decompose + parallel recurse (PR 4-5)?
+### Why ANIE flags for decompose + parallel decomposition (PR 4-5)?
 
 These are the two features most likely to regress
 behavior or cost. Behind env flags they're easy to
@@ -113,15 +113,18 @@ A/B test in the smoke without affecting the default
 path. Once smoke data shows they pay off, we promote to
 default-on in `--harness-mode=rlm`.
 
-### Why N-way voting via critic (PR 5)?
+### Why parallel decomposition instead of N-way voting (PR 5)?
 
-Self-vote (model picks its own answer from N samples)
-is susceptible to recency bias — small models tend to
-pick the last answer they generated, not the best.
-Critic-vote (separate prompt) is 2x cost but
-deterministic. The smoke run will measure whether 3-way
-critic-vote actually improves on 1-way for hard problems
-before we promote it.
+The original PR 5 design — N sub-agents tackle the
+same problem in parallel, vote on the best — was
+rejected during review. Voting is wasteful: N−1
+answers get discarded, and the harness has to make a
+judgmental pick that's prone to opaque failure modes.
+
+**Parallel decomposition** keeps all the work: each
+sub-agent tackles a DIFFERENT piece of the task, and
+results compose mechanically into the whole answer.
+No discarded work, no judgmental selection.
 
 ## Reference
 

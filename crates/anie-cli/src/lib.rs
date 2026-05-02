@@ -11,6 +11,7 @@ mod compaction_reserve;
 mod compaction_stats;
 mod context_virt;
 mod controller;
+mod decompose;
 mod embedder;
 mod external_context;
 mod harness_mode;

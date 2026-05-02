@@ -1024,6 +1024,18 @@ impl InteractiveController {
         self.compactions_remaining_this_turn
             .store(max_per_turn, Ordering::Release);
         self.state.refresh_system_prompt_if_needed();
+
+        // PR 4 of `docs/rlm_subagents_2026-05-01/`. When
+        // `ANIE_DECOMPOSE=1` is set in --harness-mode=rlm,
+        // run a one-shot pre-loop decompose call on the
+        // user's task before driving the agent. The plan is
+        // injected as a leading <system-reminder> message
+        // the model sees alongside the user's original
+        // prompt. Best-effort: any failure (timeout,
+        // provider error, empty output, NO_PLAN_NEEDED) just
+        // skips the injection.
+        let decompose_plan = self.state.maybe_run_decompose(&text).await;
+
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],
             timestamp: now_millis(),
@@ -1066,15 +1078,25 @@ impl InteractiveController {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
+        // PR 4 of `docs/rlm_subagents_2026-05-01/`: if a
+        // decompose plan was produced above, prepend it to
+        // the prompts the agent sees. The plan is a
+        // <system-reminder>-tagged user message — same
+        // channel as the per-turn ledger and skill loads, so
+        // the model treats it as injected guidance.
+        let prompts = if let Some(plan) = decompose_plan {
+            let plan_message = Message::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: crate::decompose::render_plan_as_system_reminder(&plan),
+                }],
+                timestamp: now_millis(),
+            });
+            vec![plan_message, prompt_message]
+        } else {
+            vec![prompt_message]
+        };
         let handle = tokio::spawn(async move {
-            run_via_step_machine(
-                &agent,
-                vec![prompt_message],
-                context,
-                &event_tx,
-                &task_cancel,
-            )
-            .await
+            run_via_step_machine(&agent, prompts, context, &event_tx, &task_cancel).await
         });
         self.current_run = Some(CurrentRun {
             handle,
@@ -1763,6 +1785,29 @@ impl ControllerState {
         )?;
         self.persist_runtime_state_logged("reload_config");
         Ok(())
+    }
+
+    /// PR 4 of `docs/rlm_subagents_2026-05-01/`. When
+    /// `ANIE_DECOMPOSE=1` is set and the harness installs
+    /// rlm features, run a one-shot pre-loop call asking
+    /// the model to decompose the user's task. Returns the
+    /// plan text (sub-task list) on success; `None` on any
+    /// failure mode or when the model returns
+    /// NO_PLAN_NEEDED.
+    async fn maybe_run_decompose(&self, user_task: &str) -> Option<String> {
+        if !self.harness_mode.installs_rlm_features() {
+            return None;
+        }
+        if !crate::decompose::decompose_env_enabled() {
+            return None;
+        }
+        let decomposer = crate::decompose::Decomposer::new(
+            Arc::clone(&self.provider_registry),
+            self.config.current_model().clone(),
+            Arc::clone(&self.request_options_resolver),
+            self.config.active_ollama_num_ctx_override(),
+        );
+        decomposer.decompose(user_task).await
     }
 
     /// Rebuild the system prompt if the set of context files or any of their mtimes changed.
