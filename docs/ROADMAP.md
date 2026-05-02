@@ -18,7 +18,7 @@ high-level; the per-series tracker is authoritative.
 | **RLM + context virtualization** (`rlm_2026-04-29/`) | Recursive Language Models substrate: recurse tool, indexed external store, eviction policy, ledger injection, embedding-based reranker, background summarization | **All 6 phases (A-F) + Plan 08 embedding reranker landed on `dev_rlm`** | [`rlm_2026-04-29/execution/README.md`](rlm_2026-04-29/execution/README.md) |
 | **Harness mitigations** (`harness_mitigations_2026-05-01/`) | Fix the loudest small-model failure modes from the 2026-05-01 smoke (hallucinated success on tool error, stuck loops, hallucinated improvements) | **PRs 1-3 + follow-up shipped on `dev_rlm`. PR 4 (relevance-based failed-result eviction) planned** | [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md) |
 | **Sub-agents + decompose + parallel recurse** (`rlm_subagents_2026-05-01/`) | Address the long-tail-reasoning gap (T2 stalled at 43 min): true sub-agents with full tools, decompose-and-recurse scaffolding, optional parallel recurse | **Planning. README + PR 1-2 docs written; PR 3-6 deferred pending user reaction** | [`rlm_subagents_2026-05-01/README.md`](rlm_subagents_2026-05-01/README.md) |
-| **Skills system** (`skills_2026-05-02/`) | Anthropic-style skills: markdown files in `.anie/skills/` (and `.agents/skills/`) that the agent loads on demand. The discovery layer for the recurse/decompose capabilities | **Planning. README + PR 1-3 docs written; PR 4-5 deferred pending user reaction** | [`skills_2026-05-02/README.md`](skills_2026-05-02/README.md) |
+| **Skills system** (`skills_2026-05-02/`) | Anthropic-style skills: markdown files in `.anie/skills/` (and `.agents/skills/`) that the agent loads on demand. The discovery layer for the recurse/decompose capabilities | **PRs 1-4 shipped: registry, skill tool, four bundled skills (cpp-rule-of-five, decompose-multi-constraint-task, use-recurse-for-archive-lookup, verify-after-edit), `/skills` slash command. PR 5 (smoke validation) plan written; smoke run pending** | [`skills_2026-05-02/README.md`](skills_2026-05-02/README.md) |
 | **REPL agent loop** (`repl_agent_loop/`) | Refactor `AgentLoop::run` into an explicit Read → Eval → Print → Loop runtime — the substrate that everything above ultimately rides on | **Planning + partial. See `repl_agent_loop_2026-04-27.md` for the original write-up** | [`repl_agent_loop/`](repl_agent_loop/) |
 | **Provider expansion** (`add_providers/`) | Built-in support for OpenRouter (highest-priority), xAI, Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI Responses API, Amazon Bedrock | **OpenRouter shipped (per memory). Others drafted as plans** | [`add_providers/README.md`](add_providers/README.md) |
 | **Smoke protocol** (`smoke_protocol_2026-05-01.md`) | Canonical 11-turn DLL+weather scenario for validating context-virt and small-model harness changes | **Shipped; baseline captured 2026-05-01; re-run after each major series PR** | [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md) |
@@ -101,6 +101,18 @@ across the two series").
       failures), PR 2 correctly silent (args varied), PR 3
       regression caught and fixed. See
       [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md).
+- [x] **Skills system PRs 1-4** — Anthropic-style skills
+      end-to-end: SkillRegistry with five-layer discovery
+      (bundled embedded via include_str! + four on-disk
+      precedence layers), `skill` tool wrapping bodies in
+      `<system-reminder source="skill:NAME">`, four bundled
+      skills targeting documented failure modes (rule-of-five,
+      decompose, recurse-for-archive, verify-after-edit), and
+      `/skills` slash command listing the catalog with
+      "Active in this run:" summary. Catalog appears in the
+      system prompt; agent can autonomously load. See
+      [`skills_2026-05-02/`](skills_2026-05-02/). PR 5 (smoke
+      validation) is the remaining piece.
 
 ## Next Up — Foundational Architecture
 
