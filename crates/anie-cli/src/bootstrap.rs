@@ -12,7 +12,7 @@ use anie_tools::{
     WriteTool,
 };
 use anie_tui::UiAction;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     Cli,
@@ -87,7 +87,11 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         bash_policy_from_config(&config.tools.bash.policy),
         config.tools.web.clone(),
     );
-    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::discover(&cwd));
+    if !skill_registry.is_empty() {
+        info!(skills = skill_registry.len(), "loaded skills from disk");
+    }
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
 
@@ -103,6 +107,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         model_catalog,
         provider_registry,
         tool_registry,
+        skill_registry,
         request_options_resolver,
         prompt_cache,
         retry_config: RetryConfig::default(),

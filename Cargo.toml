@@ -65,6 +65,10 @@ rpassword = "7"
 # Pure Rust; no C build dep. Stable and pinned widely.
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
+# serde_yml — actively-maintained fork of serde_yaml. Used by
+# anie-cli to parse frontmatter in skill markdown files
+# (`docs/skills_2026-05-02/`).
+serde_yml = "0.0.12"
 # serde_urlencoded — already transitive through reqwest; we
 # surface it explicitly for the OAuth authorize-URL builder.
 serde_urlencoded = "0.7"

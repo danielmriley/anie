@@ -121,8 +121,9 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
     config.compaction.enabled = false;
     config.compaction.keep_recent_tokens = 2_000;
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("prompt cache");
 
     let mut session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     preload_compactable_history(&mut session);
@@ -145,6 +146,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         model_catalog: vec![model("gpt-4o", "openai")],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig {
@@ -206,8 +208,9 @@ fn controller_with_runtime_state_path(
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let mut config_state = ConfigState::new(
         config.clone(),
@@ -224,6 +227,7 @@ fn controller_with_runtime_state_path(
         model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -410,6 +414,30 @@ fn compose_system_prompt_only_augments_in_rlm_mode() {
     );
 }
 
+/// PR 1 of `docs/skills_2026-05-02/`. When the skill
+/// registry is empty, the base prompt has no skill catalog
+/// section — keeps the prompt narrow when no skills are
+/// installed.
+#[test]
+fn build_system_prompt_omits_skill_catalog_when_registry_empty() {
+    use anie_agent::ToolRegistry;
+    use anie_config::AnieConfig;
+    use std::path::Path;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
+    let skills = crate::skills::SkillRegistry::empty();
+    let config = AnieConfig::default();
+    let prompt =
+        crate::controller::build_system_prompt(Path::new("/tmp"), &tools, &skills, &config)
+            .expect("build_system_prompt");
+
+    assert!(
+        !prompt.contains("Available skills"),
+        "empty registry should not render a catalog section: {prompt}"
+    );
+}
+
 /// PR 3 of `docs/harness_mitigations_2026-05-01/` (revised
 /// post-smoke). Pin that the base (non-rlm) system prompt
 /// does NOT carry the re-test-after-edit rule — the smoke
@@ -428,9 +456,11 @@ fn build_system_prompt_omits_retest_directive_in_base_prompt() {
 
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
+    let skills = crate::skills::SkillRegistry::empty();
     let config = AnieConfig::default();
-    let prompt = crate::controller::build_system_prompt(Path::new("/tmp"), &tools, &config)
-        .expect("build_system_prompt");
+    let prompt =
+        crate::controller::build_system_prompt(Path::new("/tmp"), &tools, &skills, &config)
+            .expect("build_system_prompt");
 
     assert!(
         !prompt.contains("you MUST re-run the most recent verification command"),
@@ -718,8 +748,9 @@ fn build_dispatch_controller_with_runtime_state_path(
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let default_model = catalog
         .first()
@@ -747,6 +778,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         },
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -776,8 +808,9 @@ fn build_state_with_registry(
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
 
     ControllerState {
@@ -792,6 +825,7 @@ fn build_state_with_registry(
         model_catalog: vec![model],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -1622,8 +1656,9 @@ fn controller_for_context_length_test_with_cap(
     config.ollama.default_max_num_ctx = Some(cap);
 
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let default_model = ollama_model();
 
@@ -1642,6 +1677,7 @@ fn controller_for_context_length_test_with_cap(
         model_catalog: vec![default_model],
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -2090,8 +2126,9 @@ async fn help_command_emits_system_message_with_registry_output() {
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let command_registry = crate::commands::CommandRegistry::with_builtins();
     let expected = command_registry.format_help();
@@ -2108,6 +2145,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         model_catalog: vec![model("gpt-4o", "openai")],
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -2221,8 +2259,9 @@ fn spawn_live_controller(
     let mut config = AnieConfig::default();
     config.compaction.enabled = false;
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("prompt cache");
 
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
 
@@ -2244,6 +2283,7 @@ fn spawn_live_controller(
         model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config,

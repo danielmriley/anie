@@ -1175,6 +1175,12 @@ pub(crate) struct ControllerState {
     pub(crate) model_catalog: Vec<Model>,
     pub(crate) provider_registry: Arc<ProviderRegistry>,
     pub(crate) tool_registry: Arc<ToolRegistry>,
+    /// Skills discovered from disk at startup. PR 1 of
+    /// `docs/skills_2026-05-02/`. Read-only for the lifetime
+    /// of the run; hot reload is deferred (skill iteration
+    /// today requires restart). Surfaced in the system
+    /// prompt as a catalog (name + description, no body).
+    pub(crate) skill_registry: Arc<crate::skills::SkillRegistry>,
     pub(crate) request_options_resolver: Arc<dyn RequestOptionsResolver>,
     pub(crate) prompt_cache: SystemPromptCache,
     pub(crate) retry_config: RetryConfig,
@@ -1737,8 +1743,12 @@ impl ControllerState {
             self.config.anie_config().clone(),
         ));
         let cwd = self.session.cwd().to_path_buf();
-        self.prompt_cache
-            .replace(&cwd, &self.tool_registry, self.config.anie_config())?;
+        self.prompt_cache.replace(
+            &cwd,
+            &self.tool_registry,
+            &self.skill_registry,
+            self.config.anie_config(),
+        )?;
         self.persist_runtime_state_logged("reload_config");
         Ok(())
     }
@@ -1746,8 +1756,12 @@ impl ControllerState {
     /// Rebuild the system prompt if the set of context files or any of their mtimes changed.
     fn refresh_system_prompt_if_needed(&mut self) {
         let cwd = self.session.cwd().to_path_buf();
-        self.prompt_cache
-            .refresh_if_stale(&cwd, &self.tool_registry, self.config.anie_config());
+        self.prompt_cache.refresh_if_stale(
+            &cwd,
+            &self.tool_registry,
+            &self.skill_registry,
+            self.config.anie_config(),
+        );
     }
 }
 
@@ -2115,6 +2129,7 @@ fn build_rlm_extras(
 pub fn build_system_prompt(
     cwd: &Path,
     tools: &ToolRegistry,
+    skills: &crate::skills::SkillRegistry,
     config: &AnieConfig,
 ) -> Result<String> {
     let tool_list = tools
@@ -2133,6 +2148,10 @@ pub fn build_system_prompt(
     };
 
     let mut parts = vec![default_base];
+    let skill_catalog = crate::skills::render_catalog(skills);
+    if !skill_catalog.is_empty() {
+        parts.push(skill_catalog);
+    }
     for context_file in collect_context_files(cwd, &config.context)? {
         parts.push(format!(
             "# Project Context\n\n## {}\n\n{}",

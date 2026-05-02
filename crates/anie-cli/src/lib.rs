@@ -26,6 +26,7 @@ mod retry_policy;
 mod rpc;
 mod runtime;
 mod runtime_state;
+mod skills;
 mod user_error;
 
 use std::{path::PathBuf, sync::OnceLock};
