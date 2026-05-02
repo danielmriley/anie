@@ -1,6 +1,6 @@
 ---
 name: verify-after-edit
-description: After editing or writing a file under test, re-run the most recent build/test/run command before claiming the change works. The harness ledger lists prior bash commands; find the build/test command and re-execute.
+description: Re-run the most recent test, build, or run command (pytest, cargo test, ./binary, etc.) AFTER editing a file and BEFORE telling the user "the change works" / "this is fixed" / "tell me if it works". This is execution verification — distinct from static code review. Trigger when (a) the user just edited a file with existing tests, OR (b) the user's request ends with "tell me if it works", "verify the change", "did this fix it", "make sure it still passes". Re-running the function alone is NOT enough; re-run the test file that was previously verifying it.
 ---
 
 # When this applies

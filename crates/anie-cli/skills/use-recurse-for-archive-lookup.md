@@ -1,6 +1,6 @@
 ---
 name: use-recurse-for-archive-lookup
-description: When a follow-up question would be answered by something already in the conversation archive (a URL fetched, command run, file read), use the `recurse` tool to search the archive instead of re-running the original tool.
+description: How to format `recurse` calls correctly — pass tool_call_ids without the parens or `id=` prefix, choose the right scope kind (message_grep vs tool_result vs summary), and avoid the literal string `(id=...)`. Load when (a) you're about to issue your first `recurse` call this run, OR (b) a recurse call returned [tool error] with bad arguments. The rlm-mode system prompt already tells you WHEN to use recurse; this skill covers HOW.
 ---
 
 # When this applies
