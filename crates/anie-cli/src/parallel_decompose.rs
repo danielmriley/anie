@@ -212,14 +212,269 @@ pub(crate) fn render_with_rounds(plan: &ParsedPlan) -> String {
 }
 
 /// True when `ANIE_PARALLEL_DECOMPOSE` is set to a value of
-/// 2 or higher. The value indicates the (future) max
-/// concurrency; for the dry-run iteration any value of 2 or
-/// higher just enables the round-rendering.
+/// 2 or higher. Enables both the dry-run round annotation
+/// (PR 5) and the concurrent executor (PR 5.1) — the
+/// executor's effective concurrency is further clamped by
+/// [`safe_max_concurrency`] based on the parent's API.
 pub(crate) fn parallel_decompose_enabled() -> bool {
     std::env::var("ANIE_PARALLEL_DECOMPOSE")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .is_some_and(|n| n >= 2)
+}
+
+/// Hard cap on concurrent sub-agent execution. We stay well
+/// below typical API rate limits even for users with 4-7
+/// sub-tasks per decompose; lifting this requires an
+/// `ANIE_PARALLEL_DECOMPOSE_MAX` knob (deferred until
+/// someone asks).
+pub(crate) const MAX_PARALLEL_DECOMPOSE_CAP: u32 = 6;
+
+/// Provider-aware concurrency selection. PR 5.1 of
+/// `docs/rlm_subagents_2026-05-01/`.
+///
+/// **Ollama defaults to sequential** (`max = 1`) regardless of
+/// `ANIE_PARALLEL_DECOMPOSE` because local concurrent inference
+/// without shared-prefix KV cache (a) doubles VRAM pressure and
+/// (b) re-processes the shared prefix per sub-agent. See
+/// `concurrency_decisions.md` for the long-form reasoning.
+///
+/// `ANIE_PARALLEL_DECOMPOSE_FORCE=1` overrides the Ollama
+/// clamp for users who know their hardware can handle it.
+///
+/// API providers (anything that's not Ollama) honor
+/// `ANIE_PARALLEL_DECOMPOSE` directly, capped at
+/// [`MAX_PARALLEL_DECOMPOSE_CAP`].
+pub(crate) fn safe_max_concurrency(api: anie_provider::ApiKind) -> u32 {
+    let raw = std::env::var("ANIE_PARALLEL_DECOMPOSE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    if raw < 2 {
+        return 1;
+    }
+    let bounded = raw.min(MAX_PARALLEL_DECOMPOSE_CAP);
+    if api == anie_provider::ApiKind::OllamaChatApi
+        && !ollama_force_parallel_enabled()
+    {
+        return 1;
+    }
+    bounded
+}
+
+fn ollama_force_parallel_enabled() -> bool {
+    matches!(
+        std::env::var("ANIE_PARALLEL_DECOMPOSE_FORCE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+// ---- PR 5.1: concurrent executor ----
+
+/// Result of executing one sub-task. Errors don't fail the
+/// whole plan — they're captured here and surfaced in the
+/// composed text so the parent agent can decide whether to
+/// retry, skip, or continue.
+#[derive(Debug, Clone)]
+pub(crate) struct SubtaskResult {
+    pub id: u32,
+    pub text: String,
+    pub answer: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Drive the parsed plan through topological rounds, running
+/// sub-tasks within each round concurrently up to
+/// `max_concurrency`. Sequential between rounds (downstream
+/// rounds depend on upstream rounds completing).
+///
+/// Returns one `SubtaskResult` per sub-task in the plan,
+/// keyed by id, in plan order.
+pub(crate) async fn execute_parallel_plan(
+    parsed: &ParsedPlan,
+    factory: std::sync::Arc<dyn anie_agent::SubAgentFactory>,
+    parent_context: Vec<anie_protocol::Message>,
+    recursion_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    max_concurrency: u32,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<SubtaskResult> {
+    use std::collections::HashMap;
+    use tokio::sync::Semaphore;
+
+    let mut results: HashMap<u32, SubtaskResult> = HashMap::new();
+    let semaphore = std::sync::Arc::new(Semaphore::new(max_concurrency.max(1) as usize));
+    let id_to_text: HashMap<u32, String> = parsed
+        .subtasks
+        .iter()
+        .map(|s| (s.id, s.text.clone()))
+        .collect();
+
+    for round in &parsed.rounds {
+        if cancel.is_cancelled() {
+            break;
+        }
+        // Spawn one task per sub-task in this round, gated
+        // by the semaphore.
+        let mut handles: Vec<tokio::task::JoinHandle<SubtaskResult>> =
+            Vec::with_capacity(round.len());
+        for &id in round {
+            let Some(text) = id_to_text.get(&id).cloned() else {
+                continue;
+            };
+            let factory = std::sync::Arc::clone(&factory);
+            let context = parent_context.clone();
+            let recursion_budget = std::sync::Arc::clone(&recursion_budget);
+            let cancel = cancel.clone();
+            let permit_acquirer = std::sync::Arc::clone(&semaphore);
+            handles.push(tokio::spawn(async move {
+                let _permit = permit_acquirer.acquire_owned().await.ok();
+                run_one_subtask(
+                    id,
+                    &text,
+                    factory,
+                    context,
+                    recursion_budget,
+                    &cancel,
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            match handle.await {
+                Ok(result) => {
+                    results.insert(result.id, result);
+                }
+                Err(join_err) => {
+                    tracing::warn!(%join_err, "sub-task task panicked or was aborted");
+                }
+            }
+        }
+    }
+
+    // Return in plan order so composition reads naturally.
+    parsed
+        .subtasks
+        .iter()
+        .filter_map(|st| results.remove(&st.id))
+        .collect()
+}
+
+/// Build + drive one sub-agent for a single sub-task. The
+/// sub-agent inherits the parent's tool registry (PR 2 of
+/// the sub-agents series) and starts with the parent's
+/// active context as its initial messages.
+async fn run_one_subtask(
+    id: u32,
+    text: &str,
+    factory: std::sync::Arc<dyn anie_agent::SubAgentFactory>,
+    parent_context: Vec<anie_protocol::Message>,
+    recursion_budget: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> SubtaskResult {
+    use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
+
+    let build_ctx = anie_agent::SubAgentBuildContext {
+        depth: 1,
+        recursion_budget,
+        model_override: None,
+    };
+    let sub_agent = match factory.build(&build_ctx) {
+        Ok(a) => a,
+        Err(error) => {
+            return SubtaskResult {
+                id,
+                text: text.to_string(),
+                answer: None,
+                error: Some(format!("sub-agent build failed: {error}")),
+            };
+        }
+    };
+
+    let user_prompt = Message::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        timestamp: now_millis(),
+    });
+    let (sub_event_tx, mut sub_event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
+    let drain_task = tokio::spawn(async move {
+        while sub_event_rx.recv().await.is_some() {
+            // Opaque sub-call: events drained, not surfaced.
+        }
+    });
+    let mut machine = sub_agent
+        .start_run_machine(vec![user_prompt], parent_context, &sub_event_tx)
+        .await;
+    while !machine.is_finished() {
+        machine.next_step(&sub_event_tx, cancel).await;
+    }
+    let sub_result = machine.finish(&sub_event_tx).await;
+    drop(sub_event_tx);
+    let _ = drain_task.await;
+
+    if let Some(error) = sub_result.terminal_error {
+        return SubtaskResult {
+            id,
+            text: text.to_string(),
+            answer: None,
+            error: Some(format!("sub-agent terminated: {error}")),
+        };
+    }
+
+    let answer = extract_final_text(&sub_result.generated_messages);
+    SubtaskResult {
+        id,
+        text: text.to_string(),
+        answer: Some(answer),
+        error: None,
+    }
+}
+
+fn extract_final_text(messages: &[anie_protocol::Message]) -> String {
+    use anie_protocol::{ContentBlock, Message};
+    for message in messages.iter().rev() {
+        if let Message::Assistant(a) = message {
+            for block in &a.content {
+                if let ContentBlock::Text { text } = block
+                    && !text.trim().is_empty()
+                {
+                    return text.trim().to_string();
+                }
+            }
+        }
+    }
+    String::from("(sub-agent produced no visible answer)")
+}
+
+/// Render the executed sub-task results as a system-reminder-
+/// tagged block. Replaces the plain plan injection when the
+/// concurrent executor ran successfully.
+pub(crate) fn render_completed_results(
+    parsed: &ParsedPlan,
+    results: &[SubtaskResult],
+) -> String {
+    let mut out = String::from(
+        "<system-reminder source=\"decompose-executed\">\n\nSub-tasks have been completed by parallel sub-agents. Their results follow — synthesize them into your final answer for the user. Verify any code/output the sub-tasks produced before reporting success.\n\nPLAN:\n",
+    );
+    out.push_str(&render_with_rounds(parsed));
+    out.push_str("\nSUB-TASK RESULTS:\n");
+    for result in results {
+        out.push_str(&format!("\n--- Sub-task {} ---\n", result.id));
+        out.push_str(&format!("Task: {}\n", result.text));
+        match (&result.answer, &result.error) {
+            (Some(answer), _) => {
+                out.push_str(&format!("Result:\n{answer}\n"));
+            }
+            (None, Some(err)) => {
+                out.push_str(&format!("[error]: {err}\n"));
+            }
+            (None, None) => {
+                out.push_str("[no result]\n");
+            }
+        }
+    }
+    out.push_str("\n</system-reminder>");
+    out
 }
 
 #[cfg(test)]
@@ -369,5 +624,106 @@ mod tests {
         unsafe {
             std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
         }
+    }
+
+    /// PR 5.1: Ollama clamps to sequential by default.
+    /// `ANIE_PARALLEL_DECOMPOSE_FORCE=1` overrides.
+    #[test]
+    fn safe_max_concurrency_clamps_ollama_to_one_by_default() {
+        unsafe {
+            std::env::set_var("ANIE_PARALLEL_DECOMPOSE", "4");
+            std::env::remove_var("ANIE_PARALLEL_DECOMPOSE_FORCE");
+        }
+        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi), 1);
+        // API providers honor the env value.
+        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OpenAICompletions), 4);
+        unsafe {
+            std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
+        }
+    }
+
+    #[test]
+    fn safe_max_concurrency_force_lets_ollama_run_parallel() {
+        unsafe {
+            std::env::set_var("ANIE_PARALLEL_DECOMPOSE", "3");
+            std::env::set_var("ANIE_PARALLEL_DECOMPOSE_FORCE", "1");
+        }
+        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi), 3);
+        unsafe {
+            std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
+            std::env::remove_var("ANIE_PARALLEL_DECOMPOSE_FORCE");
+        }
+    }
+
+    #[test]
+    fn safe_max_concurrency_caps_at_max() {
+        unsafe {
+            std::env::set_var("ANIE_PARALLEL_DECOMPOSE", "100");
+        }
+        assert_eq!(
+            safe_max_concurrency(anie_provider::ApiKind::OpenAICompletions),
+            MAX_PARALLEL_DECOMPOSE_CAP
+        );
+        unsafe {
+            std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
+        }
+    }
+
+    #[test]
+    fn safe_max_concurrency_returns_one_when_unset() {
+        unsafe {
+            std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
+        }
+        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OpenAICompletions), 1);
+        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi), 1);
+    }
+
+    #[test]
+    fn render_completed_results_includes_each_subtask_answer() {
+        let plan = "1. First task\n2. Second task";
+        let parsed = parse_plan(plan).expect("parse");
+        let results = vec![
+            SubtaskResult {
+                id: 1,
+                text: "First task".into(),
+                answer: Some("Got result A".into()),
+                error: None,
+            },
+            SubtaskResult {
+                id: 2,
+                text: "Second task".into(),
+                answer: Some("Got result B".into()),
+                error: None,
+            },
+        ];
+        let rendered = render_completed_results(&parsed, &results);
+        assert!(rendered.contains("Got result A"), "{rendered}");
+        assert!(rendered.contains("Got result B"), "{rendered}");
+        assert!(rendered.contains("decompose-executed"), "{rendered}");
+        assert!(rendered.starts_with("<system-reminder"));
+        assert!(rendered.ends_with("</system-reminder>"));
+    }
+
+    #[test]
+    fn render_completed_results_includes_errors_when_subtask_failed() {
+        let plan = "1. Working\n2. Failing";
+        let parsed = parse_plan(plan).expect("parse");
+        let results = vec![
+            SubtaskResult {
+                id: 1,
+                text: "Working".into(),
+                answer: Some("ok".into()),
+                error: None,
+            },
+            SubtaskResult {
+                id: 2,
+                text: "Failing".into(),
+                answer: None,
+                error: Some("network unavailable".into()),
+            },
+        ];
+        let rendered = render_completed_results(&parsed, &results);
+        assert!(rendered.contains("[error]: network unavailable"), "{rendered}");
+        assert!(rendered.contains("ok"), "{rendered}");
     }
 }

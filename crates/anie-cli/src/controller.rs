@@ -993,6 +993,75 @@ impl InteractiveController {
         Ok(())
     }
 
+    /// PR 5 + 5.1 of `docs/rlm_subagents_2026-05-01/`. Given
+    /// the raw decompose plan from PR 4, decide whether to:
+    /// 1. Run the concurrent executor (parallel + safe
+    ///    concurrency > 1): build a sub-agent factory, fan
+    ///    out sub-tasks across topological rounds, compose
+    ///    completed results into a `<system-reminder>` block.
+    /// 2. Render dry-run round annotations (parallel enabled
+    ///    but Ollama-clamped to N=1 sequential).
+    /// 3. Pass the plain plan through (parallel not enabled).
+    async fn maybe_run_parallel_decompose(
+        &self,
+        decompose_plan: Option<String>,
+    ) -> Option<String> {
+        let plan = decompose_plan.as_deref()?;
+        if !crate::parallel_decompose::parallel_decompose_enabled() {
+            return decompose_plan;
+        }
+        let Some(parsed) = crate::parallel_decompose::parse_plan(plan) else {
+            return decompose_plan;
+        };
+
+        let max_concurrency = crate::parallel_decompose::safe_max_concurrency(
+            self.state.config.current_model().api,
+        );
+        let has_round_with_multiple = parsed.rounds.iter().any(|r| r.len() > 1);
+        if max_concurrency < 2 || !has_round_with_multiple {
+            // PR 5 dry-run: annotate, don't execute. Either
+            // we're clamped (Ollama default) or the plan is
+            // strictly sequential.
+            return Some(crate::parallel_decompose::render_with_rounds(&parsed));
+        }
+
+        // PR 5.1 concurrent execution. Build the factory the
+        // same way build_rlm_extras does — the executor
+        // doesn't share the recurse-tool's factory because
+        // recurse_extras isn't built yet at this point in
+        // start_prompt_run.
+        let factory = Arc::new(crate::recurse_factory::ControllerSubAgentFactory {
+            provider_registry: Arc::clone(&self.state.provider_registry),
+            model: self.state.config.current_model().clone(),
+            system_prompt: self.state.prompt_cache.current().to_string(),
+            thinking: self.state.config.current_thinking(),
+            request_options_resolver: Arc::clone(&self.state.request_options_resolver),
+            ollama_num_ctx_override: self.state.config.active_ollama_num_ctx_override(),
+            parent_tools: Arc::clone(&self.state.tool_registry),
+            recurse_inherit_limit: recurse_inherit_limit_from_env(),
+        });
+        // Sub-agents start from empty parent context. The
+        // task text is everything they need (system prompt
+        // already has the catalog + skills); pulling parent
+        // history would defeat the prefix-cache benefit when
+        // the API does support it (see concurrency_decisions.md).
+        let parent_context = Vec::new();
+        let recursion_budget = Arc::clone(&self.recursions_remaining_this_run);
+        let cancel = CancellationToken::new();
+        let results = crate::parallel_decompose::execute_parallel_plan(
+            &parsed,
+            factory,
+            parent_context,
+            recursion_budget,
+            max_concurrency,
+            &cancel,
+        )
+        .await;
+        Some(crate::parallel_decompose::render_completed_results(
+            &parsed, &results,
+        ))
+    }
+
     async fn start_prompt_run(&mut self, text: String) -> Result<()> {
         info!(
             provider = %self.state.config.current_model().provider,
@@ -1035,21 +1104,22 @@ impl InteractiveController {
         // provider error, empty output, NO_PLAN_NEEDED) just
         // skips the injection.
         let decompose_plan = self.state.maybe_run_decompose(&text).await;
-        // PR 5 of `docs/rlm_subagents_2026-05-01/`. When
-        // `ANIE_PARALLEL_DECOMPOSE>=2` is set and we have a
-        // plan, attempt to parse it into structured rounds.
-        // The dry-run iteration just annotates the plan with
-        // the parallel structure; PR 5.1 will add the
-        // executor that actually fans out concurrent
-        // sub-agents.
-        let decompose_plan = if crate::parallel_decompose::parallel_decompose_enabled()
-            && let Some(plan) = decompose_plan.as_deref()
-            && let Some(parsed) = crate::parallel_decompose::parse_plan(plan)
-        {
-            Some(crate::parallel_decompose::render_with_rounds(&parsed))
-        } else {
-            decompose_plan
-        };
+        // PR 5 + 5.1 of `docs/rlm_subagents_2026-05-01/`.
+        //
+        // - If parallel-decompose is enabled AND the plan
+        //   parses AND `safe_max_concurrency > 1` (API
+        //   provider, or Ollama with FORCE), run the
+        //   concurrent executor: each sub-task gets its own
+        //   sub-agent run, results are composed back into a
+        //   `<system-reminder source="decompose-executed">`
+        //   block that the main agent synthesizes.
+        // - If parallel-decompose is enabled but concurrency
+        //   is clamped to 1 (Ollama default), render the
+        //   round structure as an annotation (PR 5 dry-run
+        //   behavior) and let the main agent execute the
+        //   sub-tasks itself.
+        // - Otherwise: pass-through to PR 4's plain plan.
+        let decompose_plan = self.maybe_run_parallel_decompose(decompose_plan).await;
         if let Some(plan) = decompose_plan.as_deref() {
             let _ = self
                 .event_tx
