@@ -1035,6 +1035,17 @@ impl InteractiveController {
         // provider error, empty output, NO_PLAN_NEEDED) just
         // skips the injection.
         let decompose_plan = self.state.maybe_run_decompose(&text).await;
+        if let Some(plan) = decompose_plan.as_deref() {
+            // Surface the plan in the transcript so the user
+            // can see what the model decomposed the task into
+            // before the agent starts acting on it.
+            let _ = self
+                .event_tx
+                .send(AgentEvent::SystemMessage {
+                    text: format!("[decompose plan]\n{plan}"),
+                })
+                .await;
+        }
 
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],

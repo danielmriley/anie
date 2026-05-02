@@ -28,7 +28,7 @@ use anie_provider::{
     ThinkingLevel,
 };
 use futures::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// System prompt for the one-shot decompose call. Tight on
 /// purpose — the model gets the user's task as the only
@@ -177,6 +177,17 @@ impl Decomposer {
             debug!("decompose: model returned NO_PLAN_NEEDED; skipping plan");
             return None;
         }
+        info!(
+            target: "anie_cli::decompose",
+            plan_chars = trimmed.chars().count(),
+            plan_lines = trimmed.lines().count(),
+            "decompose plan generated"
+        );
+        info!(
+            target: "anie_cli::decompose",
+            plan = %trimmed,
+            "decompose plan content"
+        );
         Some(trimmed.to_string())
     }
 }
