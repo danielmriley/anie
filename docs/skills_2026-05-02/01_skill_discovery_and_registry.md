@@ -14,34 +14,112 @@ No tool yet — this PR is plumbing.
 
 ### File locations
 
-Three layers, merged with **project > user > bundled**
+After reading codex's
+(`/home/daniel/Projects/agents/codex/codex-rs/core-skills/src/loader.rs`)
+and pi's
+(`/home/daniel/Projects/agents/pi/packages/coding-agent/src/core/skills.ts`)
+implementations, we'll match the emerging convention:
+**harness-specific path AND a shared `.agents/skills/`
+path**. Both repos do this — pi looks at `~/.pi/skills/`
+AND `~/.agents/skills/`; codex looks at
+`~/.agents/skills/` AND `$CODEX_HOME/skills/`. The
+shared `.agents/skills/` lets a user write a skill
+once and have multiple harnesses load it.
+
+Four layers, merged with
+**project-anie > project-shared > user-anie > user-shared > bundled**
 precedence on name collisions:
 
-1. **Bundled** — shipped inside the anie binary at
-   `crates/anie-cli/skills/*.md` (loaded from disk in
-   debug builds, embedded via `include_str!` for
-   release builds).
-2. **User** — `~/.anie/skills/*.md`. Created by the
-   user; persists across sessions.
-3. **Project** — `<cwd>/.anie/skills/*.md`. Per-repo
-   guidance; checked into the project.
+1. **Bundled** — `crates/anie-cli/skills/`. Ships with
+   the binary (loaded from disk in debug, embedded
+   via `include_str!` for release).
+2. **User-shared** — `~/.agents/skills/`. Cross-
+   harness skills.
+3. **User-anie** — `~/.anie/skills/`. anie-specific
+   user skills.
+4. **Project-shared** — `<cwd>/.agents/skills/`.
+   Cross-harness, checked into the project.
+5. **Project-anie** — `<cwd>/.anie/skills/`. anie-
+   specific, checked into the project.
 
-Recursive subdirectory scan is deferred (project
-skills can use namespacing in filenames if needed —
-e.g., `cpp_rule_of_five.md`).
+### File format — both single `.md` and directory-with-`SKILL.md`
+
+The Agent Skills standard (which both pi and codex
+follow) supports two layouts:
+
+1. **Single file:** `<path>/<skill_name>.md` —
+   simple skills with no supporting files. The body
+   is the markdown content after the frontmatter.
+2. **Directory:** `<path>/<skill_name>/SKILL.md` —
+   the directory can also contain `references/`,
+   `scripts/`, `assets/`. The agent resolves relative
+   paths inside the body against the skill's
+   directory.
+
+Codex supports only the directory layout; pi supports
+both depending on which root the skill lives in. We
+support both: in any of the five layers, both root
+`.md` files (skill name = filename stem) and
+subdirectory `<name>/SKILL.md` are valid. Bundled
+skills will start with the simple `.md` form; users
+can opt into the directory form when a skill needs
+scripts or reference files.
+
+The directory form is what unlocks the "skill includes
+a Python validator script the agent can run" pattern.
+We don't ship that today, but the format choice
+preserves the option.
+
+### Frontmatter schema — match the Agent Skills standard
+
+Both reference repos require `name` and `description`.
+We'll match that. Optional fields adopt only what
+multiple repos use to stay close to the standard:
+
+```yaml
+---
+name: cpp_rule_of_five              # required
+description: Brief catalog blurb.   # required
+disable_model_invocation: false     # optional, pi convention; default false
+license: MIT                        # optional, ignored at runtime today
+---
+```
+
+We deliberately defer the heavier fields (codex's
+`interface.*`, `dependencies.tools[]`,
+`policy.products[]`) until a real use case appears.
+They're easy to add as additive fields later.
+
+`name` validation matches the standard: 1–64 chars,
+lowercase a-z 0-9 hyphens, no leading/trailing/
+consecutive hyphens. Same regex as both reference
+repos.
+
+The `when_to_use` field I sketched in the README isn't
+in either reference implementation — both treat
+`description` as carrying that information. Drop it
+to stay standards-compliant; if descriptions get
+unwieldy we can add structured fields later.
 
 ### Skill type
 
 ```rust
 pub struct Skill {
-    pub name: String,            // unique identifier
-    pub description: String,     // one-liner for catalog
-    pub when_to_use: String,     // hint for the agent
-    pub body: String,            // markdown body (lazy?)
-    pub source: SkillSource,     // Bundled | User | Project
-    pub path: PathBuf,           // for diagnostics
+    pub name: String,
+    pub description: String,
+    pub disable_model_invocation: bool,
+    pub body: String,
+    pub source: SkillSource,           // Bundled | UserShared | UserAnie | ProjectShared | ProjectAnie
+    pub root_dir: PathBuf,             // skill's directory (for relative-path resolution in body)
+    pub manifest_path: PathBuf,        // the .md or SKILL.md file itself
 }
 ```
+
+`root_dir` is the directory containing the manifest.
+For single-file skills, that's the parent of the
+`.md`; for directory-form, it's the skill's own
+directory. The body's relative references (e.g.,
+`scripts/validate.py`) are resolved against this.
 
 Body is loaded eagerly on registry build (skills are
 small; no need for lazy loading). If a skill body
