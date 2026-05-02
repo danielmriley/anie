@@ -162,6 +162,13 @@ impl SkillRegistry {
     /// `~/.agents/skills/` shouldn't break the harness.
     pub fn discover(cwd: &Path) -> Self {
         let mut registry = Self::empty();
+        // Bundled skills are embedded via `include_str!` so they
+        // load without needing CARGO_MANIFEST_DIR or a real
+        // filesystem path — works in `cargo run` AND release
+        // binaries.
+        for skill in bundled_skills() {
+            registry.insert_with_precedence(skill);
+        }
         for (root, source) in discovery_roots(cwd) {
             registry.absorb_root(&root, source);
         }
@@ -277,15 +284,15 @@ impl SkillRegistry {
     }
 }
 
-/// Resolve the five discovery roots in **lowest-precedence
-/// first** order (so the registry's load loop can let higher
-/// layers overwrite). Layers whose paths can't be resolved
-/// (e.g. no `$HOME`) are silently omitted.
+/// Resolve the four filesystem discovery roots in
+/// **lowest-precedence first** order (so the registry's load
+/// loop can let higher layers overwrite). Layers whose paths
+/// can't be resolved (e.g. no `$HOME`) are silently omitted.
+/// Bundled skills are NOT included here — they're embedded
+/// via [`include_str!`] in [`bundled_skill_manifests`] and
+/// loaded into the registry separately.
 fn discovery_roots(cwd: &Path) -> Vec<(PathBuf, SkillSource)> {
-    let mut roots = Vec::with_capacity(5);
-    if let Some(bundled) = bundled_skills_root() {
-        roots.push((bundled, SkillSource::Bundled));
-    }
+    let mut roots = Vec::with_capacity(4);
     if let Some(home) = dirs::home_dir() {
         roots.push((home.join(USER_SHARED_SKILLS_DIR), SkillSource::UserShared));
         roots.push((home.join(USER_ANIE_SKILLS_DIR), SkillSource::UserAnie));
@@ -298,19 +305,47 @@ fn discovery_roots(cwd: &Path) -> Vec<(PathBuf, SkillSource)> {
     roots
 }
 
-/// Bundled-skills directory, located relative to
-/// `CARGO_MANIFEST_DIR`. In release builds we'd switch to
-/// `include_str!`-style embedding, but that requires
-/// per-skill const definitions; today's debug-only behavior
-/// is fine until we have a real bundled set (PR 3).
-fn bundled_skills_root() -> Option<PathBuf> {
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
-    let candidate = PathBuf::from(manifest_dir).join("skills");
-    if candidate.is_dir() {
-        Some(candidate)
-    } else {
-        None
-    }
+/// The four bundled skills, embedded into the binary at
+/// compile time via `include_str!`. Loaded into the registry
+/// at startup before the filesystem layers so any user/project
+/// skill of the same name shadows the bundled version.
+///
+/// Adding a new bundled skill: drop the `.md` file in
+/// `crates/anie-cli/skills/` and add an entry to this array.
+/// The filename stem and frontmatter `name` MUST match (the
+/// PR 1 parser enforces this).
+const BUNDLED_SKILL_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "cpp-rule-of-five",
+        include_str!("../skills/cpp-rule-of-five.md"),
+    ),
+    (
+        "decompose-multi-constraint-task",
+        include_str!("../skills/decompose-multi-constraint-task.md"),
+    ),
+    (
+        "use-recurse-for-archive-lookup",
+        include_str!("../skills/use-recurse-for-archive-lookup.md"),
+    ),
+    (
+        "verify-after-edit",
+        include_str!("../skills/verify-after-edit.md"),
+    ),
+];
+
+/// Parse the embedded bundled skill manifests into `Skill`
+/// values. Failures here are programming errors (a malformed
+/// bundled manifest would never have shipped) so we
+/// `expect` rather than log-and-skip.
+fn bundled_skills() -> Vec<Skill> {
+    BUNDLED_SKILL_MANIFESTS
+        .iter()
+        .map(|(name, raw)| {
+            parse_manifest_from_text(raw, name, SkillSource::Bundled).unwrap_or_else(|err| {
+                panic!("bundled skill `{name}` failed to parse: {err}")
+            })
+        })
+        .collect()
 }
 
 /// Parse a discovery-root entry into a skill, if it represents
@@ -347,10 +382,11 @@ fn parse_entry(path: &Path, source: SkillSource) -> Result<Option<Skill>> {
     Ok(None)
 }
 
-/// Parse a single manifest. `expected_name` is `Some(stem)` for
-/// single-file skills (we cross-check that frontmatter `name`
-/// matches the filename stem) and `None` for directory-form
-/// skills (the directory is the source of truth).
+/// Parse a single on-disk manifest. `expected_name` is
+/// `Some(stem)` for single-file skills (we cross-check that
+/// frontmatter `name` matches the filename stem) and `None`
+/// for directory-form skills (the directory is the source of
+/// truth).
 fn parse_manifest(
     manifest_path: &Path,
     body_root: &Path,
@@ -359,28 +395,48 @@ fn parse_manifest(
 ) -> Result<Skill> {
     let raw = fs::read_to_string(manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
-    let (frontmatter_text, body) = split_frontmatter(&raw)
-        .with_context(|| format!("malformed frontmatter in {}", manifest_path.display()))?;
-    let fm: SkillFrontmatter = serde_yml::from_str(frontmatter_text)
-        .with_context(|| format!("parsing YAML frontmatter in {}", manifest_path.display()))?;
-
-    validate_skill_name(&fm.name)
-        .with_context(|| format!("invalid skill name in {}", manifest_path.display()))?;
-
+    let mut skill = parse_manifest_from_text(&raw, expected_name.unwrap_or(""), source)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
     if let Some(expected) = expected_name {
-        if fm.name != expected {
+        if skill.name != expected {
             return Err(anyhow!(
                 "frontmatter name `{}` does not match filename stem `{}`",
-                fm.name,
+                skill.name,
                 expected
             ));
         }
     }
+    skill.root_dir = body_root.to_path_buf();
+    skill.manifest_path = manifest_path.to_path_buf();
+    Ok(skill)
+}
 
+/// Shared frontmatter+body parsing for both on-disk and
+/// embedded manifests. The embedded path passes the skill
+/// name as the `expected_name` (or empty string to skip the
+/// cross-check) and ignores the resulting `root_dir` /
+/// `manifest_path` since neither is meaningful for embedded
+/// skills.
+fn parse_manifest_from_text(
+    raw: &str,
+    expected_name: &str,
+    source: SkillSource,
+) -> Result<Skill> {
+    let (frontmatter_text, body) =
+        split_frontmatter(raw).context("malformed frontmatter")?;
+    let fm: SkillFrontmatter = serde_yml::from_str(frontmatter_text)
+        .context("parsing YAML frontmatter")?;
+    validate_skill_name(&fm.name).context("invalid skill name")?;
+    if !expected_name.is_empty() && fm.name != expected_name {
+        return Err(anyhow!(
+            "frontmatter name `{}` does not match expected `{}`",
+            fm.name,
+            expected_name
+        ));
+    }
     if fm.description.trim().is_empty() {
         return Err(anyhow!("skill description must be non-empty"));
     }
-
     if body.len() > SKILL_BODY_BYTE_WARN_THRESHOLD {
         warn!(
             name = %fm.name,
@@ -389,7 +445,6 @@ fn parse_manifest(
             "skill body exceeds soft cap; may pressure active context"
         );
     }
-
     Ok(Skill {
         name: fm.name,
         description: fm.description,
@@ -397,8 +452,8 @@ fn parse_manifest(
         license: fm.license,
         body: body.to_string(),
         source,
-        root_dir: body_root.to_path_buf(),
-        manifest_path: manifest_path.to_path_buf(),
+        root_dir: PathBuf::new(),
+        manifest_path: PathBuf::new(),
     })
 }
 
@@ -725,22 +780,14 @@ mod tests {
     }
 
     /// PR 3 of `docs/skills_2026-05-02/`. Pin that the four
-    /// initial bundled skills load correctly via the
-    /// CARGO_MANIFEST_DIR-based bundled-root discovery, and
-    /// that all of them appear in the agent-facing catalog.
+    /// initial bundled skills are embedded at compile time
+    /// and parse cleanly. Embedding (vs. CARGO_MANIFEST_DIR
+    /// runtime resolution) means the bundled set works in
+    /// release binaries too.
     #[test]
-    fn bundled_skills_load_from_manifest_dir() {
-        let bundled = bundled_skills_root().expect(
-            "CARGO_MANIFEST_DIR/skills should resolve to a real directory in tests",
-        );
-        assert!(
-            bundled.is_dir(),
-            "bundled skills root not found at {}",
-            bundled.display()
-        );
-        let mut registry = SkillRegistry::empty();
-        registry.absorb_root(&bundled, SkillSource::Bundled);
-        let names: Vec<String> = registry.iter().map(|s| s.name.clone()).collect();
+    fn bundled_skills_embedded_and_parse_cleanly() {
+        let bundled = bundled_skills();
+        let names: Vec<&str> = bundled.iter().map(|s| s.name.as_str()).collect();
         for expected in [
             "cpp-rule-of-five",
             "decompose-multi-constraint-task",
@@ -748,12 +795,34 @@ mod tests {
             "verify-after-edit",
         ] {
             assert!(
-                names.contains(&expected.to_string()),
+                names.contains(&expected),
                 "bundled skill `{expected}` missing; got {names:?}"
             );
         }
-        // All four are agent-invocable (no disable_model_invocation).
-        assert_eq!(registry.catalog().len(), 4);
+        // All four parse without panicking (parse_manifest_from_text
+        // would have panicked in `bundled_skills` if any frontmatter
+        // were malformed).
+        for skill in &bundled {
+            assert_eq!(skill.source, SkillSource::Bundled);
+            assert!(!skill.body.is_empty());
+            assert!(!skill.disable_model_invocation);
+        }
+    }
+
+    /// `discover` picks up bundled skills even with no on-
+    /// disk roots present. Critical: this is the path
+    /// production binaries take.
+    #[test]
+    fn discover_includes_bundled_when_no_disk_roots() {
+        let dir = tempdir().expect("tempdir");
+        // cwd has no .anie/skills or .agents/skills; home_dir
+        // probably exists in test env but won't have our skills.
+        let registry = SkillRegistry::discover(dir.path());
+        let names: Vec<String> = registry.iter().map(|s| s.name.clone()).collect();
+        assert!(
+            names.contains(&"cpp-rule-of-five".to_string()),
+            "bundled cpp-rule-of-five missing from discover() result; got {names:?}"
+        );
     }
 
     #[test]

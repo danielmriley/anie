@@ -100,7 +100,7 @@ run doesn't pressure the active ceiling.
 | 2 | [02_skill_tool.md](02_skill_tool.md) | A new `skill` tool: arg `name`, returns the body of the skill as a `<system-reminder>` injection. | **shipped** (this commit) |
 | 3 | [03_bundled_skills.md](03_bundled_skills.md) | Initial set of bundled skills addressing the 2026-05-01/05-02 smoke findings: `use-recurse-for-archive-lookup`, `cpp-rule-of-five`, `verify-after-edit`, `decompose-multi-constraint-task`. (Names use hyphens — kebab-case enforced by `validate_skill_name`.) | **shipped** (this commit) |
 | 4 | [04_tui_skill_visibility.md](04_tui_skill_visibility.md) | `/skills` slash command listing the catalog with source labels and the active set. (Status-bar segment scoped out — slash command's "Active in this run:" line provides equivalent visibility.) | **shipped** (this commit) |
-| 5 | [05_smoke_validation.md](05_smoke_validation.md) | Re-run the 11-turn smoke with skills enabled. Measure: does the model load `cpp_rule_of_five` autonomously when writing the DLL? Does it reach for `use_recurse_for_archive_lookup` instead of re-fetching? | planned |
+| 5 | [05_smoke_validation.md](05_smoke_validation.md) | Re-run the 11-turn smoke with skills enabled. Measure: does the model load `cpp-rule-of-five` autonomously when writing the DLL? Does it reach for `use-recurse-for-archive-lookup` instead of re-fetching? | **plan written; smoke run pending** (this commit) |
 
 PR 1 + 2 are infrastructure. PR 3 is content. PR 4 is
 ergonomics. PR 5 is exit criteria.
