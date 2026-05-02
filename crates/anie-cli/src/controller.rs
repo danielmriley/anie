@@ -1035,10 +1035,22 @@ impl InteractiveController {
         // provider error, empty output, NO_PLAN_NEEDED) just
         // skips the injection.
         let decompose_plan = self.state.maybe_run_decompose(&text).await;
+        // PR 5 of `docs/rlm_subagents_2026-05-01/`. When
+        // `ANIE_PARALLEL_DECOMPOSE>=2` is set and we have a
+        // plan, attempt to parse it into structured rounds.
+        // The dry-run iteration just annotates the plan with
+        // the parallel structure; PR 5.1 will add the
+        // executor that actually fans out concurrent
+        // sub-agents.
+        let decompose_plan = if crate::parallel_decompose::parallel_decompose_enabled()
+            && let Some(plan) = decompose_plan.as_deref()
+            && let Some(parsed) = crate::parallel_decompose::parse_plan(plan)
+        {
+            Some(crate::parallel_decompose::render_with_rounds(&parsed))
+        } else {
+            decompose_plan
+        };
         if let Some(plan) = decompose_plan.as_deref() {
-            // Surface the plan in the transcript so the user
-            // can see what the model decomposed the task into
-            // before the agent starts acting on it.
             let _ = self
                 .event_tx
                 .send(AgentEvent::SystemMessage {

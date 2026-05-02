@@ -20,6 +20,7 @@ mod login_command;
 mod model_catalog;
 mod models_command;
 mod onboarding;
+mod parallel_decompose;
 mod print_mode;
 mod recurse_factory;
 mod recurse_provider;

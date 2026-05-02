@@ -1,5 +1,33 @@
 # PR 5 — Parallel execution of independent sub-tasks
 
+## Status — shipped as a dry-run; PR 5.1 will add the executor
+
+The first iteration of PR 5 ships the **plan parser +
+round-structure renderer** without an actual concurrent
+executor. When `ANIE_PARALLEL_DECOMPOSE>=2` is set on top
+of `ANIE_DECOMPOSE=1`, the harness:
+
+1. Parses PR 4's plan text for numbered sub-tasks +
+   `(depends on N)` / `(after N, M)` / `(requires N)`
+   markers.
+2. Builds a topological round structure: each round groups
+   sub-tasks that have no remaining dependencies on each
+   other.
+3. Renders the plan with explicit `Round 1: [1, 3]
+   (independent — could run in parallel)` annotations
+   visible to the model.
+4. Falls back to the plain PR 4 plan on any parse failure
+   (cycle, dangling reference, no numbered list).
+
+The model sees the structure but executes sub-tasks itself
+via its existing recurse-tool path. PR 5.1 adds the
+executor that fans out the rounds via
+`ControllerSubAgentFactory` and runs them concurrently.
+
+This split lets us validate the parsing + round structure
+in smoke before committing to the more invasive concurrent
+executor.
+
 ## Rationale (revised)
 
 The original plan called for "parallel recurse + critic
