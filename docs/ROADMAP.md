@@ -1,7 +1,47 @@
 # Anie Roadmap
 
-Unified, prioritized task list. Items are ordered by impact-to-effort
-ratio — smallest impactful changes first. Check off items as they ship.
+Single source of truth for what's shipped, what's
+in flight, and what's next. Each row links to a plan
+series or doc; series with their own status trackers
+are linked at "see tracker."
+
+Last consolidated: 2026-05-02.
+
+## Active plan series
+
+The major in-flight efforts. Each series owns its own
+README + per-PR plan docs. The status column here is
+high-level; the per-series tracker is authoritative.
+
+| Series | Goal | Status | Tracker |
+|---|---|---|---|
+| **RLM + context virtualization** (`rlm_2026-04-29/`) | Recursive Language Models substrate: recurse tool, indexed external store, eviction policy, ledger injection, embedding-based reranker, background summarization | **All 6 phases (A-F) + Plan 08 embedding reranker landed on `dev_rlm`** | [`rlm_2026-04-29/execution/README.md`](rlm_2026-04-29/execution/README.md) |
+| **Harness mitigations** (`harness_mitigations_2026-05-01/`) | Fix the loudest small-model failure modes from the 2026-05-01 smoke (hallucinated success on tool error, stuck loops, hallucinated improvements) | **PRs 1-3 + follow-up shipped on `dev_rlm`. PR 4 (relevance-based failed-result eviction) planned** | [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md) |
+| **Sub-agents + decompose + parallel recurse** (`rlm_subagents_2026-05-01/`) | Address the long-tail-reasoning gap (T2 stalled at 43 min): true sub-agents with full tools, decompose-and-recurse scaffolding, optional parallel recurse | **Planning. README + PR 1-2 docs written; PR 3-6 deferred pending user reaction** | [`rlm_subagents_2026-05-01/README.md`](rlm_subagents_2026-05-01/README.md) |
+| **Skills system** (`skills_2026-05-02/`) | Anthropic-style skills: markdown files in `.anie/skills/` (and `.agents/skills/`) that the agent loads on demand. The discovery layer for the recurse/decompose capabilities | **Planning. README + PR 1-3 docs written; PR 4-5 deferred pending user reaction** | [`skills_2026-05-02/README.md`](skills_2026-05-02/README.md) |
+| **REPL agent loop** (`repl_agent_loop/`) | Refactor `AgentLoop::run` into an explicit Read → Eval → Print → Loop runtime — the substrate that everything above ultimately rides on | **Planning + partial. See `repl_agent_loop_2026-04-27.md` for the original write-up** | [`repl_agent_loop/`](repl_agent_loop/) |
+| **Provider expansion** (`add_providers/`) | Built-in support for OpenRouter (highest-priority), xAI, Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI Responses API, Amazon Bedrock | **OpenRouter shipped (per memory). Others drafted as plans** | [`add_providers/README.md`](add_providers/README.md) |
+| **Smoke protocol** (`smoke_protocol_2026-05-01.md`) | Canonical 11-turn DLL+weather scenario for validating context-virt and small-model harness changes | **Shipped; baseline captured 2026-05-01; re-run after each major series PR** | [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md) |
+
+## Cross-series coordination
+
+The active series interact:
+
+- **Skills** and **Sub-agents** are complementary —
+  sub-agents give the *capability* to decompose and
+  recurse; skills give the agent the *discovery
+  handles* to use that capability under context
+  pressure.
+- **Harness mitigations** covers the
+  reactive layer (handle failures gracefully); the
+  other series cover the proactive layer (decompose
+  hard problems, surface guidance).
+- **Smoke protocol** is the validation layer all
+  three feed into.
+
+Cross-series PR ordering captured in
+`skills_2026-05-02/README.md` ("Implementation order
+across the two series").
 
 ## Completed
 
@@ -44,21 +84,32 @@ ratio — smallest impactful changes first. Check off items as they ship.
       support, round-trip audit, `ReplayCapabilities` on `Model`,
       cross-provider invariants, error taxonomy, session schema
       migration, multi-turn integration tests
+- [x] **RLM substrate (Phases A-F + Plan 08)** — recurse tool,
+      indexed external store, ceiling + FIFO eviction with
+      pinned-tail, ledger injection, embedding-based reranker,
+      background summarization. Ships under `--harness-mode=rlm`.
+      See [`rlm_2026-04-29/execution/README.md`](rlm_2026-04-29/execution/README.md).
+- [x] **Harness mitigations PR 1-3 + follow-up** — failed-tool-
+      result wrap, observability-only failure-loop detector,
+      re-test-after-edit rule (in rlm augment only). Caught and
+      fixed the T10 wardrobe-refusal regression via the
+      follow-up. See
+      [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md).
+- [x] **11-turn smoke protocol baseline** — captured
+      2026-05-01 against qwen3.5:9b. Re-run after the
+      mitigations confirmed PR 1 working (model engages with
+      failures), PR 2 correctly silent (args varied), PR 3
+      regression caught and fixed. See
+      [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md).
 
 ## Next Up — Foundational Architecture
 
-### 0. REPL-shaped agent loop — **top priority**
-**What**: Refactor `AgentLoop::run` into an explicit
-Read → Eval → Print → Loop runtime while preserving current behavior
-first.
-**Why**: Creates stable step boundaries for error recovery, proactive
-compaction, context augmentation, queued user steering, verifier loops,
-recursive task decomposition, and stronger local-small-model behavior.
-This benefits frontier models too.
-**Effort**: Large, staged refactor — first land behavior-characterization
-tests, then extract run state, then introduce internal intents /
-observations / decisions.
-**Details**: [docs/repl_agent_loop_2026-04-27.md](repl_agent_loop_2026-04-27.md)
+### 0. REPL-shaped agent loop — **plan series active**
+Active plan series. The substrate that everything in
+the RLM / sub-agents / skills work ultimately rides
+on. See the "Active plan series" table at the top
+for status; original write-up at
+[`repl_agent_loop_2026-04-27.md`](repl_agent_loop_2026-04-27.md).
 
 ## Next Up — Small, High-Impact
 
@@ -100,12 +151,14 @@ knowledge.
 **Effort**: Medium-large — layout restructuring, theme tokens.
 **Details**: [docs/notes/tui_layout_and_visual_design.md](notes/tui_layout_and_visual_design.md)
 
-### 10. Skills system
-**What**: Agent Skills standard support — load SKILL.md files, register
-as `/skill:name` commands.
-**Why**: Enables repeatable, project-specific agent behaviors.
-**Effort**: Medium — file loading, frontmatter parsing, command registration.
-**Details**: [docs/notes/skills_system.md](notes/skills_system.md)
+### 10. Skills system — **plan series active**
+Now an active plan series under
+[`skills_2026-05-02/`](skills_2026-05-02/). README +
+PR 1-3 docs written. The system is structured as the
+discovery layer for the recurse/decompose capabilities
+the sub-agents series is building. See the "Active
+plan series" table at the top of this document for
+status.
 
 ### 11. `/settings` command
 **What**: Interactive settings viewer/editor in the TUI.
@@ -113,17 +166,13 @@ as `/skill:name` commands.
 **Effort**: Medium-large — TUI overlay, config mutation, persistence.
 **Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
 
-### 12. Provider expansion — **plans drafted**
-**What**: Built-in support for OpenRouter (top priority), xAI,
-Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI
-Responses API, and Amazon Bedrock.
-**Why**: Broader model access without manual config.
-**Effort**: Ranges from S (OpenRouter) to L (Bedrock). Most are
-OpenAI-compat and add as a preset entry + catalog rows.
-**Details**: [docs/add_providers/README.md](add_providers/README.md)
-lists priorities. Per-provider plans live beside it.
-**Skill**: `.claude/skills/adding-providers/SKILL.md` covers the
-mechanical how-to that every plan cross-references.
+### 12. Provider expansion — **plan series active**
+OpenRouter shipped (per memory entries). Other
+providers (xAI, Groq, Cerebras, Mistral, Gemini,
+Azure OpenAI, OpenAI Responses API, Bedrock) drafted
+as plans under
+[`add_providers/`](add_providers/). See the "Active
+plan series" table at the top for high-level status.
 
 ## Long-Term — Architecture
 

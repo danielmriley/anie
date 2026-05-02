@@ -28,16 +28,21 @@ the failure modes those PRs address are tracked there.
 
 ## PRs in order
 
-| PR | Doc | Failure mode it addresses |
-|---|---|---|
-| 1 | [01_forced_reverification.md](01_forced_reverification.md) | T7 hallucinated "compiled and ran successfully!" after `[tool error]` |
-| 2 | [02_failure_loop_detector.md](02_failure_loop_detector.md) | T7 sat 14 min issuing the same broken bash call without adapting |
-| 3 | [03_system_prompt_retest.md](03_system_prompt_retest.md) | T5 introduced infinite recursion; never re-ran the binary |
+| PR | Doc | Failure mode it addresses | Status |
+|---|---|---|---|
+| 1 | [01_forced_reverification.md](01_forced_reverification.md) | T7 hallucinated "compiled and ran successfully!" after `[tool error]` | **shipped** (`e7abe6a`) |
+| 2 | [02_failure_loop_detector.md](02_failure_loop_detector.md) | T7 sat 14 min issuing the same broken bash call without adapting | **shipped** (`a2b4373`) |
+| 3 | [03_system_prompt_retest.md](03_system_prompt_retest.md) | T5 introduced infinite recursion; never re-ran the binary | **shipped + revised** (`5d3ff1a` + `495a6bb` follow-up moving rule out of base prompt) |
+| 4 | [04_failed_tool_result_eviction.md](04_failed_tool_result_eviction.md) | "Context rot" from failed tool results that linger after they're no longer relevant (Cursor harness post-mortem 2026-05-02) | **planned** |
 
-PRs are independent in implementation but ordered by
-leverage: PR 1 lands first because it's the highest-
-impact / lowest-risk; PR 2 is observability-only with
-no behavior change; PR 3 is a system-prompt tweak.
+PRs 1-3 land first because they target the loudest
+failure modes. PR 4 was added after the post-PR-3
+smoke + the Cursor article confirmed that wrapping
+failures alone (PR 1) doesn't solve the second-order
+problem of failures degrading subsequent decisions.
+Together they cover both halves: "the model engages
+with the failure" (PR 1) and "the failure doesn't
+poison context indefinitely" (PR 4).
 
 ## Exit criteria for the series
 
