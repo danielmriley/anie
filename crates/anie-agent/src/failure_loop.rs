@@ -106,7 +106,12 @@ impl FailureLoopDetector {
 /// underlying JSON serialization preserves the original
 /// representation. That's fine for our purpose: the model
 /// produces deterministic argument shapes per call site.
-fn stable_args_hash(value: &Value) -> u64 {
+///
+/// Exposed as `pub` so callers in other crates (e.g.,
+/// `anie-cli`'s context-virt eviction policy) can reuse the
+/// same hash to identify supersedable failed-vs-successful
+/// pairs by `(tool_name, args_hash)`.
+pub fn stable_args_hash(value: &Value) -> u64 {
     let canonical = canonicalize(value);
     let serialized = serde_json::to_string(&canonical).unwrap_or_default();
     let mut hasher = DefaultHasher::new();

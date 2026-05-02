@@ -33,7 +33,7 @@ the failure modes those PRs address are tracked there.
 | 1 | [01_forced_reverification.md](01_forced_reverification.md) | T7 hallucinated "compiled and ran successfully!" after `[tool error]` | **shipped** (`e7abe6a`) |
 | 2 | [02_failure_loop_detector.md](02_failure_loop_detector.md) | T7 sat 14 min issuing the same broken bash call without adapting | **shipped** (`a2b4373`) |
 | 3 | [03_system_prompt_retest.md](03_system_prompt_retest.md) | T5 introduced infinite recursion; never re-ran the binary | **shipped + revised** (`5d3ff1a` + `495a6bb` follow-up moving rule out of base prompt) |
-| 4 | [04_failed_tool_result_eviction.md](04_failed_tool_result_eviction.md) | "Context rot" from failed tool results that linger after they're no longer relevant (Cursor harness post-mortem 2026-05-02) | **planned** |
+| 4 | [04_failed_tool_result_eviction.md](04_failed_tool_result_eviction.md) | "Context rot" from failed tool results that linger after they're no longer relevant (Cursor harness post-mortem 2026-05-02) | **shipped (Signal A — supersession)**: failed tool results whose `(tool_name, args_hash)` match a later successful call evict ahead of FIFO order. Signal B (low-relevance via embedding) deferred — Signal A may be sufficient on smoke evidence. |
 
 PRs 1-3 land first because they target the loudest
 failure modes. PR 4 was added after the post-PR-3

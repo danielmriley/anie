@@ -13,7 +13,7 @@ pub use agent_loop::{
     BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, CompactionGate,
     CompactionGateOutcome, NoopBeforeModelPolicy, ToolExecutionMode, send_event,
 };
-pub use failure_loop::DEFAULT_FAILURE_LOOP_THRESHOLD;
+pub use failure_loop::{DEFAULT_FAILURE_LOOP_THRESHOLD, stable_args_hash};
 pub use recurse_depth::DEFAULT_RECURSE_DEPTH_WARN_AT;
 pub use recurse::{ContextProvider, RecurseScope, SubAgentBuildContext, SubAgentFactory};
 pub use tool::{
