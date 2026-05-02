@@ -33,7 +33,17 @@ use tracing::{debug, info, warn};
 /// System prompt for the one-shot decompose call. Tight on
 /// purpose — the model gets the user's task as the only
 /// user-message content; this prompt sets format expectations.
-const DECOMPOSE_SYSTEM_PROMPT: &str = "You are a planning assistant. Given a user's task, break it into 3-7 focused, independently-solvable sub-tasks. Output as a numbered list, one sub-task per line, no other prose. Each sub-task should be small enough that a sub-agent could complete it in one focused pass. If the task is trivial enough that a plan would add no value, output the single line: NO_PLAN_NEEDED.";
+///
+/// Tuning lessons baked in (from comprehensive smoke 2026-05-02):
+/// - Old prompt said "independently-solvable" which actively
+///   pushed the model to flatten real dependencies. New prompt
+///   invites `(depends on N)` markers when sub-tasks have
+///   genuine prerequisites.
+/// - Old NO_PLAN_NEEDED guidance was vague ("trivial enough
+///   that a plan would add no value"). New version names the
+///   concrete cases: single-fact answers, single-computation
+///   answers.
+const DECOMPOSE_SYSTEM_PROMPT: &str = "You are a planning assistant. Given a user's task, break it into 3-7 focused sub-tasks. Output as a numbered list, one sub-task per line, no other prose. Each sub-task should be small enough that a sub-agent could complete it in one focused pass.\n\nIf a sub-task depends on another, mark the dependency by appending `(depends on N)` to the sub-task line, where N is the prior sub-task number. Use `(depends on 2, 3)` for multiple. Sub-tasks WITHOUT a marker are assumed independent — and may be executed concurrently. Mark dependencies accurately: don't pretend everything is independent when it isn't, and don't invent dependencies where none exist.\n\nIf the user's task is a single-fact lookup, a single computation (e.g. `what is 7 * 8?`), or otherwise too trivial to benefit from a plan, output the single line: NO_PLAN_NEEDED. Don't produce a 1-sub-task plan — that adds noise without value.";
 
 /// Cap on the decompose call's wall-clock. Plans should be
 /// quick — a slow decompose just adds latency before the user
