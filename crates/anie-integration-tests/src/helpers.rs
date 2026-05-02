@@ -102,23 +102,41 @@ pub fn create_temp_session() -> (tempfile::TempDir, SessionManager) {
     (dir, session)
 }
 
+/// Reopen a session file, retrying briefly on transient lock
+/// contention. Under `--test-threads=8+` workspace pressure we observed
+/// `try_lock_exclusive` returning `Ok(false)` ~5–15% of the time even
+/// after the prior `SessionManager` had been dropped — explicit drop
+/// alone wasn't enough. This wraps `SessionManager::open_session` with
+/// a short backoff loop so test infrastructure tolerates a Linux
+/// flock-release race that doesn't manifest in production (sessions
+/// are long-lived, not opened-then-reopened in rapid succession).
+pub fn open_session_with_retry(session_path: &Path) -> SessionManager {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..10 {
+        match SessionManager::open_session(session_path) {
+            Ok(reopened) => return reopened,
+            Err(err) => {
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(5 * (attempt + 1) as u64));
+            }
+        }
+    }
+    panic!("reopen failed after 10 attempts: {last_err:?}");
+}
+
 /// Persist a prompt and agent result into a new session, then reopen and
 /// return the deserialized context. This is the standard
 /// "persist → close → reopen → build_context" roundtrip used by many tests.
 pub fn persist_and_reopen(cwd: &Path, prompt: &Message, result: &AgentRunResult) -> SessionContext {
     let sessions_dir = cwd.join("sessions");
-    let session_path = {
-        let mut session = SessionManager::new_session(&sessions_dir, cwd).expect("new session");
-        session.append_message(prompt).expect("persist prompt");
-        session
-            .append_messages(&result.generated_messages)
-            .expect("persist result");
-        session.path().to_path_buf()
-        // `session` drops here, releasing its advisory file lock so the
-        // reopen below can acquire it.
-    };
-    let reopened = SessionManager::open_session(&session_path).expect("reopen");
-    reopened.build_context()
+    let mut session = SessionManager::new_session(&sessions_dir, cwd).expect("new session");
+    session.append_message(prompt).expect("persist prompt");
+    session
+        .append_messages(&result.generated_messages)
+        .expect("persist result");
+    let session_path = session.path().to_path_buf();
+    drop(session);
+    open_session_with_retry(&session_path).build_context()
 }
 
 /// Create a tool registry with all four real tools rooted at the given directory.

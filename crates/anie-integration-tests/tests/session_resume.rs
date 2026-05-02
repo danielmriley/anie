@@ -9,7 +9,7 @@ use anie_provider::{
     ApiKind, LlmContext, LlmMessage, Model, Provider, ProviderError, ProviderEvent,
     ProviderRegistry, ProviderStream, StreamOptions, ThinkingLevel,
 };
-use anie_session::{EntryBase, SessionEntry, SessionManager};
+use anie_session::{EntryBase, SessionEntry};
 
 use anie_agent::{AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry};
 use tokio::sync::mpsc;
@@ -31,7 +31,7 @@ async fn resumed_session_context_drives_new_agent_run() {
     let session_path = session.path().to_path_buf();
     drop(session);
 
-    let reopened = SessionManager::open_session(&session_path).expect("reopen");
+    let reopened = open_session_with_retry(&session_path);
     let prior_context: Vec<Message> = reopened
         .build_context()
         .messages
@@ -89,7 +89,7 @@ async fn thinking_blocks_survive_session_roundtrip_into_agent_context() {
     let session_path = session.path().to_path_buf();
     drop(session);
 
-    let reopened = SessionManager::open_session(&session_path).expect("reopen");
+    let reopened = open_session_with_retry(&session_path);
     let context = reopened.build_context();
     assert_eq!(context.messages.len(), 2);
 
@@ -152,7 +152,7 @@ async fn compacted_session_context_drives_agent_run() {
     let session_path = session.path().to_path_buf();
     drop(session);
 
-    let reopened = SessionManager::open_session(&session_path).expect("reopen");
+    let reopened = open_session_with_retry(&session_path);
     let context = reopened.build_context();
 
     // Context should have: compaction summary + remaining exchange (question 3 + answer 3).
@@ -304,7 +304,7 @@ async fn legacy_unsigned_thinking_is_dropped_before_replay() {
     let session_path = session.path().to_path_buf();
     drop(session);
 
-    let reopened = SessionManager::open_session(&session_path).expect("reopen");
+    let reopened = open_session_with_retry(&session_path);
     let prior_context: Vec<Message> = reopened
         .build_context()
         .messages
