@@ -50,12 +50,20 @@ use tracing::warn;
 
 /// Default skill root inside the user $HOME, harness-specific.
 pub const USER_ANIE_SKILLS_DIR: &str = ".anie/skills";
-/// Cross-harness skill root inside the user $HOME.
+/// Cross-harness skill root inside the user $HOME (codex/pi
+/// convention).
 pub const USER_SHARED_SKILLS_DIR: &str = ".agents/skills";
+/// Anthropic-standard skill root inside the user $HOME. Lets
+/// users with existing Claude Code skills get them loaded by
+/// anie automatically without re-creating files.
+pub const USER_CLAUDE_SKILLS_DIR: &str = ".claude/skills";
 /// Default skill root inside a project, harness-specific.
 pub const PROJECT_ANIE_SKILLS_DIR: &str = ".anie/skills";
 /// Cross-harness skill root inside a project.
 pub const PROJECT_SHARED_SKILLS_DIR: &str = ".agents/skills";
+/// Anthropic-standard skill root inside a project. Picks up
+/// existing Claude Code project skills.
+pub const PROJECT_CLAUDE_SKILLS_DIR: &str = ".claude/skills";
 
 /// Soft cap on a skill body in characters. Skills that exceed
 /// this still load but emit a `warn!` log so users notice the
@@ -67,12 +75,22 @@ pub const SKILL_BODY_BYTE_WARN_THRESHOLD: usize = 16_384;
 /// Where a skill was discovered. Higher-precedence layers
 /// shadow lower ones on name collisions. Order in this enum
 /// matches the precedence order, highest first.
+///
+/// Within project / user tiers, the harness-specific path
+/// (`.anie/skills/`) wins over the codex/pi convention
+/// (`.agents/skills/`), which wins over Anthropic's
+/// `.claude/skills/`. The reasoning: when a user puts a skill
+/// under `.anie/`, they explicitly want it for this harness;
+/// `.agents/` is the cross-harness "I want this everywhere"
+/// path; `.claude/` is the imported-from-elsewhere fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillSource {
     ProjectAnie,
     ProjectShared,
+    ProjectClaude,
     UserAnie,
     UserShared,
+    UserClaude,
     Bundled,
 }
 
@@ -81,9 +99,11 @@ impl SkillSource {
         match self {
             Self::ProjectAnie => 0,
             Self::ProjectShared => 1,
-            Self::UserAnie => 2,
-            Self::UserShared => 3,
-            Self::Bundled => 4,
+            Self::ProjectClaude => 2,
+            Self::UserAnie => 3,
+            Self::UserShared => 4,
+            Self::UserClaude => 5,
+            Self::Bundled => 6,
         }
     }
 
@@ -92,8 +112,10 @@ impl SkillSource {
         match self {
             Self::ProjectAnie => "project-anie",
             Self::ProjectShared => "project-shared",
+            Self::ProjectClaude => "project-claude",
             Self::UserAnie => "user-anie",
             Self::UserShared => "user-shared",
+            Self::UserClaude => "user-claude",
             Self::Bundled => "bundled",
         }
     }
@@ -284,19 +306,24 @@ impl SkillRegistry {
     }
 }
 
-/// Resolve the four filesystem discovery roots in
+/// Resolve the six filesystem discovery roots in
 /// **lowest-precedence first** order (so the registry's load
 /// loop can let higher layers overwrite). Layers whose paths
 /// can't be resolved (e.g. no `$HOME`) are silently omitted.
 /// Bundled skills are NOT included here — they're embedded
-/// via [`include_str!`] in [`bundled_skill_manifests`] and
+/// via [`include_str!`] in [`BUNDLED_SKILL_MANIFESTS`] and
 /// loaded into the registry separately.
 fn discovery_roots(cwd: &Path) -> Vec<(PathBuf, SkillSource)> {
-    let mut roots = Vec::with_capacity(4);
+    let mut roots = Vec::with_capacity(6);
     if let Some(home) = dirs::home_dir() {
+        roots.push((home.join(USER_CLAUDE_SKILLS_DIR), SkillSource::UserClaude));
         roots.push((home.join(USER_SHARED_SKILLS_DIR), SkillSource::UserShared));
         roots.push((home.join(USER_ANIE_SKILLS_DIR), SkillSource::UserAnie));
     }
+    roots.push((
+        cwd.join(PROJECT_CLAUDE_SKILLS_DIR),
+        SkillSource::ProjectClaude,
+    ));
     roots.push((
         cwd.join(PROJECT_SHARED_SKILLS_DIR),
         SkillSource::ProjectShared,
@@ -807,6 +834,59 @@ mod tests {
             assert!(!skill.body.is_empty());
             assert!(!skill.disable_model_invocation);
         }
+    }
+
+    #[test]
+    fn registry_precedence_order_within_project_tier() {
+        // A skill named the same in all three project layers
+        // should resolve to the .anie/ version.
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let claude_root = cwd_dir.path().join(PROJECT_CLAUDE_SKILLS_DIR);
+        let shared_root = cwd_dir.path().join(PROJECT_SHARED_SKILLS_DIR);
+        let anie_root = cwd_dir.path().join(PROJECT_ANIE_SKILLS_DIR);
+        write_skill(
+            &claude_root,
+            "duplicate.md",
+            &sample_skill("duplicate", "from claude"),
+        );
+        write_skill(
+            &shared_root,
+            "duplicate.md",
+            &sample_skill("duplicate", "from agents"),
+        );
+        write_skill(
+            &anie_root,
+            "duplicate.md",
+            &sample_skill("duplicate", "from anie"),
+        );
+
+        let mut registry = SkillRegistry::empty();
+        // Insert in lowest-precedence-first order, matching
+        // the production discovery loop.
+        registry.absorb_root(&claude_root, SkillSource::ProjectClaude);
+        registry.absorb_root(&shared_root, SkillSource::ProjectShared);
+        registry.absorb_root(&anie_root, SkillSource::ProjectAnie);
+
+        let skill = registry.get("duplicate").expect("present");
+        assert_eq!(skill.source, SkillSource::ProjectAnie);
+        assert_eq!(skill.description, "from anie");
+    }
+
+    #[test]
+    fn registry_loads_skills_from_project_claude_layer() {
+        let cwd_dir = tempdir().expect("cwd tempdir");
+        let claude_root = cwd_dir.path().join(PROJECT_CLAUDE_SKILLS_DIR);
+        write_skill(
+            &claude_root,
+            "claude-only.md",
+            &sample_skill("claude-only", "Lives only under .claude/"),
+        );
+
+        let mut registry = SkillRegistry::empty();
+        registry.absorb_root(&claude_root, SkillSource::ProjectClaude);
+        let skill = registry.get("claude-only").expect("present");
+        assert_eq!(skill.source, SkillSource::ProjectClaude);
+        assert_eq!(skill.source.label(), "project-claude");
     }
 
     /// `discover` picks up bundled skills even with no on-
