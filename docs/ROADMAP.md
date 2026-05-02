@@ -17,7 +17,7 @@ high-level; the per-series tracker is authoritative.
 |---|---|---|---|
 | **RLM + context virtualization** (`rlm_2026-04-29/`) | Recursive Language Models substrate: recurse tool, indexed external store, eviction policy, ledger injection, embedding-based reranker, background summarization | **All 6 phases (A-F) + Plan 08 embedding reranker landed on `dev_rlm`** | [`rlm_2026-04-29/execution/README.md`](rlm_2026-04-29/execution/README.md) |
 | **Harness mitigations** (`harness_mitigations_2026-05-01/`) | Fix the loudest small-model failure modes from the 2026-05-01 smoke (hallucinated success on tool error, stuck loops, hallucinated improvements) | **PRs 1-3 + follow-up shipped on `dev_rlm`. PR 4 (relevance-based failed-result eviction) planned** | [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md) |
-| **Sub-agents + decompose + parallel recurse** (`rlm_subagents_2026-05-01/`) | Address the long-tail-reasoning gap (T2 stalled at 43 min): true sub-agents with full tools, decompose-and-recurse scaffolding, optional parallel recurse | **Planning. README + PR 1-2 docs written; PR 3-6 deferred pending user reaction** | [`rlm_subagents_2026-05-01/README.md`](rlm_subagents_2026-05-01/README.md) |
+| **Sub-agents + decompose + parallel decomposition** (`rlm_subagents_2026-05-01/`) | Address the long-tail-reasoning gap (T2 stalled at 43 min): true sub-agents with full tools, decompose-and-recurse scaffolding, parallel decomposition (revised from voting after design review) | **PRs 1-5 shipped: depth observability, tool inheritance, sub-agent resource stats, one-shot pre-loop decompose with visibility + tuned system prompt, parallel-decompose dry-run (parser + round renderer). PR 5.1 (concurrent executor) deferred. PR 6 (smoke validation) ✓ — see smoke_protocol_2026-05-01.md** | [`rlm_subagents_2026-05-01/README.md`](rlm_subagents_2026-05-01/README.md) |
 | **Skills system** (`skills_2026-05-02/`) | Anthropic-style skills: markdown files in `.anie/skills/` (and `.agents/skills/`) that the agent loads on demand. The discovery layer for the recurse/decompose capabilities | **PRs 1-4 shipped: registry, skill tool, four bundled skills (cpp-rule-of-five, decompose-multi-constraint-task, use-recurse-for-archive-lookup, verify-after-edit), `/skills` slash command. PR 5 (smoke validation) plan written; smoke run pending** | [`skills_2026-05-02/README.md`](skills_2026-05-02/README.md) |
 | **REPL agent loop** (`repl_agent_loop/`) | Refactor `AgentLoop::run` into an explicit Read → Eval → Print → Loop runtime — the substrate that everything above ultimately rides on | **Planning + partial. See `repl_agent_loop_2026-04-27.md` for the original write-up** | [`repl_agent_loop/`](repl_agent_loop/) |
 | **Provider expansion** (`add_providers/`) | Built-in support for OpenRouter (highest-priority), xAI, Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI Responses API, Amazon Bedrock | **OpenRouter shipped (per memory). Others drafted as plans** | [`add_providers/README.md`](add_providers/README.md) |
@@ -102,17 +102,27 @@ across the two series").
       regression caught and fixed. See
       [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md).
 - [x] **Skills system PRs 1-4** — Anthropic-style skills
-      end-to-end: SkillRegistry with five-layer discovery
-      (bundled embedded via include_str! + four on-disk
-      precedence layers), `skill` tool wrapping bodies in
+      end-to-end: SkillRegistry with six-layer discovery
+      (bundled embedded via include_str! + .claude/.agents/.anie
+      at user + project), `skill` tool wrapping bodies in
       `<system-reminder source="skill:NAME">`, four bundled
       skills targeting documented failure modes (rule-of-five,
       decompose, recurse-for-archive, verify-after-edit), and
-      `/skills` slash command listing the catalog with
-      "Active in this run:" summary. Catalog appears in the
-      system prompt; agent can autonomously load. See
+      `/skills` slash command. Catalog appears in the system
+      prompt; agent can autonomously load. See
       [`skills_2026-05-02/`](skills_2026-05-02/). PR 5 (smoke
-      validation) is the remaining piece.
+      validation) ✓ in `smoke_protocol_2026-05-01.md`.
+- [x] **Sub-agents PRs 1-5** — depth observability,
+      filtered tool inheritance for sub-agents, per-sub-agent
+      resource stats (tokens/wall-clock/cost in
+      `result.details`), one-shot pre-loop decompose
+      (`ANIE_DECOMPOSE=1`) with plan visibility +
+      dependency-marker contract, and parallel-decompose
+      dry-run (`ANIE_PARALLEL_DECOMPOSE>=2`) that parses the
+      plan into a topological round structure. Validated
+      end-to-end with the 2026-05-02 comprehensive smoke. PR
+      5.1 (concurrent executor) deferred. See
+      [`rlm_subagents_2026-05-01/`](rlm_subagents_2026-05-01/).
 
 ## Next Up — Foundational Architecture
 
