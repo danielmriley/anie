@@ -52,7 +52,7 @@ they didn't make small-model reasoning **deeper**.
 
 | PR | Doc | What |
 |---|---|---|
-| 1 | [01_depth_observability.md](01_depth_observability.md) | Track recurse depth on `RecurseScope`. Log + surface in TUI. No abort. |
+| 1 | [01_depth_observability.md](01_depth_observability.md) | Track recurse depth on `RecurseScope`. Log + surface in TUI. No abort. **Shipped:** depth tracking already in place pre-PR (SubAgentBuildContext.depth + RecurseTool.depth fields); this PR added the threshold-warning emission via a new `RecurseDepthDetector` in `anie-agent::recurse_depth`, mirroring the failure_loop pattern. Default threshold 5, `ANIE_RECURSE_DEPTH_WARN_AT` overrides, `ANIE_DISABLE_RECURSE_DEPTH_WARN=1` disables. Status-bar segment scoped out (deferred). |
 | 2 | [02_tool_inheritance.md](02_tool_inheritance.md) | Sub-agents inherit a filtered tool registry (bash, read, edit, write, web_*; recurse gated by depth). |
 | 3 | [03_resource_observability.md](03_resource_observability.md) | Track per-sub-agent token spend + wall-clock; bubble to parent. Log + TUI. No abort. |
 | 4 | [04_decompose_and_recurse.md](04_decompose_and_recurse.md) | Optional pre-loop decomposition pass (one-shot LLM call producing sub-task list). Each sub-task can spawn its own recurse. Behind `ANIE_DECOMPOSE=1`. |

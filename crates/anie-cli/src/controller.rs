@@ -1840,7 +1840,8 @@ fn build_agent(
     .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
     .with_compaction_gate(compaction_gate)
     .with_wrap_failed_tool_results(should_wrap_failed_tool_results(state))
-    .with_failure_loop_threshold(failure_loop_threshold(state));
+    .with_failure_loop_threshold(failure_loop_threshold(state))
+    .with_recurse_depth_threshold(recurse_depth_threshold(state));
     if let Some(policy) = rlm_extras.policy {
         config = config.with_before_model_policy(policy);
     }
@@ -1883,6 +1884,25 @@ fn failure_loop_threshold(state: &ControllerState) -> Option<u32> {
         .and_then(|raw| raw.parse::<u32>().ok())
         .filter(|n| *n > 0);
     Some(parsed.unwrap_or(anie_agent::DEFAULT_FAILURE_LOOP_THRESHOLD))
+}
+
+/// PR 1 of `docs/rlm_subagents_2026-05-01/`. Returns the
+/// recurse-depth warn threshold to install. `None` disables
+/// detection. Defaults to `5` in `--harness-mode=rlm`;
+/// `ANIE_RECURSE_DEPTH_WARN_AT=<n>` overrides.
+/// `ANIE_DISABLE_RECURSE_DEPTH_WARN=1` disables entirely.
+fn recurse_depth_threshold(state: &ControllerState) -> Option<u32> {
+    if !state.harness_mode.installs_rlm_features() {
+        return None;
+    }
+    if env_flag_enabled("ANIE_DISABLE_RECURSE_DEPTH_WARN") {
+        return None;
+    }
+    let parsed = std::env::var("ANIE_RECURSE_DEPTH_WARN_AT")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|n| *n > 0);
+    Some(parsed.unwrap_or(anie_agent::DEFAULT_RECURSE_DEPTH_WARN_AT))
 }
 
 /// PR 4 of `docs/skills_2026-05-02/`. Format the

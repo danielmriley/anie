@@ -392,6 +392,14 @@ pub struct AgentLoopConfig {
     /// Observability-only: the detector never aborts the run.
     /// PR 2 of `docs/harness_mitigations_2026-05-01/`.
     failure_loop_threshold: Option<u32>,
+    /// When `Some(n)`, install a [`RecurseDepthDetector`] with
+    /// threshold `n`. After a recurse tool call fires at depth
+    /// `>= n`, the loop emits a `tracing::info!` log and a
+    /// `SystemMessage` event. Throttled per `(scope_kind,
+    /// depth)` so deep recursive chains warn once per pair.
+    /// Observability-only. PR 1 of
+    /// `docs/rlm_subagents_2026-05-01/`.
+    recurse_depth_threshold: Option<u32>,
 }
 
 impl AgentLoopConfig {
@@ -419,6 +427,7 @@ impl AgentLoopConfig {
             before_model_policy: Arc::new(NoopBeforeModelPolicy),
             wrap_failed_tool_results: false,
             failure_loop_threshold: None,
+            recurse_depth_threshold: None,
         }
     }
 
@@ -428,6 +437,15 @@ impl AgentLoopConfig {
     #[must_use]
     pub fn with_failure_loop_threshold(mut self, threshold: Option<u32>) -> Self {
         self.failure_loop_threshold = threshold;
+        self
+    }
+
+    /// Install a [`RecurseDepthDetector`] with the given depth
+    /// threshold. `None` (default) disables detection.
+    /// PR 1 of `docs/rlm_subagents_2026-05-01/`.
+    #[must_use]
+    pub fn with_recurse_depth_threshold(mut self, threshold: Option<u32>) -> Self {
+        self.recurse_depth_threshold = threshold;
         self
     }
 
@@ -769,6 +787,10 @@ pub struct AgentLoop {
     /// share it. None when `config.failure_loop_threshold` is
     /// `None`.
     failure_loop_detector: Option<std::sync::Mutex<crate::failure_loop::FailureLoopDetector>>,
+    /// PR 1 of `docs/rlm_subagents_2026-05-01/`. None when
+    /// `config.recurse_depth_threshold` is `None`.
+    recurse_depth_detector:
+        Option<std::sync::Mutex<crate::recurse_depth::RecurseDepthDetector>>,
 }
 
 impl AgentLoop {
@@ -782,11 +804,15 @@ impl AgentLoop {
         let failure_loop_detector = config.failure_loop_threshold.map(|threshold| {
             std::sync::Mutex::new(crate::failure_loop::FailureLoopDetector::new(threshold))
         });
+        let recurse_depth_detector = config.recurse_depth_threshold.map(|threshold| {
+            std::sync::Mutex::new(crate::recurse_depth::RecurseDepthDetector::new(threshold))
+        });
         Self {
             provider_registry,
             tool_registry,
             config,
             failure_loop_detector,
+            recurse_depth_detector,
         }
     }
 
@@ -1548,6 +1574,15 @@ impl AgentLoop {
 
         self.observe_failure_loop(&tool_call, is_error, event_tx).await;
 
+        // PR 1 of `docs/rlm_subagents_2026-05-01/`. The recurse
+        // tool encodes the depth at which it fired in
+        // `result.details["depth"]`. Read that and feed the
+        // detector. Non-recurse tools have no depth field; the
+        // method short-circuits.
+        if !is_error && tool_call.name == "recurse" {
+            self.observe_recurse_depth(&tool_call, &result, event_tx).await;
+        }
+
         attach_tool_invocation_details(&tool_call, &mut result.details);
 
         send_event(
@@ -1631,6 +1666,54 @@ impl AgentLoop {
              with the same arguments. Investigate the underlying error \
              before retrying.",
             tool = tool_call.name,
+        );
+        send_event(event_tx, AgentEvent::SystemMessage { text: message }).await;
+    }
+
+    /// PR 1 of `docs/rlm_subagents_2026-05-01/`. Read the
+    /// `depth` and `scope.kind` fields from a recurse tool
+    /// result, feed them to the detector. When the detector
+    /// signals a threshold crossing, emit a `tracing::info!`
+    /// log + `SystemMessage` event for the transcript.
+    /// Observability-only: never aborts the run.
+    async fn observe_recurse_depth(
+        &self,
+        tool_call: &ToolCall,
+        result: &ToolResult,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let Some(detector) = &self.recurse_depth_detector else {
+            return;
+        };
+        let depth = match result.details.get("depth").and_then(|v| v.as_u64()) {
+            Some(d) => d as u32,
+            None => return,
+        };
+        // Scope kind is in the original tool_call args, not the
+        // result — the tool doesn't echo its scope. Safe to
+        // pull from the args we still have a reference to.
+        let scope_kind = tool_call
+            .arguments
+            .get("scope")
+            .and_then(|s| s.get("kind"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("unknown");
+        let warning = match detector.lock() {
+            Ok(mut guard) => guard.observe(scope_kind, depth),
+            Err(poisoned) => poisoned.into_inner().observe(scope_kind, depth),
+        };
+        let Some(crossed_at) = warning else {
+            return;
+        };
+        tracing::info!(
+            target: "anie_agent::recurse_depth",
+            scope_kind,
+            depth = crossed_at,
+            "recurse_depth_threshold_crossed"
+        );
+        let message = format!(
+            "[recurse depth] recurse fired at depth {crossed_at} (scope={scope_kind}). \
+             Investigate whether sub-agents are decomposing productively or forking unnecessarily.",
         );
         send_event(event_tx, AgentEvent::SystemMessage { text: message }).await;
     }

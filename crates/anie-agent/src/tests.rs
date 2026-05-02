@@ -728,6 +728,46 @@ async fn failure_loop_detector_emits_warning_without_aborting() {
     let _ = result;
 }
 
+/// PR 1 of `docs/rlm_subagents_2026-05-01/`. With no
+/// threshold installed, the recurse-depth detector is silent.
+#[tokio::test]
+async fn recurse_depth_detector_silent_when_threshold_unset() {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        ApiKind::OpenAICompletions,
+        Box::new(MockProvider::new(vec![MockStreamScript::from_message(
+            final_assistant("done"),
+        )])),
+    );
+
+    let agent = AgentLoop::new(
+        Arc::new(provider_registry),
+        Arc::new(ToolRegistry::new()),
+        AgentLoopConfig::new(
+            sample_model(),
+            "agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        ),
+    );
+
+    let (_result, events) = collect_run(agent, vec![user_prompt("anything")], Vec::new()).await;
+    let depth_warnings: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::SystemMessage { text } if text.contains("[recurse depth]") => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        depth_warnings.is_empty(),
+        "no warning expected with threshold=None: {depth_warnings:?}"
+    );
+}
+
 /// PR 2 of `docs/harness_mitigations_2026-05-01/`. With no
 /// threshold installed, the detector is silent — confirms
 /// the gate (default off) doesn't accidentally fire.
