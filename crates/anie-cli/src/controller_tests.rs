@@ -410,11 +410,18 @@ fn compose_system_prompt_only_augments_in_rlm_mode() {
     );
 }
 
-/// PR 3 of `docs/harness_mitigations_2026-05-01/`. The base
-/// (non-rlm) system prompt also gains a re-test-after-edit
-/// rule. Pins the new line so it can't drift silently.
+/// PR 3 of `docs/harness_mitigations_2026-05-01/` (revised
+/// post-smoke). Pin that the base (non-rlm) system prompt
+/// does NOT carry the re-test-after-edit rule — the smoke
+/// against qwen3.5:9b showed that an emphatic "MUST re-run"
+/// line in the base prompt shifted the model into a rigid
+/// "I am a coding assistant" frame and made it refuse non-
+/// coding questions ("what should I wear?" → outright
+/// refusal). The rule lives only in the rlm-mode augment
+/// now (see `compose_system_prompt_only_augments_in_rlm_mode`
+/// for the augment-side assertions).
 #[test]
-fn build_system_prompt_includes_retest_after_edit_directive() {
+fn build_system_prompt_omits_retest_directive_in_base_prompt() {
     use anie_agent::ToolRegistry;
     use anie_config::AnieConfig;
     use std::path::Path;
@@ -426,12 +433,10 @@ fn build_system_prompt_includes_retest_after_edit_directive() {
         .expect("build_system_prompt");
 
     assert!(
-        prompt.contains("After any edit or write to a file you're testing, you MUST re-run"),
-        "base system prompt should include the re-test-after-edit rule: {prompt}"
-    );
-    assert!(
-        prompt.contains("Do not assume a change compiles or behaves correctly without re-verifying"),
-        "base prompt should warn against unverified claims: {prompt}"
+        !prompt.contains("you MUST re-run the most recent verification command"),
+        "base prompt should NOT contain the rlm-specific re-test rule \
+         (re-running tests is rlm-mode behavior — keep base prompt \
+         framing-neutral): {prompt}"
     );
 }
 
