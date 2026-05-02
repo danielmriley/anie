@@ -1886,6 +1886,21 @@ fn failure_loop_threshold(state: &ControllerState) -> Option<u32> {
     Some(parsed.unwrap_or(anie_agent::DEFAULT_FAILURE_LOOP_THRESHOLD))
 }
 
+/// PR 2 of `docs/rlm_subagents_2026-05-01/`. Sub-agents
+/// inherit `recurse` from the parent only at depths below
+/// this limit. Defaults to
+/// `crate::recurse_factory::DEFAULT_RECURSE_INHERIT_LIMIT`
+/// (3); `ANIE_RECURSE_DEPTH_LIMIT_FOR_INHERITANCE=<n>`
+/// overrides. Soft cap on `recurse` only; doesn't bound
+/// overall recursion depth.
+fn recurse_inherit_limit_from_env() -> u8 {
+    std::env::var("ANIE_RECURSE_DEPTH_LIMIT_FOR_INHERITANCE")
+        .ok()
+        .and_then(|raw| raw.parse::<u8>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(crate::recurse_factory::DEFAULT_RECURSE_INHERIT_LIMIT)
+}
+
 /// PR 1 of `docs/rlm_subagents_2026-05-01/`. Returns the
 /// recurse-depth warn threshold to install. `None` disables
 /// detection. Defaults to `5` in `--harness-mode=rlm`;
@@ -2163,6 +2178,8 @@ fn build_rlm_extras(
         thinking: state.config.current_thinking(),
         request_options_resolver: Arc::clone(&state.request_options_resolver),
         ollama_num_ctx_override: state.config.active_ollama_num_ctx_override(),
+        parent_tools: Arc::clone(&state.tool_registry),
+        recurse_inherit_limit: recurse_inherit_limit_from_env(),
     });
     let recurse_tool = Arc::new(anie_tools::RecurseTool::new(
         factory,
