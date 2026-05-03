@@ -597,7 +597,7 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         let mut to_evict: Vec<usize> = Vec::new();
         let mut supersedable_evicted: usize = 0;
 
-        // 3a. Supersedable failures.
+        // 3a. Supersedable failures (Signal A).
         let supersedable = find_supersedable_failures(&working);
         for &idx in &supersedable {
             if running_total <= self.active_ceiling_tokens {
@@ -618,6 +618,31 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
                 running_total = running_total.saturating_sub(estimate_tokens(m));
                 to_evict.push(idx);
                 supersedable_evicted += 1;
+            }
+        }
+
+        // 3a-bis. Stale failures (Signal B, position-based).
+        // Failures that have aged past the still-fresh window
+        // are evicted ahead of standard FIFO order — they're
+        // the most likely-stale class of message in working.
+        let mut stale_evicted: usize = 0;
+        if running_total > self.active_ceiling_tokens {
+            let stale = find_stale_failures(&working, self.keep_last_n);
+            for &idx in &stale {
+                if running_total <= self.active_ceiling_tokens {
+                    break;
+                }
+                if to_evict.contains(&idx) {
+                    continue; // already evicted by Signal A
+                }
+                if idx >= pinned_tail_start {
+                    continue;
+                }
+                if let Some(m) = working.get(idx) {
+                    running_total = running_total.saturating_sub(estimate_tokens(m));
+                    to_evict.push(idx);
+                    stale_evicted += 1;
+                }
             }
         }
 
@@ -648,11 +673,12 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         // right items.
         to_evict.sort();
         to_evict.dedup();
-        if supersedable_evicted > 0 {
+        if supersedable_evicted > 0 || stale_evicted > 0 {
             debug!(
                 supersedable_evicted,
-                fifo_evicted = to_evict.len() - supersedable_evicted,
-                "rlm policy evicted supersedable failures + FIFO"
+                stale_evicted,
+                fifo_evicted = to_evict.len() - supersedable_evicted - stale_evicted,
+                "rlm policy evicted failures (Signal A/B) + FIFO"
             );
         }
         let evicted_count = to_evict.len();
@@ -1197,6 +1223,47 @@ impl ContextVirtualizationPolicy {
             timestamp: now_millis(),
         })
     }
+}
+
+/// PR 4 Signal B (simplified) of `docs/harness_mitigations_2026-05-01/`.
+/// Walk `working` and identify failed tool results that
+/// have aged past a "still-fresh" window. A failure is
+/// considered stale when:
+///
+/// - It's a `Message::ToolResult` with `is_error == true`,
+/// - It's NOT in the trailing `keep_last_n` window
+///   (still pinned; would have been skipped anyway),
+/// - At least `min_messages_after = 4` messages follow it
+///   in `working` — heuristic for "≥ 2 turns dwell" without
+///   needing turn-tracking metadata.
+///
+/// Returns indices into `working`, sorted ascending.
+///
+/// **Why simplified vs. the original plan:** the plan
+/// called for embedding-based bottom-quartile relevance
+/// scoring against the current prompt. That requires
+/// embedding all active-context messages on every fire and
+/// passing the embedder + prompt embedding through to the
+/// eviction logic. This iteration ships a position-based
+/// approximation that addresses the core observation
+/// (older failures are usually no longer relevant). True
+/// embedding-based ranking can land as a v2 if smoke shows
+/// position alone isn't sharp enough.
+fn find_stale_failures(working: &[Message], keep_last_n: usize) -> Vec<usize> {
+    const MIN_MESSAGES_AFTER: usize = 4;
+    let working_len = working.len();
+    let pinned_tail_start = working_len.saturating_sub(keep_last_n);
+    let mut stale = Vec::new();
+    for (idx, m) in working.iter().enumerate() {
+        if let Message::ToolResult(tr) = m
+            && tr.is_error
+            && idx < pinned_tail_start
+            && working_len.saturating_sub(idx) > MIN_MESSAGES_AFTER
+        {
+            stale.push(idx);
+        }
+    }
+    stale
 }
 
 /// PR 4 of `docs/harness_mitigations_2026-05-01/`. Walk
@@ -2457,6 +2524,86 @@ mod tests {
             vec![1],
             "stable_args_hash should treat reordered keys as same"
         );
+    }
+
+    // ---- PR 4 Signal B: stale failure detection ----
+
+    #[test]
+    fn stale_failure_detected_when_far_from_tail() {
+        // Failure at idx 0, plenty of messages after it, NOT
+        // in the pinned tail.
+        let working = vec![
+            failed_tool_result("c1", "bash", 1),  // idx 0 — stale
+            user("dummy", 2),
+            user("dummy", 3),
+            user("dummy", 4),
+            user("dummy", 5),
+            user("latest", 6),                     // pinned tail
+        ];
+        let stale = find_stale_failures(&working, 1);
+        assert_eq!(stale, vec![0]);
+    }
+
+    #[test]
+    fn fresh_failure_not_marked_stale() {
+        // Failure with too few messages after it (still fresh).
+        let working = vec![
+            user("first", 1),
+            user("second", 2),
+            failed_tool_result("c1", "bash", 3),   // only 2 after
+            user("third", 4),
+            user("latest", 5),
+        ];
+        let stale = find_stale_failures(&working, 1);
+        // Failure at idx 2: messages_after = 5 - 2 = 3, < 4 threshold.
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_failure_in_pinned_tail_skipped() {
+        // Failure inside the pinned-tail window — even if old
+        // enough, the tail pin protects it.
+        let working = vec![
+            user("a", 1),
+            user("b", 2),
+            user("c", 3),
+            user("d", 4),
+            user("e", 5),
+            failed_tool_result("c1", "bash", 6),   // last; pinned
+        ];
+        let stale = find_stale_failures(&working, 2);
+        // Pinned tail is the last 2. Idx 5 is in tail.
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn multiple_stale_failures_returned_in_order() {
+        let working = vec![
+            failed_tool_result("c1", "bash", 1),   // idx 0 — stale
+            user("a", 2),
+            failed_tool_result("c2", "edit", 3),   // idx 2 — stale
+            user("b", 4),
+            user("c", 5),
+            user("d", 6),
+            user("e", 7),
+            user("latest", 8),                     // pinned
+        ];
+        let stale = find_stale_failures(&working, 1);
+        assert_eq!(stale, vec![0, 2]);
+    }
+
+    #[test]
+    fn successful_results_never_marked_stale() {
+        let working = vec![
+            ok_tool_result("c1", "bash", 1),       // idx 0 — NOT stale
+            user("a", 2),
+            user("b", 3),
+            user("c", 4),
+            user("d", 5),
+            user("latest", 6),
+        ];
+        let stale = find_stale_failures(&working, 1);
+        assert!(stale.is_empty(), "successes should not be stale-eligible");
     }
 
     #[test]
