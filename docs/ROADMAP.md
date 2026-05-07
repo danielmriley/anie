@@ -5,7 +5,7 @@ in flight, and what's next. Each row links to a plan
 series or doc; series with their own status trackers
 are linked at "see tracker."
 
-Last consolidated: 2026-05-02.
+Last consolidated: 2026-05-07.
 
 ## Active plan series
 
@@ -16,10 +16,10 @@ high-level; the per-series tracker is authoritative.
 | Series | Goal | Status | Tracker |
 |---|---|---|---|
 | **RLM + context virtualization** (`rlm_2026-04-29/`) | Recursive Language Models substrate: recurse tool, indexed external store, eviction policy, ledger injection, embedding-based reranker, background summarization | **All 6 phases (A-F) + Plan 08 embedding reranker landed on `dev_rlm`** | [`rlm_2026-04-29/execution/README.md`](rlm_2026-04-29/execution/README.md) |
-| **Harness mitigations** (`harness_mitigations_2026-05-01/`) | Fix the loudest small-model failure modes from the 2026-05-01 smoke (hallucinated success on tool error, stuck loops, hallucinated improvements) | **PRs 1-3 + follow-up shipped on `dev_rlm`. PR 4 (relevance-based failed-result eviction) planned** | [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md) |
-| **Sub-agents + decompose + parallel decomposition** (`rlm_subagents_2026-05-01/`) | Address the long-tail-reasoning gap (T2 stalled at 43 min): true sub-agents with full tools, decompose-and-recurse scaffolding, parallel decomposition (revised from voting after design review) | **PRs 1-5 shipped: depth observability, tool inheritance, sub-agent resource stats, one-shot pre-loop decompose with visibility + tuned system prompt, parallel-decompose dry-run (parser + round renderer). PR 5.1 (concurrent executor) deferred. PR 6 (smoke validation) ✓ — see smoke_protocol_2026-05-01.md** | [`rlm_subagents_2026-05-01/README.md`](rlm_subagents_2026-05-01/README.md) |
+| **Harness mitigations** (`harness_mitigations_2026-05-01/`) | Fix the loudest small-model failure modes from the 2026-05-01 smoke (hallucinated success on tool error, stuck loops, hallucinated improvements) | **PRs 1-4 shipped on `dev_rlm`. PR 4 landed in two parts: Signal A (supersession-based failure eviction, `2fee147`) and Signal B (position-based stale-failure eviction, `81c817e`)** | [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md) |
+| **Sub-agents + decompose + parallel decomposition** (`rlm_subagents_2026-05-01/`) | Address the long-tail-reasoning gap (T2 stalled at 43 min): true sub-agents with full tools, decompose-and-recurse scaffolding, parallel decomposition (revised from voting after design review) | **PRs 1-5.1 shipped: depth observability, tool inheritance, sub-agent resource stats, one-shot pre-loop decompose with visibility + tuned system prompt, parallel-decompose dry-run (parser + round renderer), and concurrent provider-aware sub-agent executor (`c1bb46a`). PR 6 (smoke validation) ✓ — see smoke_protocol_2026-05-01.md** | [`rlm_subagents_2026-05-01/README.md`](rlm_subagents_2026-05-01/README.md) |
 | **Skills system** (`skills_2026-05-02/`) | Anthropic-style skills: markdown files in `.anie/skills/` (and `.agents/skills/`) that the agent loads on demand. The discovery layer for the recurse/decompose capabilities | **PRs 1-4 shipped: registry, skill tool, four bundled skills (cpp-rule-of-five, decompose-multi-constraint-task, use-recurse-for-archive-lookup, verify-after-edit), `/skills` slash command. PR 5 (smoke validation) plan written; smoke run pending** | [`skills_2026-05-02/README.md`](skills_2026-05-02/README.md) |
-| **REPL agent loop** (`repl_agent_loop/`) | Refactor `AgentLoop::run` into an explicit Read → Eval → Print → Loop runtime — the substrate that everything above ultimately rides on | **Planning + partial. See `repl_agent_loop_2026-04-27.md` for the original write-up** | [`repl_agent_loop/`](repl_agent_loop/) |
+| **REPL agent loop** (`repl_agent_loop/`) | Refactor `AgentLoop::run` into an explicit Read → Eval → Print → Loop runtime — the substrate that everything above ultimately rides on | **All 7 PRs shipped on `dev_rlm`: characterization tests, `AgentRunState` extraction, internal REPL driver, tracing spans, public `AgentRunMachine` API, controller pilot, `BeforeModelPolicy` hook (default noop)** | [`repl_agent_loop/execution/README.md`](repl_agent_loop/execution/README.md) |
 | **Provider expansion** (`add_providers/`) | Built-in support for OpenRouter (highest-priority), xAI, Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI Responses API, Amazon Bedrock | **OpenRouter shipped (per memory). Others drafted as plans** | [`add_providers/README.md`](add_providers/README.md) |
 | **Smoke protocol** (`smoke_protocol_2026-05-01.md`) | Canonical 11-turn DLL+weather scenario for validating context-virt and small-model harness changes | **Shipped; baseline captured 2026-05-01; re-run after each major series PR** | [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md) |
 
@@ -112,26 +112,43 @@ across the two series").
       prompt; agent can autonomously load. See
       [`skills_2026-05-02/`](skills_2026-05-02/). PR 5 (smoke
       validation) ✓ in `smoke_protocol_2026-05-01.md`.
-- [x] **Sub-agents PRs 1-5** — depth observability,
+- [x] **Sub-agents PRs 1-5.1** — depth observability,
       filtered tool inheritance for sub-agents, per-sub-agent
       resource stats (tokens/wall-clock/cost in
       `result.details`), one-shot pre-loop decompose
       (`ANIE_DECOMPOSE=1`) with plan visibility +
-      dependency-marker contract, and parallel-decompose
+      dependency-marker contract, parallel-decompose
       dry-run (`ANIE_PARALLEL_DECOMPOSE>=2`) that parses the
-      plan into a topological round structure. Validated
-      end-to-end with the 2026-05-02 comprehensive smoke. PR
-      5.1 (concurrent executor) deferred. See
+      plan into a topological round structure, and
+      concurrent provider-aware sub-agent executor (PR 5.1,
+      `c1bb46a`). Validated end-to-end with the 2026-05-02
+      comprehensive smoke. See
       [`rlm_subagents_2026-05-01/`](rlm_subagents_2026-05-01/).
-
-## Next Up — Foundational Architecture
-
-### 0. REPL-shaped agent loop — **plan series active**
-Active plan series. The substrate that everything in
-the RLM / sub-agents / skills work ultimately rides
-on. See the "Active plan series" table at the top
-for status; original write-up at
-[`repl_agent_loop_2026-04-27.md`](repl_agent_loop_2026-04-27.md).
+- [x] **REPL agent loop PRs 1-7** — refactor of
+      `AgentLoop::run` into an explicit
+      Read → Eval → Print → Loop runtime.
+      Characterization tests (`2b3f951`) → `AgentRunState`
+      extraction (`02cc0cd`) → internal REPL driver
+      (`f053013`) → REPL tracing spans (`df07082`) →
+      public `AgentRunMachine` API (`f3e3cf7`) → controller
+      pilot routed through the machine (`9aedb35`) → first
+      `BeforeModelPolicy` policy boundary, default noop
+      (`e55948a`). The substrate that future RLM /
+      sub-agents / skills capabilities extend through
+      structured policy hooks rather than monolithic
+      branches in the agent loop. See
+      [`repl_agent_loop/execution/README.md`](repl_agent_loop/execution/README.md).
+- [x] **TUI typing fast-path** — bypass ratatui for
+      printable keystrokes in idle state (`e8927f1`).
+      Per-keystroke cost dropped from 22 bytes through
+      tokio + render closure + ratatui diff
+      (~250 µs/key) to 1 byte direct stdout write
+      (vim-comparable). Nine-round investigation logged at
+      [`code_review_2026-05-03.md`](code_review_2026-05-03.md);
+      decisive insight came from a standalone reproducer
+      (`crates/anie-tui/examples/typing_repro.rs`) that
+      isolated the latency to anie's pipeline rather than
+      the bytes leaving the process.
 
 ## Next Up — Small, High-Impact
 
