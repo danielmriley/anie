@@ -25,7 +25,59 @@
 //! on. There's no value in distinguishing HTTP-level vs
 //! parse-level failures at the trait boundary.
 
+use std::borrow::Cow;
+
 use async_trait::async_trait;
+use tracing::warn;
+
+/// How many characters of the failing input to include in
+/// the error string and the WARN log line. Long enough to
+/// see the shape of the input (HTML preamble, leading code
+/// fence, …) without dumping kilobytes into every log
+/// message.
+const FAIL_LOG_INPUT_PREVIEW_CHARS: usize = 160;
+
+/// How many characters of the response body to include
+/// when Ollama returns a non-2xx. Ollama errors typically
+/// fit in 200 chars (`{"error":"…"}`); this gives us
+/// headroom without bloating logs on the rare verbose
+/// case.
+const FAIL_LOG_BODY_PREVIEW_CHARS: usize = 400;
+
+/// Conservative character budget for an embed call.
+/// `nomic-embed-text` has a 2048-token context and the
+/// modern Ollama runner returns HTTP 400 (`"the input
+/// length exceeds the context length"`) on overflow
+/// rather than silently truncating. Observed on a 9121-
+/// char weather-page tool result in session
+/// `270aa8e2`: empirical char/token ratios at 3000 chars
+/// were 1.87, putting 4000 chars over the 2048-token
+/// ceiling for that content shape. Structured / numeric
+/// content (markdown tables, JSON, code) tokenizes
+/// denser than English prose, so the safe cap is
+/// well below a naive `2048 × 4` estimate. 3000 chars
+/// leaves ~400 tokens of headroom against the densest
+/// real-world content the harness has actually fed the
+/// embedder. We lose the tail of long docs but the
+/// embedder still produces a useful vector for the head,
+/// which is typically the most topical part of a web
+/// page or a tool result. Tradeoff: under-truncating
+/// loses the entry to a 4xx (worse — no signal at all);
+/// over-truncating loses tail context (better — partial
+/// signal beats none).
+const OLLAMA_INPUT_CHAR_CAP: usize = 3000;
+
+/// Truncate a string to `max_chars` graphemes-ish (chars,
+/// good enough for log diagnostics) and append an ellipsis
+/// when clipped.
+fn preview(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
 
 /// Strategy for embedding text into a fixed-dimension
 /// vector. Implementations are typically HTTP-backed
@@ -110,10 +162,31 @@ impl Embedder for OllamaEmbedder {
         if text.is_empty() {
             return Err("embed: empty input".to_string());
         }
+        // Truncate inputs that would exceed the embedding
+        // model's context length. The modern Ollama runner
+        // returns HTTP 400 (rather than silently
+        // truncating) when input length exceeds the model
+        // context, so the harness has to clip first or
+        // lose the entry to a 4xx. UTF-8-safe truncation
+        // via `.chars().take(N).collect()`.
+        let original_chars = text.chars().count();
+        let send_text: Cow<'_, str> = if original_chars > OLLAMA_INPUT_CHAR_CAP {
+            let truncated: String = text.chars().take(OLLAMA_INPUT_CHAR_CAP).collect();
+            tracing::debug!(
+                target: "anie_cli::embedder",
+                model = %self.model,
+                original_chars,
+                cap = OLLAMA_INPUT_CHAR_CAP,
+                "truncating embed input to stay under model context"
+            );
+            Cow::Owned(truncated)
+        } else {
+            Cow::Borrowed(text)
+        };
         let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
-            "input": text,
+            "input": send_text.as_ref(),
         });
         let response = self
             .client
@@ -123,7 +196,31 @@ impl Embedder for OllamaEmbedder {
             .await
             .map_err(|e| format!("embed http: {e}"))?;
         if !response.status().is_success() {
-            return Err(format!("embed http status: {}", response.status()));
+            // On non-2xx, capture the response body and
+            // log it alongside the input shape so we can
+            // diagnose what's actually failing — Ollama's
+            // `/api/embed` returns useful error JSON
+            // (`{"error":"…"}`) that the caller's plain
+            // status string would otherwise discard.
+            let status = response.status();
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+            let sent_chars = send_text.chars().count();
+            let input_preview = preview(send_text.as_ref(), FAIL_LOG_INPUT_PREVIEW_CHARS);
+            let body_preview = preview(body_text.trim(), FAIL_LOG_BODY_PREVIEW_CHARS);
+            warn!(
+                target: "anie_cli::embedder",
+                model = %self.model,
+                status = %status,
+                original_chars,
+                sent_chars,
+                input_preview = %input_preview,
+                body_preview = %body_preview,
+                "ollama embed call failed"
+            );
+            return Err(format!("embed http status: {status}; body: {body_preview}"));
         }
         let json: serde_json::Value = response
             .json()
@@ -265,6 +362,81 @@ mod tests {
         assert!(
             err.contains("500"),
             "error should surface the status code: {err}"
+        );
+    }
+
+    /// Body-length matcher used by the truncation
+    /// regression test: a request body strictly shorter
+    /// than 2× the cap means the input field had to have
+    /// been clipped before send. Un-truncated, an
+    /// 18000-char input would push the body well past
+    /// that bound (huge × 3 + JSON overhead).
+    fn request_body_under_cap_envelope(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        req.body
+            .as_ref()
+            .map(|b| b.len() < OLLAMA_INPUT_CHAR_CAP * 2)
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn ollama_embedder_truncates_oversized_input_before_send() {
+        // Regression test for the 400 observed on a 9121-
+        // char tool result in session 270aa8e2:
+        // `nomic-embed-text` rejects inputs that exceed
+        // its 2048-token context. The embedder must
+        // truncate to OLLAMA_INPUT_CHAR_CAP first so we
+        // get a usable embedding rather than losing the
+        // entry to a 4xx.
+        let server = MockServer::start_async().await;
+        let huge: String = "x".repeat(OLLAMA_INPUT_CHAR_CAP * 3);
+        // The success mock requires a body shorter than
+        // 2× the cap — only matches when the input was
+        // truncated. Without truncation the request goes
+        // unmatched (httpmock 404s), the embed call
+        // errors, and the test fails with a clear signal.
+        let success = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/api/embed")
+                    .matches(request_body_under_cap_envelope);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]}));
+            })
+            .await;
+        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into(), 3);
+        let vec = embedder
+            .embed(&huge)
+            .await
+            .expect("should succeed after truncation");
+        assert_eq!(vec.len(), 3);
+        success.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ollama_embedder_includes_response_body_in_error() {
+        // Regression test for the diagnostic gap that left
+        // 400-class failures opaque (`embed http status:
+        // 400 Bad Request` with no further detail). Ollama
+        // returns the actual cause as a JSON body
+        // (`{"error":"…"}`); the embedder should surface
+        // that body in the returned error string so the bg
+        // worker's WARN log carries it.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/api/embed");
+                then.status(400)
+                    .header("content-type", "application/json")
+                    .body(r#"{"error":"input length exceeds maximum context length"}"#);
+            })
+            .await;
+        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into(), 768);
+        let err = embedder.embed("hello").await.expect_err("should error");
+        assert!(err.contains("400"), "should include status: {err}");
+        assert!(
+            err.contains("input length exceeds maximum context length"),
+            "should include response body so failures are debuggable: {err}"
         );
     }
 

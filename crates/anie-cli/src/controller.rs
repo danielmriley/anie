@@ -2209,12 +2209,23 @@ fn rlm_relevance_budget_tokens(active_ceiling_tokens: u64) -> u64 {
 /// dim mismatch warning we might add later.
 const DEFAULT_EMBEDDING_DIM: usize = 768;
 
-/// Build the optional Plan-08 embedder + worker. Returns
-/// `None` when `ANIE_EMBEDDING_MODEL` is unset (default —
-/// preserves keyword-only behavior) or when the parent's
-/// provider isn't Ollama (the only embedding backend
-/// shipped today). Otherwise returns the embedder Arc +
-/// the worker's mpsc Sender.
+/// Default embedding model used when rlm mode runs against
+/// an Ollama parent and `ANIE_EMBEDDING_MODEL` isn't
+/// explicitly set. Picked because it's the smallest widely-
+/// available embedding model on Ollama and matches the
+/// `DEFAULT_EMBEDDING_DIM` of 768. Operators who want a
+/// different model set the env var; operators who want to
+/// disable embeddings entirely set it to the empty string.
+const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+
+/// Build the optional Plan-08 embedder + worker. In rlm
+/// mode against an Ollama parent the embedder defaults on
+/// (`DEFAULT_EMBEDDING_MODEL`); the env var
+/// `ANIE_EMBEDDING_MODEL` overrides the model, and an
+/// explicit empty string (`ANIE_EMBEDDING_MODEL=`)
+/// disables. Returns `None` when explicitly disabled or
+/// when the parent's provider isn't Ollama (the only
+/// embedding backend shipped today).
 fn build_embedder(
     state: &ControllerState,
     store: Arc<tokio::sync::RwLock<crate::external_context::ExternalContext>>,
@@ -2222,10 +2233,15 @@ fn build_embedder(
     Arc<dyn crate::embedder::Embedder>,
     mpsc::Sender<crate::bg_embedder::EmbedRequest>,
 )> {
-    let model_name = std::env::var("ANIE_EMBEDDING_MODEL").ok()?;
-    if model_name.trim().is_empty() {
-        return None;
-    }
+    // Resolve the embedding model name with three-way
+    // semantics: unset → default; empty → disabled;
+    // anything else → use that. The empty-string-disables
+    // path keeps smoke-test bisection working.
+    let model_name = match std::env::var("ANIE_EMBEDDING_MODEL") {
+        Ok(value) if value.trim().is_empty() => return None,
+        Ok(value) => value,
+        Err(_) => DEFAULT_EMBEDDING_MODEL.to_string(),
+    };
     // Today only Ollama is supported. The parent's
     // current model carries the base_url we point the
     // embedder at — embeddings come from the same
@@ -2235,7 +2251,7 @@ fn build_embedder(
         warn!(
             target: "anie_cli::controller",
             api = ?parent_model.api,
-            "ANIE_EMBEDDING_MODEL set but parent provider is not Ollama; skipping embedder"
+            "rlm embedder skipped — parent provider is not Ollama"
         );
         return None;
     }
@@ -2297,13 +2313,13 @@ fn build_rlm_extras(
         ));
     let summarizer_tx = crate::bg_summarizer::spawn_worker(summarizer, Arc::clone(&store));
 
-    // Plan 08: optionally spawn the background embedder.
-    // Reads `ANIE_EMBEDDING_MODEL` to decide whether to
-    // wire it up. When set + the parent is an Ollama
-    // provider, we spin up an OllamaEmbedder pointed at
-    // the same base_url. Failures during the actual embed
-    // call are handled in-worker (logged, entry stays
-    // unembedded → reranker falls back to keyword).
+    // Plan 08: spawn the background embedder. Defaults on
+    // when the parent is an Ollama provider; the
+    // `ANIE_EMBEDDING_MODEL` env var overrides the model
+    // and an explicit empty string disables. Failures
+    // during the actual embed call are handled in-worker
+    // (logged, entry stays unembedded → reranker falls
+    // back to keyword).
     let embed_handle = build_embedder(state, Arc::clone(&store));
 
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
