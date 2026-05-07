@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use anie_config::ToolOutputMode;
 use ratatui::{
+    buffer::Cell,
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
-use crate::markdown::{LinkRange, MarkdownTheme, find_link_ranges};
+use crate::markdown::{LinkRange, MarkdownTheme, find_link_ranges, find_link_ranges_for_arcs};
 use crate::render_debug::{PerfSpan, PerfSpanKind, perf_trace_enabled};
 use crate::terminal_capabilities::TerminalCapabilities;
 
@@ -164,7 +166,10 @@ struct StreamingRenderCache {
     width: u16,
     theme: MarkdownTheme,
     markdown_enabled: bool,
-    lines: Vec<Line<'static>>,
+    /// One refcounted slab shared across repaint frames until the buffer
+    /// grows (another token) or metadata changes — avoids cloning every
+    /// `Span`/`Cow` on steady-state streaming paints.
+    lines: Arc<Vec<Arc<Line<'static>>>>,
 }
 
 impl StreamingAssistantRender {
@@ -178,9 +183,13 @@ impl StreamingAssistantRender {
         self.cache = None;
     }
 
-    fn render_lines(&mut self, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
+    fn answer_lines_arcs(
+        &mut self,
+        width: u16,
+        ctx: &RenderContext,
+    ) -> Arc<Vec<Arc<Line<'static>>>> {
         if self.text.is_empty() {
-            return Vec::new();
+            return Arc::new(Vec::new());
         }
         if let Some(c) = &self.cache
             && c.text_len == self.text.len()
@@ -188,21 +197,31 @@ impl StreamingAssistantRender {
             && c.markdown_enabled == ctx.markdown_enabled
             && c.theme == ctx.theme
         {
-            return c.lines.clone();
+            return Arc::clone(&c.lines);
         }
         let rendered = if ctx.markdown_enabled {
             crate::markdown::render_markdown(&self.text, width, &ctx.theme)
         } else {
             wrap_text(&self.text, width, Style::default())
         };
+        let arcs: Vec<Arc<Line<'static>>> = rendered.into_iter().map(Arc::new).collect();
+        let shared = Arc::new(arcs);
         self.cache = Some(StreamingRenderCache {
             text_len: self.text.len(),
             width,
             theme: ctx.theme,
             markdown_enabled: ctx.markdown_enabled,
-            lines: rendered.clone(),
+            lines: Arc::clone(&shared),
         });
-        rendered
+        shared
+    }
+
+    #[cfg(test)]
+    fn render_lines(&mut self, width: u16, ctx: &RenderContext) -> Vec<Line<'static>> {
+        self.answer_lines_arcs(width, ctx)
+            .iter()
+            .map(|arc| (**arc).clone())
+            .collect()
     }
 }
 
@@ -258,6 +277,42 @@ impl Default for RenderContext {
             user_message_bg: Some(DEFAULT_USER_MESSAGE_BG),
         }
     }
+}
+
+/// Cell snapshot of the most recent full output-pane render.
+/// Lets keystroke-driven (urgent) paints skip the per-cell
+/// `set_line` work — they `clone_from_slice` these cells back
+/// into the buffer instead. The cells are stored in row-major
+/// order matching the captured `area` (`cells[y * width + x]`).
+///
+/// Why this exists: the bench showed ~380 µs/keystroke on
+/// `keystroke_into_idle_app_600`. Profiling that cost broke
+/// down to ~150 µs in `Buffer::set_line` walking graphemes,
+/// computing widths, and constructing `CompactString`s for
+/// every cell of the visible viewport — work the urgent path
+/// repeats every keystroke even though the output content
+/// hasn't changed. `Cell::clone` for ASCII (inline
+/// `CompactString`) is roughly memcpy speed, ~3-5× cheaper
+/// than the `set_line` path. F-13 in
+/// `docs/code_review_2026-05-03.md`.
+struct RenderedSnapshot {
+    /// Area we captured from. Reuse only matches when the
+    /// destination area in the next paint is exactly this rect
+    /// — width / height drift means the snapshot's cell layout
+    /// would land in the wrong spot.
+    area: Rect,
+    /// Scroll offset at capture. The visible flat-line slice
+    /// depends on `scroll_offset`; if it changed since capture
+    /// we must repaint to show the right lines.
+    scroll_offset: u16,
+    /// `revision` of the output pane at capture (bumped by
+    /// every mutator). If anything has changed since — block
+    /// added, content appended, scroll moved, theme changed —
+    /// the snapshot is stale and we fall back to a full paint.
+    revision: u64,
+    /// Cells in row-major order: `cells[(y * width) + x]`.
+    /// Length = `area.width * area.height`.
+    cells: Vec<Cell>,
 }
 
 /// Scrollable output pane.
@@ -325,8 +380,28 @@ pub struct OutputPane {
     /// guarded by `cfg(debug_assertions)` parity assert in
     /// `has_animated_blocks`.
     animated_block_count: usize,
+    /// Bumped on every mutation that could change the rendered
+    /// output (content append, finalize, scroll, theme switch,
+    /// width invalidation, …). The urgent-paint snapshot stores
+    /// this counter at capture time and only reuses its cells
+    /// when the value still matches — so any mutation between
+    /// the last full paint and the keystroke render forces a
+    /// full repaint instead of showing stale content.
+    render_revision: u64,
+    /// Cell snapshot taken at the end of the most recent full
+    /// (non-urgent) paint. Urgent (keystroke) paints reuse it
+    /// to skip per-cell `set_line` work when nothing about the
+    /// output has changed since capture. See `RenderedSnapshot`
+    /// for invariants. `None` until the first full paint and
+    /// any time the snapshot would be stale.
+    rendered_snapshot: Option<RenderedSnapshot>,
     #[cfg(test)]
     flat_build_count: u64,
+    /// Counts the number of urgent renders that actually reused
+    /// the cell snapshot (i.e., skipped the `set_line` loop).
+    /// Tests assert on this to pin the fast-path behavior.
+    #[cfg(test)]
+    snapshot_reuse_count: u64,
 }
 
 impl OutputPane {
@@ -348,9 +423,22 @@ impl OutputPane {
             last_viewport_height: 1,
             render_context: RenderContext::default(),
             animated_block_count: 0,
+            render_revision: 0,
+            rendered_snapshot: None,
             #[cfg(test)]
             flat_build_count: 0,
+            #[cfg(test)]
+            snapshot_reuse_count: 0,
         }
+    }
+
+    /// Bump `render_revision`, retiring any standing
+    /// `rendered_snapshot`. Called by every mutator that could
+    /// affect the rendered output. Centralizing the bump here
+    /// keeps it impossible to invalidate the line cache without
+    /// also invalidating the cell snapshot.
+    fn bump_render_revision(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
     }
 
     /// Toggle markdown rendering for finalized assistant blocks.
@@ -411,7 +499,17 @@ impl OutputPane {
                 state.cache = None;
             }
         }
+        self.invalidate_flat_cache();
+    }
+
+    /// Mark the flat-line + cell snapshot caches stale. Goes
+    /// together: any change that invalidates the line cache also
+    /// invalidates the cell-level snapshot the urgent paint reuses,
+    /// and bundling the two flips in one helper makes that
+    /// impossible to forget.
+    fn invalidate_flat_cache(&mut self) {
         self.flat_cache_valid = false;
+        self.bump_render_revision();
     }
 
     /// Add a transcript block.
@@ -422,21 +520,21 @@ impl OutputPane {
         self.blocks.push(block);
         self.caches.push(None);
         self.streaming_assistant_renders.push(None);
-        self.flat_cache_valid = false;
+        self.invalidate_flat_cache();
     }
 
     fn invalidate_last(&mut self) {
         if let Some(slot) = self.caches.last_mut() {
             *slot = None;
         }
-        self.flat_cache_valid = false;
+        self.invalidate_flat_cache();
     }
 
     fn invalidate_at(&mut self, index: usize) {
         if let Some(slot) = self.caches.get_mut(index) {
             *slot = None;
         }
-        self.flat_cache_valid = false;
+        self.invalidate_flat_cache();
     }
 
     /// Read-only view of the current block list. Used by tests
@@ -610,7 +708,6 @@ impl OutputPane {
         self.caches.clear();
         self.streaming_assistant_renders.clear();
         self.flat_lines.clear();
-        self.flat_cache_valid = false;
         self.flat_cache_width = None;
         self.last_link_map.clear();
         self.scroll_offset = 0;
@@ -618,6 +715,8 @@ impl OutputPane {
         self.last_total_lines = 0;
         self.last_viewport_height = 1;
         self.animated_block_count = 0;
+        self.rendered_snapshot = None;
+        self.invalidate_flat_cache();
     }
 
     /// Scroll the pane upward by a number of rendered lines.
@@ -680,6 +779,36 @@ impl OutputPane {
         // overhead and complicating cache invalidation.
         // Scrolling still works via wheel, PageUp/PageDown,
         // and Home/End.
+        //
+        // Urgent (keystroke) fast-path: when nothing about the
+        // output pane has changed since the last full paint —
+        // same area, same scroll, same revision — we can replay
+        // the previous frame's cells with `clone_from_slice`,
+        // skipping `rebuild_flat_cache`, `set_line`'s grapheme
+        // walk, and the per-cell `CompactString::new`. F-13 in
+        // `docs/code_review_2026-05-03.md`. The non-urgent
+        // branch always rebuilds and re-snapshots so a
+        // streaming delta or scroll between paints lands a
+        // fresh image.
+        if reuse_flat_snapshot
+            && let Some(snap) = self.rendered_snapshot.as_ref()
+            && snap.revision == self.render_revision
+            && snap.scroll_offset == self.scroll_offset
+            && snap.area == area
+            && let Some(buf_area) = snap_target_area(buf, area)
+            && buf_area == area
+        {
+            copy_snapshot_into_buffer(snap, buf);
+            self.last_total_lines = u16::try_from(self.flat_lines.len()).unwrap_or(u16::MAX);
+            self.last_viewport_height = area.height.max(1);
+            self.last_render_top = area.y;
+            #[cfg(test)]
+            {
+                self.snapshot_reuse_count = self.snapshot_reuse_count.saturating_add(1);
+            }
+            return;
+        }
+
         if reuse_flat_snapshot {
             if !self.can_reuse_flat_snapshot(area.width.max(1)) {
                 self.rebuild_flat_cache(area.width.max(1), spinner_frame);
@@ -741,6 +870,84 @@ impl OutputPane {
             buf.set_line(area.x, y, line.as_ref(), area.width);
         }
         drop(paragraph_span);
+
+        // Snapshot the cells we just wrote so the next urgent
+        // paint can replay them without redoing the per-cell
+        // grapheme work. Skipped when animated content is
+        // present (the spinner needs to tick every frame, so
+        // a snapshot would be stale on its first reuse). Also
+        // skipped when an existing snapshot still matches the
+        // current state — recapturing the same cells per frame
+        // burned ~70 µs on the `scroll_static_600` bench
+        // before this guard.
+        if self.has_animated_blocks() {
+            self.rendered_snapshot = None;
+        } else if !self.snapshot_already_matches(area) {
+            self.capture_snapshot(buf, area);
+        }
+    }
+
+    /// Whether the standing `rendered_snapshot` already reflects
+    /// the same area / scroll / revision the next urgent paint
+    /// would target. When true the cell contents haven't moved
+    /// since capture, so re-running the row-by-row clone is pure
+    /// waste — the next urgent paint would copy from this same
+    /// snapshot anyway.
+    fn snapshot_already_matches(&self, area: ratatui::layout::Rect) -> bool {
+        self.rendered_snapshot.as_ref().is_some_and(|snap| {
+            snap.area == area
+                && snap.scroll_offset == self.scroll_offset
+                && snap.revision == self.render_revision
+        })
+    }
+
+    /// Snapshot the cells we just wrote into the back buffer so
+    /// a subsequent urgent paint can replay them with
+    /// `clone_from_slice` instead of running `set_line` on each
+    /// cached line. Reuses any allocation already held in the
+    /// snapshot's `cells` vector to keep idle snapshot
+    /// maintenance allocation-free in the steady state.
+    fn capture_snapshot(&mut self, buf: &ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+        let buf_area = buf.area;
+        // Clip the captured rect to whatever the buffer actually
+        // owns. A caller passing a rect partially outside
+        // `buf.area` would otherwise produce out-of-range
+        // indices; better to drop the snapshot and force the
+        // next paint full than to record a bogus image.
+        let Some(clipped) = clip_to_buffer(area, buf_area) else {
+            self.rendered_snapshot = None;
+            return;
+        };
+        if clipped != area {
+            self.rendered_snapshot = None;
+            return;
+        }
+        let needed = (area.width as usize).saturating_mul(area.height as usize);
+        // Reuse the existing allocation across paints. Re-snapping
+        // the same area between renders would otherwise pay an
+        // alloc per frame; clear() drops the elements and keeps
+        // the capacity so the steady-state path is allocation-free.
+        let mut cells = match self.rendered_snapshot.take() {
+            Some(snap) if snap.cells.capacity() >= needed => {
+                let mut cells = snap.cells;
+                cells.clear();
+                cells
+            }
+            _ => Vec::with_capacity(needed),
+        };
+        let buf_width = buf_area.width as usize;
+        let row_len = area.width as usize;
+        for y in 0..area.height {
+            let buf_row_start = ((area.y - buf_area.y) as usize + y as usize) * buf_width
+                + (area.x - buf_area.x) as usize;
+            cells.extend_from_slice(&buf.content[buf_row_start..buf_row_start + row_len]);
+        }
+        self.rendered_snapshot = Some(RenderedSnapshot {
+            area,
+            scroll_offset: self.scroll_offset,
+            revision: self.render_revision,
+            cells,
+        });
     }
 
     /// Whether any current block has animated content
@@ -886,7 +1093,11 @@ impl OutputPane {
                     // label and jq aggregations group on it.
                     s.record("block_kind", block_kind_tag(block));
                     s.record("width", u64::from(width));
-                    s.record("lines", u64::try_from(lines.len()).unwrap_or(u64::MAX));
+                    let line_count = match &lines {
+                        BlockComputed::Lines(v) => v.len(),
+                        BlockComputed::SharedLines(v) => v.len(),
+                    };
+                    s.record("lines", u64::try_from(line_count).unwrap_or(u64::MAX));
                 }
                 lines
             };
@@ -899,19 +1110,37 @@ impl OutputPane {
             }
             // Scan for clickable URL ranges once per cache-fill
             // so cached hits are free.
-            let computed_links = {
-                let mut s = PerfSpan::enter(PerfSpanKind::FindLinkRanges);
-                let links = find_link_ranges(&computed, &theme);
-                if let Some(s) = s.as_mut() {
-                    s.record("lines", u64::try_from(computed.len()).unwrap_or(u64::MAX));
-                    s.record("ranges", u64::try_from(links.len()).unwrap_or(u64::MAX));
+            let (computed_links, lines_arcs) = match computed {
+                BlockComputed::Lines(lines) => {
+                    let computed_links = {
+                        let mut s = PerfSpan::enter(PerfSpanKind::FindLinkRanges);
+                        let links = find_link_ranges(&lines, &theme);
+                        if let Some(s) = s.as_mut() {
+                            s.record("lines", u64::try_from(lines.len()).unwrap_or(u64::MAX));
+                            s.record("ranges", u64::try_from(links.len()).unwrap_or(u64::MAX));
+                        }
+                        links
+                    };
+                    let lines_arcs: Vec<Arc<Line<'static>>> =
+                        lines.into_iter().map(Arc::new).collect();
+                    (computed_links, lines_arcs)
                 }
-                links
+                BlockComputed::SharedLines(lines_arcs) => {
+                    let computed_links = {
+                        let mut s = PerfSpan::enter(PerfSpanKind::FindLinkRanges);
+                        let links = find_link_ranges_for_arcs(&lines_arcs, &theme);
+                        if let Some(s) = s.as_mut() {
+                            s.record("lines", u64::try_from(lines_arcs.len()).unwrap_or(u64::MAX));
+                            s.record("ranges", u64::try_from(links.len()).unwrap_or(u64::MAX));
+                        }
+                        links
+                    };
+                    (computed_links, lines_arcs)
+                }
             };
-            // Wrap each line in its own `Arc` so the cache slot
-            // and the flat output share the same allocation. The
-            // cache hit path then refcount-bumps; no deep clone.
-            let lines_arcs: Vec<Arc<Line<'static>>> = computed.into_iter().map(Arc::new).collect();
+            // SharedLines already carries Arc<Line>; Owned lines
+            // get wrapped once. The cache-hit path refcount-bumps;
+            // no redundant deep clones on steady-state streaming.
             if hits_cache && let Some(slot) = self.caches.get_mut(index) {
                 let entry = CachedAtWidth {
                     width,
@@ -1047,6 +1276,11 @@ impl OutputPane {
     }
 
     #[cfg(test)]
+    pub(crate) fn snapshot_reuse_count(&self) -> u64 {
+        self.snapshot_reuse_count
+    }
+
+    #[cfg(test)]
     pub(crate) fn flat_build_count(&self) -> u64 {
         self.flat_build_count
     }
@@ -1068,6 +1302,66 @@ fn block_kind_tag(block: &RenderedBlock) -> &'static str {
     }
 }
 
+/// Compute the area we should target inside `buf` when planning
+/// a snapshot reuse. Returns `None` if the requested rect doesn't
+/// fit; the caller falls back to a full repaint in that case.
+/// Kept as a free function so the borrow checker doesn't see a
+/// `&Buffer` and `&mut Buffer` overlap when `OutputPane::render`
+/// holds the snapshot reference.
+fn snap_target_area(
+    buf: &ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+) -> Option<ratatui::layout::Rect> {
+    clip_to_buffer(area, buf.area)
+}
+
+/// Restrict `area` to the portion that lies entirely inside
+/// `bounds`. Returns `None` if there is no overlap. Used both
+/// when capturing the snapshot (we never want to record cells
+/// outside the buffer) and when reusing it (the destination
+/// rect must be within the current buffer's area).
+fn clip_to_buffer(
+    area: ratatui::layout::Rect,
+    bounds: ratatui::layout::Rect,
+) -> Option<ratatui::layout::Rect> {
+    let clipped = area.intersection(bounds);
+    if clipped.width == 0 || clipped.height == 0 {
+        None
+    } else {
+        Some(clipped)
+    }
+}
+
+/// Copy a previously-captured cell snapshot back into the buffer
+/// at the same area it was captured from. Uses
+/// `clone_from_slice` row-by-row so each cell's `CompactString`
+/// gets `Clone`'d directly — for inline (≤24-byte) symbols
+/// that's effectively a memcpy, several times cheaper than
+/// `Buffer::set_line` which has to walk graphemes and call
+/// `CompactString::new` for every cell.
+fn copy_snapshot_into_buffer(snap: &RenderedSnapshot, buf: &mut ratatui::buffer::Buffer) {
+    let buf_area = buf.area;
+    let area = snap.area;
+    debug_assert!(
+        buf_area.x <= area.x
+            && buf_area.y <= area.y
+            && area.right() <= buf_area.right()
+            && area.bottom() <= buf_area.bottom(),
+        "caller must clip snap.area to buf.area before invoking",
+    );
+    let buf_width = buf_area.width as usize;
+    let row_len = area.width as usize;
+    for y in 0..area.height {
+        let snap_row_start = (y as usize) * row_len;
+        let buf_row_start = ((area.y - buf_area.y) as usize + y as usize) * buf_width
+            + (area.x - buf_area.x) as usize;
+        let buf_row_end = buf_row_start + row_len;
+        let snap_row_end = snap_row_start + row_len;
+        buf.content[buf_row_start..buf_row_end]
+            .clone_from_slice(&snap.cells[snap_row_start..snap_row_end]);
+    }
+}
+
 /// Whether rendering `block` produces spinner-dependent output
 /// that changes between ticks even when the block's state does
 /// not. Such blocks skip the line cache — see `OutputPane::build_lines`.
@@ -1079,13 +1373,21 @@ fn block_has_animated_content(block: &RenderedBlock) -> bool {
     }
 }
 
+/// Intermediate block lines before wrapping into `Arc<Line>` slots in the
+/// flat cache. Streaming assistant misses hand back refcounted slabs so a
+/// token-quiet frame does not deep-clone Markdown `Line`s.
+enum BlockComputed {
+    Lines(Vec<Line<'static>>),
+    SharedLines(Vec<Arc<Line<'static>>>),
+}
+
 fn block_lines(
     block: &RenderedBlock,
     width: u16,
     spinner_frame: &str,
     ctx: &RenderContext,
     streaming_render: Option<&mut StreamingAssistantRender>,
-) -> Vec<Line<'static>> {
+) -> BlockComputed {
     match block {
         RenderedBlock::UserMessage { text, .. } => {
             // Shorter, quieter inbound-message marker. Codex
@@ -1106,7 +1408,7 @@ fn block_lines(
                 ],
                 width,
             );
-            apply_user_message_tint(wrapped, ctx, width)
+            BlockComputed::Lines(apply_user_message_tint(wrapped, ctx, width))
         }
         RenderedBlock::AssistantMessage {
             text,
@@ -1114,18 +1416,35 @@ fn block_lines(
             is_streaming,
             error_message,
             ..
-        } => assistant_block_lines(
-            AssistantRenderInput {
-                text,
-                thinking,
-                is_streaming: *is_streaming,
-                error_message: error_message.as_deref(),
-                streaming_render,
-            },
-            width,
-            spinner_frame,
-            ctx,
-        ),
+        } => {
+            if *is_streaming && streaming_render.is_some() {
+                BlockComputed::SharedLines(assistant_block_arcs(
+                    AssistantRenderInput {
+                        text,
+                        thinking,
+                        is_streaming: *is_streaming,
+                        error_message: error_message.as_deref(),
+                        streaming_render,
+                    },
+                    width,
+                    spinner_frame,
+                    ctx,
+                ))
+            } else {
+                BlockComputed::Lines(assistant_block_lines(
+                    AssistantRenderInput {
+                        text,
+                        thinking,
+                        is_streaming: *is_streaming,
+                        error_message: error_message.as_deref(),
+                        streaming_render,
+                    },
+                    width,
+                    spinner_frame,
+                    ctx,
+                ))
+            }
+        }
         RenderedBlock::ToolCall {
             tool_name,
             args_display,
@@ -1158,34 +1477,38 @@ fn block_lines(
             // +/- diff lines stay legible; everything else
             // (bash, read, grep, find, ls, in-flight) renders
             // flat with the `• Verb` header.
-            if is_error || (!is_executing && uses_boxed_success_layout(tool_name)) {
-                boxed_lines(
-                    format_tool_title(tool_name, args_display),
-                    body,
-                    width,
-                    is_error,
-                    *is_executing,
-                )
-            } else {
-                let header = format_tool_header_spans(
-                    tool_name,
-                    args_display,
-                    is_error,
-                    *is_executing,
-                    spinner_frame,
-                );
-                prefix_lines(
-                    header,
-                    body,
-                    width,
-                    PREFIX_TOOL_BODY_LIMIT,
-                    PrefixBodyStyle::tool_success(),
-                )
-            }
+            BlockComputed::Lines(
+                if is_error || (!is_executing && uses_boxed_success_layout(tool_name)) {
+                    boxed_lines(
+                        format_tool_title(tool_name, args_display),
+                        body,
+                        width,
+                        is_error,
+                        *is_executing,
+                    )
+                } else {
+                    let header = format_tool_header_spans(
+                        tool_name,
+                        args_display,
+                        is_error,
+                        *is_executing,
+                        spinner_frame,
+                    );
+                    prefix_lines(
+                        header,
+                        body,
+                        width,
+                        PREFIX_TOOL_BODY_LIMIT,
+                        PrefixBodyStyle::tool_success(),
+                    )
+                },
+            )
         }
-        RenderedBlock::SystemMessage { text } => {
-            wrap_text(text, width, Style::default().add_modifier(Modifier::DIM))
-        }
+        RenderedBlock::SystemMessage { text } => BlockComputed::Lines(wrap_text(
+            text,
+            width,
+            Style::default().add_modifier(Modifier::DIM),
+        )),
     }
 }
 
@@ -1239,11 +1562,106 @@ fn apply_user_message_tint(
                 })
                 .collect();
             if pad > 0 {
-                spans.push(Span::styled(" ".repeat(pad), bg_style));
+                // PR 7 of `docs/code_review_2026-05-03.md`
+                // (F-6): use a static spaces buffer with a
+                // borrowed slice instead of `" ".repeat(pad)`,
+                // which allocated a fresh `String` on every
+                // tinted line. Capped at the buffer length —
+                // wider terminals fall back to repeat()
+                // (extremely rare; the buffer is sized to
+                // cover any sane terminal width).
+                let span = if let Some(slice) = padding_spaces(pad) {
+                    Span::styled(slice, bg_style)
+                } else {
+                    Span::styled(" ".repeat(pad), bg_style)
+                };
+                spans.push(span);
             }
             Line::from(spans)
         })
         .collect()
+}
+
+/// Borrow a slice of ASCII spaces of the requested width.
+/// PR 7 of `docs/code_review_2026-05-03.md` (F-6): the
+/// user-message tint pads every line to the terminal width;
+/// borrowing from a one-time-allocated static buffer turns
+/// N per-paint allocations into zero for any terminal up to
+/// 512 columns wide. Returns `None` for wider asks so the
+/// caller falls back to `repeat()` — extremely rare; 512 is
+/// chosen to cover phone terminals up to ultra-wide monitors
+/// split across panes.
+fn padding_spaces(width: usize) -> Option<std::borrow::Cow<'static, str>> {
+    static SPACES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let buffer = SPACES.get_or_init(|| " ".repeat(512));
+    if width <= buffer.len() {
+        Some(std::borrow::Cow::Borrowed(&buffer[..width]))
+    } else {
+        None
+    }
+}
+
+fn assistant_block_arcs(
+    assistant: AssistantRenderInput<'_>,
+    width: u16,
+    spinner_frame: &str,
+    ctx: &RenderContext,
+) -> Vec<Arc<Line<'static>>> {
+    let inline_thinking_status =
+        assistant.is_streaming && assistant.text.is_empty() && !assistant.thinking.is_empty();
+
+    let mut out: Vec<Arc<Line<'static>>> = Vec::new();
+    extend_line_section_into_arcs(
+        &mut out,
+        assistant_thinking_lines(
+            assistant.thinking,
+            width,
+            inline_thinking_status.then_some(spinner_frame),
+        ),
+    );
+
+    if assistant.is_streaming {
+        if let Some(state) = assistant.streaming_render {
+            extend_answer_arcs_into(&mut out, state.answer_lines_arcs(width, ctx));
+        } else {
+            extend_line_section_into_arcs(
+                &mut out,
+                assistant_answer_lines(assistant.text, width, ctx),
+            );
+        }
+    } else {
+        extend_line_section_into_arcs(&mut out, assistant_answer_lines(assistant.text, width, ctx));
+    }
+
+    if let Some(message) = assistant.error_message {
+        extend_line_section_into_arcs(&mut out, assistant_error_lines(message, width));
+    }
+
+    if out.is_empty() {
+        vec![Arc::new(Line::default())]
+    } else {
+        out
+    }
+}
+
+fn extend_line_section_into_arcs(acc: &mut Vec<Arc<Line<'static>>>, section: Vec<Line<'static>>) {
+    if section.is_empty() {
+        return;
+    }
+    if !acc.is_empty() {
+        acc.push(Arc::new(Line::default()));
+    }
+    acc.extend(section.into_iter().map(Arc::new));
+}
+
+fn extend_answer_arcs_into(acc: &mut Vec<Arc<Line<'static>>>, slab: Arc<Vec<Arc<Line<'static>>>>) {
+    if slab.is_empty() {
+        return;
+    }
+    if !acc.is_empty() {
+        acc.push(Arc::new(Line::default()));
+    }
+    acc.extend(slab.iter().cloned());
 }
 
 fn assistant_block_lines(
@@ -1252,50 +1670,10 @@ fn assistant_block_lines(
     spinner_frame: &str,
     ctx: &RenderContext,
 ) -> Vec<Line<'static>> {
-    let mut result = Vec::new();
-    let inline_thinking_status =
-        assistant.is_streaming && assistant.text.is_empty() && !assistant.thinking.is_empty();
-
-    append_assistant_section(
-        &mut result,
-        assistant_thinking_lines(
-            assistant.thinking,
-            width,
-            inline_thinking_status.then_some(spinner_frame),
-        ),
-    );
-    append_assistant_section(
-        &mut result,
-        if assistant.is_streaming {
-            assistant.streaming_render.map_or_else(
-                || assistant_answer_lines(assistant.text, width, ctx),
-                |state| state.render_lines(width, ctx),
-            )
-        } else {
-            assistant_answer_lines(assistant.text, width, ctx)
-        },
-    );
-    // The "responding…" / "thinking…" status indicator used
-    // to render a trailing line in the assistant block. That
-    // cue now lives on the dedicated spinner row directly
-    // above the input box (see `render_spinner_row` in
-    // `app.rs`), so we no longer duplicate it here — the
-    // transcript stays focused on the content itself.
-    let _ = spinner_frame;
-    let _ = inline_thinking_status;
-    // Provider errors land at the bottom of the block so the user
-    // sees the reason a turn produced no visible answer. Without
-    // this, a thinking-only response would leave the user staring
-    // at a thinking block with nothing after it.
-    if let Some(message) = assistant.error_message {
-        append_assistant_section(&mut result, assistant_error_lines(message, width));
-    }
-
-    if result.is_empty() {
-        vec![Line::default()]
-    } else {
-        result
-    }
+    assistant_block_arcs(assistant, width, spinner_frame, ctx)
+        .into_iter()
+        .map(|arc| arc.as_ref().clone())
+        .collect()
 }
 
 fn assistant_error_lines(message: &str, width: u16) -> Vec<Line<'static>> {
@@ -1319,16 +1697,6 @@ fn assistant_error_lines(message: &str, width: u16) -> Vec<Line<'static>> {
             body: Style::default().fg(Color::Red),
         },
     )
-}
-
-fn append_assistant_section(result: &mut Vec<Line<'static>>, section: Vec<Line<'static>>) {
-    if section.is_empty() {
-        return;
-    }
-    if !result.is_empty() {
-        result.push(Line::default());
-    }
-    result.extend(section);
 }
 
 fn assistant_thinking_lines(
