@@ -456,6 +456,98 @@ fn urgent_input_render_reuses_existing_output_snapshot() {
     );
 }
 
+/// Regression: the urgent paint must replay the previous frame's
+/// output cells from the snapshot rather than re-running
+/// `set_line` for every visible row. The bench cost showed
+/// `set_line`'s grapheme walk + `CompactString::new` was the
+/// dominant remaining work on the keystroke path; the snapshot
+/// reuse path replaces it with `Vec<Cell>::clone_from_slice`,
+/// roughly memcpy speed for inline-symbol cells. This test pins
+/// the contract by counting reuses across a typing burst.
+#[test]
+fn urgent_paint_replays_output_cells_from_snapshot_on_each_keystroke() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::SystemMessage {
+        text: "stable transcript content".into(),
+    })
+    .expect("seed transcript");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 16)).expect("test terminal");
+    // Full paint primes the snapshot; subsequent urgent paints
+    // are the ones we want to assert reuse it.
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("initial full draw");
+    let reuse_before = app.output_snapshot_reuse_count();
+    assert_eq!(
+        reuse_before, 0,
+        "the warm-up full paint must capture, not reuse"
+    );
+
+    for ch in ['h', 'e', 'l', 'l', 'o'] {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type input");
+        terminal
+            .draw(|frame| app.render_urgent(frame))
+            .expect("urgent draw");
+    }
+
+    let reuse_after = app.output_snapshot_reuse_count();
+    assert_eq!(
+        reuse_after - reuse_before,
+        5,
+        "every keystroke-driven urgent paint must replay the captured cell snapshot"
+    );
+}
+
+/// Regression: any output-pane mutation between the captured
+/// snapshot and the next urgent paint must force a full
+/// repaint. Otherwise streaming tokens / system messages added
+/// while the user is typing would be hidden until the next
+/// non-urgent frame.
+#[test]
+fn snapshot_reuse_aborts_when_output_pane_mutates_between_paints() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    app.handle_agent_event(AgentEvent::SystemMessage {
+        text: "first".into(),
+    })
+    .expect("seed transcript");
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("warm full draw");
+    let reuse_before = app.output_snapshot_reuse_count();
+
+    app.handle_agent_event(AgentEvent::SystemMessage {
+        text: "second".into(),
+    })
+    .expect("append while user types");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+    )))
+    .expect("type input");
+    terminal
+        .draw(|frame| app.render_urgent(frame))
+        .expect("urgent draw after mutation");
+
+    assert_eq!(
+        app.output_snapshot_reuse_count(),
+        reuse_before,
+        "a mutation between paints must invalidate the snapshot"
+    );
+}
+
 #[test]
 fn wrapped_thinking_lines_keep_their_section_gutter() {
     let screen = render_assistant_block("done", "abcdefghijklmnop", false, 14, 8);
@@ -2903,4 +2995,49 @@ fn bounded_agent_event_drain_preserves_order_and_leaves_remainder() {
         text_delta_payload(second_batch.last().expect("last second-batch event")),
         (MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS - 1).to_string()
     );
+}
+
+/// Round 9 fast-path eligibility. A printable char in idle
+/// state with no overlay, no popup, no slash prefix should
+/// fast-commit and update the input buffer in place.
+#[test]
+fn try_fast_typing_commits_a_plain_char_in_idle_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    assert_eq!(app.input_pane_contents(), "");
+    assert!(
+        app.try_fast_typing('a'),
+        "plain char in idle must fast-path"
+    );
+    assert_eq!(app.input_pane_contents(), "a");
+    assert!(app.try_fast_typing('b'));
+    assert_eq!(app.input_pane_contents(), "ab");
+}
+
+/// Round 9 fast-path eligibility — refusal cases. Each
+/// refusal must leave the input buffer untouched, signalling
+/// the caller to fall back to the normal event path.
+#[test]
+fn try_fast_typing_refuses_when_state_is_not_eligible() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(event_rx, action_tx, Vec::new(), Vec::new());
+
+    // `/` would start a slash command — must go through the
+    // normal path so the autocomplete popup opens.
+    assert!(!app.try_fast_typing('/'), "slash must not fast-path");
+    assert_eq!(app.input_pane_contents(), "");
+
+    // While streaming we want full repaints to keep the
+    // streaming output flowing — fast-path refuses.
+    app.handle_agent_event(AgentEvent::AgentStart)
+        .expect("handle AgentStart");
+    assert!(matches!(app.agent_state(), AgentUiState::Streaming));
+    assert!(
+        !app.try_fast_typing('a'),
+        "non-idle agent state must not fast-path"
+    );
+    assert_eq!(app.input_pane_contents(), "");
 }

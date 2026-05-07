@@ -58,7 +58,16 @@ rand = "0.9"
 # height of its content. The "unstable" name is upstream's
 # stability marker; the API itself is stable enough for our
 # use (issue: ratatui-org/ratatui#293).
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+#
+# Round 7 of `docs/code_review_2026-05-03.md`: drop the
+# `underline-color` default feature. anie's render code never
+# sets cell underline colors, but with that feature on
+# ratatui's `CrosstermBackend::draw` emits `\e[59m` (reset
+# underline color) at the end of every frame anyway — 4 extra
+# bytes per keystroke that VTE/VTE-likes parse for no reason.
+# Confirmed against the per-frame byte dump
+# (`ANIE_TRACE_FLUSH_BYTES=1`).
+ratatui = { version = "0.29", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 rpassword = "7"
 # sha2 — needed for PKCE SHA-256 challenge in the OAuth flow.
