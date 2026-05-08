@@ -217,6 +217,8 @@ fn persist_credential(
         account: data.account.clone(),
         api_base_url: data.api_base_url.clone(),
         project_id: data.project_id.clone(),
+        refresh_token_expires_at: data.refresh_token_expires_at.clone(),
+        extra_refresh_token: data.extra_refresh_token.clone(),
     };
     store
         .set_credential(provider_name, credential)

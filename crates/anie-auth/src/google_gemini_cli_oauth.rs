@@ -240,6 +240,8 @@ impl OAuthProvider for GeminiCliOAuthProvider {
             account,
             api_base_url: None,
             project_id: Some(project_id),
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         })
     }
 
@@ -265,6 +267,8 @@ impl OAuthProvider for GeminiCliOAuthProvider {
             account: credential.account.clone(),
             api_base_url: credential.api_base_url.clone(),
             project_id: credential.project_id.clone(),
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         })
     }
 }
@@ -880,6 +884,8 @@ mod tests {
             account: Some("user@example.com".into()),
             api_base_url: None,
             project_id: Some("my-proj".into()),
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         };
         let refreshed = provider.refresh(&prior).await.expect("refresh");
         assert_eq!(refreshed.project_id.as_deref(), Some("my-proj"));

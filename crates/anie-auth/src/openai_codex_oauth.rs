@@ -197,6 +197,9 @@ fn build_credential(
         account,
         api_base_url: None,
         project_id: None,
+        // Codex refresh tokens are long-lived.
+        refresh_token_expires_at: None,
+        extra_refresh_token: None,
     })
 }
 
@@ -392,6 +395,8 @@ mod tests {
             account: Some("acct_preserved".into()),
             api_base_url: None,
             project_id: None,
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         };
         let refreshed = provider.refresh(&prior).await.expect("refresh");
         // The carry-over wins: we don't re-extract from the new

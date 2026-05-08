@@ -197,6 +197,13 @@ impl OAuthProvider for AnthropicOAuthProvider {
             account: credential.account.clone(),
             api_base_url: credential.api_base_url.clone(),
             project_id: credential.project_id.clone(),
+            // Anthropic refresh tokens are long-lived;
+            // mirror existing behaviour by leaving these
+            // `None` so the refresh broker falls through to
+            // the standard "treat refresh_token as
+            // long-lived" path.
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         })
     }
 }
@@ -351,6 +358,8 @@ mod tests {
             account: Some("user@example.com".into()),
             api_base_url: None,
             project_id: None,
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         };
         let refreshed = provider.refresh(&prior).await.expect("refresh");
         assert_eq!(refreshed.access_token, "sk-ant-oat01-new");

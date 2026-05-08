@@ -225,6 +225,8 @@ impl<'a> OAuthRefresher<'a> {
             account: refreshed.account,
             api_base_url: refreshed.api_base_url,
             project_id: refreshed.project_id,
+            refresh_token_expires_at: refreshed.refresh_token_expires_at,
+            extra_refresh_token: refreshed.extra_refresh_token,
         };
         self.persistence
             .save(provider_name, credential)
@@ -245,6 +247,8 @@ impl<'a> OAuthRefresher<'a> {
                 account,
                 api_base_url,
                 project_id,
+                refresh_token_expires_at,
+                extra_refresh_token,
             }) => Ok(OAuthCredentialData {
                 access_token,
                 refresh_token,
@@ -252,6 +256,8 @@ impl<'a> OAuthRefresher<'a> {
                 account,
                 api_base_url,
                 project_id,
+                refresh_token_expires_at,
+                extra_refresh_token,
             }),
             Some(AuthCredential::ApiKey { .. }) => Err(RefreshError::NotOAuth {
                 provider: provider_name.to_string(),
@@ -424,6 +430,8 @@ mod tests {
                 account: Some("user@example.com".into()),
                 api_base_url: None,
                 project_id: None,
+                refresh_token_expires_at: None,
+                extra_refresh_token: None,
             })
         }
     }
@@ -441,6 +449,8 @@ mod tests {
             account: None,
             api_base_url: None,
             project_id: None,
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         }
     }
 
