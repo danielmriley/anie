@@ -2985,3 +2985,58 @@ async fn show_state_action_emits_summary_as_system_message() {
     assert!(msg.contains("Workspace cap:    32 768"), "{msg}");
     assert!(msg.contains("Files"), "{msg}");
 }
+
+/// `/resume` (UiAction::ResumeMostRecent) on a fresh
+/// controller — only the active session exists, so there's
+/// nothing to switch to. The controller must surface a
+/// SystemMessage breadcrumb explaining that, and stay on
+/// the original session.
+#[tokio::test]
+async fn resume_most_recent_with_no_other_sessions_reports_and_stays_put() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    let original_id = controller.state.session.id().to_string();
+    controller
+        .handle_action(UiAction::ResumeMostRecent)
+        .await
+        .expect("resume must not terminate controller");
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("No other sessions"),
+        "expected no-other-sessions breadcrumb, got: {msg}"
+    );
+    // Active session unchanged.
+    assert_eq!(controller.state.session.id(), original_id);
+}
+
+/// `/resume` switches to the most-recently-modified other
+/// session in `sessions_dir`. We seed a sibling session
+/// after the controller is up; `list_sessions` sorts by
+/// modified-desc, so the sibling is at index 0 and the
+/// current session at index 1. The handler filters out
+/// current and picks the first remaining — which must be
+/// the sibling.
+#[tokio::test]
+async fn resume_most_recent_switches_to_sibling_session() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    let original_id = controller.state.session.id().to_string();
+    let sessions_dir = controller.state.session.sessions_dir().to_path_buf();
+    let cwd = controller.state.session.cwd().to_path_buf();
+    // Seed a sibling. The mtime is >= the original (created
+    // strictly after), so list_sessions returns it first.
+    let sibling = SessionManager::new_session(&sessions_dir, &cwd).expect("seed sibling");
+    let sibling_id = sibling.id().to_string();
+    drop(sibling); // release the lock so the controller can re-open it.
+
+    controller
+        .handle_action(UiAction::ResumeMostRecent)
+        .await
+        .expect("resume must succeed");
+    // Drain the breadcrumb. The active session should now
+    // be the sibling.
+    let _ = drain_next_system_message(&mut event_rx).await;
+    assert_eq!(
+        controller.state.session.id(),
+        sibling_id,
+        "controller should have switched away from {original_id} to {sibling_id}"
+    );
+}

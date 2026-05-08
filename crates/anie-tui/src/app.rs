@@ -280,6 +280,11 @@ pub enum UiAction {
     /// whitespace)` is normalised to clear by the
     /// session manager.
     SetSessionName(Option<String>),
+    /// Switch to the most-recently-modified other session
+    /// — the slash-command equivalent of `--resume <id>`
+    /// without typing the ID. Errors with a SystemMessage
+    /// when no other sessions exist.
+    ResumeMostRecent,
     /// Show registered tools.
     ShowTools,
     /// Show installed skills (catalog + active set).
@@ -2903,6 +2908,7 @@ fn fixed_noarg_action(name: &str) -> Option<UiAction> {
         "fork" => UiAction::ForkSession,
         "diff" => UiAction::ShowDiff,
         "new" => UiAction::NewSession,
+        "resume" => UiAction::ResumeMostRecent,
         "tools" => UiAction::ShowTools,
         "skills" => UiAction::ShowSkills,
         "state" => UiAction::ShowState,

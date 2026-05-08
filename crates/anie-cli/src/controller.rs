@@ -848,32 +848,38 @@ impl InteractiveController {
                     .await;
             }
             UiAction::SwitchSession(session_id) => {
+                self.switch_to_session(&session_id).await?;
+            }
+            UiAction::ResumeMostRecent => {
                 if self.current_run.is_some() {
                     self.send_system_message("Cannot switch sessions while a run is active.")
                         .await;
                 } else {
-                    self.state.switch_session(&session_id).await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await?;
-                    let transcript = self
-                        .state
-                        .session_context()
-                        .messages
-                        .into_iter()
-                        .map(|message| message.message)
-                        .collect::<Vec<_>>();
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::TranscriptReplace {
-                            messages: transcript,
-                        })
-                        .await;
-                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::SystemMessage {
-                            text: format!("Switched to session {session_id}"),
-                        })
-                        .await;
+                    let current_id = self.state.session.id().to_string();
+                    let target = match self.state.session.list() {
+                        Ok(sessions) => sessions
+                            .into_iter()
+                            .find(|info| info.id != current_id)
+                            .map(|info| (info.id, info.name)),
+                        Err(error) => {
+                            self.send_system_message(&format!(
+                                "Failed to list sessions: {error}"
+                            ))
+                            .await;
+                            return Ok(());
+                        }
+                    };
+                    match target {
+                        Some((session_id, _)) => {
+                            self.switch_to_session(&session_id).await?;
+                        }
+                        None => {
+                            self.send_system_message(
+                                "No other sessions to resume — this is the only one.",
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             UiAction::SetSessionName(payload) => {
@@ -951,6 +957,56 @@ impl InteractiveController {
             }
             UiAction::ClearOutput => {}
         }
+        Ok(())
+    }
+
+    /// Shared switch flow used by `UiAction::SwitchSession`
+    /// (explicit session ID) and `UiAction::ResumeMostRecent`
+    /// (most-recently-modified other session). Loads the
+    /// target session's transcript, replays it through the
+    /// TUI via `TranscriptReplace`, refreshes the status
+    /// bar, and emits a SystemMessage breadcrumb so the user
+    /// knows which session they ended up on.
+    ///
+    /// Refuses while a run is active — ditto the inline
+    /// guard `SwitchSession` used to have. The caller is
+    /// expected to have already messaged the user about
+    /// that case before reaching here.
+    async fn switch_to_session(&mut self, session_id: &str) -> Result<()> {
+        if self.current_run.is_some() {
+            self.send_system_message("Cannot switch sessions while a run is active.")
+                .await;
+            return Ok(());
+        }
+        self.state.switch_session(session_id).await?;
+        self.cancel_pending_retry_for_run_affecting_change().await?;
+        let transcript = self
+            .state
+            .session_context()
+            .messages
+            .into_iter()
+            .map(|message| message.message)
+            .collect::<Vec<_>>();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::TranscriptReplace {
+                messages: transcript,
+            })
+            .await;
+        anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+        // Surface the user-set display name when present
+        // so the breadcrumb reads as the topic the user
+        // recognises rather than the UUID prefix.
+        let label = match self.state.session.name() {
+            Some(name) => format!("{name:?} ({session_id})"),
+            None => session_id.to_string(),
+        };
+        let _ = self
+            .event_tx
+            .send(AgentEvent::SystemMessage {
+                text: format!("Switched to session {label}"),
+            })
+            .await;
         Ok(())
     }
 

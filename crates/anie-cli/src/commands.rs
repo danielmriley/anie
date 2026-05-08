@@ -266,6 +266,10 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
         SlashCommandInfo::builtin("fork", "Create a child session branched from now"),
         SlashCommandInfo::builtin("diff", "Show file changes made in this session"),
         SlashCommandInfo::builtin("new", "Start a fresh session"),
+        SlashCommandInfo::builtin(
+            "resume",
+            "Switch to the most recently modified other session",
+        ),
         SlashCommandInfo::builtin_with_args(
             "session",
             "Show session info, list sessions, or switch",
@@ -529,6 +533,7 @@ mod tests {
             "fork",
             "diff",
             "new",
+            "resume",
             "session",
             "name",
             "tools",
