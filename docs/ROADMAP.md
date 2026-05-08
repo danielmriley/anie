@@ -172,6 +172,14 @@ across the two series").
       added a workspace-level cap. The Ollama native
       `/api/chat` codepath now sends the discovered
       `num_ctx` per model instead of the old 32K default.
+- [x] **Session management commands** — `/name [<name>]`
+      to set / clear a persistent user-set display name on
+      the current session (`f3652e6`, schema v5
+      `SessionHeader.name` with forward-compat), and
+      `/resume` to switch to the most-recently-modified
+      other session without typing an ID (`e74eb26`).
+      `/session list` + `/session <id>` switch were
+      already in place; `--resume <id>` CLI flag too.
 
 ## Next Up — Small, High-Impact
 
@@ -208,12 +216,18 @@ complete for `Enumerated` (e.g. `/thinking`) and `Subcommands`
 `ui.slash_command_popup_enabled = false` in `~/.anie/config.toml`.
 File-path `@` completion remains a follow-up.
 
-### 8. Session management commands (`/resume`, `/session`, `/name`)
-**What**: Browse past sessions, show session info, set display names.
-**Why**: Session management currently requires CLI flags or filesystem
-knowledge.
-**Effort**: Medium — session listing UI, metadata display.
-**Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
+### 8. Session management commands (`/resume`, `/session`, `/name`) — **shipped**
+- `/session list` and `/session <id>` switching landed
+  earlier (`UiAction::ListSessions`, `SwitchSession`).
+- `/name [<name>]` adds a user-set display name on the
+  current session (schema v5 `SessionHeader.name`,
+  atomic-rewrite persistence, surfaces in `/session list`
+  as `name (id)`). Commit `f3652e6`.
+- `/resume` switches to the most-recently-modified other
+  session — slash-command counterpart to `--resume <id>`
+  without typing the ID; refuses cleanly when no siblings
+  exist or a run is active. Commit `e74eb26`.
+- `--resume <id>` CLI flag was already in place.
 
 ## Longer-Term — Features
 
