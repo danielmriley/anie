@@ -87,7 +87,15 @@ use anie_provider::ThinkingLevel;
 /// |         | `CompactionDetails` shape at                          |
 /// |         | `packages/coding-agent/src/core/compaction/           |
 /// |         | compaction.ts:~33`.                                   |
-pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 4;
+/// | 5       | `SessionHeader.name` optional user-set display name   |
+/// |         | for the session, surfaced in `/session list` so       |
+/// |         | users can recognise sessions by topic instead of      |
+/// |         | by UUID prefix. Set / cleared via the `/name`         |
+/// |         | slash command. Forward- and backward-compatible via   |
+/// |         | serde defaults — older binaries loading a v5 session  |
+/// |         | ignore the field; older sessions loaded by a v5       |
+/// |         | binary present `name = None` (anonymous).             |
+pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 5;
 
 /// Session-file header. Always the first line in a session JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +114,14 @@ pub struct SessionHeader {
     /// Optional parent session ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<String>,
+    /// Optional user-set display name. Surfaces in
+    /// `/session list` instead of the UUID-prefix when
+    /// present. Set or cleared via the `/name` slash
+    /// command. Schema v5 (forward / backward compatible
+    /// via serde defaults — pre-v5 sessions read with
+    /// `name = None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Base fields shared by all session entries.
@@ -426,6 +442,9 @@ pub struct SessionInfo {
     pub message_count: u32,
     /// First user-authored message, when available.
     pub first_message: String,
+    /// User-set display name from `SessionHeader.name`.
+    /// `None` when the session is anonymous or pre-v5.
+    pub name: Option<String>,
 }
 
 /// Append-only JSONL session manager.
@@ -479,6 +498,7 @@ impl SessionManager {
             timestamp: now_iso8601()?,
             cwd: cwd.display().to_string(),
             parent_session,
+            name: None,
         };
 
         let mut file_handle = OpenOptions::new()
@@ -580,6 +600,65 @@ impl SessionManager {
     #[must_use]
     pub fn header(&self) -> &SessionHeader {
         &self.header
+    }
+
+    /// Set or clear the user-facing display name for this
+    /// session. Schema v5 (`SessionHeader.name`). Rewrites
+    /// the whole session file atomically — the JSONL header
+    /// is the first line, so changing it requires touching
+    /// the entire file. Cleared (passed `None` or an empty /
+    /// whitespace-only `Some`) yields `name = None`, which
+    /// renders as anonymous (UUID-prefix only) in
+    /// `/session list`.
+    ///
+    /// On success the in-memory `SessionManager` is wired
+    /// to the rewritten file so subsequent `append_*` calls
+    /// land at the new tail.
+    pub fn set_name(&mut self, name: Option<&str>) -> Result<()> {
+        let normalized = name.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        // No-op when the value isn't actually changing —
+        // avoids rewriting the file (and re-acquiring the
+        // file handle) on a redundant `/name` invocation.
+        if normalized == self.header.name {
+            return Ok(());
+        }
+        self.header.name = normalized;
+        self.rewrite_file_with_current_state()
+    }
+
+    /// Atomically rewrite the JSONL session file from the
+    /// in-memory header + entries, then re-open the write
+    /// handle so future appends go to the new file. Used by
+    /// header-mutating operations like `set_name` where the
+    /// JSONL's first-line header has to change. Append-only
+    /// entry mutators stay on the existing `file_handle.write`
+    /// path — this is the rare slow path.
+    fn rewrite_file_with_current_state(&mut self) -> Result<()> {
+        let mut buffer = String::new();
+        buffer.push_str(&serde_json::to_string(&self.header)?);
+        buffer.push('\n');
+        for entry in &self.entries {
+            buffer.push_str(&serde_json::to_string(entry)?);
+            buffer.push('\n');
+        }
+        anie_config::atomic_write(&self.path, buffer.as_bytes())
+            .with_context(|| format!("failed to rewrite {}", self.path.display()))?;
+        // Reopen the write handle in append mode so
+        // subsequent `append_*` calls land after the
+        // rewritten content.
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to reopen {}", self.path.display()))?;
+        self.file_handle = file;
+        Ok(())
     }
 
     /// Return the current active leaf entry ID.
@@ -1007,6 +1086,7 @@ impl SessionManager {
                 modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 message_count,
                 first_message,
+                name: header.name,
             });
         }
 
@@ -2540,6 +2620,7 @@ mod tests {
                 timestamp: "2026-04-14T00:00:00Z".into(),
                 cwd: "/tmp".into(),
                 parent_session: None,
+                name: None,
             })
             .expect("header"),
             serde_json::to_string(&SessionEntry::Message {
@@ -3184,6 +3265,111 @@ mod tests {
 
         let second = SessionManager::open_session(&path).expect("reopen");
         assert!(second.by_id.contains_key(&id));
+    }
+
+    /// Schema v5 forward-compat: a session file written
+    /// before `name` existed (no `name` field on the header
+    /// line, schema version 4) must load cleanly with
+    /// `header.name = None`. The future-version mismatch
+    /// path is already covered above (`version + 5`); this
+    /// is the matching backwards case.
+    #[test]
+    fn pre_v5_session_loads_with_name_none() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.jsonl");
+        // Pre-v5 header — no `name` field at all. Mirrors
+        // what an anie binary that didn't know about
+        // `SessionHeader.name` would write.
+        let pre_v5 = serde_json::json!({
+            "type": "session",
+            "version": 4,
+            "id": "legacy01",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "cwd": "/tmp/legacy",
+        });
+        std::fs::write(&path, format!("{pre_v5}\n")).expect("seed legacy file");
+        let session = SessionManager::open_session(&path).expect("reopen legacy");
+        assert_eq!(session.header().name, None);
+        assert_eq!(session.header().version, 4);
+    }
+
+    /// `/name` happy path: setting a non-empty name
+    /// persists it; the in-memory state reflects the new
+    /// value, and re-opening the session reads the same
+    /// name back from disk. Regression guard for the
+    /// rewrite-the-whole-file path being the rare slow
+    /// path — easy to silently break on a future refactor.
+    #[test]
+    fn set_name_persists_through_atomic_rewrite() {
+        let dir = tempdir().expect("tempdir");
+        let sessions_dir = dir.path();
+        let cwd = sessions_dir.join("project");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(sessions_dir, &cwd).expect("new");
+        let path = session.path.clone();
+        // Append a message so the rewrite path has more
+        // than just the header to round-trip.
+        session
+            .append_message(&user_message("hello", 1))
+            .expect("append");
+        session.set_name(Some("auth-rewrite")).expect("set name");
+        assert_eq!(session.header().name.as_deref(), Some("auth-rewrite"));
+
+        let reopened = SessionManager::open_session(&path).expect("reopen");
+        assert_eq!(reopened.header().name.as_deref(), Some("auth-rewrite"));
+        assert_eq!(reopened.entries().len(), 1);
+    }
+
+    /// `set_name(None)` on a previously-named session
+    /// clears the field; `None` / whitespace-only on an
+    /// unnamed session is a no-op (no rewrite). The
+    /// trim+empty-disables path keeps `/name ""` from
+    /// persisting an empty-string display name that the
+    /// formatter would have to special-case.
+    #[test]
+    fn set_name_clears_and_normalizes_whitespace() {
+        let dir = tempdir().expect("tempdir");
+        let sessions_dir = dir.path();
+        let cwd = sessions_dir.join("project");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(sessions_dir, &cwd).expect("new");
+        session.set_name(Some("first")).expect("set first");
+        assert_eq!(session.header().name.as_deref(), Some("first"));
+        session.set_name(None).expect("clear");
+        assert_eq!(session.header().name, None);
+        // Whitespace-only is treated as clear; idempotent
+        // even with leading/trailing whitespace.
+        session.set_name(Some("   ")).expect("whitespace clear");
+        assert_eq!(session.header().name, None);
+        // Surrounding whitespace is trimmed.
+        session.set_name(Some("  spaced  ")).expect("trim");
+        assert_eq!(session.header().name.as_deref(), Some("spaced"));
+    }
+
+    /// After `set_name`, future `append_message` calls
+    /// must still land at the tail of the rewritten file —
+    /// the reopened handle has to be in append mode and
+    /// pointed at the new file. Regression guard for the
+    /// "after rewrite, appends silently overwrite the
+    /// header" failure mode.
+    #[test]
+    fn append_after_set_name_lands_after_existing_entries() {
+        let dir = tempdir().expect("tempdir");
+        let sessions_dir = dir.path();
+        let cwd = sessions_dir.join("project");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(sessions_dir, &cwd).expect("new");
+        let path = session.path.clone();
+        session
+            .append_message(&user_message("first", 1))
+            .expect("append 1");
+        session.set_name(Some("rename")).expect("rename");
+        session
+            .append_message(&user_message("second", 2))
+            .expect("append 2");
+        let reopened = SessionManager::open_session(&path).expect("reopen");
+        assert_eq!(reopened.entries().len(), 2);
+        assert_eq!(reopened.header().name.as_deref(), Some("rename"));
     }
 }
 

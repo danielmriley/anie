@@ -230,6 +230,7 @@ dependencies = [
 name = "anie-session"
 version = "0.1.0"
 dependencies = [
+ "anie-config",
  "anie-protocol",
  "anie-provider",
  "anyhow",

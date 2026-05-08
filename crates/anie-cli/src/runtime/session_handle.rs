@@ -99,6 +99,20 @@ impl SessionHandle {
         SessionManager::list_sessions(&self.sessions_dir)
     }
 
+    /// Set or clear the user-facing display name on the
+    /// current session. See [`SessionManager::set_name`] for
+    /// the trim / whitespace-as-clear / persistence rules.
+    pub(crate) fn set_name(&mut self, name: Option<&str>) -> Result<()> {
+        self.session.set_name(name)
+    }
+
+    /// Read-only access to the current session's display
+    /// name (`SessionHeader.name`). `None` for anonymous /
+    /// pre-v5 sessions.
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.session.header().name.as_deref()
+    }
+
     /// Replace the active session with a newly-created sibling.
     /// Caller should follow up with config/runtime-state
     /// reconciliation.

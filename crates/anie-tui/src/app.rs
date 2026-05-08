@@ -275,6 +275,11 @@ pub enum UiAction {
     ListSessions,
     /// Switch to another session by ID.
     SwitchSession(String),
+    /// Set or clear the user-facing display name on the
+    /// current session. `None` clears; `Some(empty /
+    /// whitespace)` is normalised to clear by the
+    /// session manager.
+    SetSessionName(Option<String>),
     /// Show registered tools.
     ShowTools,
     /// Show installed skills (catalog + active set).
@@ -1584,6 +1589,15 @@ impl App {
                         .send(UiAction::SwitchSession(session_id.to_string()));
                 }
             },
+            "name" => {
+                // `/name` (no arg) clears the display name.
+                // `/name <text>` sets it. The session
+                // manager trims + treats whitespace-only as
+                // a clear, so the dispatcher just forwards
+                // the raw payload.
+                let payload = arg.map(str::to_string);
+                let _ = self.action_tx.send(UiAction::SetSessionName(payload));
+            }
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
             "copy" => self.copy_last_assistant_to_clipboard(),

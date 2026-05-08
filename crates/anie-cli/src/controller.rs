@@ -876,6 +876,27 @@ impl InteractiveController {
                         .await;
                 }
             }
+            UiAction::SetSessionName(payload) => {
+                // Forward the user's raw `/name` argument
+                // (or `None` when no arg was given) to the
+                // session manager. It trims and treats empty
+                // / whitespace as a clear, so the dispatcher
+                // doesn't have to special-case those here.
+                match self.state.session.set_name(payload.as_deref()) {
+                    Ok(()) => {
+                        let breadcrumb = match self.state.session.name() {
+                            Some(name) => format!("Session display name set to {name:?}."),
+                            None => "Session display name cleared.".to_string(),
+                        };
+                        self.send_system_message(&breadcrumb).await;
+                        anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    }
+                    Err(error) => {
+                        self.send_system_message(&format!("Failed to set session name: {error}"))
+                            .await;
+                    }
+                }
+            }
             UiAction::ShowTools => {
                 let tools = self.state.tool_registry.definitions();
                 let body = if tools.is_empty() {
@@ -2600,6 +2621,14 @@ fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String
     sessions
         .iter()
         .map(|session| {
+            // When the user has set a display name via
+            // `/name`, surface it ahead of the ID so the
+            // line reads as "name (id)" instead of just
+            // "id". Anonymous sessions stay ID-only.
+            let label = match session.name.as_deref() {
+                Some(name) => format!("{name} ({})", session.id),
+                None => session.id.clone(),
+            };
             format!(
                 "{} {}  {}  {}",
                 if session.id == current_session_id {
@@ -2607,7 +2636,7 @@ fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String
                 } else {
                     ' '
                 },
-                session.id,
+                label,
                 session.cwd,
                 truncate_text(&session.first_message, 60),
             )
