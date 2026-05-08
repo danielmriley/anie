@@ -5,7 +5,7 @@ in flight, and what's next. Each row links to a plan
 series or doc; series with their own status trackers
 are linked at "see tracker."
 
-Last consolidated: 2026-05-07.
+Last consolidated: 2026-05-08.
 
 ## Active plan series
 
@@ -149,23 +149,56 @@ across the two series").
       (`crates/anie-tui/examples/typing_repro.rs`) that
       isolated the latency to anie's pipeline rather than
       the bytes leaving the process.
+- [x] **Automatic context compaction** —
+      [`midturn_compaction_2026-04-27/`](midturn_compaction_2026-04-27/)
+      Plans 01–06 all Done. Compaction now fires
+      proactively when token usage crosses the
+      context-aware reserve threshold, mid-turn or
+      between turns; `CompactionGate` trait sits on the
+      agent-loop boundary so the controller decides; tool-
+      output caps scale with the live context window;
+      `CompactionPhase` events drive `/state` rendering
+      and the TUI activity-row labels.
+- [x] **Local model context length detection** — three
+      coordinated plans:
+      [`ollama_capability_discovery/`](ollama_capability_discovery/)
+      replaced substring family-name matching with
+      authoritative `/api/show` probing (capability flags
+      + per-model `context_window`),
+      [`ollama_context_length_override/`](ollama_context_length_override/)
+      added the `/context-length` slash command for
+      persistent per-model user override, and
+      [`ollama_default_num_ctx_cap/`](ollama_default_num_ctx_cap/)
+      added a workspace-level cap. The Ollama native
+      `/api/chat` codepath now sends the discovered
+      `num_ctx` per model instead of the old 32K default.
 
 ## Next Up — Small, High-Impact
 
-### 1. Automatic context compaction
-**What**: Trigger compaction automatically when approaching the context limit.
-**Why**: Prevents context overflow errors. Currently compaction exists but
-must be triggered manually or by overflow recovery.
-**Effort**: Medium — threshold detection, automatic trigger, TUI indicator.
-**Details**: [docs/notes/local_model_support.md](notes/local_model_support.md)
+### 1. Automatic context compaction — **shipped**
+Landed across the `midturn_compaction_2026-04-27/` plan
+series (Plans 01–06, all Done): context-aware reserve,
+per-turn budget, agent-loop `CompactionGate` trait,
+mid-turn `auto_compact` execution wired into the
+controller's main loop, tool-output caps that scale with
+the live context window, and compaction telemetry
+(`CompactionPhase` events, `/state` rendering, TUI
+activity-row phase labels). See
+[`midturn_compaction_2026-04-27/execution/README.md`](midturn_compaction_2026-04-27/execution/README.md).
 
-### 6. Local model context length detection
-**What**: Query Ollama/vLLM for actual context window size instead of
-defaulting to 32K.
-**Why**: Incorrect context length leads to either wasted capacity or
-overflow errors.
-**Effort**: Medium — API queries, config override, caching.
-**Details**: [docs/notes/local_model_support.md](notes/local_model_support.md)
+### 6. Local model context length detection — **shipped**
+Landed across three coordinated plans:
+[`ollama_capability_discovery/`](ollama_capability_discovery/)
+(authoritative `/api/show`-driven `Model.context_window`
+per model, plus capability flags),
+[`ollama_context_length_override/`](ollama_context_length_override/)
+(`/context-length` slash command for per-model user
+override with persistence), and
+[`ollama_default_num_ctx_cap/`](ollama_default_num_ctx_cap/)
+(workspace-level `num_ctx` cap for constrained hardware).
+The Ollama native `/api/chat` codepath sends the
+discovered `num_ctx` on every request rather than the old
+32K default.
 
 ### 7. Slash command autocomplete menu — **shipped**
 Landed via plans 11 and 12. Typing `/` opens a filterable popup
