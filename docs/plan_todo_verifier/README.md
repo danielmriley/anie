@@ -475,27 +475,29 @@ warnings`; `cargo fmt --check`; manual smoke per
 
 ## 7. Exit criteria
 
-- [ ] `todo_write` tool registered and callable; full-replace
-      semantics; typed `ToolError` on bad input.
-- [ ] `TodoList` is controller-owned `Arc<Mutex<_>>`, shared by
-      the tool and the verifier (one source of truth).
-- [ ] Todo progress renders in transcript (tool result) and
-      status bar (`todo: d/t`).
-- [ ] `VerifierPolicy` injects a one-shot, **context-only**
+- [x] `todo_write` tool registered and callable; full-replace
+      semantics; typed `ToolError` on bad input. (PR 1/2)
+- [x] `TodoList` is controller-owned `Arc<Mutex<_>>`, shared by
+      the tool and the verifier (one source of truth). (PR 2)
+- [x] Todo progress renders in transcript (tool result) and
+      status bar (`todo: d/t`). (PR 3)
+- [x] `VerifierPolicy` injects a one-shot, **context-only**
       critique under `ANIE_VERIFIER=1`; byte-identical to today
-      when unset.
-- [ ] `ChainedBeforeModelPolicy` composes verifier + context-virt
-      deterministically; rlm mode unaffected.
-- [ ] `CURRENT_SESSION_SCHEMA_VERSION` unchanged (no persisted
+      when unset. (PR 4; end-to-end proof in PR 5)
+- [x] `ChainedBeforeModelPolicy` composes verifier + context-virt
+      deterministically; rlm mode unaffected. (PR 4)
+- [x] `CURRENT_SESSION_SCHEMA_VERSION` unchanged (no persisted
       field).
-- [ ] `cargo test --workspace`, `cargo clippy --workspace
+- [x] `cargo test --workspace`, `cargo clippy --workspace
       --all-targets -- -D warnings`, `cargo fmt --check` all green.
-- [ ] Manual smoke (`docs/smoke_protocol_2026-05-01.md`): a real
-      run writes a plan, the verifier critique fires once, no
-      loops, no 400s.
-- [ ] `docs/arch/anie-rs_architecture.md` documents the todo state
-      + verifier seam.
-- [ ] `docs/ROADMAP.md` marks initiative #3 landed.
+- [~] Manual smoke (`docs/smoke_protocol_2026-05-01.md`): the
+      end-to-end test (`todo_plan_drives_verifier_critique_end_to_end`)
+      drives the full path under a mock provider — plan written, one-shot
+      critique injected, context-only, no loop. A live-provider smoke
+      needs an API key (not run here).
+- [x] `docs/arch/anie-rs_architecture.md` documents the todo state
+      + verifier seam. (PR 5)
+- [x] `docs/ROADMAP.md` marks the initiative landed. (PR 5)
 
 ---
 
