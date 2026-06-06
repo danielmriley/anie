@@ -893,6 +893,7 @@ async fn queue_prompt_appends_to_fifo_queue_while_active() {
             generated_messages: Vec::new(),
             final_context: Vec::new(),
             terminal_error: None,
+            terminal_stop: None,
         }
     });
     controller.current_run = Some(CurrentRun {
@@ -1294,6 +1295,7 @@ async fn abort_and_queue_during_active_run_front_queues_and_cancels() {
             generated_messages: Vec::new(),
             final_context: Vec::new(),
             terminal_error: None,
+            terminal_stop: None,
         }
     });
     controller.current_run = Some(CurrentRun {
@@ -1585,6 +1587,19 @@ fn state_summary_includes_cost_block_with_run_and_session_dollars() {
     assert!(summary.contains("Cost this session"), "{summary}");
     assert!(summary.contains("$18.0000"), "{summary}");
     assert!(summary.contains("2000000 tokens"), "{summary}");
+}
+
+#[test]
+fn format_run_stop_renders_budget_exceeded_as_actionable_message() {
+    let message = super::format_run_stop(&anie_agent::RunStopReason::BudgetExceeded {
+        scope: anie_agent::BudgetScope::Run,
+        limit: anie_agent::BudgetLimit::Cost(0.5),
+        spent: 0.73,
+    });
+    assert!(message.contains("Budget reached (run)"), "{message}");
+    assert!(message.contains("$0.7300"), "{message}");
+    assert!(message.contains("$0.5000"), "{message}");
+    assert!(message.contains("Partial work has been saved"), "{message}");
 }
 
 #[test]

@@ -189,7 +189,7 @@ mod send_event_tests {
 
 use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, StreamDelta, ToolCall,
-    ToolResult, ToolResultMessage, now_millis,
+    ToolResult, ToolResultMessage, Usage, now_millis,
 };
 use anie_provider::{
     LlmContext, Model, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
@@ -292,6 +292,11 @@ pub struct BeforeModelRequest<'a> {
     /// per run; stays consistent with the `run_step` field on
     /// the `agent_repl_step` tracing span.
     pub step_index: u64,
+    /// Token usage accumulated by this run so far (summed over the
+    /// assistant messages generated in this run). Lets a policy gate on
+    /// run cost/tokens without holding shared state. Empty before the
+    /// first assistant message.
+    pub run_usage: &'a Usage,
 }
 
 /// What a [`BeforeModelPolicy`] returns. `Continue` is the
@@ -325,6 +330,42 @@ pub enum BeforeModelResponse {
     /// Plan `docs/rlm_2026-04-29/06_phased_implementation.md`
     /// Phase C.
     ReplaceMessages(Vec<Message>),
+    /// Halt the run before the next model request. The loop finalizes
+    /// cleanly — no further provider call — and records `reason` as the
+    /// run's terminal condition (`AgentRunResult::terminal_stop`). Used
+    /// by the budget policy to stop a runaway turn at a step boundary.
+    StopRun(RunStopReason),
+}
+
+/// Why a [`BeforeModelPolicy`] asked the loop to stop. A typed terminal
+/// condition (not a `ProviderError` — a stop is not a wire/stream
+/// failure) the controller surfaces cleanly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunStopReason {
+    /// A configured budget ceiling was reached before the next turn.
+    BudgetExceeded {
+        scope: BudgetScope,
+        limit: BudgetLimit,
+        /// What was actually spent (dollars for `Cost`, tokens for
+        /// `Tokens`) when the ceiling tripped.
+        spent: f64,
+    },
+}
+
+/// Whether a budget ceiling applies to one run or the whole session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetScope {
+    Run,
+    Session,
+}
+
+/// The kind of ceiling that tripped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BudgetLimit {
+    /// Dollar ceiling.
+    Cost(f64),
+    /// Token-count ceiling.
+    Tokens(u64),
 }
 
 /// Hook invoked before every `ModelTurn` step. The default
@@ -343,6 +384,21 @@ pub trait BeforeModelPolicy: Send + Sync {
     /// Inspect the upcoming model request and either let it
     /// proceed unchanged or append context messages first.
     async fn before_model(&self, request: BeforeModelRequest<'_>) -> BeforeModelResponse;
+}
+
+/// Sum token usage across the assistant messages generated so far in a
+/// run — the `run_usage` a policy sees on each `before_model` call.
+fn sum_run_usage(messages: &[Message]) -> Usage {
+    let mut total = Usage::default();
+    for message in messages {
+        if let Message::Assistant(assistant) = message {
+            total.input_tokens += assistant.usage.input_tokens;
+            total.output_tokens += assistant.usage.output_tokens;
+            total.cache_read_tokens += assistant.usage.cache_read_tokens;
+            total.cache_write_tokens += assistant.usage.cache_write_tokens;
+        }
+    }
+    total
 }
 
 /// Default `BeforeModelPolicy` — always returns `Continue`.
@@ -390,6 +446,7 @@ impl BeforeModelPolicy for ChainedBeforeModelPolicy {
                 generated_messages: request.generated_messages,
                 model: request.model,
                 step_index: request.step_index,
+                run_usage: request.run_usage,
             };
             match policy.before_model(child_request).await {
                 BeforeModelResponse::Continue => {}
@@ -400,6 +457,11 @@ impl BeforeModelPolicy for ChainedBeforeModelPolicy {
                 BeforeModelResponse::ReplaceMessages(messages) => {
                     working = messages;
                     changed = true;
+                }
+                // A stop short-circuits the chain: no later policy runs,
+                // and the loop halts before the next model request.
+                BeforeModelResponse::StopRun(reason) => {
+                    return BeforeModelResponse::StopRun(reason);
                 }
             }
         }
@@ -561,6 +623,10 @@ pub struct AgentRunResult {
     pub final_context: Vec<Message>,
     /// Structured terminal provider error, if the run ended with one.
     pub terminal_error: Option<ProviderError>,
+    /// Typed non-error terminal condition (e.g. a budget ceiling) if the
+    /// run was stopped by a policy. Distinct from `terminal_error`: a
+    /// stop is a clean halt, not a failure.
+    pub terminal_stop: Option<RunStopReason>,
 }
 
 /// Mutable per-run state owned by `AgentLoop::run`. Holds the
@@ -578,6 +644,7 @@ struct AgentRunState {
     context: Vec<Message>,
     generated_messages: Vec<Message>,
     terminal_error: Option<ProviderError>,
+    terminal_stop: Option<RunStopReason>,
     finished: bool,
     /// Set by `finish_with_assistant` (the preflight failure
     /// path) so the driver's tail `AgentEnd` emission does not
@@ -601,6 +668,7 @@ impl AgentRunState {
             context,
             generated_messages: Vec::new(),
             terminal_error: None,
+            terminal_stop: None,
             finished: false,
             suppress_tail_agent_end: false,
             step_index: 0,
@@ -666,6 +734,12 @@ impl AgentRunState {
         self.finished = true;
     }
 
+    /// Mark the run finished with a typed (non-error) stop condition.
+    fn finish_with_stop(&mut self, reason: RunStopReason) {
+        self.terminal_stop = Some(reason);
+        self.finished = true;
+    }
+
     /// Mark the run finished and record a terminal provider
     /// error for the controller's retry policy.
     fn finish_with_error(&mut self, error: ProviderError) {
@@ -678,6 +752,7 @@ impl AgentRunState {
             generated_messages: self.generated_messages,
             final_context: self.context,
             terminal_error: self.terminal_error,
+            terminal_stop: self.terminal_stop,
         }
     }
 }
@@ -955,11 +1030,13 @@ impl AgentLoop {
         // injection (if any) is context-only: policy messages
         // are not added to `generated_messages` and the
         // controller does not persist them as agent output.
+        let run_usage = sum_run_usage(state.generated_messages());
         let policy_request = BeforeModelRequest {
             context: state.context(),
             generated_messages: state.generated_messages(),
             model: &self.config.model,
             step_index: state.step_index,
+            run_usage: &run_usage,
         };
         match self
             .config
@@ -973,6 +1050,14 @@ impl AgentLoop {
             }
             BeforeModelResponse::ReplaceMessages(messages) => {
                 state.replace_context(messages);
+            }
+            // A policy asked to stop (e.g. budget ceiling). Finalize the
+            // run cleanly with no further provider call; the tail
+            // `AgentEnd` emits normally and the controller surfaces the
+            // typed `terminal_stop`.
+            BeforeModelResponse::StopRun(reason) => {
+                state.finish_with_stop(reason);
+                return AgentObservation::Finished;
             }
         }
 

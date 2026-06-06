@@ -135,7 +135,14 @@ mod tests {
             generated_messages: EMPTY,
             model: model(),
             step_index,
+            run_usage: empty_usage(),
         }
+    }
+
+    fn empty_usage() -> &'static anie_protocol::Usage {
+        use std::sync::OnceLock;
+        static USAGE: OnceLock<anie_protocol::Usage> = OnceLock::new();
+        USAGE.get_or_init(anie_protocol::Usage::default)
     }
 
     fn model() -> &'static anie_provider::Model {

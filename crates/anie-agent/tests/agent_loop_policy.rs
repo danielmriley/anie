@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use anie_agent::{
     AgentLoop, AgentLoopConfig, BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse,
-    NoopBeforeModelPolicy, ToolExecutionMode, ToolRegistry,
+    BudgetLimit, BudgetScope, NoopBeforeModelPolicy, RunStopReason, ToolExecutionMode,
+    ToolRegistry,
 };
 use anie_protocol::{AssistantMessage, ContentBlock, Message, StopReason, Usage, UserMessage};
 use anie_provider::{
@@ -379,6 +380,7 @@ async fn chained_policy_threads_replace_then_append() {
             generated_messages: &[],
             model: &model,
             step_index: 0,
+            run_usage: &Usage::default(),
         })
         .await;
     match response {
@@ -409,6 +411,7 @@ async fn chained_policy_all_continue_returns_continue() {
             generated_messages: &[],
             model: &model,
             step_index: 0,
+            run_usage: &Usage::default(),
         })
         .await;
     assert_eq!(response, BeforeModelResponse::Continue);
@@ -507,4 +510,76 @@ async fn agent_loop_leaves_cost_zero_when_model_pricing_is_zero() {
         first_assistant_cost(&result),
         anie_protocol::Cost::default()
     );
+}
+
+// =========================================================================
+// StopRun — typed terminal stop (cost/PR3)
+// =========================================================================
+
+struct AlwaysStop;
+
+#[async_trait]
+impl BeforeModelPolicy for AlwaysStop {
+    async fn before_model(&self, _request: BeforeModelRequest<'_>) -> BeforeModelResponse {
+        BeforeModelResponse::StopRun(RunStopReason::BudgetExceeded {
+            scope: BudgetScope::Run,
+            limit: BudgetLimit::Cost(1.0),
+            spent: 3.0,
+        })
+    }
+}
+
+#[tokio::test]
+async fn before_model_stop_run_finalizes_loop_without_further_provider_call() {
+    // The provider is scripted with a response, but the stop fires before
+    // the first ModelTurn — so the script is never consumed and no
+    // assistant message is generated.
+    let scripts = vec![MockStreamScript::from_message(assistant_text(
+        "unused",
+        StopReason::Stop,
+    ))];
+    let agent = build_loop(scripts, config_with_policy(Some(Arc::new(AlwaysStop))));
+    let (tx, _rx) = mpsc::channel(64);
+    let result = agent
+        .run(
+            vec![user_prompt("hi")],
+            Vec::new(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        result.generated_messages.is_empty(),
+        "provider must not be called"
+    );
+    assert!(result.terminal_stop.is_some(), "stop recorded");
+}
+
+#[tokio::test]
+async fn agent_run_result_carries_terminal_stop_not_provider_error_on_budget_stop() {
+    let scripts = vec![MockStreamScript::from_message(assistant_text(
+        "unused",
+        StopReason::Stop,
+    ))];
+    let agent = build_loop(scripts, config_with_policy(Some(Arc::new(AlwaysStop))));
+    let (tx, _rx) = mpsc::channel(64);
+    let result = agent
+        .run(
+            vec![user_prompt("hi")],
+            Vec::new(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        result.terminal_error.is_none(),
+        "a budget stop is not a provider error"
+    );
+    assert!(matches!(
+        result.terminal_stop,
+        Some(RunStopReason::BudgetExceeded {
+            scope: BudgetScope::Run,
+            ..
+        })
+    ));
 }

@@ -4,6 +4,7 @@
 mod bg_embedder;
 mod bg_summarizer;
 mod bootstrap;
+mod budget_policy;
 mod commands;
 mod compaction;
 mod compaction_gate;

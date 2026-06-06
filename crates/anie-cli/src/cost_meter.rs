@@ -86,6 +86,12 @@ impl CostMeter {
         sum_assistant_usage(&mut ledger.session, messages);
     }
 
+    /// The session token accumulator (the budget policy's baseline at
+    /// run start).
+    pub(crate) fn session_usage(&self) -> Usage {
+        self.lock_ledger().session.clone()
+    }
+
     pub(crate) fn snapshot(&self) -> CostSnapshot {
         let ledger = self.lock_ledger();
         let pricing = self.lock_pricing();

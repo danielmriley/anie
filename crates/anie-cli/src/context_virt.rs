@@ -1229,6 +1229,7 @@ mod tests {
             generated_messages: &[],
             model: Box::leak(Box::new(sample_model())),
             step_index: 0,
+            run_usage: Box::leak(Box::new(anie_protocol::Usage::default())),
         }
     }
 

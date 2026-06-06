@@ -8,8 +8,9 @@ mod tool;
 
 pub use agent_loop::{
     AgentLoop, AgentLoopConfig, AgentRunMachine, AgentRunResult, AgentStepBoundary,
-    BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, ChainedBeforeModelPolicy,
-    CompactionGate, CompactionGateOutcome, NoopBeforeModelPolicy, ToolExecutionMode, send_event,
+    BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, BudgetLimit, BudgetScope,
+    ChainedBeforeModelPolicy, CompactionGate, CompactionGateOutcome, NoopBeforeModelPolicy,
+    RunStopReason, ToolExecutionMode, send_event,
 };
 pub use recurse::{ContextProvider, RecurseScope, SubAgentBuildContext, SubAgentFactory};
 pub use tool::{

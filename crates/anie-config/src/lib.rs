@@ -54,6 +54,11 @@ pub struct AnieConfig {
     /// pi): pi has no MCP client. See `docs/mcp_client/`.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Optional per-run / per-session cost and token ceilings. All
+    /// `None` by default (opt-in; zero behavior change when unset).
+    /// See `docs/cost_budget/`.
+    #[serde(default)]
+    pub budget: BudgetConfig,
     /// True if a loaded config file (`~/.anie/config.toml` or
     /// a project-local `.anie/config.toml`) explicitly set the
     /// `[model]` section. Lets callers distinguish "the user
@@ -129,6 +134,26 @@ pub struct McpServerConfig {
     /// timeout the server is skipped and the rest of anie loads.
     #[serde(default = "default_mcp_startup_timeout_ms")]
     pub startup_timeout_ms: u64,
+}
+
+/// Optional cost/token ceilings. All `None` by default — the feature is
+/// opt-in and unset means no enforcement (byte-identical behavior).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BudgetConfig {
+    /// Halt a single run once its estimated cost reaches this many USD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_cost_usd: Option<f64>,
+    /// Refuse to start / halt once the session's estimated cost reaches
+    /// this many USD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_session_cost_usd: Option<f64>,
+    /// Halt a single run once it has consumed this many tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_tokens: Option<u64>,
+    /// Refuse to start / halt once the session has consumed this many
+    /// tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_session_tokens: Option<u64>,
 }
 
 fn default_mcp_enabled() -> bool {
@@ -1109,6 +1134,23 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.mcp.servers.insert(name, server);
         }
     }
+
+    // Budget ceilings overlay field-by-field so a project config can set
+    // one ceiling without clearing others from the global layer.
+    if let Some(budget) = partial.budget {
+        if budget.max_run_cost_usd.is_some() {
+            config.budget.max_run_cost_usd = budget.max_run_cost_usd;
+        }
+        if budget.max_session_cost_usd.is_some() {
+            config.budget.max_session_cost_usd = budget.max_session_cost_usd;
+        }
+        if budget.max_run_tokens.is_some() {
+            config.budget.max_run_tokens = budget.max_run_tokens;
+        }
+        if budget.max_session_tokens.is_some() {
+            config.budget.max_session_tokens = budget.max_session_tokens;
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -1141,6 +1183,8 @@ struct PartialAnieConfig {
     ui: Option<PartialUiConfig>,
     #[serde(default)]
     mcp: Option<McpConfig>,
+    #[serde(default)]
+    budget: Option<BudgetConfig>,
 }
 
 /// Optional `[ui]` overrides loaded from `config.toml`. Each
@@ -2138,6 +2182,29 @@ mod tests {
         let path = tempdir.path().join("config.toml");
         fs::write(&path, body).expect("write config");
         load_config_with_paths(Some(&path), None, CliOverrides::default()).expect("load config")
+    }
+
+    #[test]
+    fn budget_config_defaults_all_ceilings_to_none() {
+        let budget = BudgetConfig::default();
+        assert!(budget.max_run_cost_usd.is_none());
+        assert!(budget.max_session_cost_usd.is_none());
+        assert!(budget.max_run_tokens.is_none());
+        assert!(budget.max_session_tokens.is_none());
+    }
+
+    #[test]
+    fn budget_config_absent_section_loads_as_all_none() {
+        let config = load_body("[ui]\nmarkdown_enabled = true\n");
+        assert_eq!(config.budget, BudgetConfig::default());
+    }
+
+    #[test]
+    fn budget_config_parses_ceilings_from_toml() {
+        let config = load_body("[budget]\nmax_run_cost_usd = 0.5\nmax_session_tokens = 100000\n");
+        assert_eq!(config.budget.max_run_cost_usd, Some(0.5));
+        assert_eq!(config.budget.max_session_tokens, Some(100_000));
+        assert!(config.budget.max_session_cost_usd.is_none());
     }
 
     #[test]

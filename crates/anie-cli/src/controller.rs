@@ -453,6 +453,15 @@ impl InteractiveController {
                                     }
                                 } else {
                                     self.state.finish_run(&result).await?;
+                                    // A clean policy stop (e.g. budget
+                                    // ceiling): partial work is already
+                                    // persisted; surface it as a system
+                                    // message.
+                                    if let Some(stop) = &result.terminal_stop {
+                                        anie_agent::send_event(&self.event_tx, AgentEvent::SystemMessage {
+                                            text: format_run_stop(stop),
+                                        }).await;
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -986,7 +995,40 @@ impl InteractiveController {
         Ok(())
     }
 
+    /// If a configured *session* ceiling is already met, return the
+    /// message to show instead of starting a new run.
+    fn session_budget_block(&self) -> Option<String> {
+        let budget = &self.state.config.anie_config().budget;
+        let snap = self.state.cost_meter.snapshot();
+        if let Some(limit) = budget.max_session_cost_usd
+            && snap.session_cost.total >= limit
+        {
+            return Some(format!(
+                "Session budget reached: spent ${:.4} of the ${limit:.4} ceiling. \
+                 Raise `[budget] max_session_cost_usd` or start a new session with `/new`.",
+                snap.session_cost.total
+            ));
+        }
+        if let Some(limit) = budget.max_session_tokens
+            && snap.session_tokens >= limit
+        {
+            return Some(format!(
+                "Session token budget reached: {} of {limit} tokens. \
+                 Raise `[budget] max_session_tokens` or start a new session with `/new`.",
+                snap.session_tokens
+            ));
+        }
+        None
+    }
+
     async fn start_prompt_run(&mut self, text: String) -> Result<()> {
+        // Pre-run session-budget gate: if the session has already reached
+        // a configured session ceiling, refuse to start a new prompt
+        // cleanly rather than spending more.
+        if let Some(message) = self.session_budget_block() {
+            self.send_system_message(&message).await;
+            return Ok(());
+        }
         info!(
             provider = %self.state.config.current_model().provider,
             model = %self.state.config.current_model().id,
@@ -1845,25 +1887,33 @@ fn build_agent(
     )
     .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
     .with_compaction_gate(compaction_gate);
-    // Compose the before-model seam. The rlm context-virtualization
-    // policy (if any) runs first; the verifier (opt-in via ANIE_VERIFIER)
-    // runs second so its critique appends onto the virtualized context.
-    // When only one is present it installs directly; when neither is, the
-    // loop keeps its Noop default (byte-identical to today).
+    // Compose the before-model seam. Order: rlm context-virtualization
+    // (replace) first, then the verifier (append), then the budget gate
+    // (stop). Each is opt-in; with none installed the loop keeps its Noop
+    // default (byte-identical to today); with exactly one, it installs
+    // directly; with several, they fold through ChainedBeforeModelPolicy.
+    let mut policies: Vec<Arc<dyn anie_agent::BeforeModelPolicy>> = Vec::new();
+    if let Some(rlm) = rlm_extras.policy {
+        policies.push(rlm);
+    }
     let verifier = crate::verifier::VerifierPolicy::from_env(Arc::clone(&state.todo_list));
-    let verifier: Option<Arc<dyn anie_agent::BeforeModelPolicy>> = verifier
-        .is_enabled()
-        .then(|| Arc::new(verifier) as Arc<dyn anie_agent::BeforeModelPolicy>);
-    let policy: Option<Arc<dyn anie_agent::BeforeModelPolicy>> = match (rlm_extras.policy, verifier)
-    {
-        (Some(rlm), Some(verifier)) => {
-            Some(Arc::new(anie_agent::ChainedBeforeModelPolicy::new(vec![
-                rlm, verifier,
-            ])))
-        }
-        (Some(rlm), None) => Some(rlm),
-        (None, Some(verifier)) => Some(verifier),
-        (None, None) => None,
+    if verifier.is_enabled() {
+        policies.push(Arc::new(verifier));
+    }
+    let budget = crate::budget_policy::BudgetPolicy::new(
+        state.config.anie_config().budget.clone(),
+        state.config.current_model().cost_per_million.clone(),
+        state.cost_meter.session_usage(),
+    );
+    if budget.is_enforcing() {
+        policies.push(Arc::new(budget));
+    }
+    let policy: Option<Arc<dyn anie_agent::BeforeModelPolicy>> = if policies.len() <= 1 {
+        policies.pop()
+    } else {
+        Some(Arc::new(anie_agent::ChainedBeforeModelPolicy::new(
+            policies,
+        )))
     };
     if let Some(policy) = policy {
         config = config.with_before_model_policy(policy);
@@ -2187,6 +2237,35 @@ fn current_date_ymd() -> Result<String> {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     now.format(DATE_FORMAT)
         .context("failed to format current date")
+}
+
+/// Render a typed run-stop reason as a user-facing system message.
+fn format_run_stop(stop: &anie_agent::RunStopReason) -> String {
+    use anie_agent::{BudgetLimit, BudgetScope, RunStopReason};
+    match stop {
+        RunStopReason::BudgetExceeded {
+            scope,
+            limit,
+            spent,
+        } => {
+            let scope_label = match scope {
+                BudgetScope::Run => "run",
+                BudgetScope::Session => "session",
+            };
+            let (limit_label, spent_label) = match limit {
+                BudgetLimit::Cost(limit) => (format!("${limit:.4}"), format!("${spent:.4}")),
+                BudgetLimit::Tokens(limit) => (
+                    format!("{limit} tokens"),
+                    format!("{} tokens", *spent as u64),
+                ),
+            };
+            format!(
+                "Budget reached ({scope_label}): spent {spent_label} of the {limit_label} ceiling. \
+                 Raise the `[budget]` limit in config, or start a new session with `/new`. \
+                 Partial work has been saved."
+            )
+        }
+    }
 }
 
 pub(crate) fn parse_thinking_level(value: &str) -> Result<ThinkingLevel, String> {
