@@ -10,6 +10,7 @@ mod ls;
 mod read;
 mod recurse;
 mod shared;
+mod text_match;
 mod todo;
 mod write;
 

@@ -1181,6 +1181,35 @@ async fn edit_tool_applies_exact_replacements_and_returns_diff() {
     assert!(diff.contains("+    println!(\"new\");"));
 }
 
+/// Golden: after the matching engine was extracted into `text_match`
+/// (apply_patch/PR2), `edit`'s observable output — success message and
+/// rendered diff — must be byte-identical to before the refactor.
+#[tokio::test]
+async fn edit_tool_output_unchanged_after_engine_extraction() {
+    let tempdir = tempdir().expect("tempdir");
+    tokio::fs::write(tempdir.path().join("g.txt"), "alpha\nbeta\ngamma\n")
+        .await
+        .expect("seed");
+    let tool = EditTool::new(tempdir.path());
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "g.txt",
+                "edits": [{ "oldText": "beta", "newText": "BETA" }]
+            }),
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect("edit succeeds");
+
+    assert_eq!(text_content(&result), "Applied 1 edit to g.txt");
+    let diff = result.details["diff"].as_str().expect("diff");
+    assert_eq!(diff, " alpha\n-beta\n+BETA\n gamma");
+}
+
 #[tokio::test]
 async fn edit_tool_detects_duplicate_matches() {
     let tempdir = tempdir().expect("tempdir");

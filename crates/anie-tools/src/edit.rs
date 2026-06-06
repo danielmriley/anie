@@ -1,7 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use similar::{ChangeTag, TextDiff};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -11,6 +10,7 @@ use anie_protocol::ToolDef;
 use crate::{
     FileMutationQueue,
     shared::{required_string_arg, resolve_path, text_result},
+    text_match::{self, Edit},
 };
 
 pub(crate) const MAX_EDIT_COUNT: usize = 100;
@@ -116,7 +116,9 @@ impl Tool for EditTool {
                 })?;
                 let line_ending = detect_line_ending(&text);
                 let normalized = normalize_to_lf(&text);
-                let (new_normalized, diff) = apply_edits(&normalized, &edits, path)?;
+                let outcome = text_match::apply_edits(&normalized, &edits, path)?;
+                let new_normalized = outcome.updated;
+                let diff = text_match::render_diff(&normalized, &new_normalized);
                 let restored = restore_line_endings(&new_normalized, line_ending);
                 let output_bytes = encode_utf8_with_bom(&restored, has_bom);
                 if output_bytes.len() > MAX_EDIT_OUTPUT_FILE_BYTES {
@@ -148,20 +150,6 @@ impl Tool for EditTool {
             })
             .await
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Edit {
-    old_text: String,
-    new_text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MatchedEdit {
-    edit_index: usize,
-    start: usize,
-    end: usize,
-    new_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,122 +226,6 @@ fn enforce_edit_text_limit(
     Ok(())
 }
 
-fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<(String, String), ToolError> {
-    let mut matched = Vec::with_capacity(edits.len());
-    // Plan 07 PR-D: lazily compute the normalized content +
-    // index map at most once per edit batch. Most batches
-    // hit the exact-match fast path on every edit and never
-    // need fuzzy normalization; the first fuzzy fallback
-    // materializes the cache, and subsequent fuzzy edits in
-    // the same batch reuse it.
-    let mut fuzzy_cache: Option<(String, Vec<usize>)> = None;
-
-    for (index, edit) in edits.iter().enumerate() {
-        if edit.old_text.is_empty() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "edit #{index} for {path} has an empty oldText",
-            )));
-        }
-
-        let exact_matches = find_all_occurrences(content, &edit.old_text);
-        if exact_matches.len() > 1 {
-            return Err(ToolError::ExecutionFailed(format!(
-                "edit #{index} for {path} matched {} regions; make oldText unique",
-                exact_matches.len(),
-            )));
-        }
-        if let Some((start, end)) = exact_matches.first().copied() {
-            matched.push(MatchedEdit {
-                edit_index: index,
-                start,
-                end,
-                new_text: edit.new_text.clone(),
-            });
-            continue;
-        }
-
-        let fuzzy_cache = fuzzy_cache.get_or_insert_with(|| normalize_for_fuzzy_match(content));
-        let fuzzy_matches = fuzzy_find_all_occurrences_in_normalized(
-            &fuzzy_cache.0,
-            &fuzzy_cache.1,
-            content.len(),
-            &edit.old_text,
-        );
-        if fuzzy_matches.is_empty() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "edit #{index} for {path} did not match anything",
-            )));
-        }
-        if fuzzy_matches.len() > 1 {
-            return Err(ToolError::ExecutionFailed(format!(
-                "edit #{index} for {path} matched {} fuzzy regions; make oldText more specific",
-                fuzzy_matches.len(),
-            )));
-        }
-        let (start, end) = fuzzy_matches[0];
-        matched.push(MatchedEdit {
-            edit_index: index,
-            start,
-            end,
-            new_text: edit.new_text.clone(),
-        });
-    }
-
-    matched.sort_by_key(|edit| edit.start);
-    for pair in matched.windows(2) {
-        let left = &pair[0];
-        let right = &pair[1];
-        if left.end > right.start {
-            return Err(ToolError::ExecutionFailed(format!(
-                "edit #{} overlaps edit #{} in {path}; merge them into one replacement",
-                left.edit_index, right.edit_index,
-            )));
-        }
-    }
-
-    let mut updated = content.to_string();
-    for edit in matched.iter().rev() {
-        updated.replace_range(edit.start..edit.end, &edit.new_text);
-    }
-    let diff = render_diff(content, &updated);
-    Ok((updated, diff))
-}
-
-fn find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)> {
-    content
-        .match_indices(needle)
-        .map(|(start, matched)| (start, start + matched.len()))
-        .collect()
-}
-
-fn fuzzy_find_all_occurrences_in_normalized(
-    normalized_content: &str,
-    index_map: &[usize],
-    original_content_len: usize,
-    needle: &str,
-) -> Vec<(usize, usize)> {
-    let normalized_needle = normalize_fuzzy_pattern(needle);
-    if normalized_needle.is_empty() {
-        return Vec::new();
-    }
-
-    normalized_content
-        .match_indices(&normalized_needle)
-        .map(|(start_byte, matched)| {
-            let end_byte = start_byte + matched.len();
-            let start_char = normalized_content[..start_byte].chars().count();
-            let end_char = normalized_content[..end_byte].chars().count();
-            let start = index_map[start_char];
-            let end = if end_char < index_map.len() {
-                index_map[end_char]
-            } else {
-                original_content_len
-            };
-            (start, end)
-        })
-        .collect()
-}
-
 fn normalize_to_lf(value: &str) -> String {
     // Plan 07 PR-E: single-pass CRLF + CR → LF normalization.
     // The previous shape was `replace("\r\n", "\n").replace('\r', "\n")`
@@ -418,59 +290,4 @@ fn encode_utf8_with_bom(value: &str, has_bom: bool) -> Vec<u8> {
     }
     bytes.extend_from_slice(value.as_bytes());
     bytes
-}
-
-fn normalize_for_fuzzy_match(value: &str) -> (String, Vec<usize>) {
-    let mut normalized = String::new();
-    let mut index_map = Vec::new();
-    let mut chars = value.char_indices().peekable();
-
-    while let Some((index, ch)) = chars.next() {
-        if ch == '\n' {
-            normalized.push('\n');
-            index_map.push(index);
-            continue;
-        }
-
-        if ch.is_whitespace() {
-            normalized.push(' ');
-            index_map.push(index);
-            while let Some((_, next)) = chars.peek().copied() {
-                if next != '\n' && next.is_whitespace() {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        normalized.push(ch);
-        index_map.push(index);
-    }
-
-    (normalized, index_map)
-}
-
-fn normalize_fuzzy_pattern(value: &str) -> String {
-    let (normalized, _) = normalize_for_fuzzy_match(value);
-    normalized
-}
-
-fn render_diff(original: &str, updated: &str) -> String {
-    let diff = TextDiff::from_lines(original, updated);
-    let mut rendered = String::new();
-    for change in diff.iter_all_changes() {
-        let prefix = match change.tag() {
-            ChangeTag::Delete => '-',
-            ChangeTag::Insert => '+',
-            ChangeTag::Equal => ' ',
-        };
-        rendered.push(prefix);
-        rendered.push_str(change.value());
-        if !change.value().ends_with('\n') {
-            rendered.push('\n');
-        }
-    }
-    rendered.trim_end().to_string()
 }
