@@ -10,6 +10,7 @@ mod ls;
 mod read;
 mod recurse;
 mod shared;
+mod todo;
 mod write;
 
 pub use bash::{BashPolicy, BashTool};
@@ -20,6 +21,7 @@ pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use read::ReadTool;
 pub use recurse::RecurseTool;
+pub use todo::{TodoItem, TodoList, TodoStatus, TodoWriteTool};
 pub use write::WriteTool;
 
 #[cfg(test)]
