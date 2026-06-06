@@ -1,3 +1,4 @@
+use anie_protocol::{Cost, Usage};
 use serde::{Deserialize, Serialize};
 
 use crate::ApiKind;
@@ -19,6 +20,31 @@ impl CostPerMillion {
     /// A zero-cost pricing record, useful for local models.
     pub fn zero() -> Self {
         Self::default()
+    }
+
+    /// Derive the monetary [`Cost`] of a [`Usage`] record at these
+    /// per-million rates. Cache reads/writes are priced separately and
+    /// `total` is their sum.
+    ///
+    /// anie-specific (deviation from pi): cost is **derived** from token
+    /// counts × catalog price, never read from a provider-billed amount —
+    /// anie queries no billing endpoint today. Zero pricing (the
+    /// local-model default, [`CostPerMillion::zero`]) yields an all-zero
+    /// cost, which is correct (free).
+    #[must_use]
+    pub fn cost_of(&self, usage: &Usage) -> Cost {
+        let per = |tokens: u64, rate: f64| (tokens as f64) * rate / 1_000_000.0;
+        let input = per(usage.input_tokens, self.input);
+        let output = per(usage.output_tokens, self.output);
+        let cache_read = per(usage.cache_read_tokens, self.cache_read);
+        let cache_write = per(usage.cache_write_tokens, self.cache_write);
+        Cost {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            total: input + output + cache_read + cache_write,
+        }
     }
 }
 
@@ -476,6 +502,67 @@ impl From<&Model> for ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rates() -> CostPerMillion {
+        CostPerMillion {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        }
+    }
+
+    #[test]
+    fn cost_of_multiplies_each_token_class_by_its_per_million_rate() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 2_000_000,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        let cost = rates().cost_of(&usage);
+        assert!((cost.input - 3.0).abs() < 1e-9);
+        assert!((cost.output - 30.0).abs() < 1e-9);
+        assert!((cost.cache_read - 0.3).abs() < 1e-9);
+        assert!((cost.cache_write - 3.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_of_total_is_sum_of_the_four_token_classes() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 2_000_000,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        let cost = rates().cost_of(&usage);
+        assert!((cost.total - (3.0 + 30.0 + 0.3 + 3.75)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_of_zero_pricing_yields_zero_cost_for_local_models() {
+        let usage = Usage {
+            input_tokens: 5_000_000,
+            output_tokens: 5_000_000,
+            ..Usage::default()
+        };
+        assert_eq!(CostPerMillion::zero().cost_of(&usage), Cost::default());
+    }
+
+    #[test]
+    fn cost_of_prices_cache_read_and_write_independently() {
+        let usage = Usage {
+            cache_read_tokens: 2_000_000,
+            cache_write_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        let cost = rates().cost_of(&usage);
+        assert!((cost.cache_read - 0.6).abs() < 1e-9);
+        assert!((cost.cache_write - 3.75).abs() < 1e-9);
+        assert!(cost.input.abs() < 1e-9 && cost.output.abs() < 1e-9);
+    }
 
     #[test]
     fn to_model_preserves_advertised_max_output_tokens_verbatim() {

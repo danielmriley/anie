@@ -1298,6 +1298,17 @@ impl AgentLoop {
         state.suppress_tail_agent_end = true;
     }
 
+    /// Derive and stamp `usage.cost` from the configured model's pricing.
+    /// This is the one choke point that holds both halves — the token
+    /// counts (on `assistant.usage`) and the rate table (on the model) —
+    /// so cost is computed here, before `MessageEnd`, rather than in the
+    /// provider parsers (which never see pricing). Local/zero-priced
+    /// models get an all-zero cost.
+    fn priced(&self, mut assistant: AssistantMessage) -> AssistantMessage {
+        assistant.usage.cost = self.config.model.cost_per_million.cost_of(&assistant.usage);
+        assistant
+    }
+
     async fn collect_stream(
         &self,
         stream: ProviderStream,
@@ -1324,7 +1335,7 @@ impl AgentLoop {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     self.finish_active_delta(event_tx, &mut active_delta).await;
-                    let assistant = builder.finish(StopReason::Aborted, Some("Run aborted".into()));
+                    let assistant = self.priced(builder.finish(StopReason::Aborted, Some("Run aborted".into())));
                     send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
                     return CollectedAssistant {
                         assistant,
@@ -1367,6 +1378,7 @@ impl AgentLoop {
                             }
                             ProviderEvent::Done(message) => {
                                 self.finish_active_delta(event_tx, &mut active_delta).await;
+                                let message = self.priced(message);
                                 send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(message.clone()) }).await;
                                 return CollectedAssistant {
                                     assistant: message,
@@ -1376,7 +1388,7 @@ impl AgentLoop {
                         },
                         Some(Err(error)) => {
                             self.finish_active_delta(event_tx, &mut active_delta).await;
-                            let assistant = builder.finish(StopReason::Error, Some(error.to_string()));
+                            let assistant = self.priced(builder.finish(StopReason::Error, Some(error.to_string())));
                             send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
                             return CollectedAssistant {
                                 assistant,
@@ -1388,7 +1400,7 @@ impl AgentLoop {
                             let error = ProviderError::MalformedStreamEvent(
                                 "Stream ended unexpectedly".into(),
                             );
-                            let assistant = builder.finish(StopReason::Error, Some(error.to_string()));
+                            let assistant = self.priced(builder.finish(StopReason::Error, Some(error.to_string())));
                             send_event(event_tx, AgentEvent::MessageEnd { message: Message::Assistant(assistant.clone()) }).await;
                             return CollectedAssistant {
                                 assistant,

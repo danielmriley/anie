@@ -33,3 +33,38 @@ pub struct Cost {
     /// Total cost.
     pub total: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_with_populated_cost_roundtrips_through_session_schema_v4() {
+        // An older entry written before cost was populated has either no
+        // `cost` key or an all-zero one; both must deserialize with a
+        // defaulted Cost and never error (no schema bump). And a usage
+        // carrying a real cost round-trips byte-for-byte.
+        let legacy: Usage = serde_json::from_str(
+            r#"{"input_tokens":10,"output_tokens":20,"cache_read_tokens":0,"cache_write_tokens":0}"#,
+        )
+        .expect("legacy entry without a cost field");
+        assert_eq!(legacy.cost, Cost::default());
+        assert_eq!(legacy.input_tokens, 10);
+
+        let mut priced = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Usage::default()
+        };
+        priced.cost = Cost {
+            input: 0.0003,
+            output: 0.00075,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            total: 0.00105,
+        };
+        let json = serde_json::to_string(&priced).expect("serialize");
+        let back: Usage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(priced, back);
+    }
+}

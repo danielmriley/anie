@@ -413,3 +413,98 @@ async fn chained_policy_all_continue_returns_continue() {
         .await;
     assert_eq!(response, BeforeModelResponse::Continue);
 }
+
+// =========================================================================
+// Cost population (cost/PR1)
+// =========================================================================
+
+fn priced_model() -> Model {
+    let mut model = sample_model();
+    model.cost_per_million = CostPerMillion {
+        input: 3.0,
+        output: 15.0,
+        cache_read: 0.0,
+        cache_write: 0.0,
+    };
+    model
+}
+
+fn assistant_with_usage(usage: Usage) -> AssistantMessage {
+    AssistantMessage {
+        content: vec![ContentBlock::Text { text: "hi".into() }],
+        usage,
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        provider: "mock".into(),
+        model: "mock-model".into(),
+        timestamp: 1,
+        reasoning_details: None,
+    }
+}
+
+fn first_assistant_cost(result: &anie_agent::AgentRunResult) -> anie_protocol::Cost {
+    match &result.generated_messages[0] {
+        Message::Assistant(a) => a.usage.cost.clone(),
+        other => panic!("expected assistant, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn agent_loop_populates_usage_cost_from_model_pricing_before_message_end() {
+    let usage = Usage {
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        ..Usage::default()
+    };
+    let config = AgentLoopConfig::new(
+        priced_model(),
+        "system".into(),
+        ThinkingLevel::Off,
+        ToolExecutionMode::Sequential,
+        Arc::new(StaticResolver),
+    );
+    let agent = build_loop(
+        vec![MockStreamScript::from_message(assistant_with_usage(usage))],
+        config,
+    );
+    let (tx, _rx) = mpsc::channel(64);
+    let result = agent
+        .run(
+            vec![user_prompt("hi")],
+            Vec::new(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    let cost = first_assistant_cost(&result);
+    // 1M input * $3/M + 1M output * $15/M = $18.
+    assert!((cost.total - 18.0).abs() < 1e-9, "got {cost:?}");
+}
+
+#[tokio::test]
+async fn agent_loop_leaves_cost_zero_when_model_pricing_is_zero() {
+    let usage = Usage {
+        input_tokens: 5_000_000,
+        output_tokens: 5_000_000,
+        ..Usage::default()
+    };
+    // sample_model() is zero-priced (local-model default).
+    let config = config_with_policy(None);
+    let agent = build_loop(
+        vec![MockStreamScript::from_message(assistant_with_usage(usage))],
+        config,
+    );
+    let (tx, _rx) = mpsc::channel(64);
+    let result = agent
+        .run(
+            vec![user_prompt("hi")],
+            Vec::new(),
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        first_assistant_cost(&result),
+        anie_protocol::Cost::default()
+    );
+}
