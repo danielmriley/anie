@@ -317,6 +317,11 @@ pub struct StatusBarState {
     /// bar renders it in rlm mode so the user has an
     /// ambient signal that virtualization is working.
     pub rlm_archived_messages: u64,
+    /// Plan/todo progress: `done` items and total. `(0, 0)`
+    /// when there is no plan, in which case the segment is
+    /// hidden so plan-less runs stay uncluttered.
+    pub todo_done: u64,
+    pub todo_total: u64,
     /// Cached shortened cwd for the status bar. Recomputed
     /// only when `cwd` changes between paints — avoids the
     /// `env::var` + `Vec` allocation that used to fire on
@@ -338,6 +343,8 @@ impl Default for StatusBarState {
             cwd: String::new(),
             harness_mode: String::new(),
             rlm_archived_messages: 0,
+            todo_done: 0,
+            todo_total: 0,
             cached_short_cwd: None,
         }
     }
@@ -903,6 +910,8 @@ impl App {
                 session_id,
                 harness_mode,
                 rlm_archived_messages,
+                todo_done,
+                todo_total,
             } => {
                 self.status_bar.provider_name = provider;
                 self.status_bar.model_name = model_name;
@@ -913,6 +922,8 @@ impl App {
                 self.status_bar.cwd = cwd;
                 self.status_bar.harness_mode = harness_mode;
                 self.status_bar.rlm_archived_messages = rlm_archived_messages;
+                self.status_bar.todo_done = todo_done;
+                self.status_bar.todo_total = todo_total;
                 self.status_bar.last_known_input_tokens = None;
             }
             AgentEvent::CompactionStart { phase } => {
@@ -2295,8 +2306,16 @@ fn format_status_text(state: &mut StatusBarState, transcript_scrolled: bool) -> 
     } else {
         String::new()
     };
+    // Plan progress, shown only when the model has authored a plan via
+    // `todo_write` (total > 0). Hidden otherwise so plan-less runs stay
+    // uncluttered.
+    let todo_segment = if state.todo_total == 0 {
+        String::new()
+    } else {
+        format!(" │ todo: {}/{}", state.todo_done, state.todo_total)
+    };
     format!(
-        " {}{}:{}{} │ thinking: {} │ {}/{}{} │ {}",
+        " {}{}:{}{} │ thinking: {} │ {}/{}{}{} │ {}",
         if transcript_scrolled {
             "↑ history │ "
         } else {
@@ -2309,6 +2328,7 @@ fn format_status_text(state: &mut StatusBarState, transcript_scrolled: bool) -> 
         format_tokens(used_tokens),
         format_tokens(state.context_window),
         archive_segment,
+        todo_segment,
         short_cwd,
     )
 }
@@ -2675,6 +2695,31 @@ fn tool_result_elapsed_from_details(details: &serde_json::Value) -> Option<std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_segment_renders_todo_progress() {
+        let mut state = StatusBarState {
+            todo_done: 2,
+            todo_total: 5,
+            ..StatusBarState::default()
+        };
+        let text = format_status_text(&mut state, false);
+        assert!(text.contains("todo: 2/5"), "{text}");
+    }
+
+    #[test]
+    fn status_segment_absent_when_total_is_zero() {
+        let mut state = StatusBarState {
+            todo_done: 0,
+            todo_total: 0,
+            ..StatusBarState::default()
+        };
+        let text = format_status_text(&mut state, false);
+        assert!(
+            !text.contains("todo:"),
+            "plan-less runs hide the segment: {text}"
+        );
+    }
 
     /// PR 05 of `docs/tui_polish_2026-04-26/`: bullet alternates
     /// between Yellow and Yellow+DIM on a 600 ms cycle.

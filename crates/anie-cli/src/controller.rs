@@ -1213,9 +1213,8 @@ pub(crate) struct ControllerState {
     /// change). Session-lifetime rather than reset per run, so a plan
     /// survives across follow-up prompts (the model overwrites it with a
     /// full-replace `todo_write` when it starts new work).
-    // Read by `status_event` (PR 3) and the verifier policy (PR 4); the
-    // write path (the `todo_write` tool) is wired this PR.
-    #[allow(dead_code)]
+    // Read by `status_event` (status bar) and the verifier policy; the
+    // write path is the `todo_write` tool.
     pub(crate) todo_list: Arc<std::sync::Mutex<anie_tools::TodoList>>,
 }
 
@@ -1706,6 +1705,11 @@ impl ControllerState {
     }
 
     pub(crate) fn status_event(&self) -> AgentEvent {
+        let (todo_done, todo_total) = self
+            .todo_list
+            .lock()
+            .map(|list| list.counts())
+            .unwrap_or((0, 0));
         AgentEvent::StatusUpdate {
             provider: self.config.current_model().provider.clone(),
             model_name: self.config.current_model().id.clone(),
@@ -1719,6 +1723,8 @@ impl ControllerState {
                 .rlm_archived_messages
                 .load(std::sync::atomic::Ordering::Acquire)
                 as u64,
+            todo_done: todo_done as u64,
+            todo_total: todo_total as u64,
         }
     }
 

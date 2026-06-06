@@ -1497,6 +1497,45 @@ fn status_event_uses_effective_ollama_context_window() {
     ));
 }
 
+#[test]
+fn status_update_carries_todo_done_and_total() {
+    let ollama_model = model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi);
+    let (controller, _event_rx, _tx) = build_dispatch_controller_with_runtime_state(
+        vec![ollama_model],
+        16,
+        RuntimeState::default(),
+    );
+
+    // Populate the controller-owned plan; status_event must reflect it.
+    {
+        let mut list = controller.state.todo_list.lock().expect("lock");
+        list.replace(vec![
+            anie_tools::TodoItem {
+                content: "a".into(),
+                status: anie_tools::TodoStatus::Done,
+            },
+            anie_tools::TodoItem {
+                content: "b".into(),
+                status: anie_tools::TodoStatus::InProgress,
+            },
+            anie_tools::TodoItem {
+                content: "c".into(),
+                status: anie_tools::TodoStatus::Pending,
+            },
+        ]);
+    }
+
+    let event = controller.state.status_event();
+    assert!(matches!(
+        event,
+        AgentEvent::StatusUpdate {
+            todo_done: 1,
+            todo_total: 3,
+            ..
+        }
+    ));
+}
+
 #[tokio::test]
 async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
     let recorded_options = Arc::new(Mutex::new(Vec::new()));

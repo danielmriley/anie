@@ -93,6 +93,11 @@ pub enum AgentEvent {
         /// work (the count grows as the conversation
         /// progresses).
         rlm_archived_messages: u64,
+        /// Number of `done` items in the model's plan/todo list, and
+        /// the total. `(0, 0)` when no plan exists; the TUI hides the
+        /// segment in that case so plan-less runs stay uncluttered.
+        todo_done: u64,
+        todo_total: u64,
     },
     /// Context compaction has started.
     CompactionStart {

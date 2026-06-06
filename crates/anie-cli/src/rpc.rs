@@ -248,6 +248,9 @@ impl From<AgentEvent> for RpcEvent {
                 session_id,
                 harness_mode,
                 rlm_archived_messages,
+                // todo_done/todo_total are a TUI status-bar concern; the
+                // JSONL RPC status schema stays stable (not surfaced here).
+                ..
             } => Self::Status {
                 provider,
                 model: model_name,
