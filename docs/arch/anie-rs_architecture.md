@@ -41,6 +41,7 @@ isolation direction, not current behavior.
 | `anie-providers-builtin` | Built-in provider implementations, SSE/HTTP helpers, local-server probing, model discovery, built-in model catalog helpers | Controller policy, session persistence, credential storage |
 | `anie-tools` | Built-in tools and file-mutation serialization (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) | Agent loop policy, UI rendering, sandbox policy beyond its path behavior |
 | `anie-tools-web` | Default-feature web tools (`web_read`, `web_search`), HTTP fetch/search boundaries, robots/rate-limit/SSRF handling, optional headless rendering | Core filesystem tools, controller orchestration, provider calls |
+| `anie-mcp` | MCP (Model Context Protocol) client: hand-rolled JSON-RPC-over-stdio transport, `initialize`/`tools/list`/`tools/call`, and `McpTool` adapting each discovered server tool to the `Tool` trait. `McpManager` spawns configured servers at startup | Config schema (takes owned `McpServerLaunch` specs), agent-loop policy, session persistence |
 | `anie-protocol` | Shared message/content/tool/event/usage/stop-reason types | Persistence policy, provider-specific HTTP conversion |
 | `anie-session` | Append-only session file schema, file locking, context reconstruction, branch/fork support, compaction records | Config merging, auth, provider calls |
 | `anie-config` | Config schema, global/project config loading and merging, context-file discovery, web/Ollama/UI/tool config, comment-preserving config mutation | Secret storage, session history |
@@ -54,12 +55,17 @@ anie-cli
   -> anie-agent
   -> anie-auth
   -> anie-config
+  -> anie-mcp
   -> anie-provider
   -> anie-providers-builtin
   -> anie-session
   -> anie-tools
   -> anie-tools-web (default `web` feature)
   -> anie-tui
+
+anie-mcp
+  -> anie-agent
+  -> anie-protocol
 
 anie-agent
   -> anie-provider
@@ -432,6 +438,38 @@ The default `anie-cli` build enables the `web` feature and also registers:
 Lean builds can compile those out with `--no-default-features`. The
 `web-headless` feature additionally enables `web_read(javascript=true)` through
 Chrome/Chromium.
+
+### MCP (Model Context Protocol) tools
+
+External MCP servers declared in the `[mcp]` config section are spawned at
+bootstrap by `anie_mcp::McpManager::spawn_all`, called from
+`prepare_controller_state` (`bootstrap.rs`) before the registry is
+`Arc`-wrapped. Each server is launched over stdio; the client completes the
+`initialize`/`notifications/initialized` handshake, calls `tools/list`, and
+wraps every discovered tool in an `McpTool` registered under
+`mcp__<server>__<tool>`. Because `McpTool` implements the same `Tool` trait,
+the agent loop drives MCP tools identically to built-ins — no agent-loop,
+protocol, or session change is required.
+
+Lifecycle and failure model:
+
+- A server that fails to spawn, handshake, or list its tools is `warn!`-logged
+  and skipped; the rest of anie (built-ins, web tools, other MCP servers) still
+  loads. This mirrors the web-tools "log and continue" degradation.
+- `startup_timeout_ms` (default 10s) bounds the handshake + list so a hung
+  server cannot wedge startup. There is no per-call `tools/call` timeout in v1;
+  the agent's cancellation token aborts an in-flight call.
+- Spawned children are owned by their `McpClient`, kept alive by the `Arc`s
+  inside the registered `McpTool`s. When the controller drops, the clients drop
+  and the transport kills the child.
+- `--no-tools` / baseline harness mode spawns no MCP servers.
+
+The client is hand-rolled (no `rmcp` SDK dependency); scope is client + tools
+only. Resources, prompts, SSE/HTTP transport, OAuth bridging, runtime
+hot-reload, and exposing anie *as* an MCP server are deferred (see
+`docs/mcp_client/README.md`). MCP tools flow through the existing
+`before_tool_call` seam, so a future permission/approval layer gates them for
+free.
 
 ### Tool resource boundaries
 

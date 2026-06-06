@@ -5,6 +5,11 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] MCP (Model Context Protocol) client (docs/mcp_client/): `[mcp]`
+      config, hand-rolled stdio JSON-RPC client in the new `anie-mcp`
+      crate, external server tools registered as `mcp__<server>__<tool>`
+      at bootstrap with log-and-skip graceful failure. Scope is
+      client + tools only; resources/prompts/SSE/OAuth deferred.
 - [x] Fix reasoning-only completion bug (reasoning_fix_plan.md phases 1–3)
 - [x] Thinking block display regression tests (7 tests added)
 - [x] Dynamic model discovery and picker menus

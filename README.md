@@ -9,6 +9,7 @@ The workspace is split into focused crates for protocol types, provider abstract
 - **Interactive TUI** built with `ratatui` + `crossterm`
 - **Streaming output** with separate thinking and final-answer rendering when providers expose it
 - **Built-in coding tools** for files, shell, search, and web access: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, plus `web_read` and `web_search` in the default build
+- **MCP client**: connect to external [Model Context Protocol](https://modelcontextprotocol.io) servers over stdio via the `[mcp]` config section; their tools are registered automatically as `mcp__<server>__<tool>`
 - **Session persistence** in append-only JSONL files with fork/resume support
 - **Automatic context compaction** when token budgets get tight
 - **Provider support** for Anthropic Messages, OpenAI-compatible Chat Completions, native Ollama `/api/chat`, OpenRouter routing, and local servers such as Ollama and LM Studio
@@ -328,6 +329,7 @@ The workspace is split into focused crates:
 - `crates/anie-agent` — agent loop, streaming orchestration, and tool execution flow
 - `crates/anie-tools` — built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`)
 - `crates/anie-tools-web` — optional/default web tools (`web_read`, `web_search`) and web fetch/search safety boundaries
+- `crates/anie-mcp` — MCP (Model Context Protocol) client: stdio transport, server handshake/discovery, and tool adaptation
 - `crates/anie-session` — session persistence and compaction
 - `crates/anie-auth` — API key storage and request-option resolution
 - `crates/anie-config` — config loading, merging, and project-context discovery
