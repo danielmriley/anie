@@ -81,11 +81,16 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
     // ControllerState below for the rest of the harness to
     // consult; here we use it to gate tool registration.
     let suppress_tools = cli.no_tools || !cli.harness_mode.registers_tools();
+    // Spawn configured MCP servers and discover their tools before the
+    // registry is built (the registry is immutable once `Arc`-wrapped).
+    // Suppressed-tools / baseline mode stays MCP-free.
+    let mcp_tools = spawn_mcp_tools(&config.mcp, suppress_tools).await;
     let tool_registry = build_tool_registry_with_policy(
         &cwd,
         suppress_tools,
         bash_policy_from_config(&config.tools.bash.policy),
         config.tools.web.clone(),
+        mcp_tools,
     );
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
@@ -125,7 +130,46 @@ pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistr
         no_tools,
         BashPolicy::default(),
         anie_config::WebToolConfig::default(),
+        Vec::new(),
     )
+}
+
+/// Convert the `[mcp]` config into manager launch specs (sorted by name
+/// for deterministic registration), spawn the servers, and return their
+/// tools. Suppressed-tools mode yields none. A dead server is logged and
+/// skipped — it never aborts startup.
+async fn spawn_mcp_tools(
+    mcp: &anie_config::McpConfig,
+    suppress_tools: bool,
+) -> Vec<Arc<dyn anie_agent::Tool>> {
+    if suppress_tools {
+        return Vec::new();
+    }
+    let mut launches: Vec<anie_mcp::McpServerLaunch> = mcp
+        .servers
+        .iter()
+        .map(|(name, server)| anie_mcp::McpServerLaunch {
+            name: name.clone(),
+            command: server.command.clone(),
+            args: server.args.clone(),
+            env: server.env.clone(),
+            enabled: server.enabled,
+            startup_timeout: std::time::Duration::from_millis(server.startup_timeout_ms),
+        })
+        .collect();
+    launches.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let (tools, statuses) = anie_mcp::McpManager::spawn_all(&launches).await;
+    for status in &statuses {
+        match &status.error {
+            Some(error) => warn!(server = %status.name, %error, "MCP server skipped"),
+            None if status.enabled => {
+                tracing::info!(server = %status.name, tools = status.tool_count, "MCP server connected");
+            }
+            None => {}
+        }
+    }
+    tools
 }
 
 fn build_tool_registry_with_policy(
@@ -133,6 +177,7 @@ fn build_tool_registry_with_policy(
     no_tools: bool,
     bash_policy: BashPolicy,
     web_config: anie_config::WebToolConfig,
+    mcp_tools: Vec<Arc<dyn anie_agent::Tool>>,
 ) -> Arc<ToolRegistry> {
     let mut tools = ToolRegistry::new();
     if no_tools {
@@ -181,6 +226,13 @@ fn build_tool_registry_with_policy(
     }
     #[cfg(not(feature = "web"))]
     let _ = web_config;
+
+    // MCP tools discovered from configured external servers. Registered
+    // after built-ins/web so a server cannot shadow a core tool name;
+    // collisions are already prevented by the `mcp__<server>__` prefix.
+    for tool in mcp_tools {
+        tools.register(tool);
+    }
 
     Arc::new(tools)
 }
@@ -235,5 +287,95 @@ pub(crate) fn spawn_shutdown_signal_forwarder(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod mcp_bootstrap_tests {
+    use super::*;
+    use anie_config::{McpConfig, McpServerConfig};
+    use std::collections::HashMap;
+
+    /// A bash MCP server that completes the handshake, lists one tool
+    /// named `echo`, and stays alive reading stdin.
+    const LIST_ECHO_MOCK: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | grep -o '[0-9]*')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{}}}" ;;
+    *notifications/initialized*) : ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+  esac
+done
+"#;
+
+    fn server(command: &str, args: Vec<String>) -> McpServerConfig {
+        McpServerConfig {
+            command: command.to_string(),
+            args,
+            env: HashMap::new(),
+            enabled: true,
+            startup_timeout_ms: 5_000,
+        }
+    }
+
+    fn mcp_with(name: &str, server_cfg: McpServerConfig) -> McpConfig {
+        let mut servers = HashMap::new();
+        servers.insert(name.to_string(), server_cfg);
+        McpConfig { servers }
+    }
+
+    fn registry_with(mcp_tools: Vec<Arc<dyn anie_agent::Tool>>) -> Arc<ToolRegistry> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        build_tool_registry_with_policy(
+            tmp.path(),
+            false,
+            BashPolicy::default(),
+            anie_config::WebToolConfig::default(),
+            mcp_tools,
+        )
+    }
+
+    #[tokio::test]
+    async fn bootstrap_registers_mcp_tools_into_registry() {
+        let mcp = mcp_with(
+            "test",
+            server("bash", vec!["-c".to_string(), LIST_ECHO_MOCK.to_string()]),
+        );
+        let mcp_tools = spawn_mcp_tools(&mcp, false).await;
+        assert_eq!(mcp_tools.len(), 1);
+
+        let registry = registry_with(mcp_tools);
+        assert!(
+            registry.get("mcp__test__echo").is_some(),
+            "MCP tool registered under its namespaced name"
+        );
+        assert!(registry.get("read").is_some(), "built-ins still present");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_continues_when_mcp_server_fails_to_spawn() {
+        let mcp = mcp_with("bad", server("anie-no-such-binary-xyz", vec![]));
+        let mcp_tools = spawn_mcp_tools(&mcp, false).await;
+        assert!(mcp_tools.is_empty(), "a dead server contributes no tools");
+
+        // Startup still yields a working registry with built-ins.
+        let registry = registry_with(mcp_tools);
+        assert!(registry.get("read").is_some());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_suppresses_mcp_when_no_tools() {
+        let mcp = mcp_with(
+            "test",
+            server("bash", vec!["-c".to_string(), LIST_ECHO_MOCK.to_string()]),
+        );
+        let mcp_tools = spawn_mcp_tools(&mcp, true).await;
+        assert!(
+            mcp_tools.is_empty(),
+            "suppressed-tools / baseline mode spawns no MCP servers"
+        );
     }
 }

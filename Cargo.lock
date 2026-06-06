@@ -112,6 +112,7 @@ dependencies = [
  "anie-agent",
  "anie-auth",
  "anie-config",
+ "anie-mcp",
  "anie-protocol",
  "anie-provider",
  "anie-providers-builtin",

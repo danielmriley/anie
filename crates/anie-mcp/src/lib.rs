@@ -18,12 +18,14 @@
 
 mod client;
 mod error;
+mod manager;
 mod protocol;
 mod tool;
 mod transport;
 
 pub use client::McpClient;
 pub use error::McpError;
+pub use manager::{McpManager, McpServerLaunch, ServerStatus};
 pub use protocol::{CallToolResult, ListToolsResult, McpContent, McpToolSpec, ResourceRef};
 pub use tool::{McpTool, namespaced_name};
 pub use transport::StdioTransport;
