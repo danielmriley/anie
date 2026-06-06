@@ -1,0 +1,2588 @@
+{
+  "summary": "Map every anie crate + digest existing self-assessment docs into a structured understanding base",
+  "agentCount": 15,
+  "logs": [],
+  "result": {
+    "crateMaps": [
+      {
+        "crate": "anie-agent",
+        "owns": "The core agent loop execution engine for anie-rs. Responsible for orchestrating the Read-Eval-Print-Decide (REPL) state machine that drives multi-turn agent interactions with LLM providers, tool registries, and extensible policies. Owns the complete lifecycle from prompt injection through tool execution to final result collection, including streaming event emission, mid-turn compaction, before-model policy hooks, and recursive sub-agent spawning (RLM). Provides both run-to-completion (AgentLoop::run) and step-driven (AgentRunMachine) execution models.",
+        "public_surface": [
+          {
+            "name": "AgentLoop",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:726",
+            "note": "Core provider/tool-agnostic agent loop. Two entry points: run() for fire-and-forget, start_run_machine() for step-driven control."
+          },
+          {
+            "name": "AgentRunMachine",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:1593",
+            "note": "Step-driven state machine. Call next_step() in a loop until is_finished(), then finish() to get AgentRunResult. Allows fine-grained control and testing."
+          },
+          {
+            "name": "AgentLoopConfig",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:360",
+            "note": "Immutable configuration for an agent loop instance. Builder-pattern chain methods for model, system prompt, tool execution mode, request resolver, hooks, policies, and compaction gate."
+          },
+          {
+            "name": "AgentRunResult",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:502",
+            "note": "Final agent-run output: generated_messages (persisted output), final_context (full canonical context), and terminal_error (if run failed)."
+          },
+          {
+            "name": "AgentStepBoundary",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:1602",
+            "note": "Return value of next_step(): Continue or Finished."
+          },
+          {
+            "name": "BeforeModelPolicy",
+            "kind": "trait",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:342",
+            "note": "Hook invoked before every ModelTurn step. Inspect upcoming request and optionally inject context messages. Default: NoopBeforeModelPolicy."
+          },
+          {
+            "name": "BeforeModelRequest",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:279",
+            "note": "Read-phase snapshot passed to BeforeModelPolicy. Borrowed view of full context, generated messages, model, and step index."
+          },
+          {
+            "name": "BeforeModelResponse",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:308",
+            "note": "Policy response: Continue, AppendMessages, or ReplaceMessages."
+          },
+          {
+            "name": "CompactionGate",
+            "kind": "trait",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:265",
+            "note": "Hook invoked between loop iterations to decide mid-turn compaction. Inspect context and return Continue, Compacted (with new messages), or Skipped (with reason)."
+          },
+          {
+            "name": "CompactionGateOutcome",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:220",
+            "note": "Compaction gate decision: Continue, Compacted {messages}, or Skipped {reason}."
+          },
+          {
+            "name": "ToolExecutionMode",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:207",
+            "note": "Sequential or Parallel execution of tool calls in a turn."
+          },
+          {
+            "name": "NoopBeforeModelPolicy",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:350",
+            "note": "Default policy implementation that always returns Continue. Zero virtual-call overhead for non-adopters."
+          },
+          {
+            "name": "send_event",
+            "kind": "fn",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:26",
+            "note": "Process-global utility to send AgentEvent, warn once per lifetime if receiver drops."
+          },
+          {
+            "name": "Tool",
+            "kind": "trait",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:109",
+            "note": "Trait implemented by every tool. Provides definition() and execute() with validated JSON args."
+          },
+          {
+            "name": "ToolRegistry",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:145",
+            "note": "Registry of tools keyed by name. Caches sorted definitions and precompiled JSON schema validators."
+          },
+          {
+            "name": "ToolError",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:125",
+            "note": "Structured tool failures: ExecutionFailed, Aborted, Timeout."
+          },
+          {
+            "name": "ToolExecutionContext",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:31",
+            "note": "Per-execution metadata handed to Tool::execute(). Contains effective context_window for output budget scaling."
+          },
+          {
+            "name": "effective_tool_output_budget",
+            "kind": "fn",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:101",
+            "note": "Computes effective output budget for a tool result given context window and base default. Three-rule scaling: context share, cap, floor."
+          },
+          {
+            "name": "MIN_TOOL_OUTPUT_BUDGET_BYTES",
+            "kind": "const",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:60",
+            "note": "Floor on per-tool output budget (1024 bytes). Ensures pathologically small windows stay usable."
+          },
+          {
+            "name": "RecurseScope",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/recurse.rs:48",
+            "note": "Identifies region of context the sub-agent should see: MessageRange, MessageGrep, ToolResult, File, Summary."
+          },
+          {
+            "name": "ContextProvider",
+            "kind": "trait",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/recurse.rs:169",
+            "note": "Resolves RecurseScope to concrete messages. Implemented by controller (holds parent context view + filesystem access)."
+          },
+          {
+            "name": "SubAgentFactory",
+            "kind": "trait",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/recurse.rs:154",
+            "note": "Constructs AgentLoop for recurse-tool sub-call. Implemented by controller (knows parent config, tool registry gating, depth limits)."
+          },
+          {
+            "name": "SubAgentBuildContext",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/recurse.rs:125",
+            "note": "Per-sub-call build inputs: depth, recursion_budget (shared Arc<AtomicU32>), model_override."
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "agent_loop.rs is 2582 lines with complex internal state machine (AgentIntent, AgentObservation, AgentDecision enums private). Read-Eval-Print-Decide REPL spans many methods, making it hard to follow the full execution path without jumping between functions. Consider extracting intent-specific logic into separate eval_* methods or a dedicated phase module.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:644-1197",
+            "severity": "medium"
+          },
+          {
+            "description": "AssistantMessage cloned repeatedly during streaming (lines 568, 1054, 1080, 1095, 1162, 1212, 1216, 1223, 1227, 1273, 1315, 1325, 1337). Many are due to shared ownership across event emission and state mutation. Consider using Arc or Cow to reduce allocations, or batching clones at decision points.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:564-1330",
+            "severity": "low"
+          },
+          {
+            "description": "EVENT_DROP_WARNED static AtomicBool is process-global. In multi-agent scenarios with concurrent runs, first run to encounter closed channel suppresses logs for all subsequent runs in that process lifetime. Consider per-loop or per-session warning state.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:19",
+            "severity": "low"
+          },
+          {
+            "description": "Tool schema validation happens at registration time (ToolRegistry::register), but invalid schemas are silently stored as ValidatorState::Invalid. Errors only surface on first tool call. Consider raising at registration or in a startup validation hook.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:174-179",
+            "severity": "low"
+          },
+          {
+            "description": "Tool context window is threaded as a single u64 in ToolExecutionContext. If models support per-tool overrides (e.g., smaller windows for certain tools), the abstraction doesn't support granular configuration. Future extensibility may need tool-specific budgets.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/tool.rs:31-50",
+            "severity": "low"
+          },
+          {
+            "description": "BeforeToolCallHook and AfterToolCallHook traits are pub(crate) only. Extension system via JSON-RPC is planned (docs/refactor_plans/10_extension_system_pi_port.md) but not yet implemented. In-process tool interception is not exposed to external integrators.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/hooks.rs:38-59",
+            "severity": "medium"
+          },
+          {
+            "description": "tokio::spawn used to forward tool updates (line 1491). If the update forwarder panics or task is cancelled, the channel is dropped silently without logged error. Update stream starvation in concurrent parallel tool execution could cause lost updates.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:1488-1512",
+            "severity": "medium"
+          },
+          {
+            "description": "AssistantMessageBuilder reconstructs tool call arguments from streaming deltas via JSON parsing. Malformed delta sequences result in fallback {_raw: buffer} JSON, hiding parse failures from logs. Difficult to debug tool-call corruption in production.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:2091-2110",
+            "severity": "low"
+          },
+          {
+            "description": "sanitize_context_for_request() uses Cow::Borrowed optimization on hot path but the sanitization scan is linear per turn. If context grows large and sanitization becomes common, this could impact latency. No instrumentation to measure cost.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/agent_loop.rs:1726-1757",
+            "severity": "low"
+          },
+          {
+            "description": "RecurseScope::MessageGrep pattern compilation happens at resolve time, not parse time. Invalid patterns error inside a tool call, losing the opportunity for early validation. No regex cache across multiple recurse calls in the same turn.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-agent/src/recurse.rs:62-65",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No built-in rate limiting or retry orchestration. Retry logic is delegated entirely to RequestOptionsResolver. Competitors (Codex, Grok Build) may have provider-agnostic backoff and circuit breaker logic baked in.",
+          "Tool parallelism is binary (Sequential/Parallel). No prioritization, weighted parallelism, or dynamic batching. If tool A is blocking and tool B is fast, B waits for A in Parallel mode.",
+          "Mid-turn compaction gating is optional and default-off. Callers must wire up CompactionGate to prevent context overflow. Codex/Grok likely make this a first-class, mandatory concern.",
+          "No built-in cost tracking or token budgeting at the agent-loop level. effective_tool_output_budget() scales outputs but doesn't reserve tokens for upcoming model calls. Budgeting is delegated to upstream compaction.",
+          "Extension points (BeforeModelPolicy, CompactionGate, tool hooks) are all trait-based and in-process. No JSON-RPC or out-of-process extension system yet (planned for plan 10). Limits third-party tool/policy development.",
+          "Thinking/reasoning is plumbed through but not a first-class feature. ThinkingLevel is a model property, not an agentic concept. No reasoning budget, chain-of-thought planning, or explicit reasoning extraction.",
+          "No built-in multi-turn memory or session persistence. AgentRunResult is ephemeral; archival to external stores is caller's responsibility. Competitors may have session management baked in.",
+          "Tool output budget is context-window-sensitive but not model-capability-sensitive. No differentiation between fast models (can handle large outputs) and slow models (should get smaller outputs).",
+          "No observability for policy hook latency or compaction gate overhead. BeforeModelPolicy and CompactionGate are traced but not metered (no timing, no rejection rate metrics).",
+          "RecurseScope::File has a byte cap but no timeout. Resolving a large, slow filesystem access could block the agent loop. No async I/O timeouts or cancellation propagation to filesystem resolver."
+        ]
+      },
+      {
+        "crate": "anie-tui",
+        "owns": "anie-tui is the Terminal UI (TUI) rendering layer for the anie agent harness, built on ratatui and crossterm. It owns the interactive transcript display (output pane), multi-line input editor with cross-session history and autocomplete, overlay system for onboarding/provider management/model selection, markdown → ratatui rendering pipeline, terminal capability detection (images, hyperlinks, truecolor), and the main event loop that coordinates keystroke/timer/streaming event handling with frame-budgeted rendering (8ms frame budget with urgent-input fast-path).",
+        "public_surface": [
+          {
+            "name": "App",
+            "kind": "struct",
+            "location": "app.rs:54",
+            "note": "The main TUI app, holds output/input panes, overlay system, agent state, and the render event loop. Created via App::new() with event receiver, action sender, and command metadata."
+          },
+          {
+            "name": "run_tui",
+            "kind": "fn",
+            "location": "app.rs:2014",
+            "note": "Main async event loop: integrates keystroke handling, streaming events (up to 256 per frame), tick timers, and request-driven rendering with frame budget + resize debounce."
+          },
+          {
+            "name": "UiAction",
+            "kind": "enum",
+            "location": "app.rs:227",
+            "note": "All TUI-initiated actions: SubmitPrompt, QueuePrompt, AbortAndQueuePrompt, Abort, SelectModel, SetModel, SetThinking, ContextLength, ShowState, ClearOutput, Compact, ListSessions, SwitchSession, ShowTools, ShowHelp, GetState, ForkSession, ShowDiff, NewSession, ReloadConfig."
+          },
+          {
+            "name": "AgentUiState",
+            "kind": "enum",
+            "location": "app.rs:206",
+            "note": "Current run state: Idle, Streaming, ToolExecuting{tool_name}, Compacting{started_at, phase}. Drives input-locking and visual feedback."
+          },
+          {
+            "name": "StatusBarState",
+            "kind": "struct",
+            "location": "app.rs:294",
+            "note": "Status bar display: provider_name, model_name, thinking, session_id, token counts, context_window, cwd, harness_mode, rlm_archived_messages."
+          },
+          {
+            "name": "Spinner",
+            "kind": "struct",
+            "location": "app.rs:366",
+            "note": "Simple spinner animation (10-frame braille sequence, 80ms per frame) for 'model is thinking' feedback."
+          },
+          {
+            "name": "OutputPane",
+            "kind": "struct",
+            "location": "output.rs:264",
+            "note": "Scrollable transcript display: blocks (user/assistant/tool/system messages), two-slot per-width line cache, streaming assistant incremental render with cached markdown, flat viewport cache for visible lines, link tracking for mouse click-to-open."
+          },
+          {
+            "name": "RenderedBlock",
+            "kind": "enum",
+            "location": "output.rs:17",
+            "note": "One block in the transcript: UserMessage, AssistantMessage (with thinking/streaming/error), ToolCall (with optional result), SystemMessage."
+          },
+          {
+            "name": "ToolCallResult",
+            "kind": "struct",
+            "location": "output.rs:49",
+            "note": "Rendered tool result: content, is_error boolean, optional elapsed Duration. Used by RenderedBlock::ToolCall."
+          },
+          {
+            "name": "InputPane",
+            "kind": "struct",
+            "location": "input.rs:52",
+            "note": "Multi-line input editor: content + cursor, history navigation (with cross-session persistence via ~/.anie/prompt_history), optional inline autocomplete popup."
+          },
+          {
+            "name": "InputAction",
+            "kind": "enum",
+            "location": "input.rs:15",
+            "note": "Input pane outcomes: None (no action), Submit(String) when Enter pressed."
+          },
+          {
+            "name": "TerminalCapabilities",
+            "kind": "struct",
+            "location": "terminal_capabilities.rs:21",
+            "note": "Static terminal capability detection: images (Option<ImageProtocol>), truecolor, hyperlinks. Detected from env (KITTY_WINDOW_ID, TMUX, TERM_PROGRAM, COLORTERM, etc.)."
+          },
+          {
+            "name": "ImageProtocol",
+            "kind": "enum",
+            "location": "terminal_capabilities.rs:37",
+            "note": "Inline image protocol: Kitty or Iterm2. None if not supported (e.g., inside tmux/screen)."
+          },
+          {
+            "name": "TerminalGuard",
+            "kind": "struct",
+            "location": "terminal.rs:39",
+            "note": "RAII guard for terminal setup: enters raw mode + alternate screen + mouse capture, restores on drop. Catches panics and early returns."
+          },
+          {
+            "name": "setup_terminal",
+            "kind": "fn",
+            "location": "terminal.rs:112",
+            "note": "Returns a TerminalGuard; caller owns cleanup via Drop or explicit restore()."
+          },
+          {
+            "name": "draw_synchronized",
+            "kind": "fn",
+            "location": "terminal.rs:143",
+            "note": "Wraps terminal.draw() in DECSET 2026 synchronized output (unless ANIE_DISABLE_SYNC_OUTPUT=1) for tear-free composition."
+          },
+          {
+            "name": "SlashCommandInfo",
+            "kind": "struct",
+            "location": "commands.rs:90",
+            "note": "Slash-command metadata: name, summary, source (Builtin/Extension/Prompt/Skill), arguments (ArgumentSpec), argument_hint. Used by TUI pre-dispatch validation and autocomplete."
+          },
+          {
+            "name": "ArgumentSpec",
+            "kind": "enum",
+            "location": "commands.rs:64",
+            "note": "Command argument shape: None, FreeForm{required}, Enumerated{values, required}, Subcommands{known}, ContextLengthOverride."
+          },
+          {
+            "name": "SlashCommandSource",
+            "kind": "enum",
+            "location": "commands.rs:27",
+            "note": "Command origin: Builtin, Extension{name}, Prompt{path}, Skill{name}. Displayed in /help output."
+          },
+          {
+            "name": "OnboardingScreen",
+            "kind": "struct",
+            "location": "overlays/onboarding.rs:191",
+            "note": "Full-screen onboarding overlay: provider selection, model configuration, local server discovery. Returns OnboardingCompletion with configured providers."
+          },
+          {
+            "name": "OnboardingAction",
+            "kind": "enum",
+            "location": "overlays/onboarding.rs:57",
+            "note": "Onboarding outcomes: Continue, Complete(OnboardingCompletion), Cancelled."
+          },
+          {
+            "name": "OnboardingCompletion",
+            "kind": "struct",
+            "location": "overlays/onboarding.rs:48",
+            "note": "Result of onboarding: providers to write, reload_target (provider, model pair for config reload)."
+          },
+          {
+            "name": "ConfiguredProvider",
+            "kind": "struct",
+            "location": "overlays/onboarding.rs:28",
+            "note": "Provider configured during onboarding: model, kind (BuiltinHosted or ConfigBacked), is_default flag."
+          },
+          {
+            "name": "ConfiguredProviderKind",
+            "kind": "enum",
+            "location": "overlays/onboarding.rs:39",
+            "note": "How a provider persists: BuiltinHosted (no custom metadata) or ConfigBacked (persist base_url, api_kind, model metadata)."
+          },
+          {
+            "name": "write_configured_providers",
+            "kind": "fn",
+            "location": "overlays/onboarding.rs:~2650",
+            "note": "Write OnboardingCompletion providers to config.toml, updating default selection if needed."
+          },
+          {
+            "name": "ModelPickerPane",
+            "kind": "struct",
+            "location": "overlays/model_picker.rs",
+            "note": "Overlay for model discovery and selection (native Ollama, API discovery, etc.) with spinner feedback."
+          },
+          {
+            "name": "ModelPickerAction",
+            "kind": "enum",
+            "location": "overlays/model_picker.rs",
+            "note": "Model picker outcomes: Continue, Selected(Model), Cancelled, error cases."
+          },
+          {
+            "name": "ProviderManagementScreen",
+            "kind": "struct",
+            "location": "overlays/providers.rs",
+            "note": "Provider management overlay: list configured providers, test connections, add/remove providers, OAuth flows."
+          },
+          {
+            "name": "ProviderManagementAction",
+            "kind": "enum",
+            "location": "overlays/providers.rs",
+            "note": "Provider management outcomes: Continue, ConfigChanged(Model), TestResult, etc."
+          },
+          {
+            "name": "ProviderEntry",
+            "kind": "struct",
+            "location": "overlays/providers.rs",
+            "note": "Display view of one provider for the management overlay."
+          },
+          {
+            "name": "ProviderType",
+            "kind": "enum",
+            "location": "overlays/providers.rs",
+            "note": "Provider categories: BuiltinHosted, ApiCustom, LocalServer, etc."
+          },
+          {
+            "name": "TestResult",
+            "kind": "enum",
+            "location": "overlays/providers.rs",
+            "note": "Result of provider connection test: Success, Failure(reason)."
+          },
+          {
+            "name": "render_markdown",
+            "kind": "fn",
+            "location": "markdown/mod.rs:20",
+            "note": "Transform markdown string to ratatui Lines at given width with theme. Called per-block in OutputPane (uses block-level cache)."
+          },
+          {
+            "name": "MarkdownTheme",
+            "kind": "struct",
+            "location": "markdown/theme.rs",
+            "note": "Colors/styles for markdown elements: headings, bold, code, links, blockquotes, etc. default_dark() factory."
+          },
+          {
+            "name": "LinkRange",
+            "kind": "struct",
+            "location": "markdown/mod.rs:33",
+            "note": "Clickable link region: col_start/col_end (char offsets in line), url string. Used for mouse-click-to-open."
+          },
+          {
+            "name": "find_link_ranges",
+            "kind": "fn",
+            "location": "markdown/mod.rs:50",
+            "note": "Extract clickable URL regions from rendered markdown lines. Returns Vec<Vec<LinkRange>> (one per line)."
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "OutputPane is 3199 LOC; contains four separate impl blocks (core, Default, private, and test-only internals). The block-level caching, flat viewport cache, streaming assistant incremental render, and link extraction are all intertwined. Refactoring into smaller focused types (e.g., BlockCache, FlatViewportCache, StreamingRender as separate structs) would improve readability.",
+            "location": "output.rs:264-3199",
+            "severity": "medium"
+          },
+          {
+            "description": "App struct (app.rs:54) is complex state machine with 20 fields (output_pane, input_pane, overlay, agent_state, etc.) plus lots of event dispatch logic spread across many match statements. The render method delegates to three panes (OutputPane, InputPane, ModelPickerPane) with branching per pane type. No trait abstraction for panes.",
+            "location": "app.rs:54-2800",
+            "severity": "medium"
+          },
+          {
+            "description": "OverlayScreen trait (overlay.rs:44) is not public; overlays are hard-coded as Box<dyn OverlayScreen> with enum-based outcome routing in App::apply_overlay_outcome. Adding new overlays requires editing app.rs. Extension overlays will be blocked until the trait and outcome union are public.",
+            "location": "overlay.rs:44, app.rs:~1400",
+            "severity": "high"
+          },
+          {
+            "description": "Placeholder overlay stubs (hotkeys.rs, settings.rs, session_picker.rs, tree.rs) marked with #![cfg_attr(not(test), allow(dead_code))]. Session tree navigation and per-session settings UI are roadmap items; no extension point for third-party overlays yet.",
+            "location": "overlays/hotkeys.rs:1, overlays/settings.rs:1, overlays/session_picker.rs:1, overlays/tree.rs:1",
+            "severity": "high"
+          },
+          {
+            "description": "LineBuilder in markdown/layout.rs (1968 LOC) is a monolithic event-stream consumer handling all markdown elements (headings, lists, tables, blockquotes, code blocks, links). No separate formatter per element type; styles and line breaks are handled inline. Hard to test individual elements or extend with new formatting.",
+            "location": "markdown/layout.rs:44-1968",
+            "severity": "medium"
+          },
+          {
+            "description": "Autocomplete module is marked pub(crate) private; the trait AutocompleteProvider, Suggestion, SuggestionSet, and Context types cannot be used by external code to add custom completion sources. Extension commands (plan 10) will need public autocomplete API.",
+            "location": "autocomplete/mod.rs:1-100",
+            "severity": "high"
+          },
+          {
+            "description": "app.rs run_tui (line 2014) contains the entire event loop with complex timeout calculation, streaming burst coalescence, render scheduling, and keyboard/mouse/resize handling. ~800 LOC with nested branching. No extractable event handler trait; tightly coupled to frame budgets and resize debounce constants.",
+            "location": "app.rs:2014-2800",
+            "severity": "medium"
+          },
+          {
+            "description": "Mouse click-to-open links work only on markdown-rendered fallback text `(url)` suffixes; autolinks (plain URL text) are not clickable. Detection in find_link_ranges is conservative (only link_url style spans). Future improvement needed for autolink click handling.",
+            "location": "markdown/mod.rs:57-96",
+            "severity": "low"
+          },
+          {
+            "description": "Tool output display modes (Verbose vs Compact) only apply to bash/read tool results; other tools always render full body. Architectural assumption that only specific tools benefit from mode switching. Harder to extend per-tool customization.",
+            "location": "output.rs:226-260",
+            "severity": "low"
+          },
+          {
+            "description": "render_markdown is called on every streaming delta (every frame) during streaming blocks. Even with block-level cache, the cache is keyed by text length + width, invalidating on every delta. Per-PR A docs note this is sub-millisecond but perf assumptions live in comments, not enforced.",
+            "location": "output.rs:170-206",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No plugin/extension API for custom overlays yet; OverlayScreen trait is private. Claude Code / Codex allow custom panels. Extension support is roadmap (plan 10) but architectural blocking exists.",
+          "Autocomplete only covers slash commands; no file path / variable / context completion yet. pi has richer autocomplete providers. Custom completion sources cannot be registered.",
+          "Session tree navigation (tree.rs) is unimplemented placeholder. Rival tools (Claude Code, Codex) have rich session/file tree navigation. No public API to add tree-like overlays.",
+          "Settings overlay is unimplemented (settings.rs placeholder). Config must be edited manually in ~/.anie/config.toml. No in-app settings UI.",
+          "Hotkey reference is unimplemented (hotkeys.rs placeholder). No searchable keybinding browser or customization UI.",
+          "Session picker (session_picker.rs) unimplemented; users must use /session list|<id> commands. No visual session picker overlay.",
+          "Image rendering is only protocol detection + placeholder text `[image: alt]`. No actual inline images displayed. kitty/iTerm2 support exists in TerminalCapabilities but not wired to rendering.",
+          "OSC 8 hyperlink support (exists in code) is disabled inside tmux/screen with no passthrough override. Limits hyperlink use in multiplexed environments.",
+          "No markdown table cell styling (inline bold/italic inside tables flattened for PR C). Roadmap item but not in spec yet.",
+          "No syntax highlighting in inline code spans (only in code blocks via syntect). Competitors highlight inline code.",
+          "Link click detection only works on markdown-generated fallback text `(url)`; autolinks (plain URLs rendered as link_text style) are not clickable.",
+          "No custom theme picker overlay (theme_picker.rs is placeholder). Users can't swap dark/light themes in-app; only default_dark() factory available.",
+          "Streaming assistant render re-parses full markdown every frame (even with cache). Cache invalidates per delta. Architectural choice for simplicity but higher CPU than block-level caching alone.",
+          "No AI-powered code explanation / annotation features (copilot-like hover hints). Output rendering is markdown-to-lines only.",
+          "Model discovery is tightly coupled to onboarding overlay (OnboardingScreen). No standalone model discovery API for third-party tools.",
+          "No custom tool output formatters. Tool results are rendered as plain text or markdown; no plugin system for tool-specific renderers.",
+          "Performance instrumentation (render_debug, perf tracing) is compile-time feature-gated; not accessible to extensions.",
+          "Spelling/grammar checking integration not implemented (roadmap item in docs). No inline spell-check UI."
+        ]
+      },
+      {
+        "crate": "anie-cli",
+        "owns": "anie-cli is the interactive and RPC frontends for the anie coding-agent harness. It owns the CLI argument parsing, the interactive TUI controller that manages agent loop lifecycle + session persistence, retry logic + compaction gating, the recursive sub-agent factory, context-virtualization policy, external-context indexing + relevance-based paging, background summarization + embedding workers, the command registry for slash commands, and model/provider selection. It bridges the gap between user input (TUI, RPC, print mode) and the agent loop, implementing harness profiles (baseline/current/rlm) that control which tools and policies are installed.",
+        "public_surface": [
+          {
+            "name": "Cli",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/lib.rs:51",
+            "note": "Main CLI arguments parsed by clap. Entry point for all three execution modes. Public fields: command, interactive, print, rpc, no_tools, harness_mode, prompt, model, provider, api_key, thinking, resume, cwd."
+          },
+          {
+            "name": "Command",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/lib.rs:105",
+            "note": "Subcommands: Onboard, Models, Login, Logout. Parsed from Cli.command."
+          },
+          {
+            "name": "run",
+            "kind": "async fn",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/lib.rs:132",
+            "note": "Main entry point: parse Cli, dispatch to interactive_mode/print_mode/rpc_mode/subcommands. Returns Result."
+          },
+          {
+            "name": "build_system_prompt",
+            "kind": "fn",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/controller.rs:2075",
+            "note": "Re-exported from controller; used by other crates to build the system prompt from project context."
+          },
+          {
+            "name": "HarnessMode",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/harness_mode.rs:31",
+            "note": "Baseline/Current/Rlm. Determines tool registration, compaction gate, RLM feature installation. Part of CLI args."
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "Controller.rs is 2321 lines and contains multiple responsibilities: interactive loop state machine, RLM feature factory, retry policy orchestration, compaction gating, context virtualization policy building, model/provider mutation. The ControllerState struct (1172-1208) holds 13 fields mixing config, session, catalog, registry, resolver, policy, stats, and harness mode. This is difficult to reason about and extend.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/controller.rs:59-2321",
+            "severity": "high"
+          },
+          {
+            "description": "Context-virtualization policy (context_virt.rs, 2230 lines) is a single monolithic struct ContextVirtualizationPolicy implementing BeforeModelPolicy. Eviction logic, ledger building, relevance reranking, keyword overlap scoring, stopwords filtering, and ledger injection are all inlined. Missing internal abstractions for reranker, ledger builder, and eviction strategist.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/context_virt.rs:1-2230",
+            "severity": "high"
+          },
+          {
+            "description": "Compaction gate (compaction_gate.rs, 1041 lines) is a single struct ControllerCompactionGate managing stagnation detection, aggressive-level state machine, history tracking, and compaction scheduling. Stagnation detection logic is embedded; would benefit from extracted StagnationDetector trait.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/compaction_gate.rs:223-1041",
+            "severity": "medium"
+          },
+          {
+            "description": "InteractiveController (controller.rs:59-1207) uses a complex three-way select! loop with tokio tasks, cancellation tokens, mpsc channels, and atomic counters (Arc<AtomicU32>) for budget tracking. The PendingRetry enum carries cloned ProviderError + provider/model strings to enable breadcrumb writing on cancel. The queued_prompts VecDeque is only persisted in memory; crashes mid-queue lose unstarted prompts. No tests for the retry backoff cancellation path or queued-prompt persistence semantics.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/controller.rs:59-400",
+            "severity": "medium"
+          },
+          {
+            "description": "Heavy use of Arc<AtomicU32> for shared counters (compactions_remaining_this_turn, recursions_remaining_this_run) across task boundaries without clear ownership semantics. The Arc is cloned into spawned tasks and the mid-turn gate; decrement order is implicit via Ordering::Release. Future modifications could introduce lost updates if Ordering assumptions change.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/controller.rs:92,101",
+            "severity": "medium"
+          },
+          {
+            "description": "External-context indexing (external_context.rs:101) uses three separate HashMaps (by_id, by_kind, by_tool_call_id) that must stay in sync when messages are pushed. No interior mutability or locks to prevent concurrent mutations; coherence relies on caller discipline (Phase B only appends at run start; Phase C eviction code will need synchronization redesign).",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/external_context.rs:101-350",
+            "severity": "medium"
+          },
+          {
+            "description": "Model catalog building (model_catalog.rs:788 lines) does blocking HTTP requests in build_model_catalog, which is called from bootstrap before the controller is spawned. If a provider times out, the entire startup blocks. No timeout configuration exposed to CLI.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/model_catalog.rs:1-788",
+            "severity": "low"
+          },
+          {
+            "description": "Retry policy (retry_policy.rs:820 lines) uses string matching and cloning of ProviderError to decide retry actions. The error taxonomy is structured, but the policy logic is tightly coupled to specific ProviderError variants. Adding a new error type requires touching RetryPolicy::decide.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/retry_policy.rs:110-200",
+            "severity": "low"
+          },
+          {
+            "description": "Background summarizer (bg_summarizer.rs:731 lines) and embedder (bg_embedder.rs:244 lines) are spawned as fire-and-forget tasks with no explicit shutdown coordination. They send results back through mpsc channels but the controller doesn't signal them to stop before exit. On shutdown, they may still be running in the background.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/bg_summarizer.rs:1-731",
+            "severity": "low"
+          },
+          {
+            "description": "Recurse tool (recurse_provider.rs:508 lines) holds Arc<RwLock<ExternalContext>> and reads from it for every scope resolution. Future scope kinds (e.g., temporal ranges, semantic search) will require extending the store; the current flat-map interface (by_kind, by_tool_call_id) may not scale well.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/recurse_provider.rs:69-508",
+            "severity": "low"
+          },
+          {
+            "description": "Multiple dead-code allowances (#[allow(dead_code)]) on methods in external_context, embedder, bg_embedder, and bg_summarizer. These are intentionally wired in future PR phases (08.2, 08.3, Phase C, Phase E, Phase F) per inline comments. Risk: code rot if PRs are delayed or merge order changes.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/external_context.rs:78,180,198,210,220,232,240,314,326",
+            "severity": "low"
+          },
+          {
+            "description": "Commands registry (commands.rs:584 lines) is a catalog-only module. Dispatch happens in controller, creating a coupling between command definition and controller action handling. No type-safe command dispatch; command names are matched as strings in controller. Extensions (not yet implemented) will add complexity here.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-cli/src/commands.rs:52-584",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No observable streaming of intermediate reasoning, tool execution, or compaction events to stdout/client during execution. Claude Code streams all events in real-time so users see progress; anie collects events and writes them after the run completes (RPC mode) or in the TUI (interactive mode).",
+          "Compaction strategy is deterministic (summarize old messages) but opaque to the model. Claude Code / Codex can expose the compaction summary as a system hint so the model is aware its context was compressed. anie's ledger (Phase E) provides this, but it's not yet wired into the prompt.",
+          "No explicit session branching (fork) implementation here. The `/fork` command is mentioned in error messages (bootstrap.rs) but not implemented. Claude Code has native session fork + worktree support.",
+          "Retry policy caps rate-limit retries at 1 attempt (to avoid burning rate budget) but caps model-output-malformed retries at 2. Other transient errors get 3 retries. No exponential backoff customization per error type; all use the same config. Claude Code allows per-error retry strategies.",
+          "No native support for multi-turn tool-use loops within a single model request. Each tool call requires a full round-trip through the session + event loop. Colab-style agents (Python + code execution in one cell) are not directly comparable, but the constraint limits interactive refinement.",
+          "RLM (context virtualization) mode is an evaluation harness with tunable environment variables (ANIE_ACTIVE_CEILING_TOKENS, ANIE_KEEP_LAST_N, ANIE_RELEVANCE_BUDGET_TOKENS). No UI for these; can't adjust mid-session. Claude Code's context management is always-on and auto-tuned.",
+          "Baseline harness mode is a measurement floor (no tools, no compaction gate). Codex / Claude Code have no such mode; their tooling is always active. This is useful for research but adds configuration surface.",
+          "Sub-agent recursion via the recurse tool is limited to 8 recursions per run and depth 2. Deeper nesting disables the recurse tool. No async parallel sub-agent spawning; all recursion is serial.",
+          "No built-in cost tracking or token budgeting. Compaction budgets are turn-based; no per-run or per-session cost limits. Claude Code can enforce global cost ceilings.",
+          "External-context store (Phase B) is in-memory only. No durability guarantees if the process crashes. Claude Code persists all context to storage so recovery is possible.",
+          "Slash-command extensions are not yet wired up (plan mentions extension system but no implementation). All commands are builtin. Claude Code has a full plugin/extension marketplace.",
+          "No support for custom tool definitions at runtime. Tool registry is built at startup from hardcoded anie_tools. Claude Code supports dynamic tool registration via MCP.",
+          "One notable *strength*: the per-turn compaction budget (Arc<AtomicU32>) prevents infinite compaction loops when a single turn hits repeated context overflows. Reactive overflow (compaction budget exhausted → error) surfaces actionable feedback. Claude Code doesn't have this protection."
+        ]
+      },
+      {
+        "crate": "anie-providers-builtin",
+        "owns": "This crate owns the built-in LLM provider implementations for anie: Anthropic Messages API, OpenAI-compatible chat completions (hosting both OpenAI and OpenRouter), and Ollama native `/api/chat` endpoints. It also owns shared HTTP/SSE infrastructure, model discovery from live provider catalogs (supporting OpenAI-compat, Anthropic, and Ollama endpoints), a static builtin model registry, and helper modules for local server detection, OpenRouter-specific capability mapping, and provider-neutral error classification. The crate bridges anie's provider-agnostic `anie-provider` trait down to concrete wire protocols.",
+        "public_surface": [
+          {
+            "name": "AnthropicProvider",
+            "kind": "struct",
+            "location": "src/anthropic.rs:82",
+            "note": "Implements Provider trait for Anthropic Messages API; exposes new() and Default."
+          },
+          {
+            "name": "OpenAIProvider",
+            "kind": "struct",
+            "location": "src/openai/mod.rs:45",
+            "note": "Implements Provider trait for OpenAI-compatible endpoints (OpenAI, OpenRouter, local Ollama/LM Studio/vLLM)."
+          },
+          {
+            "name": "OllamaChatProvider",
+            "kind": "struct",
+            "location": "src/ollama_chat/mod.rs:27",
+            "note": "Implements Provider trait for Ollama native /api/chat NDJSON protocol; anie-specific, not in pi."
+          },
+          {
+            "name": "register_builtin_providers",
+            "kind": "fn",
+            "location": "src/lib.rs:50",
+            "note": "Public registration function to wire all three providers into a ProviderRegistry."
+          },
+          {
+            "name": "discover_models",
+            "kind": "fn",
+            "location": "src/model_discovery.rs:41",
+            "note": "Public discovery entry point; dispatches to OpenAI-compat, Anthropic, or Ollama discovery based on ApiKind."
+          },
+          {
+            "name": "ModelDiscoveryCache",
+            "kind": "struct",
+            "location": "src/model_discovery.rs:62",
+            "note": "In-memory TTL cache for provider model discovery with Arc-wrapped backing for zero-copy hits."
+          },
+          {
+            "name": "ModelDiscoveryRequest",
+            "kind": "struct",
+            "location": "src/model_discovery.rs:16",
+            "note": "Struct carrying provider_name, api, base_url, optional api_key, headers for discovery requests."
+          },
+          {
+            "name": "builtin_models",
+            "kind": "fn",
+            "location": "src/models.rs:26",
+            "note": "Static catalog of 5 hosted models: claude-sonnet-4-6, claude-opus-4-6, claude-haiku, gpt-4o, o4-mini."
+          },
+          {
+            "name": "LocalServer",
+            "kind": "struct",
+            "location": "src/local.rs:12",
+            "note": "Detected local server with name, base_url, and discovered models."
+          },
+          {
+            "name": "detect_local_servers",
+            "kind": "fn",
+            "location": "src/local.rs:138",
+            "note": "Probes localhost:11434, localhost:1234, etc. for Ollama/LM Studio/vLLM servers; returns empty vec on HTTP client init failure (best-effort)."
+          },
+          {
+            "name": "probe_openai_compatible",
+            "kind": "fn",
+            "location": "src/local.rs:181",
+            "note": "Probes a specific OpenAI-compatible server URL; upgrades Ollama with authoritative /api/show data."
+          },
+          {
+            "name": "apply_openrouter_capabilities",
+            "kind": "fn",
+            "location": "src/openrouter.rs:105",
+            "note": "Mutates a Model to apply OpenRouter upstream-prefix-based capability mapping (replay + reasoning)."
+          },
+          {
+            "name": "needs_anthropic_cache_control",
+            "kind": "fn",
+            "location": "src/openrouter.rs:142",
+            "note": "Returns true when model targets OpenRouter AND upstream is Anthropic; signals need for cache_control insertion."
+          },
+          {
+            "name": "insert_anthropic_cache_control",
+            "kind": "fn",
+            "location": "src/openrouter.rs:159",
+            "note": "Mutates message list to add cache_control ephemeral marker to last text part when routing through OpenRouter Anthropic."
+          },
+          {
+            "name": "is_openrouter_target",
+            "kind": "fn",
+            "location": "src/openrouter.rs:40",
+            "note": "Returns true when base_url contains openrouter.ai substring."
+          },
+          {
+            "name": "openrouter_capabilities_for",
+            "kind": "fn",
+            "location": "src/openrouter.rs:65",
+            "note": "Pure function computing (ReplayCapabilities, ReasoningCapabilities) tuple from model_id prefix and reasoning flag."
+          },
+          {
+            "name": "classify_http_error",
+            "kind": "fn",
+            "location": "src/util.rs:12",
+            "note": "Classifies HTTP error codes into typed ProviderError variants (Auth, RateLimited, ContextOverflow, Http, etc)."
+          },
+          {
+            "name": "parse_retry_after",
+            "kind": "fn",
+            "location": "src/util.rs:2",
+            "note": "Parses HTTP Retry-After header into milliseconds."
+          },
+          {
+            "name": "create_http_client",
+            "kind": "fn",
+            "location": "src/http.rs:68",
+            "note": "Public fallback to create a fresh HTTP client with 30s connect timeout, no overall timeout (panics on TLS failure)."
+          },
+          {
+            "name": "sse_stream",
+            "kind": "fn",
+            "location": "src/sse.rs:24",
+            "note": "Converts reqwest Response body into Stream<Result<SseEvent>>; wraps eventsource_stream."
+          },
+          {
+            "name": "SseEvent",
+            "kind": "struct",
+            "location": "src/sse.rs:8",
+            "note": "Parsed SSE event with event_type and data fields."
+          },
+          {
+            "name": "SseError",
+            "kind": "enum",
+            "location": "src/sse.rs:17",
+            "note": "Single-variant Stream error wrapper."
+          },
+          {
+            "name": "is_ollama_native_discovery_target",
+            "kind": "fn",
+            "location": "src/lib.rs:36",
+            "note": "Returns true when provider is 'ollama' (case-insensitive) OR base_url contains :11434."
+          },
+          {
+            "name": "ollama_native_base_url",
+            "kind": "fn",
+            "location": "src/lib.rs:44",
+            "note": "Strips /v1 suffix from OpenAI-compat base URL to get Ollama native endpoint root."
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "anthropic.rs at 1680 LOC is the largest single provider file; handles stream reassembly, thinking/redacted-thinking state, tool-use accumulation, and message conversion in one module. Stream state machine (AnthropicStreamState, AnthropicBlockState lines 436–781) is tightly coupled to the Provider impl; extraction into a separate streaming.rs (like openai/ does) would improve readability.",
+            "location": "src/anthropic.rs",
+            "severity": "medium"
+          },
+          {
+            "description": "openai/mod.rs at 1543 LOC similarly houses Provider impl, message conversion, tool schema, and native-reasoning orchestration. The decide_native_reasoning_request_strategy function (inlined in build_request_body_with_native_reasoning_strategy) synthesizes too many concerns: local vs. hosted detection, request strategy dispatch, and max_tokens headroom calculation. Refactoring to split native-reasoning logic into a dedicated strategy orchestrator would reduce coupling.",
+            "location": "src/openai/mod.rs:135-230",
+            "severity": "medium"
+          },
+          {
+            "description": "model_discovery.rs at 2015 LOC handles OpenAI-compat, Anthropic, and Ollama discovery but makes ad-hoc decisions about when to try Ollama's native /api/tags (should_try_ollama_tags), model type filtering (Copilot vs. OpenAI), and fallback ordering. The discovery dispatch tree (lines 322–360) is fragile to new provider additions; no abstraction for 'discovery strategy'.",
+            "location": "src/model_discovery.rs:322-360",
+            "severity": "medium"
+          },
+          {
+            "description": "ollama_chat/mod.rs at 1050 LOC combines provider impl, request serialization (build_request_body), retry orchestration (send_request_with_load_resource_retry, send_request_with_reasoning_retry), and error classification. Three levels of nested retries (load resource → reasoning compat → base request) make it hard to trace the retry loop contract. No explicit documentation of which errors are retryable and why.",
+            "location": "src/ollama_chat/mod.rs:54-117",
+            "severity": "high"
+          },
+          {
+            "description": "Local model reasoning capability inference (default_local_reasoning_capabilities_normalized in local.rs:90–115) uses heuristics based on provider name and base URL. No single source of truth for reasoning-capable model families; both local.rs and model_discovery.rs maintain reasoning-family checks (is_reasoning_capable_family vs. model_discovery::is_reasoning_capable_family_id). A breaking change to the family list requires edits in two places.",
+            "location": "src/local.rs:90-115 and src/model_discovery.rs",
+            "severity": "medium"
+          },
+          {
+            "description": "openai/streaming.rs at 816 LOC and anthropic.rs streaming state (lines 436–781) both track finish_reason, usage, and content accumulation. Duplicated state machines for the same responsibility. No shared abstraction for 'SSE stream → AssistantMessage'. Reasoning_details replay (openai/streaming.rs:56–63) is specific to OpenRouter but embedded in OpenAIStreamState, not gated by model metadata.",
+            "location": "src/openai/streaming.rs and src/anthropic.rs:436-781",
+            "severity": "medium"
+          },
+          {
+            "description": "The shared HTTP client uses OnceLock with a cached error (http.rs:13–33). If the shared client fails to initialize, every call returns the same Transport error; no way to retry after a transient TLS failure. The fallback to create_http_client() on error (openai/mod.rs:58–60) builds a new client but that's only called at provider construction, not per-request.",
+            "location": "src/http.rs:13-34",
+            "severity": "low"
+          },
+          {
+            "description": "Error body-pattern matching for compatibility failures (openai/reasoning_strategy.rs:209–243 looks_like_native_reasoning_compat_body, anthropic.rs:70–79 looks_like_replay_fidelity) uses string-search heuristics. Changes to provider error messages could silently break error classification. No test harness for 'error bodies from real provider rejections'.",
+            "location": "src/openai/reasoning_strategy.rs:209-243 and src/anthropic.rs:70-79",
+            "severity": "medium"
+          },
+          {
+            "description": "Model.context_window is hardcoded to 32,768 as a placeholder in local server discovery (local.rs:230), then overwritten with Ollama /api/show data when available. Non-Ollama local servers (lmstudio, vllm) never discover their true context window; users must manually adjust. No extension point for per-server discovery strategies.",
+            "location": "src/local.rs:230 and src/local.rs:255-338",
+            "severity": "low"
+          },
+          {
+            "description": "Tool schema conversion (openai uses tool_schema.rs:4–18, anthropic inlines in convert_tools) is not shared. OpenAI and Anthropic have different tool formats but similar underlying ToolDef. Duplicated conversion logic increases maintenance burden.",
+            "location": "src/tool_schema.rs and src/anthropic.rs:289-312",
+            "severity": "low"
+          },
+          {
+            "description": "The reasoning_strategy module (openai/reasoning_strategy.rs) contains both request-side strategy selection (NativeReasoningRequestStrategy enum) and response-side delta extraction (native_reasoning_delta). Request vs. response concerns are intertwined; splitting by direction (request_strategy.rs / response_extraction.rs) would isolate the decision trees.",
+            "location": "src/openai/reasoning_strategy.rs",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No per-model capability discovery from LLM-hosted metadata endpoints (e.g., OpenAI's models endpoint is queried but tool/vision/reasoning flags are inferred statically). Claude Code / Codex likely discover and cache capabilities per session.",
+          "Reasoning/thinking output format is provider-specific (Anthropic thinking blocks, OpenAI reasoning deltas, tagged <think> for local models) with no unified internal representation. Makes it hard to add new reasoning formats or let users choose output format. Codex likely normalizes these to a single AST.",
+          "No fallback provider routing: if OpenRouter is down, requests fail rather than transparently routing to direct Anthropic/OpenAI. Single point of failure for multi-provider deployments.",
+          "Local model discovery is best-effort (returns empty vec on HTTP client failure), but there's no retry or deferred-init mechanism. If the user plugs in a USB GPU or starts Ollama after anie launches, it won't be rediscovered.",
+          "Streaming timeout is infinite (http.rs:43 comment), which is correct for long reasoning but means a stuck upstream can block indefinitely. No user-controlled streaming timeout or keepalive ping.",
+          "Error classification is heuristic-based (body string matching); no structured error codes from providers. Codex likely decodes provider error enums or uses their SDKs' typed errors.",
+          "No built-in circuit-breaker or provider health monitoring. Three consecutive 503s doesn't automatically failover to a backup provider.",
+          "Model discovery cache is in-memory with no persistence. Cache misses on every restart, even for the same endpoint.",
+          "Thinking/reasoning field names vary across providers (Anthropic `thinking`, OpenAI `reasoning`, Ollama `think`) but there's no extensible way to add new field names without editing reasoning_strategy.rs:254–260.",
+          "OpenRouter-specific logic (apply_openrouter_capabilities, needs_anthropic_cache_control, insert_anthropic_cache_control) is hardcoded. Adding a fourth aggregator endpoint (e.g., a custom on-prem proxy) requires code changes, not configuration."
+        ]
+      },
+      {
+        "crate": "anie-tools",
+        "owns": "anie-tools provides the complete toolkit of I/O and text-search operations that a coding agent invokes: bash execution with timeouts and cancellation, file read/write/edit, directory listing, glob-based file finding, regex-based content search, and a `recurse` tool for delegating sub-queries to focused sub-agents. All tools respect .gitignore, stream output to avoid loading files into memory, implement byte/line caps scaled to the model's context window, and share a FileMutationQueue for serializing concurrent mutations on the same file path.",
+        "public_surface": [
+          {
+            "name": "BashTool",
+            "kind": "struct",
+            "location": "bash.rs:23",
+            "note": "Execute shell commands with timeout, cancellation, and optional pre-spawn deny policy. Streams output to avoid buffering large results. Implements tokio async execution and process group management (Unix) or taskkill (Windows)."
+          },
+          {
+            "name": "BashPolicy",
+            "kind": "struct",
+            "location": "bash.rs:34",
+            "note": "Optional deny-list for command names and regex patterns matched against raw command string before spawning. Not a sandbox; accidental-risk guardrail only."
+          },
+          {
+            "name": "ReadTool",
+            "kind": "struct",
+            "location": "read.rs:21",
+            "note": "Stream-read text files with offset/limit controls, or read images (PNG/JPG/GIF/WebP) as base64 attachments. Detects binary files via NUL byte. Byte budget scaled to model context window. Hard line-buffer cap prevents pathological newline-less files from allocating unbounded memory."
+          },
+          {
+            "name": "WriteTool",
+            "kind": "struct",
+            "location": "write.rs:16",
+            "note": "Write content to files, creating parent directories as needed. Uses shared FileMutationQueue to serialize mutations on the same path."
+          },
+          {
+            "name": "EditTool",
+            "kind": "struct",
+            "location": "edit.rs:25",
+            "note": "Apply exact-text replacements in batch (up to 100 edits per call). Supports both exact and fuzzy matching (whitespace-insensitive). Detects and preserves UTF-8 BOM and line-ending style (LF/CRLF/CR). Lazy fuzzy-cache to amortize normalization cost across multiple fuzzy edits in one batch."
+          },
+          {
+            "name": "FindTool",
+            "kind": "struct",
+            "location": "find.rs:31",
+            "note": "Find files matching glob patterns using the `ignore` crate's walker. Respects .gitignore, .git_exclude, and hidden-file filters. Returns up to 1000 paths or 50 KB output."
+          },
+          {
+            "name": "GrepTool",
+            "kind": "struct",
+            "location": "grep.rs:42",
+            "note": "Search files for regex patterns using ripgrep's libraries (grep-regex + grep-searcher). Supports case-insensitive, literal (escaped), glob/type filters, and context lines. Returns up to 100 matches or 50 KB of `path:line:match` output."
+          },
+          {
+            "name": "LsTool",
+            "kind": "struct",
+            "location": "ls.rs:24",
+            "note": "List directory contents with `/` suffix on dirs, `*` on executables (Unix only). Hides dotfiles by default. Limit defaults to 500 entries."
+          },
+          {
+            "name": "RecurseTool",
+            "kind": "struct",
+            "location": "recurse.rs:48",
+            "note": "Invoke a focused sub-agent over a scoped slice of context (message range, regex grep, prior tool result, file, or summary). Sub-agent runs in isolation with its own AgentLoop. Budget and depth shared across all recurse instances in a run; when exhausted or depth-limited, returns error."
+          },
+          {
+            "name": "FileMutationQueue",
+            "kind": "struct",
+            "location": "file_mutation_queue.rs:11",
+            "note": "Serializes concurrent mutations (writes/edits) on a per-canonicalized-path basis using DashMap + Arc<Mutex>. Prevents race conditions when multiple tool calls target the same file."
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "Hardcoded output caps (MAX_READ_BYTES=50KB, MAX_READ_LINES=2000, MAX_IMAGE_BYTES=10MB) are not configurable. While they scale with context window in read/bash, the base 50 KB BYTE_LIMIT for grep/find is fixed. A power user cannot globally tune these for a resource-constrained environment or a fast-search-broad-scan use case.",
+            "location": "shared.rs:37-40; grep.rs:36; find.rs:28",
+            "severity": "medium"
+          },
+          {
+            "description": "grep and find use separate BYTE_LIMIT (50 KB) constants, not `MAX_READ_BYTES`. Makes it unclear whether these are intentionally different or a copy-paste artifact. A single source of truth would improve maintainability and reasoning about tool output consistency.",
+            "location": "grep.rs:36; find.rs:28; shared.rs:38",
+            "severity": "low"
+          },
+          {
+            "description": "EditTool's fuzzy matching heuristic (whitespace-insensitive) is not documented in the tool definition schema. Users calling the tool see no hint that oldText will be matched fuzzily if exact match fails. A new user might expect 'exact match only' or be surprised by behavior on whitespace changes.",
+            "location": "edit.rs:55-58 (definition); edit.rs:275-281 (fuzzy fallback)",
+            "severity": "medium"
+          },
+          {
+            "description": "RecurseTool is tightly coupled to `anie_agent::SubAgentFactory`, `anie_agent::ContextProvider`, and the `AgentLoop` type. There is no trait abstraction for swapping different sub-agent strategies or context resolution backends. Extending the recurse logic would require trait changes at the anie_agent level.",
+            "location": "recurse.rs:49-50, 72-86",
+            "severity": "medium"
+          },
+          {
+            "description": "The recursion budget is shared across all recurse instances via Arc<AtomicU32>, but the depth-limit check happens only at tool construction time (via depth >= max_depth in the factory). If factory doesn't register recurse again, there's no tool-level enforcement. The recursion safety contract lives partly in tool, partly in factory.",
+            "location": "recurse.rs:59-65",
+            "severity": "low"
+          },
+          {
+            "description": "BashTool's pre-spawn deny policy uses simple basename matching for command names (extracted via string split/rsplit) and regex on the raw command string. This is vulnerable to evasion (e.g., `/ b i n / r m` with path separators embedded in shell quotes), and doesn't parse shell syntax correctly (doesn't handle quoting, pipes, subshells deeply). Not a security boundary, but fragile for accidental-risk guardrails.",
+            "location": "bash.rs:268-293",
+            "severity": "medium"
+          },
+          {
+            "description": "ReadTool's image detection is case-insensitive extension matching, which correctly avoids allocation, but there's no MIME-type validation. A file named `image.png.zip` would be read as PNG. Not a safety issue, but could produce confusing errors when the user passes the wrong extension by mistake.",
+            "location": "read.rs:262-287",
+            "severity": "low"
+          },
+          {
+            "description": "The `grep-searcher` Sink trait is implemented as a mutable struct (MatchCollector) that tracks state across calls. If `matched()` is called many times, the struct accumulates cancellation checks (`self.cancel.load()`) and byte-cap checks on every match. For grep jobs with tens of thousands of matches, this per-match overhead compounds. No streaming output or early-exit optimization for the sink.",
+            "location": "grep.rs:364-413",
+            "severity": "low"
+          },
+          {
+            "description": "test.rs is monolithic at 1398 LOC. While comprehensive, it mixes unit tests (e.g., `resolve_path_preserves_absolute_paths`) with integration tests (full tool-chain runs) and end-to-end tests (agent loop with mock provider). Breaking this into separate test modules would improve maintainability and test organization.",
+            "location": "tests.rs:1-1398",
+            "severity": "low"
+          },
+          {
+            "description": "FileMutationQueue's `canonicalize_best_effort` falls back to joining with current_dir if the parent can't be canonicalized. This could cause unexpected lock-key mismatches if the tool is invoked from different cwds in the same process. Two calls to the same 'src/file.txt' from different starting directories might get different lock keys.",
+            "location": "file_mutation_queue.rs:53-72",
+            "severity": "medium"
+          }
+        ],
+        "competitive_notes": [
+          "Streaming read/write/bash output is well-designed (matches pi's shape on byte/line caps scaled to context window), but the caps themselves are not configurable at runtime. Claude Code / Codex users may want to trade off size for speed (e.g., return 10KB in grep to avoid latency) or size for breadth (e.g., return 200KB in bash to capture full CI logs).",
+          "RecurseTool is novel in anie (not in pi), but architecture requires tight coupling to anie_agent::SubAgentFactory and anie_agent::ContextProvider. A competing agent would need these abstractions in place or face code changes in multiple crates to experiment with different recursion strategies.",
+          "EditTool's fuzzy matching (whitespace-insensitive fallback) is powerful and undocumented. Competitors may not implement this, forcing users to be pixel-perfect with whitespace. Or they may implement it without signaling the behavior, causing surprise matches. This is a UX edge case worth documenting or removing.",
+          "GrepTool and FindTool use ripgrep's libraries directly, avoiding subprocess overhead. Competitors shelling out to `rg`/`find` CLI would have PATH/version dependencies and slightly higher startup cost, but identical behavior.",
+          "BashTool's pre-spawn deny policy is an accidental-risk guardrail, not a security boundary. It's bypassable and doesn't parse shell syntax correctly. A security-conscious competitor would implement proper shell parsing or a sandbox (OS-level or via seccomp/pledge), which anie doesn't attempt.",
+          "No support for streaming tool results (partial output to the agent before the tool finishes). GrepTool/FindTool/ReadTool do not implement `update_tx` (the partial-result channel); bash does. Power users searching enormous repos might want streaming 'first 10 matches' results while the full grep completes in the background.",
+          "Image support (base64 attachment via ReadTool) is present but limited to 10 MB and five formats (PNG/JPG/GIF/WebP). No HEIC or progressive-JPEG support. Competitors may offer broader format coverage.",
+          "EditTool's max file size (5 MB input, up to 5.5 MB output after edits) is reasonable but fixed. A power user editing very large generated files (e.g., bundled JavaScript) might hit this ceiling. Competitors with configurable or streaming edit-application might win here.",
+          "RecurseTool's scope types (message_range, message_grep, tool_result, file, summary) cover the main use cases, but there's no 'session archive slice' scope type. A future competitor might offer 'recurse on the last 3 tool results that mention X' or 'recurse on archived messages 5-10 with a fresh filter', which would require extending the scope enum."
+        ]
+      },
+      {
+        "crate": "anie-tools-web",
+        "owns": "This crate provides two web-integrated tools (`web_read` and `web_search`) for the anie agent harness. `web_read` fetches URLs via reqwest with SSRF defense (textual hostname classification, resolved-IP re-validation, robots.txt compliance, per-host rate limiting), bounds the response size with soft truncation, and pipes the HTML through Defuddle (a subprocess reader-mode extractor) to emit clean Markdown with YAML frontmatter. Optional headless Chrome rendering via chromiumoxide supports JavaScript-heavy pages. `web_search` queries DuckDuckGo's HTML endpoint and parses results into ranked URLs with snippets. Both tools share a per-host rate-limit bucket and are registered into the anie ToolRegistry.",
+        "public_surface": [
+          {
+            "name": "web_tools",
+            "kind": "fn",
+            "location": "src/lib.rs:55",
+            "note": "Build the default set of web tools (web_read and web_search) with default FetchOptions"
+          },
+          {
+            "name": "web_tools_with_options",
+            "kind": "fn",
+            "location": "src/lib.rs:65",
+            "note": "Build web tools with operator-supplied FetchOptions for per-host rate limit, timeout, byte caps"
+          },
+          {
+            "name": "WebReadTool",
+            "kind": "struct",
+            "location": "src/read/tool.rs:26",
+            "note": "Tool impl for web_read; fetches URL + runs Defuddle extraction; supports javascript=true with headless Chrome"
+          },
+          {
+            "name": "WebSearchTool",
+            "kind": "struct",
+            "location": "src/search/tool.rs:33",
+            "note": "Tool impl for web_search; queries DuckDuckGo HTML and parses SERP; SearchBackend enum is currently DuckDuckGo-only"
+          },
+          {
+            "name": "WebToolError",
+            "kind": "enum",
+            "location": "src/error.rs:14",
+            "note": "Typed error enum covering InvalidUrl, PrivateAddress, Forbidden (robots.txt), Fetch, HttpStatus, TooLarge (deprecated), Timeout, Aborted, HeadlessFailure, DefuddleNotFound/Failed, UnsupportedContentType, SearchBackend"
+          },
+          {
+            "name": "FetchOptions",
+            "kind": "struct",
+            "location": "src/read/fetch.rs:595",
+            "note": "Configuration for HTTP fetch: timeout, user_agent, max_bytes, max_redirects, allow_private_ips, headless_timeout_secs"
+          },
+          {
+            "name": "FetchedBody",
+            "kind": "struct",
+            "location": "src/read/fetch.rs:42",
+            "note": "Result of fetch_html: body (possibly truncated) + Optional truncation diagnostics"
+          },
+          {
+            "name": "FetchTruncation",
+            "kind": "struct",
+            "location": "src/read/fetch.rs:53",
+            "note": "Diagnostic: bytes_returned and max_bytes when fetch hit size cap (soft-truncation policy)"
+          },
+          {
+            "name": "fetch_html",
+            "kind": "fn",
+            "location": "src/read/fetch.rs:661",
+            "note": "Core fetch function: manual redirect handling with validate_url check at each hop, resolved-IP SSRF guard, streaming body with soft truncation, non-HTML content type rejection"
+          },
+          {
+            "name": "validate_url",
+            "kind": "fn",
+            "location": "src/read/fetch.rs:106",
+            "note": "Parse and validate URL; rejects unsupported schemes and known-private textual hostnames"
+          },
+          {
+            "name": "validate_destination",
+            "kind": "fn",
+            "location": "src/read/fetch.rs:258",
+            "note": "Resolve hostname and reject if any IP is private (DNS-based SSRF guard)"
+          },
+          {
+            "name": "Resolver",
+            "kind": "trait",
+            "location": "src/read/fetch.rs:212",
+            "note": "DNS resolver abstraction; SystemResolver (platform DNS) for production, StaticResolver for tests"
+          },
+          {
+            "name": "HostRateLimiter",
+            "kind": "struct",
+            "location": "src/read/fetch.rs:548",
+            "note": "Token-bucket rate limiter keyed by hostname; shared across web_read and web_search"
+          },
+          {
+            "name": "RobotsCache",
+            "kind": "struct",
+            "location": "src/read/fetch.rs:347",
+            "note": "In-memory robots.txt cache keyed by (scheme, host, port) origin; permissive on parse failure"
+          },
+          {
+            "name": "DefuddleOutput",
+            "kind": "struct",
+            "location": "src/read/extract.rs:71",
+            "note": "Deserialized JSON from defuddle CLI: title, author, domain, language, published, word_count, reading_time, content_markdown (markdown when --markdown flag used)"
+          },
+          {
+            "name": "DefuddleRunner",
+            "kind": "trait",
+            "location": "src/read/extract.rs:148",
+            "note": "Abstraction for Defuddle invocation; SubprocessDefuddleRunner spawns CLI, tests inject mocks"
+          },
+          {
+            "name": "SearchHit",
+            "kind": "struct",
+            "location": "src/search/mod.rs:14",
+            "note": "Single search result: title, url, snippet, site (hostname)"
+          },
+          {
+            "name": "render_with_chrome",
+            "kind": "fn",
+            "location": "src/read/headless.rs:98",
+            "note": "Headless Chrome render for javascript=true; gated behind --features headless; NOT SSRF-equivalent (subresources loaded by Chrome bypass private-IP guard)"
+          },
+          {
+            "name": "locate_chrome",
+            "kind": "fn",
+            "location": "src/read/headless.rs:40",
+            "note": "Find Chrome/Chromium binary: CHROME_PATH env var, then which, then /Applications/Google Chrome.app on macOS"
+          }
+        ],
+        "todos_fixmes": [
+          {
+            "text": "Tracking as follow-up to PR 4.1 (headless.rs:200): cancellation during headless render leaks the Chrome process because chromiumoxide does NOT tear down Chrome on Browser drop. Requires explicit .kill() handle outside the render future.",
+            "location": "src/read/headless.rs:187-200"
+          },
+          {
+            "text": "Deferred: relative-link resolution in extracted Markdown. source_url reaches DefuddleRunner trait for metadata, but Defuddle 0.18 CLI has no --base-url flag and we pass a tempfile not the URL. Relative <a> / <img> references come through as relative paths. Would require pulldown-cmark post-processor.",
+            "location": "src/read/extract.rs:126-146"
+          },
+          {
+            "text": "Deferred: headless render byte capping. Plan 05 PR D notes that effective_max_bytes is computed but only the non-headless branch honors it. Chrome's render buffer is not capped from anie's side, so javascript=true can return a body larger than the per-call budget. Requires post-render trim or virtual-time-budget tweak.",
+            "location": "src/read/tool.rs:177-188"
+          },
+          {
+            "text": "Deferred: TOCTOU in SSRF guard between validate_destination and actual request. Small window where DNS could change. Would require custom reqwest Resolve implementation.",
+            "location": "src/read/fetch.rs:253-257"
+          },
+          {
+            "text": "Deferred: Phase 2 addition of Brave and SearXNG search backends (currently only DuckDuckGo).",
+            "location": "src/search/tool.rs:23-24"
+          }
+        ],
+        "rough_edges": [
+          {
+            "description": "fetch.rs at 1306 LOC is the largest module and combines URL validation, SSRF guards, DNS resolution, robots caching, rate limiting, and HTTP streaming in a single file. Consider breaking into submodules (ssrf.rs, robots.rs, limiter.rs, streaming.rs) as the feature set expands.",
+            "location": "src/read/fetch.rs",
+            "severity": "medium"
+          },
+          {
+            "description": "tool.rs at 1035 LOC (read/tool.rs) is oversized and mixes URL handling, phase signaling, truncation markers, Defuddle invocation, frontmatter generation, and comprehensive test suite. The test suite alone (500+ LOC) could move to a separate test module and fixtures. Phase-update plumbing (emit_phase) is low-level detail.",
+            "location": "src/read/tool.rs",
+            "severity": "medium"
+          },
+          {
+            "description": "Chrome process leak on cancellation/timeout in headless.rs (lines 187-200). The render future is dropped before browser.close() can run, and chromiumoxide does not clean up on Browser drop. User-data-dir is created per-render to work around singleton lock, but the browser process itself is leaked. Requires architectural rework: top-level Browser handle + explicit .kill().",
+            "location": "src/read/headless.rs:187-209",
+            "severity": "high"
+          },
+          {
+            "description": "StaticResolver is doc(hidden) but public #[doc(hidden)] pub struct (fetch.rs:841) — it's designed for tests but the visibility is ambiguous. Consider moving to a test-only module or feature-gating.",
+            "location": "src/read/fetch.rs:841",
+            "severity": "low"
+          },
+          {
+            "description": "RobotsCache uses origin key (scheme, host, port) as of PR 6.1, but the pre-PR-6.1 bug (host-only key shadowing) means older sessions could have stale cached robots policies. No migration/clearing on upgrade. Low risk in practice (robots policies rarely change), but not formally documented.",
+            "location": "src/read/fetch.rs:311-316",
+            "severity": "low"
+          },
+          {
+            "description": "Defuddle invocation hardcodes version 0.18.x for npx fallback (extract.rs:43) and always passes --markdown --json. No way for callers to adjust CLI flags or pin to a different version without modifying the crate. Hardcoded Defuddle version could drift from installed package.",
+            "location": "src/read/extract.rs:43",
+            "severity": "low"
+          },
+          {
+            "description": "bounded_text_for_error and collect_bounded_body are nearly identical functions handling streaming + cap logic (fetch.rs:475-538). Minor duplication; could factor into a generic helper.",
+            "location": "src/read/fetch.rs:475-538",
+            "severity": "low"
+          },
+          {
+            "description": "read_to_end_bounded in extract.rs reads in 8192-byte chunks (hardcoded, line 315). No tuning for Defuddle's typical output patterns or performance implications. Buffer sizing could be configurable.",
+            "location": "src/read/extract.rs:308-331",
+            "severity": "low"
+          },
+          {
+            "description": "SearchBackend enum is a placeholder (only DuckDuckGo implemented). The enum exists but the tool always uses DuckDuckGo; no dispatch logic for other backends. Adding Brave/SearXNG would require plumbing SearchBackend through WebSearchTool (currently baked as default). Design anticipates expansion but the integration seams are not yet present.",
+            "location": "src/search/tool.rs:26-30",
+            "severity": "medium"
+          },
+          {
+            "description": "WebReadTool and WebSearchTool have separate rate_limiter and client fields. Both are passed separately to web_tools_with_options (lib.rs:75-76) but there's no documented contract that they must share the same instances. Caller error could lead to double rate-limiting.",
+            "location": "src/lib.rs:65-78",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No local search index / offline search fallback. Agent always hits DuckDuckGo live. Rival tools (Claude Code, Codex) might cache search results or use local indices for fast iteration.",
+          "Defuddle subprocess dependency is a hard runtime requirement for web_read extraction. No fallback parser (e.g., readability.rs or a built-in HTML extractor) if Defuddle is unavailable. Rival tools embed extraction logic to avoid external process overhead.",
+          "No streaming output from fetch_html. The entire page is buffered before returning. Large (but truncated) fetches force the model to wait for the full buffer before seeing results. Streaming-aware defuddle invocation could show partial extraction results mid-fetch.",
+          "robots.txt is checked pre-fetch and honored strictly (Forbidden error). No way for the agent to override with explicit acknowledgment. More aggressive tools allow opt-in bypass with a flag.",
+          "No caching of successful fetches or search results within a session. Each call re-fetches and re-extracts. Rival tools cache by URL so repeated reads of the same page are instant.",
+          "Phase progress updates (emit_phase) are dropped on full channel and never retried. A slow UI consumer could miss phase signals. No buffering or coalescing logic.",
+          "Headless Chrome path has documented SSRF weakness (subresources + redirects loaded by Chrome bypass private-IP guard). Operators enabling --features headless must accept this tradeoff explicitly, limiting the tool's usefulness in high-security contexts where JavaScript rendering is needed.",
+          "SearchBackend enum design anticipates Brave/SearXNG but no extension seam exists. Adding a new backend requires modifying WebSearchTool::run() dispatch logic. Rival tools might use a pluggable backend registry pattern.",
+          "No support for search filters (site:, filetype:, date range, etc.). DDG's HTML endpoint supports these in the query string, but the tool doesn't expose them to the agent. Rival tools expose backend-specific query syntax.",
+          "DuckDuckGo SERP parsing is HTML-scraping-based and fragile to layout changes. Fixture-based tests catch regressions, but DDG has no API contract. Rival tools might use official search APIs (requires keys) or RSS feeds for more stability."
+        ]
+      },
+      {
+        "crate": "anie-session",
+        "owns": "anie-session is the persistence and context-management layer for anie, providing append-only JSONL session files with exclusive file locking, context compaction with pi-compatible summarization (including split-turn mid-turn splits), and structured file-operation tracking during message summarization. It manages session state reconstruction, branching, and both pre-prompt and inline (mid-turn) compaction with optional LLM-driven text summarization.",
+        "public_surface": [
+          {
+            "name": "SessionManager",
+            "kind": "struct",
+            "location": "src/lib.rs:432",
+            "note": "Core session lifecycle: new_session, open_session, append_message/messages, append_model_change, append_thinking_change, add_entries, auto_compact, force_compact, build_context, get_branch, fork, fork_to_child_session, list_sessions"
+          },
+          {
+            "name": "SessionError",
+            "kind": "enum",
+            "location": "src/lib.rs:36",
+            "note": "AlreadyOpen variant for exclusive file locking violations"
+          },
+          {
+            "name": "SessionEntry",
+            "kind": "enum",
+            "location": "src/lib.rs:126",
+            "note": "Append-only entry variants: Message, Compaction, ModelChange, ThinkingChange, Label"
+          },
+          {
+            "name": "SessionContext",
+            "kind": "struct",
+            "location": "src/lib.rs:214",
+            "note": "Reconstructed active-branch state: messages, thinking_level, model, compaction_details"
+          },
+          {
+            "name": "SessionHeader",
+            "kind": "struct",
+            "location": "src/lib.rs:94",
+            "note": "JSONL file header: id, version, cwd, parent_session (for child forks)"
+          },
+          {
+            "name": "CompactionDetails",
+            "kind": "struct",
+            "location": "src/lib.rs:257",
+            "note": "Structured file-op tracking: read_files and modified_files vectors deduplicated"
+          },
+          {
+            "name": "CompactionConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:377",
+            "note": "Compaction thresholds: context_window, reserve_tokens, keep_recent_tokens"
+          },
+          {
+            "name": "CompactionResult",
+            "kind": "struct",
+            "location": "src/lib.rs:364",
+            "note": "Compaction outcome: summary, tokens_before, first_kept_entry_id, messages_discarded"
+          },
+          {
+            "name": "CutPoint",
+            "kind": "struct",
+            "location": "src/lib.rs:1425",
+            "note": "Compaction cut analysis: discarded messages, first_kept_entry_id, optional split_turn metadata"
+          },
+          {
+            "name": "SplitTurn",
+            "kind": "struct",
+            "location": "src/lib.rs:1444",
+            "note": "Mid-turn split metadata: turn_start_entry_id, prefix_entry_ids for two-pass summarization"
+          },
+          {
+            "name": "InlineCompactionResult",
+            "kind": "struct",
+            "location": "src/lib.rs:1165",
+            "note": "Mid-turn compaction output: compacted messages, summary prose, tokens_before/after"
+          },
+          {
+            "name": "MessageSummarizer",
+            "kind": "trait",
+            "location": "src/lib.rs:395",
+            "note": "Async trait for LLM-backed summarization; caller-implemented to keep session crate provider-agnostic"
+          },
+          {
+            "name": "SessionContextMessage",
+            "kind": "struct",
+            "location": "src/lib.rs:205",
+            "note": "Message paired with its entry_id for tracking through compaction"
+          },
+          {
+            "name": "SessionInfo",
+            "kind": "struct",
+            "location": "src/lib.rs:414",
+            "note": "Session metadata for /session list: path, id, cwd, created, modified, message_count, first_message"
+          },
+          {
+            "name": "extract_compaction_details",
+            "kind": "function",
+            "location": "src/lib.rs:287",
+            "note": "Walk discarded messages, extract read/write/edit tool call paths with deduplication"
+          },
+          {
+            "name": "append_details_to_summary",
+            "kind": "function",
+            "location": "src/lib.rs:338",
+            "note": "Inject <read-files>/<modified-files> XML tag blocks into summary text for resumed sessions"
+          },
+          {
+            "name": "compact_messages_inline",
+            "kind": "function",
+            "location": "src/lib.rs:1191",
+            "note": "In-memory mid-turn compaction returning synthetic User summary + kept tail (no session persistence)"
+          },
+          {
+            "name": "can_compact_messages_inline",
+            "kind": "function",
+            "location": "src/lib.rs:1260",
+            "note": "Preflight check for inline compaction feasibility"
+          },
+          {
+            "name": "estimate_tokens",
+            "kind": "function",
+            "location": "src/lib.rs:1129",
+            "note": "Single-message token estimate using chars/4 heuristic"
+          },
+          {
+            "name": "estimate_message_tokens",
+            "kind": "function",
+            "location": "src/lib.rs:1149",
+            "note": "Sum of token estimates across a slice of messages (pure content-based)"
+          },
+          {
+            "name": "estimate_context_tokens",
+            "kind": "function",
+            "location": "src/lib.rs:1304",
+            "note": "Hybrid estimation for SessionContextMessage slice: seeds from latest assistant usage, adds heuristic for trailing messages"
+          },
+          {
+            "name": "find_cut_point",
+            "kind": "function",
+            "location": "src/lib.rs:1453",
+            "note": "Analyze where to cut context for compaction: returns discarded slice, first_kept_id, optional SplitTurn"
+          },
+          {
+            "name": "join_split_turn_prose",
+            "kind": "function",
+            "location": "src/lib.rs:1523",
+            "note": "Join two summaries with '---' separator and 'Turn Context (split turn)' label per pi format"
+          },
+          {
+            "name": "build_compaction_prompt",
+            "kind": "function",
+            "location": "src/lib.rs:1350",
+            "note": "LLM prompt builder for compaction with six sections: Goal, Progress, Key Decisions, Files Modified, Next Steps, Critical Context"
+          },
+          {
+            "name": "parse_session_file",
+            "kind": "function",
+            "location": "src/lib.rs:1106",
+            "note": "JSONL parser: header line + entry lines, skips malformed lines with warning"
+          },
+          {
+            "name": "CURRENT_SESSION_SCHEMA_VERSION",
+            "kind": "const",
+            "location": "src/lib.rs:90",
+            "note": "Currently 4; updated with schema changes (v3: reasoning_details, v4: CompactionDetails)"
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "Single monolithic 3436-line lib.rs file with two test modules (tests, inline_compaction_tests) but no internal module structure. 127KB file exceeds practical navigation; extract compaction logic (find_cut_point, partition_split_turn, detect_split_turn, join_split_turn_prose, ~300 LOC) to compaction submodule and estimation logic (estimate_tokens, estimate_message_tokens, content_tokens, ~100 LOC) to estimation submodule.",
+            "location": "src/lib.rs",
+            "severity": "medium"
+          },
+          {
+            "description": "Three distinct estimate_*_tokens functions with overlapping but subtly different behavior: estimate_tokens(Message) heuristic, estimate_message_tokens(&[Message]) sum of above, estimate_context_tokens(&[SessionContextMessage]) hybrid with provider usage seeding. Naming and contract could clarify: pure-heuristic vs. hybrid vs. component-level. Document the distinction between provider-seeded (SessionManager::estimate_context_tokens, estimate_context_tokens) and pure-heuristic (estimate_message_tokens) paths.",
+            "location": "src/lib.rs:1129-1346",
+            "severity": "low"
+          },
+          {
+            "description": "Duplication in latest_compaction_summary (line 921) and latest_compaction_details (line 943): identical loop pattern with different match arms. Extract common helper fn get_latest_compaction_entry() returning &SessionEntry::Compaction to avoid the repetition.",
+            "location": "src/lib.rs:921-952",
+            "severity": "low"
+          },
+          {
+            "description": "In SessionManager::list_sessions (line 955), files are re-read line-by-line during startup/listing. For 100s of sessions this could be inefficient; consider lazy header parsing or a compact index file. Currently acceptable but will block scaling to thousands of session files.",
+            "location": "src/lib.rs:955-1015",
+            "severity": "low"
+          },
+          {
+            "description": "SessionManager::open_session accepts schema version > CURRENT and errors; however, schema version changes are rare and tightly coupled to serde defaults. If a field is added but not properly serde-defaulted, forward-compat fails silently during parsing. Add a migration test for each new schema version bump to prevent regression.",
+            "location": "src/lib.rs:523-533",
+            "severity": "medium"
+          },
+          {
+            "description": "MessageSummarizer trait is async but SessionManager is sync. This forces summarizer calls through .await in compact_internal (line 1021) but no timeout/cancellation contract is documented. Long-running summarizer calls block the session. Consider adding a timeout parameter or documenting expected response times in trait docs.",
+            "location": "src/lib.rs:395-410, 1021-1103",
+            "severity": "low"
+          },
+          {
+            "description": "File locking via fs4 logs a warning and proceeds on unsupported filesystems; this silently violates the exclusive-writer contract. Callers have no way to know if locking actually succeeded without parsing logs. Consider returning a struct from try_acquire_session_lock indicating lock confidence level, or Err on unsupported systems and let operators choose.",
+            "location": "src/lib.rs:47-64",
+            "severity": "medium"
+          },
+          {
+            "description": "generate_unique_id tries 100 UUID shortening attempts, then falls back to full UUID if all collide. On 2^32 collision space this is safe but reads as arbitrary magic; document the collision probability and why 100 was chosen.",
+            "location": "src/lib.rs:1563-1571",
+            "severity": "low"
+          },
+          {
+            "description": "content_tokens assigns fixed 1_200 tokens to all images regardless of size. This matches pi but image tokens should scale with resolution or byte size. Document why flat cost was chosen or parameterize if provider-specific.",
+            "location": "src/lib.rs:1573-1589",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No built-in support for session branching beyond fork() — cannot easily tag or name branch points for resume UI. Claude Code likely needs explicit branch labels/bookmarks.",
+          "Compaction is LLM-driven via trait; no built-in fallback summarizer (e.g. extractive summary, simple bullet-point merger). If summarizer fails or times out, compaction aborts entirely. Should have a safe default fallback.",
+          "No session encryption or key derivation — all session files are plaintext JSON/JSONL. Thinking blocks and tool results are visible to any reader of the session directory. Codex/Claude Code likely encrypts at rest.",
+          "Schema migration is manual (serde defaults + version checks); no automatic migration hooks. Users upgrading anie must manually refresh old sessions or risk schema version mismatches.",
+          "No built-in session deduplication or cleanup — sessions accumulate in the sessions directory forever. No archival, expiry, or compression strategy. Large agent workflows will eventually have hundreds of session files.",
+          "Compaction summary text is unstructured prose; no machine-readable summary format (e.g. YAML, JSON blocks) to extract structured decisions/context programmatically. Resumed agents must re-parse LLM text to extract key decisions.",
+          "No session replay or branch-and-retry workflow — once a branch is taken, the alternative is lost unless explicitly forked. No undo/rewind semantics.",
+          "Token estimation uses chars/4 heuristic for all models; no provider-specific tokenizer integration (e.g. tiktoken, provider APIs). Estimates will drift for non-Claude models.",
+          "Split-turn compaction assumes synchronous summarizer; no streaming or progressive summary refinement. Large compactions may hang the UI.",
+          "No telemetry or instrumentation for compaction cost; callers can't measure summarization latency or token cost across a session lifecycle. Makes cost optimization difficult."
+        ]
+      },
+      {
+        "crate": "anie-provider",
+        "owns": "anie-provider is the core abstraction layer for LLM provider integration. It defines the traits (Provider, RequestOptionsResolver), types (Model, ProviderEvent, ProviderStream), and error taxonomy (ProviderError) that all concrete provider implementations (Anthropic, OpenAI, Google, Ollama, OpenRouter) depend on. It normalizes streaming events, model metadata, request options, and reasoning capabilities across vastly different wire protocols into a unified interface that the agent loop consumes blindly.",
+        "public_surface": [
+          {
+            "name": "Provider trait",
+            "kind": "trait",
+            "location": "src/provider.rs:33-53",
+            "note": "Core async trait with stream(), convert_messages(), convert_tools(), includes_thinking_in_replay(). All providers implement this."
+          },
+          {
+            "name": "ProviderEvent enum",
+            "kind": "enum",
+            "location": "src/provider.rs:12-27",
+            "note": "Normalized streaming events: Start, TextDelta, ThinkingDelta, ToolCallStart, ToolCallDelta, ToolCallEnd, Done"
+          },
+          {
+            "name": "ProviderStream type",
+            "kind": "type alias",
+            "location": "src/provider.rs:30",
+            "note": "Pin<Box<dyn Stream<Item = Result<ProviderEvent, ProviderError>> + Send>>"
+          },
+          {
+            "name": "ProviderError enum",
+            "kind": "enum",
+            "location": "src/error.rs:12-185",
+            "note": "Structured error taxonomy: Http, Auth, RateLimited, ContextOverflow, RequestBuild, Transport, EmptyAssistantResponse, ResponseTruncated, InvalidStreamJson, MalformedStreamEvent, ToolCallMalformed, ModelOutputMalformed, NativeReasoningUnsupported, UnsupportedStreamFeature, ReplayFidelity, FeatureUnsupported, ModelLoadResources"
+          },
+          {
+            "name": "RequestOptionsResolver trait",
+            "kind": "trait",
+            "location": "src/provider.rs:56-64",
+            "note": "Async trait for resolving per-request auth and routing (api_key, headers, base_url_override)"
+          },
+          {
+            "name": "Model struct",
+            "kind": "struct",
+            "location": "src/model.rs:303-335",
+            "note": "Runtime model definition: id, name, provider, api, base_url, context_window, max_tokens, supports_reasoning, reasoning_capabilities, supports_images, cost_per_million, replay_capabilities, compat"
+          },
+          {
+            "name": "ModelInfo struct",
+            "kind": "struct",
+            "location": "src/model.rs:240-278",
+            "note": "Model discovery result from endpoints: id, name, provider, context_length, max_output_tokens, supports_images, supports_reasoning, pricing, supported_parameters, provider_capabilities"
+          },
+          {
+            "name": "ReasoningCapabilities struct",
+            "kind": "struct",
+            "location": "src/model.rs:81-94",
+            "note": "Model reasoning metadata: control (Prompt/Native), output (Tagged/Separated), tags (open/close), request_mode"
+          },
+          {
+            "name": "ThinkingRequestMode enum",
+            "kind": "enum",
+            "location": "src/model.rs:45-68",
+            "note": "How reasoning is requested: PromptSteering, ReasoningEffort, NestedReasoning, EnableThinkingFlag, ChatTemplateEnableThinking"
+          },
+          {
+            "name": "ModelCompat enum",
+            "kind": "enum",
+            "location": "src/model.rs:149-157",
+            "note": "Provider-family compat knobs: None or OpenAICompletions(OpenAICompletionsCompat)"
+          },
+          {
+            "name": "OpenAICompletionsCompat struct",
+            "kind": "struct",
+            "location": "src/model.rs:165-183",
+            "note": "OpenAI wire protocol overrides: openrouter_routing, max_tokens_field"
+          },
+          {
+            "name": "ReplayCapabilities struct",
+            "kind": "struct",
+            "location": "src/model.rs:103-131",
+            "note": "Model round-trip requirements: requires_thinking_signature, supports_redacted_thinking, supports_encrypted_reasoning, supports_reasoning_details_replay"
+          },
+          {
+            "name": "ApiKind enum",
+            "kind": "enum",
+            "location": "src/api_kind.rs:5-20",
+            "note": "Supported wire protocols: AnthropicMessages, OpenAICompletions, OpenAIResponses, GoogleGenerativeAI, OllamaChatApi"
+          },
+          {
+            "name": "ThinkingLevel enum",
+            "kind": "enum",
+            "location": "src/thinking.rs:10-25",
+            "note": "Reasoning budget levels: Off, Minimal, Low, Medium, High (ordered)"
+          },
+          {
+            "name": "ProviderRegistry struct",
+            "kind": "struct",
+            "location": "src/registry.rs:6-48",
+            "note": "Registry keyed by ApiKind: register(api, provider), get(api), stream(model, context, options)"
+          },
+          {
+            "name": "StreamOptions struct",
+            "kind": "struct",
+            "location": "src/options.rs:28-43",
+            "note": "Request parameters: api_key, temperature, max_tokens, thinking, headers, num_ctx_override"
+          },
+          {
+            "name": "ResolvedRequestOptions struct",
+            "kind": "struct",
+            "location": "src/options.rs:46-54",
+            "note": "Resolved request context: api_key, headers, base_url_override"
+          },
+          {
+            "name": "LlmContext struct",
+            "kind": "struct",
+            "location": "src/options.rs:17-25",
+            "note": "Full request context: system_prompt, messages (LlmMessage), tools"
+          },
+          {
+            "name": "LlmMessage struct",
+            "kind": "struct",
+            "location": "src/options.rs:8-14",
+            "note": "Provider-native message: role (string), content (serde_json::Value)"
+          },
+          {
+            "name": "ModelInfo::to_model()",
+            "kind": "fn",
+            "location": "src/model.rs:386-430",
+            "note": "Converts discovery result to runtime Model with conservative defaults and Ollama-specific guards"
+          },
+          {
+            "name": "clamp_ollama_context_window()",
+            "kind": "fn",
+            "location": "src/model.rs:355-360",
+            "note": "Public utility to apply workspace-wide context window cap to Ollama models"
+          },
+          {
+            "name": "MockProvider struct",
+            "kind": "struct",
+            "location": "src/mock.rs:43-54",
+            "note": "Feature-gated (mock feature) test provider for unit testing agent loop"
+          },
+          {
+            "name": "MockStreamScript struct",
+            "kind": "struct",
+            "location": "src/mock.rs:14-40",
+            "note": "Scripted provider response: from_message(), from_error(), new(items)"
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "model.rs is 936 lines, containing 15+ structs/enums plus 20+ test functions in a single file. ReasoningCapabilities, ReplayCapabilities, ModelCompat, and their related types could be split into separate modules (reasoning.rs, replay.rs, compat.rs) for maintainability and clarity, especially as they grow.",
+            "location": "src/model.rs (entire file)",
+            "severity": "medium"
+          },
+          {
+            "description": "Provider trait only has synchronous convert_messages() and convert_tools() methods, but async stream(). This forces providers to either pre-compute conversions (wasting CPU on unused messages) or refactor message conversion into the stream itself. RequestOptionsResolver is async but the Provider trait's message conversion is not—potential friction point for stateful providers.",
+            "location": "src/provider.rs:34-53",
+            "severity": "medium"
+          },
+          {
+            "description": "ProviderEvent enum is closed (no extensibility). If a new provider needs to emit custom block types (e.g., citations, web search results, server tools), the enum must be extended in anie-provider and every consumer updated. No way to emit opaque vendor-specific blocks without breaking the pipeline.",
+            "location": "src/provider.rs:12-27",
+            "severity": "medium"
+          },
+          {
+            "description": "LlmMessage uses serde_json::Value for content, which loses type safety. Providers must serialize arbitrary protocol messages and then downstream deserialize the JSON. No schema validation, no type guarantees. Fragile across provider updates.",
+            "location": "src/options.rs:8-14",
+            "severity": "low"
+          },
+          {
+            "description": "ModelCompat enum uses a tagged discriminator (serde tag='kind') but currently has only None and OpenAICompletions variants. Adding xAI, Groq, Bedrock, Azure variants later requires updating the enum and serialization. The pattern scales but will need refactoring if compat blobs become truly vendor-specific (not just OpenAI variants).",
+            "location": "src/model.rs:149-157",
+            "severity": "low"
+          },
+          {
+            "description": "ReasoningCapabilities has optional fields (control, output, tags, request_mode) but no validation that they're populated consistently. A model could have control=Native + output=None, which is incoherent. No invariant enforcement.",
+            "location": "src/model.rs:81-94",
+            "severity": "low"
+          },
+          {
+            "description": "MockProvider in mock.rs uses unwrap_or() on serde_json::to_value(message), silently dropping errors. If message serialization fails, the provider emits Null instead of failing. Low impact in tests but represents silent failure.",
+            "location": "src/mock.rs:93",
+            "severity": "low"
+          },
+          {
+            "description": "ProviderError::ModelLoadResources carries suggested_num_ctx but only used by Ollama. The error is specific to one provider but lives in the generic taxonomy. No other provider will ever populate this field, making it an orphan variant.",
+            "location": "src/error.rs:177-184",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "Provider trait lacks hooks for server-side tool calling, code execution, or artifact generation (Claude Code supports all three). No extensibility for custom content blocks without modifying anie-provider itself.",
+          "ProviderEvent enum is a closed union. Cannot emit vendor-specific blocks (e.g., OpenAI's web-search results, Anthropic's redacted_thinking, Claude Code artifacts) without upstreaming to anie-provider. Codex / Grok likely have open plugin models.",
+          "No built-in support for streaming reasoning/thinking blocks separately from visible output (though ReasoningOutputMode::Separated hints at this). Competing agents may expose this transparently in the UI.",
+          "ReplayCapabilities is narrowly focused on signature/redaction round-trip needs. Doesn't model conversation state reset, session tokens, or provider-specific context preservation required by long-running sessions. Claude Code likely handles this more generically.",
+          "ModelCompat is OpenAI-centric (one enum variant). Adding Bedrock, xAI, Cohere, or other APIs' compat knobs requires enum changes. No generic 'extra_fields: Map<String, Value>' fallback for unanticipated provider quirks.",
+          "MockProvider is feature-gated, forcing consumers to depend on a dev feature. Competing harnesses may have production-grade mocks (deterministic, inspectable) baked into the core.",
+          "No built-in cost tracking or token accounting in ProviderError or Model. Competitors track costs per call and surface budgets to the UI; anie-provider only carries static pricing metadata.",
+          "RequestOptionsResolver is async but stateless (takes Model + Message context only). Cannot model per-session credentials, rate-limit state, or provider-specific routing policies that depend on prior call history.",
+          "No observability hooks (traces, metrics) in Provider trait. Competing agents likely emit structured events for latency, token usage, error rates per provider.",
+          "ProviderEvent::Done carries final AssistantMessage but no provenance metadata (provider latency, usage delta, retry attempts). CLI must reconstruct this downstream."
+        ]
+      },
+      {
+        "crate": "anie-config",
+        "owns": "anie-config is responsible for TOML configuration loading, merging, path discovery, and atomic file writing. It manages the full lifecycle of AnieConfig objects: loading from global (`~/.anie/config.toml`) and project-local (`.anie/config.toml`) TOML files with layer-based merging and CLI overrides, validating config constraints at load time, exporting safe comment-preserving config mutation via ConfigMutator, collecting project context files (CLAUDE.md, AGENTS.md), and providing atomic write semantics to protect state files like `~/.anie/auth.json` and `~/.anie/state.json` against partial writes.",
+        "public_surface": [
+          {
+            "name": "AnieConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:32",
+            "note": "Root config type with model, providers, compaction, context, ui, tools, ollama subsections and model_explicitly_set tracking flag"
+          },
+          {
+            "name": "CliOverrides",
+            "kind": "struct",
+            "location": "src/lib.rs:401",
+            "note": "CLI-supplied overrides for model, provider, thinking level; applied last in merge precedence"
+          },
+          {
+            "name": "ContextConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:380",
+            "note": "Project context file discovery limits (filenames, per-file cap, total cap); defaults to CLAUDE.md and AGENTS.md with 32KB/64KB limits"
+          },
+          {
+            "name": "ContextFile",
+            "kind": "struct",
+            "location": "src/lib.rs:414",
+            "note": "Loaded context file with path, truncation flag, mtime; returned by collect_context_files"
+          },
+          {
+            "name": "CompactionConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:327",
+            "note": "Context compaction knobs (enabled, reserve_tokens, keep_recent_tokens, max_per_turn budget); validates max_per_turn in range 1..=500"
+          },
+          {
+            "name": "ModelConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:246",
+            "note": "Default provider/model/thinking level; defaults to openai/gpt-4o/Medium; tracked via model_explicitly_set flag to distinguish user declaration from fallback"
+          },
+          {
+            "name": "ProviderConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:267",
+            "note": "Per-provider config (api_key_env, base_url, api kind override, custom model catalog)"
+          },
+          {
+            "name": "CustomModelConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:281",
+            "note": "User-defined model metadata with context_window, max_tokens, reasoning/thinking/image support, reasoning control/output/tags/request_mode"
+          },
+          {
+            "name": "UiConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:188",
+            "note": "TUI-only preferences (slash_command_popup_enabled, markdown_enabled, tool_output_mode)"
+          },
+          {
+            "name": "ToolOutputMode",
+            "kind": "enum",
+            "location": "src/lib.rs:216",
+            "note": "Verbose (full output) or Compact (tool body hidden, only title shown)"
+          },
+          {
+            "name": "ToolsConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:98",
+            "note": "Built-in tool settings (bash policy, web tool config)"
+          },
+          {
+            "name": "BashToolConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:151",
+            "note": "Bash pre-spawn deny policy (enabled, deny_commands, deny_patterns); not a sandbox"
+          },
+          {
+            "name": "WebToolConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:114",
+            "note": "Web tool guardrails (request_timeout_secs, headless_timeout_secs, max_page_bytes, max_redirects, allow_private_ips); validated at load time"
+          },
+          {
+            "name": "OllamaConfig",
+            "kind": "struct",
+            "location": "src/lib.rs:71",
+            "note": "Ollama-specific (anie-only, no pi equivalent): optional default_max_num_ctx cap, validated >= 2048"
+          },
+          {
+            "name": "load_config",
+            "kind": "function",
+            "location": "src/lib.rs:646",
+            "note": "Load config from standard global and project paths, apply CLI overrides, validate"
+          },
+          {
+            "name": "load_config_with_paths",
+            "kind": "function",
+            "location": "src/lib.rs:654",
+            "note": "Load from explicit file paths; core loader used by load_config and tests"
+          },
+          {
+            "name": "configured_models",
+            "kind": "function",
+            "location": "src/lib.rs:792",
+            "note": "Extract Model catalog from AnieConfig custom provider entries; builds reasoning_capabilities from CustomModelConfig"
+          },
+          {
+            "name": "collect_context_files",
+            "kind": "function",
+            "location": "src/lib.rs:883",
+            "note": "Walk up from cwd, load matching filenames, respect per-file and total byte caps, skip duplicates, mark truncations"
+          },
+          {
+            "name": "find_project_config",
+            "kind": "function",
+            "location": "src/lib.rs:629",
+            "note": "Ancestor walk from path to find .anie/config.toml; returns first match or None"
+          },
+          {
+            "name": "preferred_write_target",
+            "kind": "function",
+            "location": "src/lib.rs:641",
+            "note": "Return project config if present, else global config; used to decide where mutations land"
+          },
+          {
+            "name": "atomic_write",
+            "kind": "function",
+            "location": "src/lib.rs:507",
+            "note": "POSIX-only: atomic temp-file-then-rename with parent directory fsync; Windows gated at compile time"
+          },
+          {
+            "name": "atomic_write_create_parent",
+            "kind": "function",
+            "location": "src/lib.rs:497",
+            "note": "atomic_write with parent directory pre-creation; used for first-run paths like ~/.anie/auth.json"
+          },
+          {
+            "name": "anie_dir",
+            "kind": "function",
+            "location": "src/lib.rs:427",
+            "note": "Return ~/.anie/ or None if home unavailable"
+          },
+          {
+            "name": "global_config_path",
+            "kind": "function",
+            "location": "src/lib.rs:600",
+            "note": "Return ~/.anie/config.toml or None"
+          },
+          {
+            "name": "anie_auth_json_path",
+            "kind": "function",
+            "location": "src/lib.rs:606",
+            "note": "Return ~/.anie/auth.json or None"
+          },
+          {
+            "name": "anie_sessions_dir",
+            "kind": "function",
+            "location": "src/lib.rs:612",
+            "note": "Return ~/.anie/sessions/ or None"
+          },
+          {
+            "name": "anie_logs_dir",
+            "kind": "function",
+            "location": "src/lib.rs:618",
+            "note": "Return ~/.anie/logs/ or None"
+          },
+          {
+            "name": "anie_state_json_path",
+            "kind": "function",
+            "location": "src/lib.rs:624",
+            "note": "Return ~/.anie/state.json or None"
+          },
+          {
+            "name": "anie_prompt_history_path",
+            "kind": "function",
+            "location": "src/lib.rs:437",
+            "note": "Return ~/.anie/prompt_history (append-only, JSON strings, one per line)"
+          },
+          {
+            "name": "ensure_global_config_exists",
+            "kind": "function",
+            "location": "src/lib.rs:777",
+            "note": "Create ~/.anie/config.toml with commented template if absent"
+          },
+          {
+            "name": "default_config_template",
+            "kind": "function",
+            "location": "src/lib.rs:929",
+            "note": "Return static TOML template written on first run; documents all major config sections"
+          },
+          {
+            "name": "ConfigMutator",
+            "kind": "struct",
+            "location": "src/mutation.rs:14",
+            "note": "Comment-preserving config editor using toml_edit; wraps DocumentMut + path"
+          },
+          {
+            "name": "ConfigMutator::load",
+            "kind": "function",
+            "location": "src/mutation.rs:38",
+            "note": "Load existing config into DocumentMut"
+          },
+          {
+            "name": "ConfigMutator::load_or_create",
+            "kind": "function",
+            "location": "src/mutation.rs:21",
+            "note": "Load existing or create from default template"
+          },
+          {
+            "name": "ConfigMutator::as_toml",
+            "kind": "function",
+            "location": "src/mutation.rs:52",
+            "note": "Render DocumentMut to string without saving"
+          },
+          {
+            "name": "ConfigMutator::set_default_model",
+            "kind": "function",
+            "location": "src/mutation.rs:57",
+            "note": "Set [model] provider and id"
+          },
+          {
+            "name": "ConfigMutator::ensure_provider",
+            "kind": "function",
+            "location": "src/mutation.rs:64",
+            "note": "Ensure [providers.name] table exists"
+          },
+          {
+            "name": "ConfigMutator::upsert_provider",
+            "kind": "function",
+            "location": "src/mutation.rs:70",
+            "note": "Create or update provider with optional base_url and api kind"
+          },
+          {
+            "name": "ConfigMutator::upsert_provider_model",
+            "kind": "function",
+            "location": "src/mutation.rs:87",
+            "note": "Add or replace model in [[providers.name.models]] array; updates all reasoning metadata"
+          },
+          {
+            "name": "ConfigMutator::remove_provider",
+            "kind": "function",
+            "location": "src/mutation.rs:109",
+            "note": "Delete provider table entirely"
+          },
+          {
+            "name": "ConfigMutator::save",
+            "kind": "function",
+            "location": "src/mutation.rs:118",
+            "note": "Write DocumentMut back to path with atomic_write; creates parent if absent"
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "lib.rs is 2070 LOC with extensive inline documentation. While well-written, the module combines four distinct concerns: (1) path discovery and file I/O, (2) TOML loading/merging, (3) validation logic, (4) context file collection. Consider extracting a `paths` module and a `validation` module to improve navigation.",
+            "location": "src/lib.rs:1-2070",
+            "severity": "low"
+          },
+          {
+            "description": "Partial config structs (PartialAnieConfig, PartialModelConfig, etc.) are duplicates of the main config structs with Option-wrapped fields. This is correct for serde but adds boilerplate. Eleven Partial structs at lines 1069-1162 could be generated via a derive macro or macro_rules!, but the current approach is explicit and testable.",
+            "location": "src/lib.rs:1069-1162",
+            "severity": "low"
+          },
+          {
+            "description": "ConfigMutator allows mutation via &mut self and saves via &self (save() takes &self not &mut self). This is odd because save() persists changes that have already been made; there's no transactional safety or rollback path. If save() fails, the in-memory state is lost but the previous file is untouched. This is acceptable but could be clearer with a Result<Self> return on save() that consumes self.",
+            "location": "src/mutation.rs:118",
+            "severity": "low"
+          },
+          {
+            "description": "atomic_write_temp_path uses a combination of process ID and an in-process atomic counter to generate temp file names (line 576). The counter is never reset across the lifetime of the process, so it grows unbounded (though practically this is fine). More importantly, temp file cleanup is best-effort on error (line 550); a hard crash after create() but before the temp file is removed could leave orphans behind.",
+            "location": "src/lib.rs:576-588, 529-553",
+            "severity": "low"
+          },
+          {
+            "description": "Web tool config validation (validate_web_tool_config, line 755) rejects request_timeout_secs == 0, but the error message suggests operators should set 'a generous value like 300 for persistent-agent deployments' — this is prescriptive and belongs in a comment or docs, not the error path. The validation is correct but the UX could be clearer.",
+            "location": "src/lib.rs:755-773",
+            "severity": "low"
+          },
+          {
+            "description": "ConfigMutator's ensure_models_array (mutation.rs:144) uses allow(clippy::expect_used) and unconditionally expects after assignment. The invariants are local to the file and documented in a comment, but this is a layering smell: toml_edit's API makes statically guaranteeing the invariant difficult. The code is correct but fragile if toml_edit's Item semantics change.",
+            "location": "src/mutation.rs:143-157",
+            "severity": "low"
+          },
+          {
+            "description": "populate_model_table (mutation.rs:159) unconditionally writes all model fields including supports_images and supports_reasoning, even if they are false. This bloats the TOML file with redundant false values. Could optimize by using skip_serializing_if patterns or only writing if true, but the current approach is simpler and the redundancy is minor.",
+            "location": "src/mutation.rs:159-197",
+            "severity": "low"
+          },
+          {
+            "description": "Windows support is deliberately gated at compile time (line 4-7) because atomic_write relies on POSIX rename semantics. The TODO comment indicates ReplaceFileW is needed. This is a known limitation but blocks Windows users entirely; could use conditional compilation and a Windows-specific implementation on sync_parent_dir and atomic_write.",
+            "location": "src/lib.rs:4-7, 561-574",
+            "severity": "medium"
+          },
+          {
+            "description": "collect_context_files walks ancestors from cwd and collects files by name. If CLAUDE.md exists at multiple ancestor levels, only the first is kept (HashSet dedup on line 891). This is by design (project-local takes precedence) but could be a surprise if a user expects both global and local context files to be loaded. The behavior is documented in the code comment but not in the public API docs.",
+            "location": "src/lib.rs:883-925",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "Ollama-specific context window capping (OllamaConfig::default_max_num_ctx) is anie-specific and not in pi. This is a key safety feature for local LLM deployments with constrained hardware — Claude Code/Codex would need similar native Ollama support to compete on small-model workloads. Anie sends native `num_ctx` to Ollama's /api/chat; pi uses the OpenAI-compatible endpoint and never customizes context.",
+          "Per-model reasoning capability metadata (ReasoningControlMode, ReasoningOutputMode, ReasoningTags, ThinkingRequestMode) is fully configurable in CustomModelConfig. Anie can declare arbitrary reasoning tag pairs (<think>...</think>) for local models. Claude Code's equivalent would require similar extensible reasoning schema to support smaller models that use non-standard reasoning blocks.",
+          "Bash tool policy (deny_commands, deny_patterns) provides pre-spawn guardrails without full sandboxing. Claude Code's ability to selectively block commands or patterns at configuration time (not just at runtime) is a gap if end users want to protect against accidental destructive operations.",
+          "Web tool configuration validation (request_timeout_secs, headless_timeout_secs, max_page_bytes, max_redirects, allow_private_ips) allows operators to tune tool behavior for their deployment (persistent agents, limited bandwidth, constrained memory). Claude Code would need similar knobs to serve persistent-agent use cases in restricted environments.",
+          "context_window clamping at catalog-load time is unique to anie-config's configured_models(). Anie's design loads custom Ollama models and immediately clamps their context_window if default_max_num_ctx is set. Claude Code's architecture doesn't expose per-model configuration at all, making local hardware constraints harder to express.",
+          "Comment-preserving config mutation via ConfigMutator/toml_edit is essential for user experience — destructive TOML serialization would wipe all comments and structure. If Claude Code ever needs safe config editing in the TUI (adding/removing providers), it would need similar comment-preserving logic.",
+          "Layer-based config merging (global -> project -> CLI) with model_explicitly_set flag allows fine-grained precedence control. The flag ensures user-declared defaults are never silently overridden by session history. Claude Code's config precedence (if it exists) may not distinguish between 'explicitly set' and 'defaulted' values.",
+          "Atomic write with parent-directory fsync (atomic_write, line 540-544) guarantees durability beyond the file body — directory entries are synced to stable storage. Claude Code's config/state writing may not have this level of durability guarantee, making it vulnerable to metadata-loss scenarios on power-cycle."
+        ]
+      },
+      {
+        "crate": "anie-auth",
+        "owns": "anie-auth is responsible for authentication state management and OAuth integration across multiple provider ecosystems (Anthropic, OpenAI, GitHub Copilot, Google Gemini CLI, Google Antigravity). It owns: API-key and OAuth credential persistence (JSON files + optional native OS keyring), multi-provider OAuth flows (device-code and authorization-code+PKCE variants), refresh-token rotation under advisory file locks to prevent race conditions when multiple agent processes share credentials, localhost callback servers for auth-code redirects, provider-specific discovery flows (Google Cloud project ID detection), and the request-options resolution pipeline that callers use to mint bearer tokens for API calls.",
+        "public_surface": [
+          {
+            "name": "AuthStore",
+            "kind": "struct",
+            "location": "src/lib.rs:45",
+            "note": "HashMap of provider-name → AuthCredential; top-level persistent store shape. Serializes/deserializes as JSON."
+          },
+          {
+            "name": "AuthCredential",
+            "kind": "enum",
+            "location": "src/lib.rs:61",
+            "note": "Tagged enum with ApiKey { key } and OAuth { access_token, refresh_token, expires_at, account?, api_base_url?, project_id? } variants. Matches pi's on-disk shape for portability."
+          },
+          {
+            "name": "AuthResolver",
+            "kind": "struct",
+            "location": "src/lib.rs:134",
+            "note": "RequestOptionsResolver that resolves auth per-request: CLI override → credential store → environment. OAuth callers must check expiry separately."
+          },
+          {
+            "name": "CredentialStore",
+            "kind": "struct",
+            "location": "src/store.rs:25",
+            "note": "Facade over native-keyring + JSON fallback. Implements CredentialPersistence trait. Handles migration of legacy JSON to native keyring."
+          },
+          {
+            "name": "OAuthProvider",
+            "kind": "trait",
+            "location": "src/oauth.rs:181",
+            "note": "Async trait with begin_login, complete_login, and refresh methods. Implemented by five provider-specific structs."
+          },
+          {
+            "name": "LoginFlow",
+            "kind": "enum",
+            "location": "src/oauth.rs:35",
+            "note": "AuthorizationCode or Device variant, carrying flow-state from begin to complete_login."
+          },
+          {
+            "name": "OAuthCredentialData",
+            "kind": "struct",
+            "location": "src/oauth.rs:121",
+            "note": "Protocol-level credential (access_token, refresh_token, expires_at, account?, api_base_url?, project_id?). Internal shape before persisting as AuthCredential."
+          },
+          {
+            "name": "OAuthRefresher",
+            "kind": "struct",
+            "location": "src/refresh.rs:120",
+            "note": "Broker that refreshes OAuth tokens under per-provider advisory file locks. Prevents duplicate refresh calls when multiple processes share credentials."
+          },
+          {
+            "name": "RefreshError",
+            "kind": "enum",
+            "location": "src/refresh.rs:55",
+            "note": "Typed failures: LockTimeout, NotOAuth, Missing, RefreshFailed, Persist, Expiry. Distinct so callers can decide retry policy."
+          },
+          {
+            "name": "Callback",
+            "kind": "struct",
+            "location": "src/callback.rs:31",
+            "note": "OAuth redirect result: code + state pair captured from localhost callback server."
+          },
+          {
+            "name": "CallbackError",
+            "kind": "enum",
+            "location": "src/callback.rs:42",
+            "note": "Errors from callback server: Timeout, Bind, Io, ProviderError, MissingParam."
+          },
+          {
+            "name": "await_callback",
+            "kind": "fn",
+            "location": "src/callback.rs:116",
+            "note": "Legacy convenience; legacy callers should use await_callback_on_path."
+          },
+          {
+            "name": "await_callback_on_path",
+            "kind": "fn",
+            "location": "src/callback.rs:129",
+            "note": "Run one-shot callback server on localhost:port, accept first request matching expected_path, return code+state or error."
+          },
+          {
+            "name": "oauth_request_headers",
+            "kind": "fn",
+            "location": "src/lib.rs:278",
+            "note": "Public; returns provider-specific headers (GitHub Copilot gets editor-identifying headers; others get empty map)."
+          },
+          {
+            "name": "generate_pkce",
+            "kind": "fn",
+            "location": "src/oauth.rs:229",
+            "note": "Generate a PKCE pair (verifier + SHA-256 challenge) for auth-code+PKCE flows."
+          },
+          {
+            "name": "parse_expires_at",
+            "kind": "fn",
+            "location": "src/oauth.rs:272",
+            "note": "Parse RFC 3339 expires_at string back to OffsetDateTime for expiry checks."
+          },
+          {
+            "name": "default_lock_dir",
+            "kind": "fn",
+            "location": "src/refresh.rs:343",
+            "note": "Compute lock directory next to auth file: ~/.anie/auth.json → ~/.anie/auth.lock."
+          },
+          {
+            "name": "AnthropicOAuthProvider",
+            "kind": "struct",
+            "location": "src/anthropic_oauth.rs:62",
+            "note": "Auth-code+PKCE flow to https://claude.ai + https://platform.claude.com."
+          },
+          {
+            "name": "OpenAICodexOAuthProvider",
+            "kind": "struct",
+            "location": "src/openai_codex_oauth.rs",
+            "note": "Auth-code+PKCE flow for OpenAI."
+          },
+          {
+            "name": "GithubCopilotOAuthProvider",
+            "kind": "struct",
+            "location": "src/github_copilot_oauth.rs:82",
+            "note": "Device-code flow + GitHub token exchange + Copilot internal token + proxy-ep extraction."
+          },
+          {
+            "name": "GoogleAntigravityOAuthProvider",
+            "kind": "struct",
+            "location": "src/google_antigravity_oauth.rs:75",
+            "note": "Auth-code+PKCE+client-secret flow + project discovery with prod/sandbox fallback and hardcoded fallback."
+          },
+          {
+            "name": "GeminiCliOAuthProvider",
+            "kind": "struct",
+            "location": "src/google_gemini_cli_oauth.rs:69",
+            "note": "Auth-code+PKCE+client-secret flow + LRO-based project discovery (no hardcoded fallback; returns error on discovery failure)."
+          },
+          {
+            "name": "CredentialPersistence",
+            "kind": "trait",
+            "location": "src/refresh.rs:112",
+            "note": "Injected trait for load/save during refresh; lets OAuthRefresher stay decoupled from CredentialStore."
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "oauth_provider_for (line 289-298 lib.rs) is a hardcoded match statement with a comment 'turn into a registry when a second OAuth provider lands' — the comment is now outdated (five providers exist). The function is private and inline, but adding a sixth provider requires editing this single match site. No extension mechanism (trait registry, DI factory, etc.); growth is O(n) hand-edits.",
+            "location": "src/lib.rs:289-298",
+            "severity": "low"
+          },
+          {
+            "description": "oauth_request_headers (line 278-287 lib.rs) is a second hardcoded match on provider_name for GitHub Copilot editor headers. Duplicates the string key 'github-copilot' across both functions; if a new OAuth provider needs headers, this site must also be edited. No abstraction unifying provider config.",
+            "location": "src/lib.rs:278-287",
+            "severity": "low"
+          },
+          {
+            "description": "Deprecated functions load_auth_store, load_auth_store_from, save_api_key, save_api_key_to (lines 424-447) are marked deprecated but still publicly exported and used in tests. Callers migrating to CredentialStore have no auto-upgrade path; the old functions still work, creating maintenance debt.",
+            "location": "src/lib.rs:424-447",
+            "severity": "low"
+          },
+          {
+            "description": "CredentialStore has a private NativeKeyringMode enum with System/Disabled/Json(test-only) variants (src/store.rs:16). Test mode uses a Json fallback, but the test seam with_test_native_keyring is cfg(test) only, making it invisible to type-checking in prod code paths. Integration testing across native-keyring and JSON paths is harder without this being opt-in at runtime.",
+            "location": "src/store.rs:16-20",
+            "severity": "low"
+          },
+          {
+            "description": "Google Antigravity (google_antigravity_oauth.rs line ~56) has a hardcoded fallback project ID 'rising-fact-p41fc' if discovery endpoints fail. Comment notes this matches pi, but if Google's project ID is ephemeral, users with stale auth.json may get a non-functional default. No warning is logged when falling back; user sees a 403/404 later at runtime.",
+            "location": "src/google_antigravity_oauth.rs:57",
+            "severity": "medium"
+          },
+          {
+            "description": "GeminiCliOAuthProvider polls LRO (long-running operations) with a hardcoded max 60 attempts + 5-second interval (src/google_gemini_cli_oauth.rs:64-67). If a user's project is provisioning slowly (e.g., Google's backend is under load), the login flow times out after 5 minutes. No way for users to extend the timeout without rebuilding. Comment says 'pi polls indefinitely' — this is an anie-specific deviation without rationale inline.",
+            "location": "src/google_gemini_cli_oauth.rs:64-67",
+            "severity": "medium"
+          },
+          {
+            "description": "OAuthRefresher uses tokio::task::spawn_blocking to acquire locks (src/refresh.rs:271-279), which works but requires a tokio runtime. No fallback for non-async contexts; callers must be async. If a future auth method (e.g., mutable config reload) needs sync lock acquisition, a separate code path is required.",
+            "location": "src/refresh.rs:271-279",
+            "severity": "low"
+          },
+          {
+            "description": "AuthResolver::resolve calls resolve_oauth_token which creates a new OAuthRefresher each time (src/lib.rs:258). On high-frequency calls (e.g., per-message in a chat loop), repeated lock-dir creation + refresher construction is wasteful. Caching the refresher at the AuthResolver level could avoid this overhead.",
+            "location": "src/lib.rs:245-263",
+            "severity": "low"
+          },
+          {
+            "description": "RefreshError::Expiry wraps an anyhow::Error and doesn't distinguish between 'bad RFC 3339 syntax' (user hand-edited auth.json) vs. 'system clock skew' (device's clock is far in the past). Callers can't offer specific recovery UI.",
+            "location": "src/refresh.rs:85",
+            "severity": "low"
+          },
+          {
+            "description": "GithubCopilotOAuthProvider and GoogleAntigravityOAuthProvider both implement their own refresh token fallback logic when the provider omits refresh_token on rotation (github_copilot_oauth.rs line ~240, google_antigravity_oauth.rs line ~180). No shared helper; same pattern is duplicated. If a third Google-like provider lands, duplication continues.",
+            "location": "src/github_copilot_oauth.rs:220-272 & src/google_antigravity_oauth.rs:180-210",
+            "severity": "low"
+          },
+          {
+            "description": "callback.rs implements a handwritten HTTP parser (parse_request_target, split_target) instead of using a HTTP library. Works for the simple GET case but fragile to edge cases (oversized headers, chunked encoding, pipelined requests). Caller sending a malformed chunked request could trigger a read timeout instead of being parsed correctly.",
+            "location": "src/callback.rs:328-344",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No provider registry / plugin system: adding a new OAuth provider requires editing the hardcoded match in oauth_provider_for. OpenAI Code Interpreter or Grok might benefit from a DI-based provider factory so third-party / user-defined providers can be loaded without recompilation.",
+          "oauth_request_headers is a hardcoded match duplicating provider name strings. Claude Code / Codex would benefit from provider metadata (headers, callback path, scopes, URLs) living in a single source-of-truth struct or registry entry.",
+          "No audit log of token refreshes: RefreshError surfaces to callers but there's no persistent record of when/why a token was refreshed, what the refresh latency was, or whether refresh failures are recurring. Operational visibility into OAuth health is minimal.",
+          "Fallback project IDs (Google Antigravity's 'rising-fact-p41fc') are hardcoded with no user override mechanism. If Google deprecates or changes the project, users stuck with stale auth.json have no way to recover without manual intervention.",
+          "GeminiCliOAuthProvider LRO poll timeout is hardcoded (60 attempts × 5s = 5 min). No env var or config option to extend for slow provisioning. Power users hitting this wall have no recourse.",
+          "CredentialStore migration from JSON to native keyring is one-way and silent (no undo, no dry-run mode). If native keyring has a bug on a platform, users can't roll back without manually restoring from the `.migrated` backup.",
+          "AuthResolver doesn't cache OAuthRefresher instances, creating refresh-broker churn on high-frequency requests. Codex might benefit from per-provider refresher pooling.",
+          "OAuth refresh only checks expiry via RFC 3339 string parsing; no clock-skew detection or user notification when system time is dramatically wrong (e.g., VM wake-after-sleep with old clock). Callers see a 401 at request time instead of a clear 'your clock is wrong' error.",
+          "No support for incremental consent / scope re-negotiation. If anie's scopes expand (e.g., file-upload support), users must re-login from scratch — no 'request additional scopes' flow.",
+          "Callback server is single-connection, one-shot. If the user closes the browser tab and retries before the overall OAuth timeout expires, the second attempt fails (new connection required, but server closed). Power users testing or recovering from flaky networks see poor UX."
+        ]
+      },
+      {
+        "crate": "anie-protocol",
+        "owns": "anie-protocol is the canonical type definition and serialization boundary for cross-crate communication in the anie harness. It defines the complete set of conversation abstractions (Message, ContentBlock, Usage, StopReason, etc.), event types (AgentEvent with streaming deltas and compaction telemetry), and tool orchestration primitives (ToolDef, ToolCall, ToolResult). All message flow from the provider layer through the agent loop and into the UI is typed through these protocol types, which are persisted (e.g., in session files) and validated through comprehensive roundtrip tests. This crate owns the shape contract for anie's observable interface: what the rest of the workspace and external integrators depend on.",
+        "public_surface": [
+          {
+            "name": "Message",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/messages.rs:8",
+            "note": "Tagged union (role=user|assistant|toolResult|custom); the root type for all conversation history"
+          },
+          {
+            "name": "UserMessage",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/messages.rs:25",
+            "note": "content: Vec<ContentBlock>, timestamp: u64"
+          },
+          {
+            "name": "AssistantMessage",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/messages.rs:34",
+            "note": "content, usage, stop_reason, error_message, provider, model, timestamp, reasoning_details (for OpenRouter replay)"
+          },
+          {
+            "name": "ToolResultMessage",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/messages.rs:64",
+            "note": "tool_call_id, tool_name, content, details (JSON), is_error, timestamp"
+          },
+          {
+            "name": "CustomMessage",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/messages.rs:82",
+            "note": "custom_type (discriminator), content (opaque JSON), timestamp; for extension-defined messages"
+          },
+          {
+            "name": "ContentBlock",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/content.rs:6",
+            "note": "Tagged union (type=text|image|thinking|redactedThinking|toolCall); content carriers inside messages"
+          },
+          {
+            "name": "ToolCall",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/content.rs:41",
+            "note": "id (provider-minted), name, arguments (JSON); assistant's structured tool invocation"
+          },
+          {
+            "name": "AgentEvent",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/events.rs:30",
+            "note": "Tagged union for in-process harness events: AgentStart, TurnStart/End, MessageStart/Delta/End, ToolExecStart/Update/End, TranscriptReplace, SystemMessage, RlmStatsUpdate, StatusUpdate, CompactionStart/End, RetryScheduled"
+          },
+          {
+            "name": "CompactionPhase",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/events.rs:10",
+            "note": "PrePrompt (user-triggered), MidTurn (mid-agent-loop), ReactiveOverflow (post-provider-error); discriminator on CompactionStart/End events"
+          },
+          {
+            "name": "StopReason",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/stop_reason.rs:5",
+            "note": "Copy+Eq; Stop, ToolUse, Error, Aborted"
+          },
+          {
+            "name": "StreamDelta",
+            "kind": "enum",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/stream.rs:5",
+            "note": "Incremental updates during streaming: TextStart/Delta/End, ThinkingStart/Delta/End, ToolCallStart/Delta/End"
+          },
+          {
+            "name": "Usage",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/usage.rs:5",
+            "note": "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens (Option), cost (Cost)"
+          },
+          {
+            "name": "Cost",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/usage.rs:24",
+            "note": "input, output, cache_read, cache_write, total (all f64)"
+          },
+          {
+            "name": "ToolDef",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/tools.rs:7",
+            "note": "name, description, parameters (JSON Schema)"
+          },
+          {
+            "name": "ToolResult",
+            "kind": "struct",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/tools.rs:18",
+            "note": "content (Vec<ContentBlock>), details (opaque JSON)"
+          },
+          {
+            "name": "now_millis",
+            "kind": "fn",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/time.rs:4",
+            "note": "Return current Unix epoch milliseconds; handles clock-before-epoch edge case by returning 0"
+          }
+        ],
+        "todos_fixmes": [],
+        "rough_edges": [
+          {
+            "description": "All tool/custom JSON structured as opaque serde_json::Value (ToolCall.arguments, ToolDef.parameters, ToolResult.details, CustomMessage.content, ToolResultMessage.details, AgentEvent::ToolExecStart.args). No schema validation, type safety, or structured parsing at protocol boundary; all JSON parsing deferred to consumers. Enables forward compatibility but trades type safety and IDE support.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/content.rs:47, messages.rs:73, tools.rs:13/22, events.rs:52",
+            "severity": "medium"
+          },
+          {
+            "description": "reasoning_details on AssistantMessage is stored as Vec<serde_json::Value> with a comment explaining it's opaque upstream JSON for replay on OpenRouter models (openai/o*, gpt-5*). This is provider-specific artifact leaking into protocol; forward compat is correct, but the semantic is hidden from type system.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/messages.rs:50-59",
+            "severity": "low"
+          },
+          {
+            "description": "AgentEvent is a large untagged enum (15+ variants) representing all harness state changes. No internal grouping or trait-based event hierarchy; consumers must match all variants for any special handling. Extensibility requires modifying this enum and all match sites across the workspace.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/events.rs:30",
+            "severity": "medium"
+          },
+          {
+            "description": "ContentBlock is tagged union supporting Text, Image, Thinking, RedactedThinking, ToolCall but no structured extension point for new block types. Adding a new content type (e.g., Code, Artifact) requires enum change and all-sites updates.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/content.rs:6",
+            "severity": "low"
+          },
+          {
+            "description": "Thinking content has optional signature field for provider-minted opaque state (Anthropic extended thinking) with default for older sessions. Good forward compat via #[serde(default, skip_serializing_if)], but semantic coupling to Anthropic's provider-specific feature leaks into the protocol abstraction.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/content.rs:13-24",
+            "severity": "low"
+          },
+          {
+            "description": "now_millis() returns 0 on SystemTime::now().duration_since(UNIX_EPOCH) failure instead of propagating an error. Clock-before-epoch is possible on embedded/virtual systems; silently returning 0 could cause timestamp collisions or incorrect ordering.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/time.rs:4-8",
+            "severity": "medium"
+          },
+          {
+            "description": "ToolResultMessage.details uses #[serde(default, skip_serializing_if = \"serde_json::Value::is_null\")] which defaults to null but allows any JSON. Inconsistent with ToolResult.details which omits the attribute; both represent structured metadata but with different serialization strategies.",
+            "location": "/home/daniel/Projects/agents/anie/crates/anie-protocol/src/messages.rs:72-73",
+            "severity": "low"
+          }
+        ],
+        "competitive_notes": [
+          "No support for streaming metadata (e.g., token counts, latency estimates) on StreamDelta; all metrics are post-hoc in AssistantMessage.usage. Other agents (Claude Code, Grok) stream usage info inline.",
+          "ContentBlock union is closed; no plugin/extension system for custom content types. Codex supports arbitrary block types via a discriminator-based registry. anie requires enum changes to add new block types.",
+          "AgentEvent has no filtering/subscription mechanism; all consumers must process all events. High-cardinality streams (e.g., token-by-token deltas) couple UI and telemetry to the same event bus. Could benefit from event type tags or pub/sub filtering.",
+          "No explicit version on protocol types; schema evolution relies entirely on serde defaults and skip_serializing_if. No CURRENT_SESSION_SCHEMA_VERSION or changelog comment pattern (referenced in CLAUDE.md for other crates but not present here). Version drift risk on long-lived session files.",
+          "StopReason is simple enum (Stop, ToolUse, Error, Aborted) without structured error context. Error variant doesn't carry the error; details must come from AssistantMessage.error_message (string, unstructured). Compare to providers that distinguish retry-able vs terminal errors at the type level.",
+          "ToolDef.parameters is raw JSON Schema, not validated at registration. No capability declaration (e.g., supports_streaming, supports_errors) at the tool def level. pi and Claude Code include capability flags on tools.",
+          "CustomMessage.custom_type is string discriminator without a schema registry. No way to version or discover custom message schemas. Extensibility is opaque; coupling happens via string matching in consumers.",
+          "AssistantMessage requires provider and model fields (strings), duplicating info already in the context. No Model type/reference for stricter typing or shared model metadata (e.g., max_tokens capability)."
+        ]
+      }
+    ],
+    "docDigests": [
+      {
+        "cluster": "anie (Rust coding-agent harness)",
+        "key_findings": [
+          "Workspace is in good health: 898 test passes / 0 failures, zero clippy warnings, all code compiles clean. Workspace shape is 12 crates, 126 Rust files, ~53,658 LOC (code_review_comprehensive_2026-04-23.md)",
+          "Three-tier caching in TUI rendering (block / flat / viewport) is smart and well-factored; streaming is efficient (parses per newline, not per char), but has three concrete optimization leaks (not correctness issues): selective cache invalidation on setting toggle, animated-block cache scoping, and per-fence syntect caching (code_review_comprehensive_2026-04-23.md)",
+          "anie-protocol and anie-provider are small, idiomatic data/contract crates with no issues. anie-tools is exemplary modularity pattern (one tool per file). OAuth is production-grade with RFC 7636 PKCE compliance and refresh-race safety via double-check + file-lock (code_review_comprehensive_2026-04-23.md)",
+          "Empty assistant messages are now sanitized at replay time in agent loop, matching pi's behavior but with cleaner centralized approach: drops StopReason::Error/Aborted messages and whitespace-only blocks before converting context (local_mitigations.md)",
+          "Web tools have high-risk SSRF boundary gap: validate_url() only checks textual host but does not validate DNS-resolved IPs, redirects follow before IP validation, and headless/javascript path bypasses SSRF checks entirely. Default-enabled web tools can be induced to send requests to loopback/metadata/intranet (code_review_2026-04-27.md, finding #1 HIGH)",
+          "[ui] config section is ignored by real config loader: PartialAnieConfig has no ui field, so load_config_with_paths() never copies [ui] table values. User settings like markdown_enabled, tool_output_mode are silently stuck at defaults (code_review_2026-04-27.md, finding #2 HIGH)",
+          "Web tools do not respect cancellation tokens and Defuddle has no execution timeout: web_read/web_search discard CancellationToken, npx defuddle can stall unbounded, single web tool call can keep agent run alive after user abort (code_review_2026-04-27.md, finding #4 MEDIUM)",
+          "Built-in read tool advertises 50 KiB / 2000-line truncation but loads full files into memory before truncating; multi-GB files can cause memory pressure (code_review_2026-04-27.md, finding #6 MEDIUM)",
+          "Ollama context-window override message uses discovered context_window not effective_ollama_context_window(), giving misleading failure hints when user has set /context-length override (code_review_2026-04-27.md, finding #7 MEDIUM)",
+          "Web tools have unbounded error/side-channel reads: non-2xx responses read entire body before excerpt, robots.txt has no size cap, Defuddle collects all stdout/stderr. Hostile server can bypass 10 MiB page cap (code_review_2026-04-27.md, finding #5 MEDIUM)",
+          "Tool registry re-compiles jsonschema validators on every tool call and re-sorts definitions on every call, treating registry as dynamic when it is startup-time immutable. Both are performance-only issues, not correctness (code_review_performance_2026-04-21/01_tool_registry_and_schema.md)",
+          "OAuth refresh lock acquisition runs inside async request path but uses blocking thread::sleep polling loop, occupying Tokio worker for up to 15 seconds. Should move to spawn_blocking (code_review_2026-04-24/01_oauth_refresh_async_lock.md)"
+        ],
+        "open_items": [
+          {
+            "item": "anie-session/src/lib.rs is a 3,031-line single-file monolith with 34 top-level items, a merge-conflict magnet. Three repeated branch walks per compaction (get_branch called 3x per compaction). Recommended split into schema.rs, storage.rs, context_builder.rs, compaction.rs, tokens.rs",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "anie-tools depends on anie-agent for Tool trait (wrong-direction dep). Fix: move Tool trait + ToolRegistry contract into small anie-tool-contract crate",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "Web SSRF boundary not enforced: DNS resolution, redirects, and headless rendering all bypass IP validation. Must add manual redirect loop with Location validation, DNS resolution check before connect, or headless request interception",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "[ui] config is completely ignored; PartialAnieConfig needs ui field and merge logic",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "Web tools ignore cancellation tokens and have no timeout for Defuddle subprocess. Must thread CancellationToken through run(), add tokio::select! against cancel + timeout, kill child on either",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "Formatting is red in CI: cargo fmt --all -- --check fails on multiple files (controller.rs, model.rs, web tools, TUI files). Must run cargo fmt --all",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "Built-in read tool loads full file into memory before truncating. Must check metadata or stream via BufReader with byte/line caps",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "Web tools have unbounded error/side-channel reads (non-2xx bodies, robots.txt, Defuddle stderr). Must cap all paths equally",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "robots.txt evaluation always uses wildcard User-agent(*) instead of configured user-agent, and caches by host only not by origin/user-agent",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "No slash-command integration test (dispatch through controller untested). /model, /thinking, /compact, /fork have no end-to-end coverage",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "No urgent-paint fast path regression test for RenderMode::UrgentInput (TUI input responsiveness plan landed but test missing)",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "OAuth refresh lock polling uses std::thread::sleep (50ms spin loop) on async context. Should use spawn_blocking or async sleep",
+            "source": "code_review_2026-04-24/01_oauth_refresh_async_lock.md"
+          },
+          {
+            "item": "Three-tier cache optimizations are pending (not bugs, but perf wins): selective cache invalidation on setting toggle, animated-block cache scope, per-fence syntect cache",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "anie-session lacks #[serde(default)] discipline doc for evolving CompactionDetails; next field added without defaults will break backward-compat silently",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "Ollama load-failure message uses discovered context_window not effective_ollama_context_window() when override is active",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "atomic_write() is atomic for replacement but not crash-durable: does not fsync parent directory after rename. Should fsync directory after rename on Unix",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "Defuddle tempfile path supplied but source URL unused; relative links may not resolve correctly",
+            "source": "code_review_2026-04-27.md"
+          },
+          {
+            "item": "Triple CredentialStore::new() in fallback chains (runtime/config_state.rs:94,154,172) re-scans keyring + JSON on every apply_session_overrides call",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "overlays/onboarding.rs (2,644 LOC) and overlays/providers.rs (1,606 LOC) are procedural and could be split by state/concern",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          },
+          {
+            "item": "Print-mode event ordering has no defensive check if events arrive out-of-order; AgentLoop guarantees order but a regression would silently double-print",
+            "source": "code_review_comprehensive_2026-04-23.md"
+          }
+        ],
+        "competitive_gaps": [
+          "pi (TypeScript reference implementation) uses regex-based error classification for providers; anie uses structured ProviderError taxonomy with retry_after_ms() helper — anie is strictly better here and docs explicitly note not to copy pi's regex approach",
+          "pi's 15 API variants for different providers; anie uses OpenRouter + built-ins (Anthropic, OpenAI, Ollama, Copilot, etc.) — simpler but less exhaustive",
+          "pi has component-local line cache; anie has three-tier block/flat/viewport cache with streaming-aware commit/tail split — anie is more sophisticated and correct",
+          "pi does not have structured provider error taxonomy or retry-policy decision making; anie's ProviderError + RetryPolicy is production-grade and better than pi's approach"
+        ]
+      },
+      {
+        "cluster": "pi-adoption: anie's functional gap analysis vs pi (TypeScript coding agent), with seven prioritized implementation plans spanning provider compat, search tools, markdown UI, compaction fidelity, and OAuth auth. Execution status tracker shows plans 1–7 substantially complete as of 2026-04-21.",
+        "key_findings": [
+          "anie lacks markdown rendering in TUI (pi's biggest visible UX gap). Plan 05 ships heading/code/list/table/link rendering via pulldown-cmark + syntect; streaming blocks stay plain-text, finalized blocks render markdown (docs/pi_adoption_plan/05_markdown_renderer.md, execution status: 7/7 PRs landed).",
+          "anie has live /v1/models discovery (pi does not). pi hardcodes 50+ models in generated catalog; anie dynamically probes OpenRouter with TTL cache, enabling model expansion without rebuilding (anie_vs_pi_comparison.md lines 406–419).",
+          "anie's structured ProviderError taxonomy (14 typed variants routed via match) strictly outperforms pi's regex string-matching on error.message (anie_vs_pi_comparison.md lines 191–214). Rate-limit retries capped at 1; ResponseTruncated vs EmptyAssistantResponse distinction.",
+          "Plan 06 (compaction fidelity) adopts pi's split-turn summarization + file-op tracking. When cut lands mid-turn, generates two parallel summaries joined with '---' separator; tracks read/write/edit tool paths. Schema v4. Execution status: 5/5 PRs landed (docs/pi_adoption_plan/06_compaction_fidelity.md, commits d8bf578–6876d42).",
+          "Plan 07 (OAuth auth) ships Anthropic + OpenAI Codex + GitHub Copilot + Google Antigravity + Google Gemini CLI. Token refresh via per-provider fs4 file locks; short-lived access tokens auto-refresh transparently. Execution status: 14 PRs landed, 5 providers registered (docs/pi_adoption_plan/07_oauth_auth.md, commits 91f6f82–f9bba9e).",
+          "Plans 01–04 (Tier 1–2) all landed: maxTokensField compat flag, ThinkingLevel::Minimal, usage-seeded token estimation, grep/find/ls search tools, terminal capability detection (execution/README.md lines 5–21). Total 7 PRs.",
+          "Markdown rendering (Plan 05) defers OSC 8 hyperlink emission due to ratatui unicode-width accounting bug — URL bytes counted as visible cells break layout (docs/pi_adoption_plan/execution/README.md lines 45–46). Fallback: plain `[text] (url)` format.",
+          "anie-specific deviations from pi documented inline per CLAUDE.md principles: maxTokensField defaults to legacy 'max_tokens' not pi's 'max_completion_tokens' (supports older local-model servers); usage-seeded estimation includes 2× cap + model-switch reset guardrails (plans 01, 03); terminal capability probing adds ANIE_FORCE_OSC8 override env vars (plan 04).",
+          "Plan 07 split into 14 PRs (A: credential enum, B: trait + Anthropic, C: refresh-lock, D.1: CLI, E.1–E.5: five OAuth providers, F–G: routing + discovery fixes, D.2: TUI surface). Live smoke on GitHub Copilot 2026-04-21; Anthropic/Codex/Gemini verification deferred (ToS/unshipped)",
+          "Seven adoption plans span 42 PRs total (execution/README.md tracks ~30 landed commits). Suggested landing order: Tiers 1–2 (week 1), Tier 3 (markdown, several weeks), Tier 4 (compaction+OAuth in parallel when Tier 3 stable). All plans documented with rationale, design, files-to-touch, phased PRs, test plans, risks, exit criteria."
+        ],
+        "open_items": [
+          {
+            "item": "Markdown Plan 05: Manual smoke test — 'No observable TUI latency regression on a long agent run vs. plain-text baseline' and 'Visual smoke against 3+ real assistant responses' require live provider session, not yet verified (execution/README.md line 46–49)",
+            "source": "docs/pi_adoption_plan/execution/README.md"
+          },
+          {
+            "item": "Markdown Plan 05: OSC 8 hyperlink rendering deferred — ratatui's unicode-width accounting counts URL bytes as visible cells, breaking horizontal layout. Fallback: plain `[text] (url)` format. Revisit when ratatui ships native hyperlink support (05_markdown_renderer.md line 82, execution/README.md lines 45–46)",
+            "source": "docs/pi_adoption_plan/05_markdown_renderer.md"
+          },
+          {
+            "item": "Compaction Plan 06: Manual exit criteria 'compacts 30+ message session mid-turn' and 'jq inspection of real session' require live provider session (execution/README.md line 71–72)",
+            "source": "docs/pi_adoption_plan/execution/README.md"
+          },
+          {
+            "item": "OAuth Plan 07: Onboarding first-run flow offering OAuth as a preset is deferred. `anie login <provider>` works standalone; surfacing inside onboarding is a UX polish task (execution/README.md line 122–123)",
+            "source": "docs/pi_adoption_plan/execution/README.md"
+          },
+          {
+            "item": "OAuth Plan 07: Live refresh-with-lock exercise deferred. Copilot access tokens expire ~30 min; transparent refresh on next run not yet validated in production (execution/README.md line 125–127)",
+            "source": "docs/pi_adoption_plan/execution/README.md"
+          },
+          {
+            "item": "Search tools Plan 02: Slash-command surface (`/grep`, `/find`, `/ls`) deferred as optional PR D. Tools work via agent tool-use; slash commands are parity polish (02_search_tools.md line 194–198, execution/README.md line 20)",
+            "source": "docs/pi_adoption_plan/02_search_tools.md"
+          },
+          {
+            "item": "Compaction Plan 06: System-prompt integration to inject recently-touched-files hints at resume is deferred as 'optional polish' (06_compaction_fidelity.md line 241–247, execution/README.md line 67–68)",
+            "source": "docs/pi_adoption_plan/06_compaction_fidelity.md"
+          },
+          {
+            "item": "OAuth Plan 07: Live refresh-with-lock test with concurrent agents not yet exercised. File-lock behavior varies macOS/Linux; fs4 abstracts but requires dual-platform validation (07_oauth_auth.md line 255–256)",
+            "source": "docs/pi_adoption_plan/07_oauth_auth.md"
+          }
+        ],
+        "competitive_gaps": [
+          "Markdown rendering in TUI — pi supports headings, lists, code blocks with syntax highlighting, tables, blockquotes, OSC 8 hyperlinks. anie shipped Plan 05 but defers OSC 8 due to ratatui unicode-width bug (docs/pi_adoption_plan/execution/README.md line 45, 05_markdown_renderer.md line 82)",
+          "Inline image rendering — pi supports Kitty + iTerm2 APC/OSC 1337 protocols. anie has terminal-capability detection (Plan 04) but image rendering not planned (anie_vs_pi_comparison.md line 549)",
+          "Broader provider breadth — pi supports 15 Api variants (Bedrock, Vertex, Azure, Mistral native, etc.). anie covers 4 via ApiKind; OpenRouter routing offsets this for many cases but not all (anie_vs_pi_comparison.md lines 128–130)",
+          "Sophisticated input editor — pi has undo/kill-ring/paste-markers/grapheme-aware cursor. anie has multiline editing + history + autocomplete (anie_vs_pi_comparison.md lines 515–520)",
+          "Richer compat knobs — pi models carry ~13 compat flags (maxTokensField, thinkingFormat variants incl. zai/qwen, supportsDeveloperRole, supportsStore, reasoningEffortMap, routing configs). anie ships maxTokensField (Plan 01) but defers zai/qwen/developer-role/store variants (anie_vs_pi_comparison.md line 157–165, 01_compat_knobs.md line 164–166)",
+          "Component widget inventory — pi ships markdown renderer, inline images, settings-list widget, truncated-text, cancellable-loader. anie has select, text-field, fuzzy-search, overlay (anie_vs_pi_comparison.md lines 481–493)"
+        ]
+      },
+      {
+        "cluster": "anie refactor plans: pi-parity / perf / consolidation (2026-04-22 through 2026-04-29)",
+        "key_findings": [
+          "14 of 14 pi-adoption refactor plans (00-14) completed and landed between 2026-04-18 and 2026-04-22; all phases of plans 01-14 shipped with only minor optional deferrals.",
+          "Performance worklist (tui_perf_architecture + code_review_performance_2026-04-21) is heavily executed: Phase 0-4 largely landed, achieving 10.7× scroll speedup (3.16 ms → 296 µs) on hot path; streaming performance improved from 3.35 ms → 2.19 ms (Phase 3 gate met, further optimization deferred).",
+          "Code consolidation identified ~800-1000 LOC of refactorable duplication; PR 01 (safe wins) implemented on 2026-04-26 branch for low-risk ~200-300 LOC removal; PRs 02-05 documented but deferred pending design review/risk assessment.",
+          "Plan 10 (extension system / JSON-RPC subprocess architecture) is the only active refactor plan, not yet started; requires multi-phase 7-week effort with pi-shaped 35+ event types, tool/command/provider/renderer registration across external processes.",
+          "Two primary tech-debt blockers identified for rival-grade parity: (1) SSE streaming state machine duplication (3 providers, ~400 LOC consolidatable, HIGH risk, deferred until 4th provider motivates abstraction); (2) OAuth provider deduplication (5 providers, ~1,700 LOC, VERY HIGH risk, deferred until 6th provider addition)."
+        ],
+        "open_items": [
+          {
+            "item": "Plan 03 phase 2: move compaction behind MessageSummarizer trait in anie-session (eliminates duplicate call-site logic in controller); no architectural blocker, scope/budget decision queued for next session",
+            "source": "/home/daniel/Projects/agents/anie/docs/completed/refactor_plans/remaining_work_notes.md:12-24"
+          },
+          {
+            "item": "Plan 03 phase 3: slash-command registry with SlashCommandSource tagging; settled on approach (B) — fn pointer registry, less risky than trait-based dispatch; queued after phase 2",
+            "source": "/home/daniel/Projects/agents/anie/docs/completed/refactor_plans/remaining_work_notes.md:26-38"
+          },
+          {
+            "item": "Code consolidation PR 02: TUI render consolidation (bullet-header builder, overlay frame extraction, spinner unification) — medium risk, deferred pending user validation of tui_polish_2026-04-26",
+            "source": "/home/daniel/Projects/agents/anie/docs/code_consolidation_2026-04-26/02_tui_render_consolidation.md"
+          },
+          {
+            "item": "Code consolidation PR 03: markdown layout simplification (adopt pi's single-pass table rendering, drop list side-channel state) — medium risk, deferred pending UX validation from tui_polish round",
+            "source": "/home/daniel/Projects/agents/anie/docs/code_consolidation_2026-04-26/03_markdown_simplification.md"
+          },
+          {
+            "item": "Code consolidation PR 04: SSE streaming state machine consolidation (OpenAI/Anthropic/Ollama) — HIGH risk, ~400 LOC, deferred until 4th provider addition provides clear pull on abstraction",
+            "source": "/home/daniel/Projects/agents/anie/docs/code_consolidation_2026-04-26/04_provider_streaming.md"
+          },
+          {
+            "item": "Code consolidation PR 05: OAuth provider deduplication (5 providers, ~1,700 LOC boilerplate, ~2,967 LOC total) — VERY HIGH risk, security-critical, deferred until next OAuth provider addition",
+            "source": "/home/daniel/Projects/agents/anie/docs/code_consolidation_2026-04-26/05_oauth_deduplication.md"
+          },
+          {
+            "item": "Plan 10: extension system JSON-RPC subprocess architecture (35+ event types, tool/command/provider/renderer registration) — 7 phases over ~6 weeks, not started, preconditioned on Plan 07 option A (stub removal, already landed)",
+            "source": "/home/daniel/Projects/agents/anie/docs/refactor_plans/10_extension_system_pi_port.md:1-150"
+          },
+          {
+            "item": "tui_perf Phase 08: streaming collector (Codex-style newline-gated commit) — deferred; Phase 3.1-3.2 + Phase 2 reduced frame time from 3.35 ms → 2.19 ms, gate met, revisit only if long-stream perf regresses",
+            "source": "/home/daniel/Projects/agents/anie/docs/tui_perf_architecture/execution/README.md:22"
+          },
+          {
+            "item": "tui_perf Phase 6 PR-C: mouse-motion trace investigation — deferred, no real-user report; can open if ANIE_PERF_TRACE data surfaces",
+            "source": "/home/daniel/Projects/agents/anie/docs/tui_perf_architecture/execution/README.md:28"
+          },
+          {
+            "item": "code_review Phase 02 (Agent turn ownership): PRs B-F deferred as residual cleanups after PR-A (Cow sanitization) landed",
+            "source": "/home/daniel/Projects/agents/anie/docs/code_review_performance_2026-04-21/execution/README.md:32-36"
+          },
+          {
+            "item": "code_review Phase 03 (Session indexing): PRs B/C/E/F deferred after PR-A (id_set) and PR-D (CutPoint trim) landed",
+            "source": "/home/daniel/Projects/agents/anie/docs/code_review_performance_2026-04-21/execution/README.md:38-41"
+          }
+        ],
+        "competitive_gaps": [
+          "Extension system not yet ported from pi (Plan 10 not started): pi has 35+ event types, JSON-RPC subprocess architecture, tool/command/provider/renderer registration; anie has stub crate only. This blocks feature parity for user-authored extensions, custom tools, and language-agnostic plugins.",
+          "SSE streaming state machine duplication across 3 providers (OpenAI, Anthropic, Ollama) creates correctness risk and maintenance burden; pi's equivalent abstracted (if pi even duplicates, docs don't say). ~400 LOC consolidatable but deferred for abstraction risk.",
+          "OAuth boilerplate duplication across 5 providers (~1,700 LOC) vs. pi's unknown factorization. Blocks low-friction addition of new OAuth providers. Deferred due to security-critical correctness risk.",
+          "Markdown table rendering still multi-pass on anie (66 LOC compute_column_widths + 50+ LOC wrap_plain_text_cell vs. pi's single-pass token walk, 170 LOC total). Simplification deferred pending UX validation.",
+          "No documented container/sandbox isolation for extension execution (Plan 10 phase 1-7 will address); pi's subprocess model already specified."
+        ]
+      },
+      {
+        "cluster": "forward_looking_features_anie_harness",
+        "key_findings": [
+          "Skills system (Agent Skills standard) is planned for medium priority — load SKILL.md files from ~/.anie/skills/ and .anie/skills/, register as /skill:name commands, support allowed-tools field (docs/notes/skills_system.md, docs/ROADMAP.md item 10)",
+          "Memory system is flagged as low-priority long-term — graph/cluster-based persistent memories across sessions, retrieval by semantic similarity, initially design-phase only (docs/notes/memory_system.md)",
+          "Persistent daemon and messaging integrations (Telegram priority-high, Discord/Slack/SMS/Email low) — background agent process supporting multi-frontend architecture (docs/notes/daemon_and_messaging.md)",
+          "Extension system (Plan 10) — subprocess-based JSON-RPC extensions spawned at startup, any language, 35+ event types, tool registration, command registration, UI context for dialogs, error isolation. Multi-week effort sequenced in 7 phases (docs/refactor_plans/10_extension_system_pi_port.md)",
+          "Provider expansion — OpenRouter top priority, xAI/Groq/Cerebras/Mistral/Google Gemini/Azure/Bedrock drafted in docs/add_providers/ with skill-based guidance (docs/notes/provider_expansion_and_auth.md, docs/ROADMAP.md item 12)",
+          "OAuth/subscription authentication — login flows for Claude Pro, ChatGPT Plus, GitHub Copilot with browser-based OAuth, device code, and auto-refresh (docs/notes/provider_expansion_and_auth.md)",
+          "REPL-shaped agent loop — top architectural priority (roadmap item 0) — Read → Eval → Print → Loop runtime with explicit step boundaries for error recovery, context augmentation, compaction, and recursive task decomposition (docs/repl_agent_loop_2026-04-27.md, docs/ROADMAP.md)",
+          "Mid-turn compaction — Phase 8 of implementation roadmap: automatic compaction when approaching context limit, context-aware reserve sizing, tool-output caps that scale with window, per-turn compaction budget with anti-thrash limit (docs/implementation_roadmap_2026-04-27.md phases 8.1–8.7)",
+          "Benchmarks and evaluation suite — internal end-to-end benchmark tasks on real-world codebases measuring completion, correctness, efficiency, time; investigation of TerminalBench external suite (docs/notes/benchmarks_and_evaluation.md)",
+          "Internet search tool — self-hosted SearXNG meta-search engine with page-fetch and Defuddle content extraction, registered as search() and fetch() tools (docs/notes/internet_search_tool.md)",
+          "Reactive context files (AGENTS.md/CLAUDE.md) — file mtime checking before each LLM call to enable mid-session edits without /reload; Medium priority (docs/notes/context_file_handling.md, docs/ROADMAP.md completed)",
+          "Active input during streaming — user can type drafts and queue follow-ups while agent runs; Ctrl+Enter for interrupt-and-send; phases 1–7 of implementation roadmap (docs/implementation_roadmap_2026-04-27.md)",
+          "Web tool hardening — manual redirect validation, DNS/private-IP checks, headless path policy, cancellation support, bounded side-channel reads, configurable [tools.web] budgets (docs/implementation_roadmap_2026-04-27.md phases 3–4)",
+          "Compaction telemetry — mid-turn/pre-prompt/reactive labels, /state summary with counts, optional /compaction-stats command (docs/implementation_roadmap_2026-04-27.md phase 8.7)",
+          "TUI layout improvements — input area bars, region separation, user message styling, rate limit display (docs/notes/tui_layout_and_visual_design.md, docs/ROADMAP.md item 9)",
+          "Session management commands (/resume, /session, /name) — browse past sessions, show metadata, set display names (docs/notes/commands_and_slash_menu.md, docs/ROADMAP.md item 8)",
+          "/settings command — interactive configuration viewer/editor in TUI (docs/notes/commands_and_slash_menu.md)"
+        ],
+        "open_items": [
+          {
+            "item": "Extension system design and transport contract — JSON-RPC 2.0 over stdin/stdout, manifest discovery (.anie/extensions/*/manifest.json), event subscription, tool/command/keybinding registration, blocked on OAuth support for phase 7",
+            "source": "docs/refactor_plans/10_extension_system_pi_port.md"
+          },
+          {
+            "item": "Memory system — format for storing/linking memories, retrieval via semantic similarity, contradiction handling, agent vs user-driven memory writes, speed optimization for per-turn retrieval",
+            "source": "docs/notes/memory_system.md"
+          },
+          {
+            "item": "Daemon architecture for persistent agents — IPC mechanism (Unix socket/WebSocket/pipe), authentication, lifecycle management, headless mode, session continuity pairing with memory system",
+            "source": "docs/notes/daemon_and_messaging.md"
+          },
+          {
+            "item": "REPL loop refactoring — behavior-characterization tests must come first (PR 0), then extract run state into structured Read/Eval/Print/Loop phases without adding planner/verifier/recursive subtask features yet",
+            "source": "docs/repl_agent_loop_2026-04-27.md"
+          },
+          {
+            "item": "Mid-turn compaction phases — effective_reserve helper (8.1), per-turn budget counter (8.2), CompactionGate hook (8.3), mid-turn execution (8.4), budget-aware path (8.5), context-scaled tool output caps (8.6), telemetry (8.7)",
+            "source": "docs/implementation_roadmap_2026-04-27.md phase 8"
+          },
+          {
+            "item": "Active input phases — editable draft (1.2), queued prompts FIFO (2.1–2.4), interrupt-and-send keybinding and UX (7.1–7.3), must land before active input is claimed complete",
+            "source": "docs/implementation_roadmap_2026-04-27.md phases 1–7"
+          },
+          {
+            "item": "Web tool security boundary — manual redirect loop (3.1), DNS resolution + private-IP validation (3.2), headless feature-gate or Chrome request interception (3.3) for SSRF-equivalent safety",
+            "source": "docs/implementation_roadmap_2026-04-27.md phase 3"
+          },
+          {
+            "item": "Provider expansion concrete work — seven per-provider plans under docs/add_providers/ covering OpenRouter (top priority), xAI, Groq, Cerebras, Mistral, Google Gemini, Azure, Bedrock; skill guidance at .claude/skills/adding-providers/SKILL.md",
+            "source": "docs/notes/provider_expansion_and_auth.md, docs/ROADMAP.md item 12"
+          },
+          {
+            "item": "SearXNG infrastructure for internet search — self-hosted meta-search engine setup, page content extraction via headless or readability parsing, graceful degradation if not running",
+            "source": "docs/notes/internet_search_tool.md"
+          },
+          {
+            "item": "Benchmark suite design — task profile, scoring dimensions (completion, correctness, efficiency, time), reproducibility, regression tracking across models/providers",
+            "source": "docs/notes/benchmarks_and_evaluation.md"
+          }
+        ],
+        "competitive_gaps": [
+          "MCP (Model Context Protocol) — Codex/Claude Code have native MCP servers (codex-mcp/ with tool exposure, model calling support); anie has no MCP integration planned or specified in public roadmap",
+          "Sandboxing — Codex implements multi-tier sandboxing (Landlock + bubblewrap on Linux, Scheme-based on macOS, restricted-token on Windows); anie has no process sandboxing, resource limits, or permission boundaries for tool execution",
+          "OAuth flows — pi and Codex support OAuth (ChatGPT Plus, Claude Pro, GitHub Copilot); anie's provider_expansion doc mentions OAuth as 'low-medium' priority and not yet implemented",
+          "Responses API streaming — Codex uses OpenAI Responses API with WebSocket prewarming and SSE fallback; anie uses traditional streaming but lacks Responses API support or prewarm optimization",
+          "Provider breadth — Codex lists 15 Api variants plus cloud-agnostic capability profiles; anie currently supports Anthropic/OpenAI/OpenRouter/local Ollama. Additional providers are in planning but not shipped",
+          "Hook system — Codex has pre/post-tool-use hooks, session-start hooks, stop hooks with command execution; anie's CompactionGate is the first hook being introduced (phase 8.3 of mid-turn compaction)",
+          "Extensions/plugins — Codex native extension system with subprocess JSON-RPC (any language), 35+ event types; anie Plan 10 extension system is multi-week future work, blocked on OAuth",
+          "Daemon/persistent agent — Codex app-server is the baseline; anie daemon+messaging is low-priority future work, Telegram integration is 'post-phase' idea not yet roadmapped",
+          "Database backend (state/history) — Codex uses SQLite for threads, history, state; anie uses JSONL session files with in-memory compaction, no structured query backend",
+          "Skills as extensible units — Codex supports skills with event subscriptions and runtime registration (codex-skills); anie skills_system is not yet shipped; pi has agent skills standard but anie adoption is medium priority",
+          "Recursive task decomposition — Codex and pi reference agent planning, subtask decomposition, Reflexion-style learning; anie REPL loop explicitly defers planner/recursive calls to post-MVP stage",
+          "Context retrieval / RAG — Not mentioned in anie docs as planned; implicit via compaction summary but no vector DB, retriever, or dynamic context enrichment system",
+          "Verifier loops / self-critique — anie REPL loop mentions verifier loops as future capability but does not plan implementation; Codex and pi reference this as part of complex task flows",
+          "Realtime voice/audio — Codex has realtime-webrtc/ for voice interaction; anie TUI is text-only",
+          "Collaboration modes — Codex models-manager supports collaboration presets; anie has no multi-user or collaboration features planned"
+        ]
+      }
+    ],
+    "missingCrateMaps": 0,
+    "missingDocDigests": 0
+  }
+}
