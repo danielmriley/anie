@@ -9,7 +9,7 @@ use anie_providers_builtin::register_builtin_providers;
 use anie_session::SessionManager;
 use anie_tools::{
     BashPolicy, BashTool, EditTool, FileMutationQueue, FindTool, GrepTool, LsTool, ReadTool,
-    WriteTool,
+    TodoList, TodoWriteTool, WriteTool,
 };
 use anie_tui::UiAction;
 use tracing::warn;
@@ -85,12 +85,17 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
     // registry is built (the registry is immutable once `Arc`-wrapped).
     // Suppressed-tools / baseline mode stays MCP-free.
     let mcp_tools = spawn_mcp_tools(&config.mcp, suppress_tools).await;
+    // The plan/todo list is owned here and shared with the `todo_write`
+    // tool registered below, so the status bar and verifier read the same
+    // state. (See ControllerState::todo_list.)
+    let todo_list = Arc::new(std::sync::Mutex::new(TodoList::default()));
     let tool_registry = build_tool_registry_with_policy(
         &cwd,
         suppress_tools,
         bash_policy_from_config(&config.tools.bash.policy),
         config.tools.web.clone(),
         mcp_tools,
+        Arc::clone(&todo_list),
     );
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
@@ -115,6 +120,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: cli.harness_mode,
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list,
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {
@@ -131,6 +137,7 @@ pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistr
         BashPolicy::default(),
         anie_config::WebToolConfig::default(),
         Vec::new(),
+        Arc::new(std::sync::Mutex::new(TodoList::default())),
     )
 }
 
@@ -178,6 +185,7 @@ fn build_tool_registry_with_policy(
     bash_policy: BashPolicy,
     web_config: anie_config::WebToolConfig,
     mcp_tools: Vec<Arc<dyn anie_agent::Tool>>,
+    todo_list: Arc<std::sync::Mutex<TodoList>>,
 ) -> Arc<ToolRegistry> {
     let mut tools = ToolRegistry::new();
     if no_tools {
@@ -186,6 +194,10 @@ fn build_tool_registry_with_policy(
 
     let queue = Arc::new(FileMutationQueue::new());
     tools.register(Arc::new(ReadTool::new(cwd.to_path_buf())));
+    // The plan/todo tool, available in every tool-enabled mode (absent in
+    // the no-tools baseline by virtue of the early return above). Writes
+    // the controller-owned shared list.
+    tools.register(Arc::new(TodoWriteTool::new(todo_list)));
     tools.register(Arc::new(WriteTool::with_queue(
         cwd.to_path_buf(),
         Arc::clone(&queue),
@@ -335,6 +347,7 @@ done
             BashPolicy::default(),
             anie_config::WebToolConfig::default(),
             mcp_tools,
+            Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         )
     }
 
@@ -377,5 +390,67 @@ done
             mcp_tools.is_empty(),
             "suppressed-tools / baseline mode spawns no MCP servers"
         );
+    }
+}
+
+#[cfg(test)]
+mod todo_bootstrap_tests {
+    use super::*;
+    use anie_tools::{TodoList, TodoStatus};
+
+    fn registry_with(
+        todo_list: Arc<std::sync::Mutex<TodoList>>,
+        no_tools: bool,
+    ) -> Arc<ToolRegistry> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        build_tool_registry_with_policy(
+            tmp.path(),
+            no_tools,
+            BashPolicy::default(),
+            anie_config::WebToolConfig::default(),
+            Vec::new(),
+            todo_list,
+        )
+    }
+
+    #[tokio::test]
+    async fn todo_tool_registered_for_default_mode() {
+        let list = Arc::new(std::sync::Mutex::new(TodoList::default()));
+        let registry = registry_with(Arc::clone(&list), false);
+        assert!(
+            registry.get("todo_write").is_some(),
+            "todo_write must be registered in tool-enabled modes"
+        );
+        // ...and absent in the no-tools baseline.
+        let baseline = registry_with(list, true);
+        assert!(baseline.get("todo_write").is_none());
+    }
+
+    #[tokio::test]
+    async fn todo_write_call_mutates_controller_owned_list() {
+        // The tool registered in the registry and the controller-owned
+        // Arc<Mutex<TodoList>> are the same state — one source of truth.
+        let list = Arc::new(std::sync::Mutex::new(TodoList::default()));
+        let registry = registry_with(Arc::clone(&list), false);
+        let tool = registry.get("todo_write").expect("todo_write present");
+
+        tool.execute(
+            "call",
+            serde_json::json!({ "todos": [
+                { "content": "step one", "status": "in_progress" },
+                { "content": "step two", "status": "pending" }
+            ] }),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            &anie_agent::ToolExecutionContext::default(),
+        )
+        .await
+        .expect("todo_write executes");
+
+        let guard = list.lock().expect("lock");
+        assert_eq!(guard.items().len(), 2);
+        assert_eq!(guard.items()[0].content, "step one");
+        assert_eq!(guard.items()[0].status, TodoStatus::InProgress);
+        assert_eq!(guard.counts(), (0, 2));
     }
 }

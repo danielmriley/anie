@@ -158,6 +158,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -231,6 +232,7 @@ fn controller_with_runtime_state_path(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -708,6 +710,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -753,6 +756,7 @@ fn build_state_with_registry(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
     }
 }
 
@@ -1603,6 +1607,7 @@ fn controller_for_context_length_test_with_cap(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2069,6 +2074,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2205,6 +2211,7 @@ fn spawn_live_controller(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);

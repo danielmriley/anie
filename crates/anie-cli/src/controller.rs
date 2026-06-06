@@ -1205,6 +1205,18 @@ pub(crate) struct ControllerState {
     /// Always present (even in non-rlm modes, where it
     /// stays at 0) so the field is uniform across modes.
     pub(crate) rlm_archived_messages: Arc<std::sync::atomic::AtomicUsize>,
+    /// The model's plan/todo list for this session. Owned here so the
+    /// `todo_write` tool (writer), the status bar (reader via
+    /// `status_event`), and the verifier policy (reader) all share one
+    /// source of truth — the same arrangement as the recurse tool's
+    /// `ExternalContext`. In-memory and not persisted (no session-schema
+    /// change). Session-lifetime rather than reset per run, so a plan
+    /// survives across follow-up prompts (the model overwrites it with a
+    /// full-replace `todo_write` when it starts new work).
+    // Read by `status_event` (PR 3) and the verifier policy (PR 4); the
+    // write path (the `todo_write` tool) is wired this PR.
+    #[allow(dead_code)]
+    pub(crate) todo_list: Arc<std::sync::Mutex<anie_tools::TodoList>>,
 }
 
 impl ControllerState {
