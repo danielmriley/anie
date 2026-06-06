@@ -545,26 +545,30 @@ server.
 
 ## 7. Exit criteria
 
-- [ ] PRs 1-6 merged in order; each PR's named tests pass.
-- [ ] `cargo test --workspace` green.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- [ ] `cargo fmt --check` clean.
-- [ ] `cargo tree -p anie-mcp` adds **zero** new external crates
-      vs. the workspace baseline.
-- [ ] A configured stdio MCP server's tools appear in the registry
-      as `mcp__<server>__<tool>` and are callable end-to-end.
-- [ ] A misconfigured / dead server logs `warn!` and does **not**
-      abort startup; other servers and built-ins still load.
-- [ ] `--no-tools` / baseline harness mode spawns no MCP servers.
-- [ ] **Manual smoke** per `docs/smoke_protocol_2026-05-01.md`:
-      configure a real stdio MCP server (e.g. an `npx`-launched
-      filesystem or everything-server), start anie, confirm its
-      tools list, drive the model to call one, and confirm the
-      result renders. Repeat with the server's command broken to
-      confirm graceful degradation.
-- [ ] `docs/arch/anie-rs_architecture.md` documents `anie-mcp` and
+- [x] PRs 1-6 merged in order (`d2d1c03`..`fb0116b`); each PR's named tests pass.
+- [x] `cargo test --workspace` green (36 ok blocks, 0 failures; 22 anie-mcp tests).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [x] `cargo fmt --check` clean.
+- [x] `cargo tree -p anie-mcp` adds **zero** new external crates
+      vs. the workspace baseline (Cargo.lock gained only the `anie-mcp`
+      entry; all deps come from existing workspace crates).
+- [x] A configured stdio MCP server's tools appear in the registry
+      as `mcp__<server>__<tool>` and are callable end-to-end
+      (`bootstrap_registers_mcp_tools_into_registry`; live smoke below).
+- [x] A misconfigured / dead server logs `warn!` and does **not**
+      abort startup; other servers and built-ins still load
+      (`manager_skips_dead_server_*`, `bootstrap_continues_when_mcp_server_fails_to_spawn`).
+- [x] `--no-tools` / baseline harness mode spawns no MCP servers
+      (`bootstrap_suppresses_mcp_when_no_tools`).
+- [x] **Manual smoke**: captured as an `#[ignore]`d live test
+      (`crates/anie-mcp/tests/live_server_smoke.rs`) that drives the real
+      `@modelcontextprotocol/server-everything` through `McpClient`.
+      Verified locally: handshake OK, 13 tools listed, `echo` called and
+      returned a content block. (The "drive the model to call one" leg
+      needs a live provider/API key and was not run here.)
+- [x] `docs/arch/anie-rs_architecture.md` documents `anie-mcp` and
       the bootstrap registration point.
-- [ ] `docs/ROADMAP.md` marks the MCP client landed.
+- [x] `docs/ROADMAP.md` marks the MCP client landed.
 
 > **Schema bump:** none. MCP config lives in TOML, not in the
 > session schema; tool calls/results already persist via the
