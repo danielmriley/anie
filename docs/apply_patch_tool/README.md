@@ -480,31 +480,31 @@ Cross-cutting:
 
 ## 7. Exit criteria
 
-- [ ] PRs 1–5 land in order, one commit each, ≤5 files each.
-- [ ] `cargo test --workspace` green.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-      clean.
-- [ ] `cargo fmt --check` clean.
-- [ ] `cargo tree -p anie-tools` shows **no new dependency** vs.
-      pre-PR1.
-- [ ] `apply_patch` registered in `bootstrap.rs` on the shared
+- [x] PRs 1–5 land in order, one commit each (`903bc8d`..`b7681a9`).
+      (PR4 touched 6 files — the 6th, `edit.rs`, is a mechanical
+      `pub(crate)` visibility change so apply_patch reuses the BOM/line-
+      ending helpers instead of duplicating them; documented in the commit.)
+- [x] `cargo test --workspace` green (0 failures; 115 anie-tools tests).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [x] `cargo fmt --check` clean.
+- [x] `cargo tree -p anie-tools` shows **no new dependency** (Cargo.lock
+      gained nothing across PR1–5).
+- [x] `apply_patch` registered in `bootstrap.rs` on the shared
       `FileMutationQueue` and in integration `helpers.rs`.
-- [ ] EDIT-1/EDIT-5: one call applies multi-hunk, multi-file
-      changes from an envelope.
-- [ ] EDIT-2: a failing hunk anywhere in the call leaves **every**
-      target file untouched on disk (proven by test).
-- [ ] EDIT-3: `edit`'s ToolDef documents the fuzzy fallback and its
-      result reports when a match was fuzzy; `apply_patch` reports
-      `fuzzy_hunks` and supports `dry_run` preview.
-- [ ] No `CURRENT_SESSION_SCHEMA_VERSION` bump (no new persisted
-      typed field; `details` is free-form `Value`) — stated and
-      verified.
-- [ ] Manual smoke (Section 5) passes on a live free-tier model.
-- [ ] `docs/arch/anie-rs_architecture.md` updated: new tool +
-      `with_locks` primitive + the `edit`/`apply_patch` shared
-      `text_match` engine.
-- [ ] `docs/ROADMAP.md` updated: mark the `apply_patch` initiative
-      (#4 in the rival shortlist) landed.
+- [x] EDIT-1/EDIT-5: one call applies multi-hunk, multi-file changes
+      (`apply_patch_applies_changes_across_three_files_in_one_call`).
+- [x] EDIT-2: a failing hunk leaves **every** target untouched
+      (`apply_patch_writes_nothing_when_any_hunk_fails_to_match`).
+- [x] EDIT-3: `edit` documents the fuzzy fallback and reports fuzzy
+      matches; `apply_patch` reports `fuzzy_hunks` and supports `dry_run`.
+- [x] No `CURRENT_SESSION_SCHEMA_VERSION` bump (`details` is free-form
+      `Value`; nothing persisted gained a typed field).
+- [~] Manual smoke on a live model: covered at the tool level by the
+      multi-file/atomicity/dry-run/fuzzy unit tests; a live-model drive
+      needs an API key (not run here).
+- [x] `docs/arch/anie-rs_architecture.md` updated (new tool, `with_locks`,
+      shared `text_match` engine).
+- [x] `docs/ROADMAP.md` updated: `apply_patch` marked landed.
 
 ---
 
