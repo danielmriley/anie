@@ -158,6 +158,36 @@ the controller. Future hooks (after-model, on-tool-error, etc.) get
 their own traits when real consumers materialize. Plan series:
 `docs/repl_agent_loop/`.
 
+### Plan/todo state and the verifier seam
+
+The model maintains a plan via the `todo_write` tool
+(`anie-tools/src/todo.rs`). The durable `TodoList` is owned by the
+controller as `ControllerState::todo_list` (`Arc<Mutex<TodoList>>`) and
+shared three ways — the same single-source-of-truth arrangement as the
+recurse tool's `ExternalContext`:
+
+- the `todo_write` tool is the model's writable surface (full-replace
+  semantics: the model sends the whole list each call);
+- the status bar reads `counts()` in `status_event` and renders a
+  `todo: d/t` segment (`AgentEvent::StatusUpdate.todo_done/todo_total`);
+- the verifier policy reads the list to gate its critique.
+
+The list is session-lifetime, in-memory, and not persisted (no
+`SessionEntry` variant, no schema bump).
+
+`VerifierPolicy` (`anie-cli/src/verifier.rs`) is the first *outcome-
+validation* consumer of the `BeforeModelPolicy` seam (context-virt is the
+other consumer, but it does eviction, not validation). It is opt-in via
+`ANIE_VERIFIER=1`; disabled (default) it returns `Continue`, so behavior
+is byte-identical to before. When enabled it injects a single
+**context-only** critique (one-shot per run) once the plan is all-`done`,
+with a step-cadence fallback (`ANIE_VERIFIER_MIN_STEP`) for plan-less
+runs. Because the seam holds a single `Arc<dyn BeforeModelPolicy>`, the
+verifier composes with context-virtualization through
+`ChainedBeforeModelPolicy` (`anie-agent`), which folds N consumers over
+one running context (replace-then-append ordering) and returns `Continue`
+when none changed anything. Plan: `docs/plan_todo_verifier/`.
+
 Each run is wrapped in a tracing `agent_run` span keyed by a UUID
 `run_id`; each REPL iteration gets a child `agent_repl_step` span with
 `run_step` (monotonic), `intent`, `context_messages`, and
@@ -427,6 +457,7 @@ tool set is always available unless `--no-tools` is passed:
 - `grep`
 - `find`
 - `ls`
+- `todo_write` (plan/todo tool; see "Plan/todo state and the verifier seam")
 
 `write` and `edit` share a `FileMutationQueue` so file mutations are serialized.
 

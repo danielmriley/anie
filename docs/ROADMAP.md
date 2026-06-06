@@ -5,6 +5,14 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] Plan/todo tool + verifier loop (docs/plan_todo_verifier/): a
+      TodoWrite-style `todo_write` tool over a controller-owned
+      `TodoList`, rendered as a `todo: d/t` status segment, plus an
+      opt-in (`ANIE_VERIFIER=1`) self-critique `BeforeModelPolicy` that
+      injects a one-shot context-only verification nudge when the plan is
+      all-done. `ChainedBeforeModelPolicy` composes it with context
+      virtualization. Run-scoped/in-memory; parallel sub-agents and DAG
+      decomposition deferred.
 - [x] MCP (Model Context Protocol) client (docs/mcp_client/): `[mcp]`
       config, hand-rolled stdio JSON-RPC client in the new `anie-mcp`
       crate, external server tools registered as `mcp__<server>__<tool>`

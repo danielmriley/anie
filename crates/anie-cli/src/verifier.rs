@@ -222,4 +222,140 @@ mod tests {
             BeforeModelResponse::AppendMessages(_)
         ));
     }
+
+    // ---- end-to-end: plan -> verifier critique, context-only ----
+
+    use anie_agent::{AgentLoop, AgentLoopConfig, ToolExecutionMode, ToolRegistry};
+    use anie_protocol::{AssistantMessage, StopReason, ToolCall, Usage};
+    use anie_provider::{
+        ApiKind, ProviderError, ProviderRegistry, RequestOptionsResolver, ResolvedRequestOptions,
+        mock::{MockProvider, MockStreamScript},
+    };
+    use async_trait::async_trait;
+
+    struct StaticResolver;
+
+    #[async_trait]
+    impl RequestOptionsResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            _model: &anie_provider::Model,
+            _context: &[Message],
+        ) -> Result<ResolvedRequestOptions, ProviderError> {
+            Ok(ResolvedRequestOptions::default())
+        }
+    }
+
+    fn assistant_tool_call(id: &str, args: serde_json::Value) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: id.into(),
+                name: "todo_write".into(),
+                arguments: args,
+            })],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider: "mock".into(),
+            model: "m".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        }
+    }
+
+    fn assistant_done() -> AssistantMessage {
+        AssistantMessage {
+            content: vec![ContentBlock::Text {
+                text: "all set".into(),
+            }],
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "mock".into(),
+            model: "m".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        }
+    }
+
+    fn contains_critique(messages: &[Message]) -> bool {
+        messages.iter().any(|message| match message {
+            Message::User(u) => u
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == CRITIQUE)),
+            _ => false,
+        })
+    }
+
+    #[tokio::test]
+    async fn todo_plan_drives_verifier_critique_end_to_end() {
+        // The model writes an all-done plan via todo_write on turn 1,
+        // then answers on turn 2. With the verifier enabled, the critique
+        // must land in the run context before turn 2 but NOT in the
+        // controller-persisted generated_messages (context-only).
+        let list = Arc::new(Mutex::new(TodoList::default()));
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(anie_tools::TodoWriteTool::new(Arc::clone(&list))));
+
+        let mut providers = ProviderRegistry::new();
+        providers.register(
+            ApiKind::OpenAICompletions,
+            Box::new(MockProvider::new(vec![
+                MockStreamScript::from_message(assistant_tool_call(
+                    "c1",
+                    serde_json::json!({ "todos": [{ "content": "do it", "status": "done" }] }),
+                )),
+                MockStreamScript::from_message(assistant_done()),
+            ])),
+        );
+
+        let config = AgentLoopConfig::new(
+            model().clone(),
+            "system".into(),
+            anie_provider::ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver),
+        )
+        .with_before_model_policy(Arc::new(VerifierPolicy::new(
+            Arc::clone(&list),
+            true,
+            4,
+        )));
+
+        let agent = AgentLoop::new(Arc::new(providers), Arc::new(tools), config);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let result = agent
+            .run(
+                vec![Message::User(UserMessage {
+                    content: vec![ContentBlock::Text {
+                        text: "please do the thing".into(),
+                    }],
+                    timestamp: 1,
+                })],
+                Vec::new(),
+                tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            result.terminal_error.is_none(),
+            "run should complete: {:?}",
+            result.terminal_error
+        );
+        // The plan was actually written through the shared list.
+        assert!(list.lock().expect("lock").all_done());
+        // Critique is in the canonical context...
+        assert!(
+            contains_critique(&result.final_context),
+            "critique must be injected into the run context"
+        );
+        // ...but NOT persisted as agent output.
+        assert!(
+            !contains_critique(&result.generated_messages),
+            "critique is context-only and must not appear in generated_messages"
+        );
+    }
 }
