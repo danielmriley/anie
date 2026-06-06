@@ -101,6 +101,18 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
 
+    // Cost meter priced from the selected model; on resume, rebuild the
+    // session total by summing usage over the persisted messages.
+    let cost_meter = Arc::new(crate::cost_meter::CostMeter::new(
+        selection.model.cost_per_million.clone(),
+    ));
+    let persisted: Vec<_> = session_context
+        .messages
+        .iter()
+        .map(|entry| entry.message.clone())
+        .collect();
+    cost_meter.rebuild_session(&persisted);
+
     let mut state = ControllerState {
         config: ConfigState::new(
             config,
@@ -121,6 +133,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         harness_mode: cli.harness_mode,
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list,
+        cost_meter,
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {

@@ -290,7 +290,8 @@ pub enum UiAction {
 }
 
 /// Status-bar display state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `session_cost` is an f64, which only implements `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatusBarState {
     /// Display provider name.
     pub provider_name: String,
@@ -322,6 +323,10 @@ pub struct StatusBarState {
     /// hidden so plan-less runs stay uncluttered.
     pub todo_done: u64,
     pub todo_total: u64,
+    /// Accumulated session cost (USD, estimated from token counts ×
+    /// catalog price). Hidden in the status bar while exactly 0.0
+    /// (local/free models).
+    pub session_cost: f64,
     /// Cached shortened cwd for the status bar. Recomputed
     /// only when `cwd` changes between paints — avoids the
     /// `env::var` + `Vec` allocation that used to fire on
@@ -345,6 +350,7 @@ impl Default for StatusBarState {
             rlm_archived_messages: 0,
             todo_done: 0,
             todo_total: 0,
+            session_cost: 0.0,
             cached_short_cwd: None,
         }
     }
@@ -856,6 +862,9 @@ impl App {
                         self.status_bar.last_known_input_tokens =
                             Some(assistant.usage.input_tokens);
                     }
+                    // Accumulate session cost from the already-priced
+                    // usage on the wire (no new event needed).
+                    self.status_bar.session_cost += assistant.usage.cost.total;
                 }
             }
             AgentEvent::ToolExecStart {
@@ -2314,8 +2323,14 @@ fn format_status_text(state: &mut StatusBarState, transcript_scrolled: bool) -> 
     } else {
         format!(" │ todo: {}/{}", state.todo_done, state.todo_total)
     };
+    // Estimated session cost; hidden for free/local models (0.0).
+    let cost_segment = if state.session_cost > 0.0 {
+        format!(" │ ${:.4}", state.session_cost)
+    } else {
+        String::new()
+    };
     format!(
-        " {}{}:{}{} │ thinking: {} │ {}/{}{}{} │ {}",
+        " {}{}:{}{} │ thinking: {} │ {}/{}{}{}{} │ {}",
         if transcript_scrolled {
             "↑ history │ "
         } else {
@@ -2329,6 +2344,7 @@ fn format_status_text(state: &mut StatusBarState, transcript_scrolled: bool) -> 
         format_tokens(state.context_window),
         archive_segment,
         todo_segment,
+        cost_segment,
         short_cwd,
     )
 }
@@ -2718,6 +2734,29 @@ mod tests {
         assert!(
             !text.contains("todo:"),
             "plan-less runs hide the segment: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_renders_session_cost_segment_for_priced_model() {
+        let mut state = StatusBarState {
+            session_cost: 0.0123,
+            ..StatusBarState::default()
+        };
+        let text = format_status_text(&mut state, false);
+        assert!(text.contains("$0.0123"), "{text}");
+    }
+
+    #[test]
+    fn status_bar_omits_cost_segment_when_session_cost_is_zero() {
+        let mut state = StatusBarState {
+            session_cost: 0.0,
+            ..StatusBarState::default()
+        };
+        let text = format_status_text(&mut state, false);
+        assert!(
+            !text.contains('$'),
+            "free/local models hide the cost segment: {text}"
         );
     }
 

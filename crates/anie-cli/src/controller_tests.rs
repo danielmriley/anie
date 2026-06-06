@@ -159,6 +159,9 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+        cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
+            anie_provider::CostPerMillion::zero(),
+        )),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -233,6 +236,9 @@ fn controller_with_runtime_state_path(
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+        cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
+            anie_provider::CostPerMillion::zero(),
+        )),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -537,6 +543,7 @@ fn state_summary_includes_compaction_counts_block() {
         None,
         None,
         stats,
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(
@@ -711,6 +718,9 @@ fn build_dispatch_controller_with_runtime_state_path(
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+        cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
+            anie_provider::CostPerMillion::zero(),
+        )),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -757,6 +767,9 @@ fn build_state_with_registry(
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+        cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
+            anie_provider::CostPerMillion::zero(),
+        )),
     }
 }
 
@@ -1536,6 +1549,63 @@ fn status_update_carries_todo_done_and_total() {
     ));
 }
 
+fn priced_assistant(input: u64, output: u64) -> Message {
+    let mut a = assistant_message("x");
+    a.usage = anie_protocol::Usage {
+        input_tokens: input,
+        output_tokens: output,
+        ..anie_protocol::Usage::default()
+    };
+    Message::Assistant(a)
+}
+
+#[test]
+fn state_summary_includes_cost_block_with_run_and_session_dollars() {
+    let meter = crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion {
+        input: 3.0,
+        output: 15.0,
+        cache_read: 0.0,
+        cache_write: 0.0,
+    });
+    // 1M input * $3 + 1M output * $15 = $18.
+    meter.record_run_messages(&[priced_assistant(1_000_000, 1_000_000)]);
+
+    let summary = super::format_state_summary(
+        &model_with_api("gpt-4o", "openai", ApiKind::OpenAICompletions),
+        ThinkingLevel::Off,
+        None,
+        None,
+        128_000,
+        "sid",
+        None,
+        None,
+        crate::compaction_stats::CompactionStatsAtomic::default().snapshot(),
+        meter.snapshot(),
+    );
+    assert!(summary.contains("Cost this session"), "{summary}");
+    assert!(summary.contains("$18.0000"), "{summary}");
+    assert!(summary.contains("2000000 tokens"), "{summary}");
+}
+
+#[test]
+fn state_summary_cost_block_shows_zero_for_local_model_session() {
+    let meter = crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero());
+    meter.record_run_messages(&[priced_assistant(5_000_000, 5_000_000)]);
+    let summary = super::format_state_summary(
+        &model_with_api("qwen3:32b", "ollama", ApiKind::OllamaChatApi),
+        ThinkingLevel::Off,
+        None,
+        None,
+        32_768,
+        "sid",
+        None,
+        None,
+        crate::compaction_stats::CompactionStatsAtomic::default().snapshot(),
+        meter.snapshot(),
+    );
+    assert!(summary.contains("$0.0000"), "{summary}");
+}
+
 #[tokio::test]
 async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
     let recorded_options = Arc::new(Mutex::new(Vec::new()));
@@ -1647,6 +1717,9 @@ fn controller_for_context_length_test_with_cap(
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+        cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
+            anie_provider::CostPerMillion::zero(),
+        )),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2114,6 +2187,9 @@ async fn help_command_emits_system_message_with_registry_output() {
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+        cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
+            anie_provider::CostPerMillion::zero(),
+        )),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2251,6 +2327,9 @@ fn spawn_live_controller(
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+        cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
+            anie_provider::CostPerMillion::zero(),
+        )),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);
@@ -2678,6 +2757,7 @@ fn state_summary_for_ollama_with_runtime_override_shows_all_three_layers() {
         Some(std::path::PathBuf::from("/tmp/anie/config.toml")),
         Some(std::path::PathBuf::from("/tmp/anie/state.json")),
         crate::compaction_stats::CompactionStats::default(),
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(summary.contains("ollama:qwen3:32b"), "{summary}");
@@ -2711,6 +2791,7 @@ fn state_summary_for_ollama_without_override_marks_override_none() {
         None,
         None,
         crate::compaction_stats::CompactionStats::default(),
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(
@@ -2736,6 +2817,7 @@ fn state_summary_for_ollama_without_cap_marks_cap_none() {
         None,
         None,
         crate::compaction_stats::CompactionStats::default(),
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(summary.contains("Runtime override: (none)"), "{summary}");
@@ -2755,6 +2837,7 @@ fn state_summary_for_non_ollama_model_omits_layered_breakdown() {
         None,
         None,
         crate::compaction_stats::CompactionStats::default(),
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(summary.contains("openai:gpt-5"), "{summary}");
@@ -2786,6 +2869,7 @@ fn state_summary_includes_thinking_and_session_id() {
         None,
         None,
         crate::compaction_stats::CompactionStats::default(),
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(summary.contains("Thinking: high"), "{summary}");
@@ -2804,6 +2888,7 @@ fn state_summary_lists_persistent_file_paths_when_available() {
         Some(std::path::PathBuf::from("/home/u/.anie/config.toml")),
         Some(std::path::PathBuf::from("/home/u/.anie/state.json")),
         crate::compaction_stats::CompactionStats::default(),
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(
@@ -2829,6 +2914,7 @@ fn state_summary_omits_path_lines_when_path_helpers_return_none() {
         None,
         None,
         crate::compaction_stats::CompactionStats::default(),
+        crate::cost_meter::CostMeter::new(anie_provider::CostPerMillion::zero()).snapshot(),
     );
 
     assert!(summary.contains("Files"), "{summary}");

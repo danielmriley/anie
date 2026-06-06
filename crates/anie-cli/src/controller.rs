@@ -1049,6 +1049,9 @@ impl InteractiveController {
         // this atomic on every invocation.
         self.recursions_remaining_this_run
             .store(RECURSION_BUDGET_DEFAULT, Ordering::Release);
+        // Reset the per-run cost meter at the top of every fresh prompt
+        // (session total is untouched).
+        self.state.cost_meter.reset_run();
         let rlm_extras = build_rlm_extras(
             &self.state,
             Arc::clone(&self.recursions_remaining_this_run),
@@ -1216,6 +1219,10 @@ pub(crate) struct ControllerState {
     // Read by `status_event` (status bar) and the verifier policy; the
     // write path is the `todo_write` tool.
     pub(crate) todo_list: Arc<std::sync::Mutex<anie_tools::TodoList>>,
+    /// Run + session cost/token meter. Reset per run, accumulated per
+    /// session, rebuilt from persisted usage on resume. Surfaced in
+    /// `/state` and the TUI status bar.
+    pub(crate) cost_meter: Arc<crate::cost_meter::CostMeter>,
 }
 
 impl ControllerState {
@@ -1251,6 +1258,9 @@ impl ControllerState {
     async fn set_model_resolved(&mut self, model: Model) -> Result<Option<String>> {
         upsert_model(&mut self.model_catalog, &model);
         self.config.set_model(model);
+        // Re-price the cost meter for the new model.
+        self.cost_meter
+            .set_pricing(self.config.current_model().cost_per_million.clone());
         self.session.inner_mut().append_model_change(
             &self.config.current_model().provider,
             &self.config.current_model().id,
@@ -1291,6 +1301,7 @@ impl ControllerState {
             anie_config::global_config_path(),
             anie_config::anie_state_json_path(),
             self.compaction_stats.snapshot(),
+            self.cost_meter.snapshot(),
         )
     }
 
@@ -1585,6 +1596,9 @@ impl ControllerState {
         self.session
             .inner_mut()
             .append_messages(&result.generated_messages)?;
+        // Fold this run's token usage into the run + session cost meter.
+        self.cost_meter
+            .record_run_messages(&result.generated_messages);
         Ok(())
     }
 
@@ -2220,6 +2234,7 @@ fn format_state_summary(
     config_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
     compaction_stats: CompactionStats,
+    cost: crate::cost_meter::CostSnapshot,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -2301,6 +2316,22 @@ fn format_state_summary(
         compaction_stats.pre_prompt,
         compaction_stats.mid_turn,
         compaction_stats.reactive_overflow,
+    );
+    let _ = writeln!(out);
+
+    // Cost is an estimate derived from token counts × catalog price, not
+    // a provider-billed amount. Hidden dollar values stay 0.0000 for
+    // local/free models.
+    let _ = writeln!(out, "Cost this session (est.)");
+    let _ = writeln!(
+        out,
+        "  Run:     {} tokens · ${:.4}",
+        cost.run_tokens, cost.run_cost.total,
+    );
+    let _ = writeln!(
+        out,
+        "  Session: {} tokens · ${:.4}",
+        cost.session_tokens, cost.session_cost.total,
     );
     let _ = writeln!(out);
 
