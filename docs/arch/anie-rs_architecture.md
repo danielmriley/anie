@@ -453,13 +453,39 @@ tool set is always available unless `--no-tools` is passed:
 - `read`
 - `write`
 - `edit`
+- `apply_patch` (structured multi-file patch; see "Mutation tools and the shared matcher")
 - `bash`
 - `grep`
 - `find`
 - `ls`
 - `todo_write` (plan/todo tool; see "Plan/todo state and the verifier seam")
 
-`write` and `edit` share a `FileMutationQueue` so file mutations are serialized.
+`write`, `edit`, and `apply_patch` share a `FileMutationQueue` so file
+mutations are serialized.
+
+### Mutation tools and the shared matcher
+
+`edit` and `apply_patch` are two surfaces over one matching engine
+(`anie-tools/src/text_match.rs`): exact match first, a whitespace-
+insensitive fuzzy fallback second, with ambiguous/overlapping matches
+rejected and edits applied right-to-left. The engine reports per-edit
+whether the match was exact or fuzzy, which both tools surface (the
+result message / `fuzzy_*` details) so a surprising fuzzy match is
+visible to the model.
+
+`edit` is the right primitive for one or two surgical replacements;
+`apply_patch` is for coordinated multi-hunk, multi-file changes from a
+`*** Begin Patch` / `*** End Patch` envelope (Add/Update/Delete sections).
+`apply_patch` locks **all** target paths at once via
+`FileMutationQueue::with_locks` (canonicalized + sorted, so no deadlock)
+and uses **validate-all-then-write-all** semantics: every op is validated
+against on-disk state before a single byte is written, so a stale hunk
+anywhere leaves every target untouched. It honors `dry_run` (validate +
+return the combined diff, write nothing) — the seam a future approval
+layer would call into. Writes are direct (like `edit`/`write`), not
+temp-then-rename; the multi-file crash window is documented in
+`docs/apply_patch_tool/`, not closed. Rename and a true cross-file
+journal are deferred.
 
 The default `anie-cli` build enables the `web` feature and also registers:
 

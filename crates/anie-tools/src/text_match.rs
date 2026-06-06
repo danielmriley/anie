@@ -33,9 +33,8 @@ pub(crate) enum MatchKind {
 #[derive(Debug, Clone)]
 pub(crate) struct ApplyOutcome {
     pub(crate) updated: String,
-    // Consumed by callers for fuzzy-match reporting (edit PR5 + apply_patch);
-    // populated and unit-tested here.
-    #[allow(dead_code)]
+    /// Per-edit, in input order: whether the match was exact or fuzzy.
+    /// Consumed by `edit` and `apply_patch` for fuzzy-match reporting.
     pub(crate) kinds: Vec<MatchKind>,
 }
 

@@ -5,6 +5,13 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] `apply_patch` tool (docs/apply_patch_tool/): a Codex-style
+      `*** Begin Patch` envelope (Add/Update/Delete) applying multi-hunk,
+      multi-file changes through the shared `text_match` engine and a new
+      `FileMutationQueue::with_locks` primitive, with validate-all-then-
+      write-all atomicity, `dry_run` preview, and whitespace-fuzzy match
+      reporting on both `edit` and `apply_patch` (EDIT-1/2/3/5). Rename
+      and a cross-file journal deferred.
 - [x] Plan/todo tool + verifier loop (docs/plan_todo_verifier/): a
       TodoWrite-style `todo_write` tool over a controller-owned
       `TodoList`, rendered as a `todo: d/t` status segment, plus an

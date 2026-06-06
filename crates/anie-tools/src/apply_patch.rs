@@ -270,6 +270,10 @@ impl Tool for ApplyPatchTool {
         _ctx: &ToolExecutionContext,
     ) -> Result<ToolResult, ToolError> {
         let patch = required_string_arg(&args, "patch")?;
+        let dry_run = args
+            .get("dry_run")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let ops = parse_patch(patch)?;
 
         // Resolve every target path (same policy as edit/write) and lock
@@ -285,17 +289,19 @@ impl Tool for ApplyPatchTool {
 
         self.mutation_queue
             .with_locks(&lock_paths, move || async move {
-                apply_under_lock(resolved, &cancel).await
+                apply_under_lock(resolved, &cancel, dry_run).await
             })
             .await
     }
 }
 
 /// Validate every file op against the on-disk state (no writes), then —
-/// only if all validated and the call wasn't cancelled — write them all.
+/// only if all validated, the call wasn't cancelled, and it isn't a dry
+/// run — write them all.
 async fn apply_under_lock(
     resolved: Vec<(FileOp, PathBuf)>,
     cancel: &CancellationToken,
+    dry_run: bool,
 ) -> Result<ToolResult, ToolError> {
     let mut planned = Vec::new();
     let mut reports = Vec::new();
@@ -383,6 +389,13 @@ async fn apply_under_lock(
                 });
             }
         }
+    }
+
+    // Dry run: everything validated, return the combined diff without
+    // touching disk. This is the preview seam a future approval layer
+    // would call into.
+    if dry_run {
+        return Ok(build_result(&reports, false));
     }
 
     if cancel.is_cancelled() {

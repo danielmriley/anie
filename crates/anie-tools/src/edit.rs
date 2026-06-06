@@ -55,7 +55,7 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "edit".into(),
-            description: "Edit a single file using exact text replacement. Relative paths resolve from the session cwd; absolute paths are allowed. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits.".into(),
+            description: "Edit a single file by text replacement. Relative paths resolve from the session cwd; absolute paths are allowed. Every edits[].oldText must match a unique, non-overlapping region of the original file. Matching is exact first; if no exact match is found, a whitespace-insensitive fallback is tried (differences in spaces/tabs/indentation are ignored, newlines are not) — the result message notes when a match was fuzzy. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. For coordinated changes across several files or many hunks, prefer apply_patch.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -67,7 +67,7 @@ impl Tool for EditTool {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "oldText": { "type": "string", "maxLength": MAX_EDIT_OLD_TEXT_BYTES, "description": "Exact text for one targeted replacement" },
+                                "oldText": { "type": "string", "maxLength": MAX_EDIT_OLD_TEXT_BYTES, "description": "Text identifying the region to replace. Matched exactly when possible; falls back to whitespace-insensitive matching if no exact match exists." },
                                 "newText": { "type": "string", "maxLength": MAX_EDIT_NEW_TEXT_BYTES, "description": "Replacement text for this targeted edit" }
                             },
                             "required": ["oldText", "newText"],
@@ -117,6 +117,11 @@ impl Tool for EditTool {
                 let line_ending = detect_line_ending(&text);
                 let normalized = normalize_to_lf(&text);
                 let outcome = text_match::apply_edits(&normalized, &edits, path)?;
+                let fuzzy_count = outcome
+                    .kinds
+                    .iter()
+                    .filter(|kind| matches!(kind, text_match::MatchKind::Fuzzy))
+                    .count();
                 let new_normalized = outcome.updated;
                 let diff = text_match::render_diff(&normalized, &new_normalized);
                 let restored = restore_line_endings(&new_normalized, line_ending);
@@ -134,16 +139,28 @@ impl Tool for EditTool {
                         ToolError::ExecutionFailed(format!("Failed to write {path}: {error}"))
                     })?;
 
+                // EDIT-3 transparency: tell the model when a match was
+                // located via the whitespace-insensitive fallback rather
+                // than verbatim, so a surprising fuzzy match is visible.
+                let fuzzy_note = if fuzzy_count > 0 {
+                    format!(
+                        " ({fuzzy_count} matched ignoring whitespace)",
+                    )
+                } else {
+                    String::new()
+                };
                 Ok(text_result(
                     format!(
-                        "Applied {} edit{} to {}",
+                        "Applied {} edit{} to {}{}",
                         edits.len(),
                         if edits.len() == 1 { "" } else { "s" },
                         path,
+                        fuzzy_note,
                     ),
                     serde_json::json!({
                         "path": path,
                         "edits": edits.len(),
+                        "fuzzy_edits": fuzzy_count,
                         "diff": diff,
                     }),
                 ))

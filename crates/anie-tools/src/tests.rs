@@ -1749,3 +1749,148 @@ async fn apply_patch_serializes_against_edit_on_the_same_shared_queue() {
     holder.await.expect("holder");
     assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "y\n");
 }
+
+// ===================== apply_patch / edit transparency (PR5) =====================
+
+#[tokio::test]
+async fn apply_patch_dry_run_returns_diff_without_touching_disk() {
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("a.rs"), "x\n")
+        .await
+        .expect("seed");
+    let tool = ApplyPatchTool::new(dir.path());
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "patch": "*** Begin Patch\n*** Update File: a.rs\n-x\n+y\n*** End Patch",
+                "dry_run": true
+            }),
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect("dry run");
+    assert_eq!(result.details["applied"], serde_json::json!(false));
+    let diff = result.details["files"][0]["diff"].as_str().expect("diff");
+    assert!(diff.contains("-x") && diff.contains("+y"), "{diff}");
+    // Disk is untouched.
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("a.rs"))
+            .await
+            .unwrap(),
+        "x\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_reports_fuzzy_hunk_count_in_details() {
+    let dir = tempdir().expect("tempdir");
+    // File has extra internal spacing; the hunk's context differs only in
+    // whitespace, forcing the fuzzy fallback.
+    tokio::fs::write(dir.path().join("a.rs"), "let  x   =  1;\n")
+        .await
+        .expect("seed");
+    let tool = ApplyPatchTool::new(dir.path());
+    let result = run_apply_patch(
+        &tool,
+        "*** Begin Patch\n*** Update File: a.rs\n-let x = 1;\n+let x = 2;\n*** End Patch",
+    )
+    .await
+    .expect("apply");
+    assert_eq!(
+        result.details["files"][0]["fuzzy_hunks"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("a.rs"))
+            .await
+            .unwrap(),
+        "let x = 2;\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_tool_message_notes_when_a_match_was_whitespace_fuzzy() {
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("a.rs"), "let  x   =  1;\n")
+        .await
+        .expect("seed");
+    let tool = EditTool::new(dir.path());
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "a.rs",
+                "edits": [{ "oldText": "let x = 1;", "newText": "let x = 2;" }]
+            }),
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect("edit");
+    assert!(
+        text_content(&result).contains("matched ignoring whitespace"),
+        "{}",
+        text_content(&result)
+    );
+    assert_eq!(result.details["fuzzy_edits"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn edit_tool_message_omits_fuzzy_note_when_all_matches_exact() {
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("a.rs"), "let x = 1;\n")
+        .await
+        .expect("seed");
+    let tool = EditTool::new(dir.path());
+    let result = tool
+        .execute(
+            "call",
+            serde_json::json!({
+                "path": "a.rs",
+                "edits": [{ "oldText": "let x = 1;", "newText": "let x = 2;" }]
+            }),
+            CancellationToken::new(),
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect("edit");
+    assert!(!text_content(&result).contains("ignoring whitespace"));
+    assert_eq!(result.details["fuzzy_edits"], serde_json::json!(0));
+}
+
+#[tokio::test]
+async fn edit_tool_definition_documents_whitespace_fallback() {
+    let dir = tempdir().expect("tempdir");
+    let tool = EditTool::new(dir.path());
+    let def = tool.definition();
+    assert!(
+        def.description.to_lowercase().contains("whitespace"),
+        "edit description must document the whitespace fallback"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_preserves_crlf_and_bom_on_update() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("crlf.rs");
+    // BOM + CRLF line endings.
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(b"one\r\ntwo\r\n");
+    tokio::fs::write(&path, &bytes).await.expect("seed");
+    let tool = ApplyPatchTool::new(dir.path());
+    run_apply_patch(
+        &tool,
+        "*** Begin Patch\n*** Update File: crlf.rs\n one\n-two\n+TWO\n*** End Patch",
+    )
+    .await
+    .expect("apply");
+    let got = tokio::fs::read(&path).await.expect("read");
+    assert_eq!(&got[..3], &[0xEF, 0xBB, 0xBF], "BOM preserved");
+    let text = String::from_utf8(got[3..].to_vec()).expect("utf8");
+    assert_eq!(text, "one\r\nTWO\r\n", "CRLF preserved");
+}
