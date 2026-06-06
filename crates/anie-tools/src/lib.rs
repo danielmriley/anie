@@ -15,6 +15,7 @@ mod text_match;
 mod todo;
 mod write;
 
+pub use apply_patch::ApplyPatchTool;
 pub use bash::{BashPolicy, BashTool};
 pub use edit::EditTool;
 pub use file_mutation_queue::FileMutationQueue;

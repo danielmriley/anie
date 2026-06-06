@@ -153,7 +153,7 @@ impl Tool for EditTool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineEnding {
+pub(crate) enum LineEnding {
     Lf,
     CrLf,
     Cr,
@@ -226,7 +226,7 @@ fn enforce_edit_text_limit(
     Ok(())
 }
 
-fn normalize_to_lf(value: &str) -> String {
+pub(crate) fn normalize_to_lf(value: &str) -> String {
     // Plan 07 PR-E: single-pass CRLF + CR → LF normalization.
     // The previous shape was `replace("\r\n", "\n").replace('\r', "\n")`
     // which allocates a new String on each `replace` call — two
@@ -249,7 +249,7 @@ fn normalize_to_lf(value: &str) -> String {
     out
 }
 
-fn detect_line_ending(value: &str) -> LineEnding {
+pub(crate) fn detect_line_ending(value: &str) -> LineEnding {
     if value.contains("\r\n") {
         LineEnding::CrLf
     } else if value.contains('\r') {
@@ -259,7 +259,7 @@ fn detect_line_ending(value: &str) -> LineEnding {
     }
 }
 
-fn restore_line_endings(value: &str, line_ending: LineEnding) -> String {
+pub(crate) fn restore_line_endings(value: &str, line_ending: LineEnding) -> String {
     match line_ending {
         LineEnding::Lf => value.to_string(),
         LineEnding::CrLf => value.replace('\n', "\r\n"),
@@ -267,7 +267,9 @@ fn restore_line_endings(value: &str, line_ending: LineEnding) -> String {
     }
 }
 
-fn decode_utf8_with_bom(bytes: &[u8]) -> Result<(bool, String), std::string::FromUtf8Error> {
+pub(crate) fn decode_utf8_with_bom(
+    bytes: &[u8],
+) -> Result<(bool, String), std::string::FromUtf8Error> {
     const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
     let has_bom = bytes.starts_with(UTF8_BOM);
     let text = String::from_utf8(if has_bom {
@@ -278,7 +280,7 @@ fn decode_utf8_with_bom(bytes: &[u8]) -> Result<(bool, String), std::string::Fro
     Ok((has_bom, text))
 }
 
-fn encode_utf8_with_bom(value: &str, has_bom: bool) -> Vec<u8> {
+pub(crate) fn encode_utf8_with_bom(value: &str, has_bom: bool) -> Vec<u8> {
     const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
     // Plan 07 PR-E: size the buffer up front so extend_from_slice
     // doesn't grow it (one reallocation avoided for files with

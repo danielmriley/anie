@@ -25,7 +25,9 @@ use crate::edit::{
     MAX_EDIT_ARGUMENT_BYTES, MAX_EDIT_COUNT, MAX_EDIT_INPUT_FILE_BYTES, MAX_EDIT_NEW_TEXT_BYTES,
     MAX_EDIT_OLD_TEXT_BYTES, MAX_EDIT_OUTPUT_FILE_BYTES,
 };
-use crate::{BashPolicy, BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
+use crate::{
+    ApplyPatchTool, BashPolicy, BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool,
+};
 
 struct StaticResolver;
 
@@ -1533,4 +1535,217 @@ async fn edit_tool_can_fuzzily_match_whitespace_runs() {
         .await
         .expect("read file");
     assert!(written.contains("fn main() { // updated"));
+}
+
+// ===================== apply_patch (PR4) =====================
+
+async fn run_apply_patch(
+    tool: &ApplyPatchTool,
+    patch: &str,
+) -> Result<anie_protocol::ToolResult, ToolError> {
+    tool.execute(
+        "call",
+        serde_json::json!({ "patch": patch }),
+        CancellationToken::new(),
+        None,
+        &ToolExecutionContext::default(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn apply_patch_updates_single_file_with_two_hunks() {
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\nfour\n")
+        .await
+        .expect("seed");
+    let tool = ApplyPatchTool::new(dir.path());
+    let patch = "*** Begin Patch\n*** Update File: a.rs\n one\n-two\n+TWO\n@@\n three\n-four\n+FOUR\n*** End Patch";
+    run_apply_patch(&tool, patch).await.expect("apply");
+    let got = tokio::fs::read_to_string(dir.path().join("a.rs"))
+        .await
+        .expect("read");
+    assert_eq!(got, "one\nTWO\nthree\nFOUR\n");
+}
+
+#[tokio::test]
+async fn apply_patch_creates_file_from_add_section() {
+    let dir = tempdir().expect("tempdir");
+    let tool = ApplyPatchTool::new(dir.path());
+    let patch = "*** Begin Patch\n*** Add File: sub/new.rs\n+fn main() {}\n*** End Patch";
+    run_apply_patch(&tool, patch).await.expect("apply");
+    let got = tokio::fs::read_to_string(dir.path().join("sub/new.rs"))
+        .await
+        .expect("read");
+    assert_eq!(got, "fn main() {}\n");
+}
+
+#[tokio::test]
+async fn apply_patch_deletes_existing_file() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("dead.rs");
+    tokio::fs::write(&path, "junk\n").await.expect("seed");
+    let tool = ApplyPatchTool::new(dir.path());
+    run_apply_patch(
+        &tool,
+        "*** Begin Patch\n*** Delete File: dead.rs\n*** End Patch",
+    )
+    .await
+    .expect("apply");
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn apply_patch_applies_changes_across_three_files_in_one_call() {
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("up.rs"), "alpha\n")
+        .await
+        .expect("seed up");
+    tokio::fs::write(dir.path().join("del.rs"), "bye\n")
+        .await
+        .expect("seed del");
+    let tool = ApplyPatchTool::new(dir.path());
+    let patch = "*** Begin Patch\n*** Update File: up.rs\n-alpha\n+ALPHA\n*** Add File: add.rs\n+new\n*** Delete File: del.rs\n*** End Patch";
+    run_apply_patch(&tool, patch).await.expect("apply");
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("up.rs"))
+            .await
+            .unwrap(),
+        "ALPHA\n"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("add.rs"))
+            .await
+            .unwrap(),
+        "new\n"
+    );
+    assert!(!dir.path().join("del.rs").exists());
+}
+
+#[tokio::test]
+async fn apply_patch_writes_nothing_when_any_hunk_fails_to_match() {
+    // File A's hunk is valid; file B's hunk is stale. The whole call must
+    // abort and leave BOTH files untouched on disk.
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("a.rs"), "good\n")
+        .await
+        .expect("seed a");
+    tokio::fs::write(dir.path().join("b.rs"), "real\n")
+        .await
+        .expect("seed b");
+    let tool = ApplyPatchTool::new(dir.path());
+    let patch = "*** Begin Patch\n*** Update File: a.rs\n-good\n+GOOD\n*** Update File: b.rs\n-not-present\n+nope\n*** End Patch";
+    let err = run_apply_patch(&tool, patch).await.expect_err("must fail");
+    assert!(matches!(err, ToolError::ExecutionFailed(_)), "{err:?}");
+    // Neither file changed.
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("a.rs"))
+            .await
+            .unwrap(),
+        "good\n"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("b.rs"))
+            .await
+            .unwrap(),
+        "real\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_add_over_existing_file() {
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("exists.rs"), "x\n")
+        .await
+        .expect("seed");
+    let tool = ApplyPatchTool::new(dir.path());
+    let err = run_apply_patch(
+        &tool,
+        "*** Begin Patch\n*** Add File: exists.rs\n+y\n*** End Patch",
+    )
+    .await
+    .expect_err("must fail");
+    assert!(matches!(err, ToolError::ExecutionFailed(m) if m.contains("already exists")));
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_delete_of_missing_file() {
+    let dir = tempdir().expect("tempdir");
+    let tool = ApplyPatchTool::new(dir.path());
+    let err = run_apply_patch(
+        &tool,
+        "*** Begin Patch\n*** Delete File: ghost.rs\n*** End Patch",
+    )
+    .await
+    .expect_err("must fail");
+    assert!(matches!(err, ToolError::ExecutionFailed(m) if m.contains("does not exist")));
+}
+
+#[tokio::test]
+async fn apply_patch_aborts_when_cancelled_before_write() {
+    let dir = tempdir().expect("tempdir");
+    tokio::fs::write(dir.path().join("a.rs"), "x\n")
+        .await
+        .expect("seed");
+    let tool = ApplyPatchTool::new(dir.path());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let err = tool
+        .execute(
+            "call",
+            serde_json::json!({ "patch": "*** Begin Patch\n*** Update File: a.rs\n-x\n+y\n*** End Patch" }),
+            cancel,
+            None,
+            &ToolExecutionContext::default(),
+        )
+        .await
+        .expect_err("cancelled");
+    assert!(matches!(err, ToolError::Aborted));
+    // The cancel landed before the write phase: the file is untouched.
+    assert_eq!(
+        tokio::fs::read_to_string(dir.path().join("a.rs"))
+            .await
+            .unwrap(),
+        "x\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_serializes_against_edit_on_the_same_shared_queue() {
+    // Holding the shared queue's lock for a path must block an
+    // apply_patch on that path until released — proving apply_patch
+    // goes through the same FileMutationQueue as edit/write.
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("a.rs");
+    tokio::fs::write(&path, "x\n").await.expect("seed");
+    let queue = Arc::new(FileMutationQueue::new());
+    let tool = ApplyPatchTool::with_queue(dir.path(), Arc::clone(&queue));
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_clone = Arc::clone(&started);
+    let hold_queue = Arc::clone(&queue);
+    let hold_path = path.clone();
+    let holder = tokio::spawn(async move {
+        hold_queue
+            .with_lock(&hold_path, || async move {
+                started_clone.notify_one();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            })
+            .await;
+    });
+
+    started.notified().await;
+    let t0 = Instant::now();
+    run_apply_patch(
+        &tool,
+        "*** Begin Patch\n*** Update File: a.rs\n-x\n+y\n*** End Patch",
+    )
+    .await
+    .expect("apply");
+    assert!(
+        t0.elapsed() >= Duration::from_millis(150),
+        "apply_patch should have waited on the held lock"
+    );
+    holder.await.expect("holder");
+    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "y\n");
 }

@@ -8,8 +8,8 @@ use anie_provider::{ProviderRegistry, RequestOptionsResolver};
 use anie_providers_builtin::register_builtin_providers;
 use anie_session::SessionManager;
 use anie_tools::{
-    BashPolicy, BashTool, EditTool, FileMutationQueue, FindTool, GrepTool, LsTool, ReadTool,
-    TodoList, TodoWriteTool, WriteTool,
+    ApplyPatchTool, BashPolicy, BashTool, EditTool, FileMutationQueue, FindTool, GrepTool, LsTool,
+    ReadTool, TodoList, TodoWriteTool, WriteTool,
 };
 use anie_tui::UiAction;
 use tracing::warn;
@@ -203,6 +203,12 @@ fn build_tool_registry_with_policy(
         Arc::clone(&queue),
     )));
     tools.register(Arc::new(EditTool::with_queue(
+        cwd.to_path_buf(),
+        Arc::clone(&queue),
+    )));
+    // apply_patch shares the same mutation queue as write/edit so they
+    // serialize against each other on shared paths.
+    tools.register(Arc::new(ApplyPatchTool::with_queue(
         cwd.to_path_buf(),
         Arc::clone(&queue),
     )));

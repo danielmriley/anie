@@ -15,7 +15,7 @@ use anie_provider::{
     RequestOptionsResolver, ResolvedRequestOptions, ThinkingLevel, mock::MockProvider,
 };
 use anie_session::{SessionContext, SessionManager};
-use anie_tools::{BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
+use anie_tools::{ApplyPatchTool, BashTool, EditTool, FileMutationQueue, ReadTool, WriteTool};
 
 /// A minimal mock model for integration tests.
 pub fn sample_model() -> Model {
@@ -128,6 +128,10 @@ pub fn real_tool_registry(cwd: &Path) -> Arc<ToolRegistry> {
     registry.register(Arc::new(ReadTool::new(cwd)));
     registry.register(Arc::new(WriteTool::with_queue(cwd, Arc::clone(&queue))));
     registry.register(Arc::new(EditTool::with_queue(cwd, Arc::clone(&queue))));
+    registry.register(Arc::new(ApplyPatchTool::with_queue(
+        cwd,
+        Arc::clone(&queue),
+    )));
     registry.register(Arc::new(BashTool::new(cwd)));
     Arc::new(registry)
 }
