@@ -16,8 +16,12 @@
 //! transport internals later (e.g. for SSE) touches nothing
 //! downstream.
 
+mod client;
 mod error;
+mod protocol;
 mod transport;
 
+pub use client::McpClient;
 pub use error::McpError;
+pub use protocol::{CallToolResult, ListToolsResult, McpContent, McpToolSpec, ResourceRef};
 pub use transport::StdioTransport;
