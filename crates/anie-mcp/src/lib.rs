@@ -19,9 +19,11 @@
 mod client;
 mod error;
 mod protocol;
+mod tool;
 mod transport;
 
 pub use client::McpClient;
 pub use error::McpError;
 pub use protocol::{CallToolResult, ListToolsResult, McpContent, McpToolSpec, ResourceRef};
+pub use tool::{McpTool, namespaced_name};
 pub use transport::StdioTransport;

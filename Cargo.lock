@@ -186,10 +186,14 @@ dependencies = [
 name = "anie-mcp"
 version = "0.1.0"
 dependencies = [
+ "anie-agent",
+ "anie-protocol",
+ "async-trait",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
