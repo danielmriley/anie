@@ -27,6 +27,7 @@ mod rpc;
 mod runtime;
 mod runtime_state;
 mod user_error;
+mod verifier;
 
 use std::{path::PathBuf, sync::OnceLock};
 

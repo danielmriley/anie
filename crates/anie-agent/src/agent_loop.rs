@@ -356,6 +356,61 @@ impl BeforeModelPolicy for NoopBeforeModelPolicy {
     }
 }
 
+/// Folds several [`BeforeModelPolicy`] consumers over one running
+/// context. The loop's seam holds a single `Arc<dyn BeforeModelPolicy>`,
+/// so when more than one consumer must run (e.g. context-virtualization
+/// *and* a verifier), they compose through this chain instead of
+/// displacing each other.
+///
+/// Children run in declared order; each sees the context the previous
+/// produced. `Continue` is a no-op, `AppendMessages` extends, and
+/// `ReplaceMessages` resets the working context. The combined result is
+/// `ReplaceMessages(final)` if any child changed the context, else
+/// `Continue` — so an all-`Continue` chain stays byte-identical to the
+/// noop path.
+pub struct ChainedBeforeModelPolicy {
+    policies: Vec<Arc<dyn BeforeModelPolicy>>,
+}
+
+impl ChainedBeforeModelPolicy {
+    #[must_use]
+    pub fn new(policies: Vec<Arc<dyn BeforeModelPolicy>>) -> Self {
+        Self { policies }
+    }
+}
+
+#[async_trait::async_trait]
+impl BeforeModelPolicy for ChainedBeforeModelPolicy {
+    async fn before_model(&self, request: BeforeModelRequest<'_>) -> BeforeModelResponse {
+        let mut working = request.context.to_vec();
+        let mut changed = false;
+        for policy in &self.policies {
+            let child_request = BeforeModelRequest {
+                context: &working,
+                generated_messages: request.generated_messages,
+                model: request.model,
+                step_index: request.step_index,
+            };
+            match policy.before_model(child_request).await {
+                BeforeModelResponse::Continue => {}
+                BeforeModelResponse::AppendMessages(messages) => {
+                    working.extend(messages);
+                    changed = true;
+                }
+                BeforeModelResponse::ReplaceMessages(messages) => {
+                    working = messages;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            BeforeModelResponse::ReplaceMessages(working)
+        } else {
+            BeforeModelResponse::Continue
+        }
+    }
+}
+
 /// Immutable configuration for an agent loop instance.
 pub struct AgentLoopConfig {
     model: Model,

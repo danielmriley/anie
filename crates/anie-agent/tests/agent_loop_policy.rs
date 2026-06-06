@@ -328,3 +328,88 @@ async fn replace_policy_swaps_run_context() {
         Message::Assistant(_)
     ));
 }
+
+// =========================================================================
+// ChainedBeforeModelPolicy — composing several consumers on the one seam.
+// =========================================================================
+
+use anie_agent::ChainedBeforeModelPolicy;
+
+struct AppendOne(&'static str);
+
+#[async_trait]
+impl BeforeModelPolicy for AppendOne {
+    async fn before_model(&self, _request: BeforeModelRequest<'_>) -> BeforeModelResponse {
+        BeforeModelResponse::AppendMessages(vec![user_prompt(self.0)])
+    }
+}
+
+struct ReplaceWith(Vec<Message>);
+
+#[async_trait]
+impl BeforeModelPolicy for ReplaceWith {
+    async fn before_model(&self, _request: BeforeModelRequest<'_>) -> BeforeModelResponse {
+        BeforeModelResponse::ReplaceMessages(self.0.clone())
+    }
+}
+
+fn text_of(message: &Message) -> &str {
+    match message {
+        Message::User(u) => match &u.content[0] {
+            ContentBlock::Text { text } => text,
+            _ => "",
+        },
+        _ => "",
+    }
+}
+
+#[tokio::test]
+async fn chained_policy_threads_replace_then_append() {
+    // Order matters: a replace (context-virt analogue) runs first, then
+    // an append (verifier analogue) lands on top of the replaced context.
+    let model = sample_model();
+    let chain = ChainedBeforeModelPolicy::new(vec![
+        Arc::new(ReplaceWith(vec![user_prompt("A")])),
+        Arc::new(AppendOne("B")),
+    ]);
+    let original = [user_prompt("X")];
+    let response = chain
+        .before_model(BeforeModelRequest {
+            context: &original,
+            generated_messages: &[],
+            model: &model,
+            step_index: 0,
+        })
+        .await;
+    match response {
+        BeforeModelResponse::ReplaceMessages(messages) => {
+            let texts: Vec<&str> = messages.iter().map(text_of).collect();
+            assert_eq!(
+                texts,
+                vec!["A", "B"],
+                "replace dropped X, then append added B"
+            );
+        }
+        other => panic!("expected ReplaceMessages, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chained_policy_all_continue_returns_continue() {
+    // An all-Continue chain must be indistinguishable from the noop path.
+    let model = sample_model();
+    let chain = ChainedBeforeModelPolicy::new(vec![
+        Arc::new(NoopBeforeModelPolicy),
+        Arc::new(NoopBeforeModelPolicy),
+    ]);
+    let original = [user_prompt("X")];
+    let response = chain
+        .before_model(BeforeModelRequest {
+            context: &original,
+            generated_messages: &[],
+            model: &model,
+            step_index: 0,
+        })
+        .await;
+    assert_eq!(response, BeforeModelResponse::Continue);
+}

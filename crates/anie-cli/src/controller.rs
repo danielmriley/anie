@@ -1831,7 +1831,27 @@ fn build_agent(
     )
     .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
     .with_compaction_gate(compaction_gate);
-    if let Some(policy) = rlm_extras.policy {
+    // Compose the before-model seam. The rlm context-virtualization
+    // policy (if any) runs first; the verifier (opt-in via ANIE_VERIFIER)
+    // runs second so its critique appends onto the virtualized context.
+    // When only one is present it installs directly; when neither is, the
+    // loop keeps its Noop default (byte-identical to today).
+    let verifier = crate::verifier::VerifierPolicy::from_env(Arc::clone(&state.todo_list));
+    let verifier: Option<Arc<dyn anie_agent::BeforeModelPolicy>> = verifier
+        .is_enabled()
+        .then(|| Arc::new(verifier) as Arc<dyn anie_agent::BeforeModelPolicy>);
+    let policy: Option<Arc<dyn anie_agent::BeforeModelPolicy>> = match (rlm_extras.policy, verifier)
+    {
+        (Some(rlm), Some(verifier)) => {
+            Some(Arc::new(anie_agent::ChainedBeforeModelPolicy::new(vec![
+                rlm, verifier,
+            ])))
+        }
+        (Some(rlm), None) => Some(rlm),
+        (None, Some(verifier)) => Some(verifier),
+        (None, None) => None,
+    };
+    if let Some(policy) = policy {
         config = config.with_before_model_policy(policy);
     }
     AgentLoop::new(Arc::clone(&state.provider_registry), tool_registry, config)
