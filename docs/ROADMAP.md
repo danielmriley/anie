@@ -5,6 +5,12 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] Cost / token-budget enforcement (docs/cost_budget/): derive
+      `Usage.cost` from catalog pricing, a session cost meter surfaced in
+      `/state` and the TUI status bar, and optional `[budget]` run/session
+      cost+token ceilings enforced as a typed `BeforeModelResponse::
+      StopRun` (clean halt, partial work saved — not a ProviderError, not
+      a panic). Opt-in; byte-identical when unset.
 - [x] `apply_patch` tool (docs/apply_patch_tool/): a Codex-style
       `*** Begin Patch` envelope (Add/Update/Delete) applying multi-hunk,
       multi-file changes through the shared `text_match` engine and a new

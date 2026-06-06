@@ -188,6 +188,29 @@ verifier composes with context-virtualization through
 one running context (replace-then-append ordering) and returns `Continue`
 when none changed anything. Plan: `docs/plan_todo_verifier/`.
 
+### Cost accounting and budget enforcement
+
+`Usage.cost` is derived at message finalization from the model's
+`CostPerMillion` (`CostPerMillion::cost_of`) — anie queries no billing
+endpoint, so cost is an estimate (token counts × catalog price), never a
+provider-billed amount. The controller's `CostMeter`
+(`anie-cli/src/cost_meter.rs`) accumulates run + session token totals
+(re-derived to dollars on read, never by summing `f64`); it is reset per
+run, folded in at `finish_run`, re-priced on `/model`, and rebuilt from
+persisted usage on resume. Cost surfaces in `/state` and the TUI status
+bar. No session-schema bump (`Usage.cost` already serialized).
+
+Optional `[budget]` ceilings (run/session × cost/tokens, all `None` by
+default) are enforced two ways, both typed and clean: a pre-run
+session-gate in `start_prompt_run`, and an in-loop `BudgetPolicy`
+(`anie-cli/src/budget_policy.rs`) installed into the before-model chain
+when enforcing. A ceiling overage returns the new
+`BeforeModelResponse::StopRun(RunStopReason::BudgetExceeded { .. })`
+terminal variant — **not** a `ProviderError` (so it never enters the
+retry path) and not a panic. The loop finalizes cleanly, partial work is
+persisted, and the controller surfaces it as a system message. Plan:
+`docs/cost_budget/`.
+
 Each run is wrapped in a tracing `agent_run` span keyed by a UUID
 `run_id`; each REPL iteration gets a child `agent_repl_step` span with
 `run_step` (monotonic), `intent`, `context_messages`, and

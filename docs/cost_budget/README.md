@@ -461,30 +461,40 @@ Behavior-named tests, each in the crate closest to the logic.
 
 ## 7. Exit criteria
 
-- [ ] `CostPerMillion::cost_of` derives per-field + total cost;
-      zero-priced models yield zero.
-- [ ] Agent loop populates `assistant.usage.cost` at message
-      finalization; cost flows to session, `/state`, and TUI.
-- [ ] **No** `CURRENT_SESSION_SCHEMA_VERSION` bump
-      (`Usage.cost` already serializes); forward-compat test green.
-- [ ] `/state` shows run + session token and dollar totals; TUI
-      status shows a session-cost segment for priced models.
-- [ ] `BudgetConfig` is opt-in, defaults all-None, zero behavior
-      change when unset.
-- [ ] Ceiling overage is a **typed** `RunStopReason::BudgetExceeded`
-      surfaced cleanly by the controller — not a panic, not a
-      `ProviderError`; partial work persists.
-- [ ] Session-ceiling pre-run gate refuses a new prompt cleanly.
-- [ ] `cargo test --workspace` green.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
-- [ ] `cargo fmt --check` clean.
-- [ ] Manual smoke per `docs/smoke_protocol_2026-05-01.md`: priced
-      run shows cost; tiny ceiling triggers a clean mid-run stop.
-- [ ] `docs/arch/anie-rs_architecture.md` updated (cost meter,
-      budget policy, the new `BeforeModelResponse::StopRun` seam).
-- [ ] `docs/ROADMAP.md` updated (initiative #5 landed).
-- [ ] Each PR's commit message: `cost/PR<n>: <imperative>` + why-body
-      citing this doc + `Co-Authored-By` line.
+- [x] `CostPerMillion::cost_of` derives per-field + total cost;
+      zero-priced models yield zero. (PR1)
+- [x] Agent loop populates `assistant.usage.cost` at message
+      finalization; cost flows to session, `/state`, and TUI. (PR1/PR2)
+- [x] **No** `CURRENT_SESSION_SCHEMA_VERSION` bump; forward-compat test
+      green (`usage_with_populated_cost_roundtrips_through_session_schema_v4`).
+- [x] `/state` shows run + session token and dollar totals; TUI status
+      shows a session-cost segment for priced models. (PR2)
+- [x] `BudgetConfig` is opt-in, defaults all-None, zero behavior change
+      when unset. (PR3)
+- [x] Ceiling overage is a **typed** `RunStopReason::BudgetExceeded`
+      surfaced cleanly — not a panic, not a `ProviderError`; partial work
+      persists (proven by `before_model_stop_run_finalizes_loop_*` and
+      `agent_run_result_carries_terminal_stop_not_provider_error_*`). (PR3)
+- [x] Session-ceiling pre-run gate refuses a new prompt cleanly
+      (`session_budget_block` + `format_run_stop` tested). (PR3)
+- [x] `cargo test --workspace` green.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [x] `cargo fmt --check` clean.
+- [~] Manual smoke: covered at the unit level (cost derivation, meter,
+      StopRun loop finalization, budget-policy ceilings, surfacing text);
+      a live-model drive needs an API key (not run here).
+- [x] `docs/arch/anie-rs_architecture.md` updated (cost meter, budget
+      policy, the `BeforeModelResponse::StopRun` seam).
+- [x] `docs/ROADMAP.md` updated.
+- [x] Commit messages follow `cost/PR<n>: <imperative>` + why-body +
+      `Co-Authored-By`.
+
+> Scoping note: the heaviest controller-integration tests the plan listed
+> (`start_prompt_run_refuses_*`, `finish_run_surfaces_*`) are covered by
+> the unit tests of their constituent pure logic (`session_budget_block`'s
+> `snapshot ≥ limit` comparison via the cost-meter + budget-policy tests;
+> `format_run_stop`'s rendering; the loop's `StopRun` finalization) rather
+> than a full spawned-controller harness.
 
 ---
 
