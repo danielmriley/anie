@@ -49,6 +49,11 @@ pub struct AnieConfig {
     /// this whole block has no pi equivalent. Per CLAUDE.md §3.
     #[serde(default)]
     pub ollama: OllamaConfig,
+    /// External MCP servers to spawn at startup. Empty by
+    /// default; MCP is opt-in via config. anie-specific (not in
+    /// pi): pi has no MCP client. See `docs/mcp_client/`.
+    #[serde(default)]
+    pub mcp: McpConfig,
     /// True if a loaded config file (`~/.anie/config.toml` or
     /// a project-local `.anie/config.toml`) explicitly set the
     /// `[model]` section. Lets callers distinguish "the user
@@ -90,6 +95,48 @@ pub struct OllamaConfig {
     /// load time with a clear error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_max_num_ctx: Option<u64>,
+}
+
+/// External MCP (Model Context Protocol) servers anie connects to
+/// as a client. Each enabled server is spawned over stdio at
+/// startup; its tools are registered into the tool registry as
+/// `mcp__<name>__<tool>`. anie-specific (not in pi): pi has no MCP
+/// client. See `docs/mcp_client/README.md`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpConfig {
+    /// Server name -> launch spec. The name namespaces the
+    /// server's tools as `mcp__<name>__<tool>`.
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+/// Launch spec for a single stdio MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServerConfig {
+    /// Executable to launch (stdio transport).
+    pub command: String,
+    /// Arguments passed to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the child process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Disable a server without deleting its config entry.
+    #[serde(default = "default_mcp_enabled")]
+    pub enabled: bool,
+    /// Handshake + `tools/list` timeout in milliseconds. Bounds
+    /// startup so a hung server cannot wedge a session; on
+    /// timeout the server is skipped and the rest of anie loads.
+    #[serde(default = "default_mcp_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+}
+
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+fn default_mcp_startup_timeout_ms() -> u64 {
+    10_000
 }
 
 /// Built-in tool configuration. These settings are guardrails and
@@ -927,7 +974,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 /// Return the default config template written on first run.
 #[must_use]
 pub fn default_config_template() -> &'static str {
-    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Ollama-wide settings (only meaningful for OllamaChatApi models).\n# Optional cap on the num_ctx anie sends to Ollama. Useful on\n# constrained hardware: a 16 GB Mac with a 32B+ model can hit\n# load failures at the 262144-token architectural max from\n# /api/show. Setting this lets anie clamp every Ollama model's\n# context window at catalog-load time. Per-model runtime\n# overrides via /context-length still win over this cap.\n# Acceptable values: >= 2048 (matches the /context-length minimum).\n# [ollama]\n# default_max_num_ctx = 32768\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
+    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Ollama-wide settings (only meaningful for OllamaChatApi models).\n# Optional cap on the num_ctx anie sends to Ollama. Useful on\n# constrained hardware: a 16 GB Mac with a 32B+ model can hit\n# load failures at the 262144-token architectural max from\n# /api/show. Setting this lets anie clamp every Ollama model's\n# context window at catalog-load time. Per-model runtime\n# overrides via /context-length still win over this cap.\n# Acceptable values: >= 2048 (matches the /context-length minimum).\n# [ollama]\n# default_max_num_ctx = 32768\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# External MCP servers (stdio transport). Each enabled server is\n# spawned at startup; its tools register as mcp__<name>__<tool>.\n# A server that fails to start is skipped with a warning.\n# [mcp.servers.everything]\n# command = \"npx\"\n# args = [\"-y\", \"@modelcontextprotocol/server-everything\"]\n# enabled = true\n# startup_timeout_ms = 10000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
 }
 
 fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
@@ -1052,6 +1099,16 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.ui.tool_output_mode = tool_output_mode;
         }
     }
+
+    // MCP servers overlay by name, mirroring the provider-section
+    // overlay above: a project config can add or replace a server
+    // entry without clobbering servers declared in the global
+    // config.
+    if let Some(mcp) = partial.mcp {
+        for (name, server) in mcp.servers {
+            config.mcp.servers.insert(name, server);
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -1082,6 +1139,8 @@ struct PartialAnieConfig {
     ollama: Option<PartialOllamaConfig>,
     #[serde(default)]
     ui: Option<PartialUiConfig>,
+    #[serde(default)]
+    mcp: Option<McpConfig>,
 }
 
 /// Optional `[ui]` overrides loaded from `config.toml`. Each
@@ -2066,5 +2125,142 @@ mod tests {
                 .contents
                 .contains("[truncated due to context limits]")
         );
+    }
+
+    // --- MCP config (docs/mcp_client PR 1) ---
+
+    /// Parse a config body through the real loader path (the same
+    /// `PartialAnieConfig` -> `merge_partial_config` plumbing the
+    /// app uses), so these tests exercise production code, not a
+    /// direct `AnieConfig` deserialize (which requires `[model]`).
+    fn load_body(body: &str) -> AnieConfig {
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("config.toml");
+        fs::write(&path, body).expect("write config");
+        load_config_with_paths(Some(&path), None, CliOverrides::default()).expect("load config")
+    }
+
+    #[test]
+    fn mcp_config_defaults_to_empty_servers() {
+        // An absent `[mcp]` section must yield an empty server
+        // map, never an error. This doubles as the config
+        // forward-compat test: an old config without `[mcp]`
+        // loads clean.
+        assert!(AnieConfig::default().mcp.servers.is_empty());
+        assert!(
+            load_body("[ui]\nmarkdown_enabled = true\n")
+                .mcp
+                .servers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_parses_command_args_env_from_toml() {
+        let config = load_body(
+            r#"
+            [mcp.servers.github]
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-github"]
+            [mcp.servers.github.env]
+            GITHUB_TOKEN = "x"
+            "#,
+        );
+        let server = config.mcp.servers.get("github").expect("github server");
+        assert_eq!(server.command, "npx");
+        assert_eq!(
+            server.args,
+            vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-github".to_string()
+            ]
+        );
+        assert_eq!(server.env.get("GITHUB_TOKEN"), Some(&"x".to_string()));
+    }
+
+    #[test]
+    fn mcp_server_enabled_defaults_true() {
+        // Omitting `enabled` means the server is active; you opt
+        // out with `enabled = false`, not in.
+        let config = load_body("[mcp.servers.fs]\ncommand = \"server-filesystem\"\n");
+        assert!(config.mcp.servers["fs"].enabled);
+    }
+
+    #[test]
+    fn mcp_startup_timeout_defaults_to_ten_seconds() {
+        let config = load_body("[mcp.servers.fs]\ncommand = \"server-filesystem\"\n");
+        assert_eq!(config.mcp.servers["fs"].startup_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn partial_mcp_section_merges_without_clobbering_other_sections() {
+        // A project config that adds an MCP server must overlay
+        // onto a global config's servers (by name) and leave
+        // unrelated sections untouched — the provider-overlay
+        // semantics, applied to `[mcp]`.
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.toml");
+        let project_path = tempdir.path().join("project.toml");
+        fs::write(
+            &global_path,
+            "[mcp.servers.alpha]\ncommand = \"alpha-server\"\n\n[ui]\nmarkdown_enabled = false\n",
+        )
+        .expect("write global");
+        fs::write(
+            &project_path,
+            "[mcp.servers.beta]\ncommand = \"beta-server\"\n",
+        )
+        .expect("write project");
+
+        let config = load_config_with_paths(
+            Some(&global_path),
+            Some(&project_path),
+            CliOverrides::default(),
+        )
+        .expect("load config");
+
+        // Both servers survive the merge.
+        assert_eq!(config.mcp.servers["alpha"].command, "alpha-server");
+        assert_eq!(config.mcp.servers["beta"].command, "beta-server");
+        // The unrelated `[ui]` override from the global layer is
+        // not clobbered by the project layer's `[mcp]`.
+        assert!(!config.ui.markdown_enabled);
+    }
+
+    #[test]
+    fn config_template_mcp_example_parses_when_uncommented() {
+        // The first-run template documents `[mcp.servers.*]` as a
+        // commented example. Uncommenting it must yield a valid
+        // config — guards against a template example that drifts
+        // from the real schema.
+        let template = default_config_template();
+        assert!(
+            template.contains("[mcp.servers."),
+            "template must document an [mcp.servers.*] example"
+        );
+        // Extract just the commented `[mcp...]` block (from its
+        // header to the next blank line), uncomment it, and parse
+        // it in isolation. Parsing the whole template at once is
+        // brittle because other example sections carry their own
+        // enum/shape constraints; this pins the mcp example only.
+        let block: String = template
+            .lines()
+            .skip_while(|line| !line.contains("[mcp.servers."))
+            .take_while(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = load_body(&block);
+        let server = config
+            .mcp
+            .servers
+            .get("everything")
+            .expect("everything server from template");
+        assert_eq!(server.command, "npx");
+        assert_eq!(server.startup_timeout_ms, 10_000);
     }
 }
