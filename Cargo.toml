@@ -10,6 +10,7 @@ members = [
     "crates/anie-session",
     "crates/anie-config",
     "crates/anie-auth",
+    "crates/anie-mcp",
     "crates/anie-tui",
     "crates/anie-cli",
     "crates/anie-integration-tests",
@@ -104,6 +105,7 @@ anie-agent = { path = "crates/anie-agent" }
 anie-auth = { path = "crates/anie-auth" }
 anie-cli = { path = "crates/anie-cli" }
 anie-config = { path = "crates/anie-config" }
+anie-mcp = { path = "crates/anie-mcp" }
 anie-provider = { path = "crates/anie-provider" }
 anie-protocol = { path = "crates/anie-protocol" }
 anie-providers-builtin = { path = "crates/anie-providers-builtin" }
