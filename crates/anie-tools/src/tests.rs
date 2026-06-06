@@ -617,6 +617,115 @@ async fn file_mutation_queue_canonicalizes_alias_paths() {
     first.await.expect("first task");
 }
 
+#[tokio::test]
+async fn with_locks_acquires_distinct_paths_and_runs_operation() {
+    let tempdir = tempdir().expect("tempdir");
+    let a = tempdir.path().join("a.txt");
+    let b = tempdir.path().join("b.txt");
+    let queue = FileMutationQueue::new();
+    let ran = queue.with_locks(&[a, b], || async { 42 }).await;
+    assert_eq!(ran, 42);
+}
+
+#[tokio::test]
+async fn with_locks_serializes_two_callers_contending_on_a_shared_path() {
+    let tempdir = tempdir().expect("tempdir");
+    let shared = tempdir.path().join("shared.txt");
+    let other = tempdir.path().join("other.txt");
+    let queue = Arc::new(FileMutationQueue::new());
+
+    let start = Instant::now();
+    let queue_clone = Arc::clone(&queue);
+    let shared_clone = shared.clone();
+    let first = tokio::spawn(async move {
+        queue_clone
+            .with_locks(&[shared_clone], || async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            })
+            .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    // Second caller locks {shared, other}; it must wait on the shared key.
+    queue
+        .with_locks(&[shared, other], || async {
+            assert!(start.elapsed() >= Duration::from_millis(150));
+        })
+        .await;
+    first.await.expect("first task");
+}
+
+#[tokio::test]
+async fn with_locks_is_deadlock_free_under_reversed_path_order() {
+    let tempdir = tempdir().expect("tempdir");
+    let a = tempdir.path().join("a.txt");
+    let b = tempdir.path().join("b.txt");
+    let queue = Arc::new(FileMutationQueue::new());
+
+    // Two callers take the same two locks in opposite request order.
+    // Because with_locks sorts keys, neither can hold one while waiting
+    // on the other — both complete (no deadlock) within the timeout.
+    let q1 = Arc::clone(&queue);
+    let (a1, b1) = (a.clone(), b.clone());
+    let t1 = tokio::spawn(async move {
+        for _ in 0..20 {
+            q1.with_locks(&[a1.clone(), b1.clone()], || async {}).await;
+        }
+    });
+    let q2 = Arc::clone(&queue);
+    let t2 = tokio::spawn(async move {
+        for _ in 0..20 {
+            q2.with_locks(&[b.clone(), a.clone()], || async {}).await;
+        }
+    });
+
+    let joined = tokio::time::timeout(Duration::from_secs(5), async {
+        t1.await.expect("t1");
+        t2.await.expect("t2");
+    })
+    .await;
+    assert!(joined.is_ok(), "with_locks deadlocked under reversed order");
+}
+
+#[tokio::test]
+async fn with_locks_dedupes_repeated_path_so_it_does_not_self_deadlock() {
+    let tempdir = tempdir().expect("tempdir");
+    let a = tempdir.path().join("a.txt");
+    let queue = FileMutationQueue::new();
+    // The same path twice must dedupe to one lock, not deadlock on itself.
+    let done = tokio::time::timeout(
+        Duration::from_secs(2),
+        queue.with_locks(&[a.clone(), a], || async { true }),
+    )
+    .await;
+    assert_eq!(done.ok(), Some(true));
+}
+
+#[tokio::test]
+async fn with_lock_still_serializes_single_path_after_refactor() {
+    // Regression: with_lock now delegates to with_locks; single-path
+    // serialization must still hold.
+    let tempdir = tempdir().expect("tempdir");
+    let file = tempdir.path().join("f.txt");
+    let queue = Arc::new(FileMutationQueue::new());
+    let start = Instant::now();
+    let q = Arc::clone(&queue);
+    let f = file.clone();
+    let first = tokio::spawn(async move {
+        q.with_lock(&f, || async {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        })
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    queue
+        .with_lock(&file, || async {
+            assert!(start.elapsed() >= Duration::from_millis(120));
+        })
+        .await;
+    first.await.expect("first task");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn bash_tool_runs_simple_command() {

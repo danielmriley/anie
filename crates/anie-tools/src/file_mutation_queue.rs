@@ -33,14 +33,44 @@ impl FileMutationQueue {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        let canonical = self.canonicalize_path(path);
-        let lock = self
-            .locks
-            .entry(canonical)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
-        operation().await
+        let paths = [path.to_path_buf()];
+        self.with_locks(&paths, operation).await
+    }
+
+    /// Run an async operation while holding the locks for **all** of
+    /// `paths` at once — the primitive behind atomic multi-file
+    /// mutations (`apply_patch`). Keys are canonicalized, deduped, and
+    /// sorted before acquisition so two callers can never deadlock by
+    /// taking the same locks in different orders, and a path repeated
+    /// within one call cannot self-deadlock.
+    pub async fn with_locks<F, Fut, T>(&self, paths: &[PathBuf], operation: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let mut keys: Vec<PathBuf> = paths
+            .iter()
+            .map(|path| self.canonicalize_path(path))
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        // `lock_owned` yields guards that own an `Arc` clone, so the
+        // Vec of guards carries no borrow of `self.locks` and can be
+        // held across the operation without lifetime gymnastics.
+        let mut guards = Vec::with_capacity(keys.len());
+        for key in keys {
+            let lock = self
+                .locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone();
+            guards.push(lock.lock_owned().await);
+        }
+
+        let result = operation().await;
+        drop(guards);
+        result
     }
 }
 
