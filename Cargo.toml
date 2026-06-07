@@ -53,6 +53,7 @@ keyring = "3"
 # Linux process-sandbox backends, used only by anie-sandbox behind its
 # `sandbox-linux` feature (kept out of default builds and non-Linux).
 landlock = "0.4"
+libc = "0.2"
 seccompiler = "0.5"
 nix = { version = "0.30", features = ["signal", "process"] }
 # opener — cross-platform "open this URL in the default
