@@ -5,6 +5,18 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] Working-tree checkpoint / rewind (docs/session_ux/, Workstream B):
+      `/rewind` restores **both** the conversation and the working tree to
+      a prior user turn; `/checkpoint [name]` records a labeled anchor. A
+      content-addressed shadow store (`WorkspaceCheckpointStore` in
+      `anie-session/src/checkpoint.rs`) keeps sha256-deduplicated blobs +
+      a manifest in a `<session_id>.checkpoints/` sidecar; capture is at
+      the user-turn boundary over the same write/edit set compaction
+      tracks. Restore refuses on a typed `WorkingTreeDrifted` (no silent
+      clobber) and reuses the existing append-only `SessionManager::fork`
+      for the conversation half. Ships at session schema v4 (no bump), no
+      new third-party crate. The interactive session *picker* (Workstream
+      A) and fork branch-summaries (Workstream C) are deferred.
 - [x] Process sandbox for tool execution (docs/tool_sandbox/): opt-in,
       Linux-only `[tools.sandbox]` that confines the `bash` tool's spawned
       child via Landlock (writes restricted to roots) + seccomp (network
@@ -131,7 +143,13 @@ File-path `@` completion remains a follow-up.
 **Why**: Session management currently requires CLI flags or filesystem
 knowledge.
 **Effort**: Medium — session listing UI, metadata display.
+**Status**: Partially shipped. `/rewind` + `/checkpoint` (working-tree
+rewind, the rival-distinguishing piece) landed via docs/session_ux/
+Workstream B — see Completed. The interactive session **picker**
+(Workstream A) and per-session display names remain; `/session list`
+and `/session <id>` text paths already work.
 **Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
+and [docs/session_ux/README.md](session_ux/README.md)
 
 ## Longer-Term — Features
 

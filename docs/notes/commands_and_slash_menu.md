@@ -40,9 +40,11 @@ free once they land. Max visible items defaults to 5.
 | `/resume` | Browse and select a previous session | Not implemented |
 | `/new` | Start a fresh session | Not implemented |
 | `/name <name>` | Set session display name | Not implemented |
-| `/session` | Show session info (path, tokens, cost) | Not implemented |
+| `/session` | Show session info, `list`, or switch by id | Implemented (text command; interactive picker deferred) |
+| `/rewind [<entry-id>]` | List rewind anchors, or restore tree + conversation to one | Implemented (text command) |
+| `/checkpoint [name]` | Record a working-tree checkpoint to rewind to | Implemented |
 | `/tree` | Navigate session history tree | Not implemented |
-| `/fork` | Branch from a point in history | Not implemented |
+| `/fork` | Branch from the current point into a child session | Implemented |
 | `/copy` | Copy last assistant response to clipboard | Not implemented |
 | `/export [file]` | Export session to HTML | Not implemented |
 | `/reload` | Hot-reload config, context files, etc. | Not implemented |

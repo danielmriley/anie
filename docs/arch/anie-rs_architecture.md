@@ -720,6 +720,41 @@ reconstructable during resume/fork, such as user prompts, generated messages,
 model changes, thinking changes, and compactions, belongs in the session log
 rather than only in runtime state.
 
+### Working-tree checkpoint / rewind
+
+`/rewind` restores **both** the conversation and the working tree to a prior
+user turn; `/checkpoint [name]` records a labeled anchor. The conversation half
+reuses the existing append-only `SessionManager::fork(entry_id)` (re-point the
+leaf, no history rewrite). The working-tree half is a content-addressed shadow
+store, `WorkspaceCheckpointStore` (`anie-session/src/checkpoint.rs`), kept in a
+sidecar dir next to the JSONL:
+
+```text
+~/.anie/sessions/<session_id>.checkpoints/
+  blobs/<sha256-hex>   # one file per unique content, deduplicated
+  manifest.json        # ordered entry_id -> { label, files: path -> Blob|Absent }
+```
+
+- **Capture** happens at the user-turn boundary (in `start_prompt_run`, keyed
+  by the new prompt entry id) and on `/checkpoint`. The tracked path set is the
+  union of `modified_files` from `extract_compaction_details` over the active
+  branch — the same write/edit extraction compaction uses — so the rewind store
+  and the compaction summary agree on what the agent touched. Content addressing
+  makes an unchanged file cost one hash and zero extra bytes.
+- **Restore** rewrites each tracked path to its captured blob, or deletes it if
+  it was `Absent` at the target. It is refused with a typed
+  `CheckpointError::WorkingTreeDrifted { path }` when a tracked file changed on
+  disk since its most recent capture (no silent clobber), and the drift check
+  runs for every path before any write so a refusal is a clean no-op.
+
+The session JSONL is **not** touched — binary file content does not belong in
+the message log — so this feature ships at schema **v4** (no bump). Deliberate
+bounds: capture is turn-granular (not per-edit), only `write`/`edit` paths are
+tracked (bash-driven `mv`/`>`/`rm` are not), and the store is self-contained
+with no `git` dependency (works in non-git trees). The interactive session
+*picker* and fork branch-summaries from the same plan are deferred; `/rewind`
+and `/checkpoint` are text commands today.
+
 ## Config and runtime state
 
 `anie-config` owns TOML config:
