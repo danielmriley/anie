@@ -1740,6 +1740,7 @@ impl ControllerState {
         // session zeroes them out alongside the rest of the
         // session-bound state.
         self.compaction_stats.reset();
+        self.rebuild_cost_meter_for_active_session();
         self.persist_runtime_state_logged("new_session");
         Ok(())
     }
@@ -1753,6 +1754,7 @@ impl ControllerState {
         // away from the active session zeroes them out so the
         // newly-active session starts with its own count.
         self.compaction_stats.reset();
+        self.rebuild_cost_meter_for_active_session();
         self.persist_runtime_state_logged("switch_session");
         Ok(())
     }
@@ -1763,8 +1765,30 @@ impl ControllerState {
         // Same rationale as `switch_session` — the fork is a
         // distinct session and starts with fresh counters.
         self.compaction_stats.reset();
+        self.rebuild_cost_meter_for_active_session();
         self.persist_runtime_state_logged("fork_session");
         Ok(child_id)
+    }
+
+    /// Rebuild the session-scoped cost meter for the now-active session.
+    /// Session cost is session-scoped state (like `compaction_stats`),
+    /// so `/new`, `/switch` and `/fork` must reset it — otherwise the
+    /// session-budget gate enforces the new session against the previous
+    /// session's spend, and the "run /new to clear" hint in the
+    /// over-budget message would not actually clear the block. Re-prices
+    /// to the current model and re-sums the active branch's persisted
+    /// assistant usage (zero for a fresh session), mirroring bootstrap.
+    fn rebuild_cost_meter_for_active_session(&self) {
+        let persisted: Vec<_> = self
+            .session_context()
+            .messages
+            .into_iter()
+            .map(|entry| entry.message)
+            .collect();
+        self.cost_meter
+            .set_pricing(self.config.current_model().cost_per_million.clone());
+        self.cost_meter.rebuild_session(&persisted);
+        self.cost_meter.reset_run();
     }
 
     async fn finish_run(&mut self, result: &anie_agent::AgentRunResult) -> Result<()> {

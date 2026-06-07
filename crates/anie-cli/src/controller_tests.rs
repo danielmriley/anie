@@ -3404,3 +3404,29 @@ async fn switching_to_the_current_session_is_a_no_op_not_an_error() {
     }
     assert!(!saw_replace, "no-op switch must not replace the transcript");
 }
+
+#[tokio::test]
+async fn new_session_resets_the_session_cost_meter() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    // Simulate prior spend on the current session.
+    let mut spent = assistant_message("done");
+    spent.usage = anie_protocol::Usage {
+        input_tokens: 1_000,
+        output_tokens: 500,
+        ..anie_protocol::Usage::default()
+    };
+    controller
+        .state
+        .cost_meter
+        .record_run_messages(&[Message::Assistant(spent)]);
+    assert!(controller.state.cost_meter.snapshot().session_tokens > 0);
+
+    controller.state.new_session().await.expect("new session");
+
+    // A fresh session starts from zero spend — otherwise the session
+    // budget gate would enforce it against the previous session, and the
+    // "run /new to clear" hint could never clear an over-budget block.
+    assert_eq!(controller.state.cost_meter.snapshot().session_tokens, 0);
+}
