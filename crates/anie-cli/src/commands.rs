@@ -61,6 +61,24 @@ impl CommandRegistry {
         }
     }
 
+    /// Builtins plus a `/skill:<name>` command for each discovered
+    /// skill. A skill whose command name collides with an already
+    /// registered command is skipped with a warning (`register` dedups,
+    /// first registration wins — matching pi).
+    pub(crate) fn with_builtins_and_skills(skills: &crate::skills::SkillSet) -> Self {
+        let mut registry = Self::with_builtins();
+        for skill in skills.iter() {
+            let info = SlashCommandInfo::skill(skill.name.clone(), skill.description.clone());
+            if let Err(duplicate) = registry.register(info) {
+                tracing::warn!(
+                    command = %duplicate.name,
+                    "skill command name collides with an existing command; skipping"
+                );
+            }
+        }
+        registry
+    }
+
     /// Look up a command by exact name.
     ///
     /// Used by tests today and by plan 12's autocomplete provider
@@ -164,7 +182,6 @@ impl CommandRegistry {
 
     /// Register a command. Duplicates (by name) are rejected — the
     /// first registration wins, matching pi's behavior.
-    #[cfg(test)]
     pub(crate) fn register(&mut self, command: SlashCommandInfo) -> Result<(), DuplicateCommand> {
         if self.commands.iter().any(|c| c.name == command.name) {
             return Err(DuplicateCommand {
@@ -209,7 +226,6 @@ impl From<&SlashCommandSource> for SourceKey {
 
 /// Error returned when attempting to register a command whose name
 /// is already taken.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct DuplicateCommand {
     pub name: String,
@@ -333,6 +349,78 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_skill(name: &str, description: &str) -> crate::skills::Skill {
+        crate::skills::Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            allowed_tools: Vec::new(),
+            body: "body".to_string(),
+        }
+    }
+
+    #[test]
+    fn register_runtime_skill_command_is_looked_up_by_name() {
+        let mut registry = CommandRegistry::with_builtins();
+        registry
+            .register(SlashCommandInfo::skill(
+                "deploy".to_string(),
+                "Deploy it".to_string(),
+            ))
+            .expect("register skill");
+        let info = registry.lookup("skill:deploy").expect("lookup skill");
+        assert!(matches!(info.source, SlashCommandSource::Skill { .. }));
+        assert_eq!(info.summary, "Deploy it");
+    }
+
+    #[test]
+    fn duplicate_skill_name_is_rejected_first_wins() {
+        let mut registry = CommandRegistry::with_builtins();
+        registry
+            .register(SlashCommandInfo::skill(
+                "dup".to_string(),
+                "first".to_string(),
+            ))
+            .expect("first registration");
+        let err = registry
+            .register(SlashCommandInfo::skill(
+                "dup".to_string(),
+                "second".to_string(),
+            ))
+            .expect_err("duplicate rejected");
+        assert_eq!(err.name, "skill:dup");
+        assert_eq!(registry.lookup("skill:dup").unwrap().summary, "first");
+    }
+
+    #[test]
+    fn with_builtins_and_skills_registers_one_command_per_skill() {
+        let skills = crate::skills::SkillSet::from_skills(vec![
+            test_skill("alpha", "A"),
+            test_skill("beta", "B"),
+        ]);
+        let registry = CommandRegistry::with_builtins_and_skills(&skills);
+        assert!(registry.lookup("skill:alpha").is_some());
+        assert!(registry.lookup("skill:beta").is_some());
+        // Builtins are still present.
+        assert!(registry.lookup("help").is_some());
+    }
+
+    #[test]
+    fn empty_skill_set_leaves_registry_builtin_only() {
+        let skills = crate::skills::SkillSet::default();
+        let with_skills = CommandRegistry::with_builtins_and_skills(&skills);
+        let builtin_only = CommandRegistry::with_builtins();
+        assert_eq!(with_skills.all().len(), builtin_only.all().len());
+    }
+
+    #[test]
+    fn skill_command_groups_under_skills_heading_in_help() {
+        let skills = crate::skills::SkillSet::from_skills(vec![test_skill("deploy", "Deploy it")]);
+        let registry = CommandRegistry::with_builtins_and_skills(&skills);
+        let help = registry.format_help();
+        assert!(help.contains("  Skills:\n"), "{help}");
+        assert!(help.contains("/skill:deploy"), "{help}");
+    }
 
     #[test]
     fn with_builtins_populates_known_commands() {

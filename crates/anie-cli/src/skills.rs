@@ -78,6 +78,17 @@ impl SkillSet {
     pub(crate) fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
+
+    /// Build a set directly from skills, for tests in sibling modules.
+    #[cfg(test)]
+    pub(crate) fn from_skills(skills: Vec<Skill>) -> Self {
+        Self {
+            skills: skills
+                .into_iter()
+                .map(|skill| (skill.name.clone(), skill))
+                .collect(),
+        }
+    }
 }
 
 /// Why a single `SKILL.md` failed to load. Loader-local (file IO +

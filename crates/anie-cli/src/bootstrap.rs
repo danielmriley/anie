@@ -114,6 +114,20 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         .collect();
     cost_meter.rebuild_session(&persisted);
 
+    // Discover skills from the global (`~/.anie/skills/`) and project
+    // (`.anie/skills/`) roots, then register a `/skill:<name>` command
+    // for each. Best-effort: malformed files warn and are skipped.
+    let global_skills_dir = anie_config::anie_dir().map(|dir| dir.join("skills"));
+    let project_skills_dir = project_skills_dir(&cwd);
+    let (skills, skill_errors) = crate::skills::discover_skills(
+        global_skills_dir.as_deref().unwrap_or(Path::new("")),
+        project_skills_dir.as_deref(),
+    );
+    for error in &skill_errors {
+        warn!(%error, "skipping malformed skill");
+    }
+    let command_registry = crate::commands::CommandRegistry::with_builtins_and_skills(&skills);
+
     let mut state = ControllerState {
         config: ConfigState::new(
             config,
@@ -129,18 +143,28 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         request_options_resolver,
         prompt_cache,
         retry_config: RetryConfig::default(),
-        command_registry: crate::commands::CommandRegistry::with_builtins(),
+        command_registry,
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: cli.harness_mode,
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list,
         cost_meter,
+        skills,
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {
         warn!(%error, "failed to persist runtime state during bootstrap");
     }
     Ok(state)
+}
+
+/// Locate a project skills directory by walking upward from `cwd` for
+/// the first ancestor containing a `.anie/skills/` directory. Mirrors
+/// the upward-walk convention used for project config discovery.
+fn project_skills_dir(cwd: &Path) -> Option<std::path::PathBuf> {
+    cwd.ancestors()
+        .map(|ancestor| ancestor.join(".anie").join("skills"))
+        .find(|candidate| candidate.is_dir())
 }
 
 #[cfg(test)]

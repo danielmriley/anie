@@ -162,6 +162,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        skills: crate::skills::SkillSet::default(),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -239,6 +240,7 @@ fn controller_with_runtime_state_path(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        skills: crate::skills::SkillSet::default(),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -721,6 +723,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        skills: crate::skills::SkillSet::default(),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -770,6 +773,7 @@ fn build_state_with_registry(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        skills: crate::skills::SkillSet::default(),
     }
 }
 
@@ -1735,6 +1739,7 @@ fn controller_for_context_length_test_with_cap(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        skills: crate::skills::SkillSet::default(),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2205,6 +2210,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        skills: crate::skills::SkillSet::default(),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2345,6 +2351,7 @@ fn spawn_live_controller(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        skills: crate::skills::SkillSet::default(),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);

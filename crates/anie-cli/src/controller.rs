@@ -1332,6 +1332,12 @@ pub(crate) struct ControllerState {
     /// session, rebuilt from persisted usage on resume. Surfaced in
     /// `/state` and the TUI status bar.
     pub(crate) cost_meter: Arc<crate::cost_meter::CostMeter>,
+    /// Skills discovered at startup from `~/.anie/skills/` and the
+    /// project `.anie/skills/`. Their `/skill:<name>` commands are
+    /// registered in `command_registry`; activation resolves the body
+    /// from here. Re-discovered each launch; not persisted.
+    #[allow(dead_code)] // read by the ActivateSkill handler wired in skills/4
+    pub(crate) skills: crate::skills::SkillSet,
 }
 
 impl ControllerState {
