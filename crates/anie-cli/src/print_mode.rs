@@ -16,6 +16,15 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
     }
 
     let state = prepare_controller_state(&cli).await?;
+    // Capture metrics identity before `state` moves into the controller;
+    // the accumulator is only built when `--metrics-out` is set.
+    let mut metrics = cli.metrics_out.as_ref().map(|_| {
+        crate::run_metrics::RunMetricsAccumulator::new(
+            cli.harness_mode,
+            &state.config.current_model().id,
+            &state.config.current_model().provider,
+        )
+    });
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel(256);
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
     let controller = InteractiveController::new(state, ui_action_rx, agent_event_tx, true);
@@ -41,8 +50,19 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
         &mut streamed_text,
         &mut printed_assistant_output,
         &mut pending_terminal_text,
+        metrics.as_mut(),
     )
     .await?;
+
+    // Write the metrics sidecar (if requested) via the crash-safe
+    // temp-file + fsync + rename helper — not a raw fs::write.
+    if let (Some(path), Some(accumulator)) = (cli.metrics_out.as_ref(), metrics) {
+        let artifact = accumulator.finish();
+        let json =
+            serde_json::to_vec_pretty(&artifact).context("failed to serialize run metrics")?;
+        anie_config::atomic_write(path, &json)
+            .with_context(|| format!("failed to write metrics to {}", path.display()))?;
+    }
 
     let _ = ui_action_tx.send(UiAction::Quit);
     match controller_task.await {
@@ -51,6 +71,7 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_print_events(
     agent_event_rx: &mut mpsc::Receiver<AgentEvent>,
     stdout: &mut impl Write,
@@ -58,8 +79,12 @@ async fn process_print_events(
     streamed_text: &mut bool,
     printed_assistant_output: &mut bool,
     pending_terminal_text: &mut Option<String>,
+    mut metrics: Option<&mut crate::run_metrics::RunMetricsAccumulator>,
 ) -> Result<()> {
     while let Some(event) = agent_event_rx.recv().await {
+        if let Some(accumulator) = metrics.as_deref_mut() {
+            accumulator.observe(&event);
+        }
         match event {
             AgentEvent::MessageStart {
                 message: Message::Assistant(_),
@@ -266,6 +291,76 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn metrics_accumulator_observes_events_through_print_loop() {
+        // The print loop must feed every event to the metrics
+        // accumulator. (The absent-flag case writes nothing — that is
+        // structurally gated in run_print_mode on `cli.metrics_out`.)
+        let events = vec![
+            AgentEvent::ToolExecStart {
+                call_id: "c1".into(),
+                tool_name: "grep".into(),
+                args: serde_json::Value::Null,
+            },
+            AgentEvent::ToolExecEnd {
+                call_id: "c1".into(),
+                result: anie_protocol::ToolResult {
+                    content: vec![],
+                    details: serde_json::Value::Null,
+                },
+                is_error: false,
+            },
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(AssistantMessage {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    usage: Usage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        ..Usage::default()
+                    },
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    provider: "p".into(),
+                    model: "m".into(),
+                    timestamp: 1,
+                    reasoning_details: None,
+                }),
+            },
+        ];
+        let (tx, mut rx) = mpsc::channel(events.len());
+        for event in events {
+            tx.send(event).await.expect("send");
+        }
+        drop(tx);
+
+        let mut accumulator = crate::run_metrics::RunMetricsAccumulator::new(
+            crate::harness_mode::HarnessMode::default(),
+            "m",
+            "p",
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut a = false;
+        let mut b = false;
+        let mut c = None;
+        process_print_events(
+            &mut rx,
+            &mut stdout,
+            &mut stderr,
+            &mut a,
+            &mut b,
+            &mut c,
+            Some(&mut accumulator),
+        )
+        .await
+        .expect("process");
+
+        let metrics = accumulator.finish();
+        assert_eq!(metrics.tools.calls, 1);
+        assert_eq!(metrics.turns, 1);
+        assert_eq!(metrics.tokens.input_tokens, 5);
+    }
+
     async fn process_events(events: Vec<AgentEvent>) -> (String, String) {
         let (tx, mut rx) = mpsc::channel(events.len().max(1));
         for event in events {
@@ -286,6 +381,7 @@ mod tests {
             &mut streamed_text,
             &mut printed_assistant_output,
             &mut pending_terminal_text,
+            None,
         )
         .await
         .expect("process events");

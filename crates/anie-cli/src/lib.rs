@@ -26,6 +26,7 @@ mod recurse_factory;
 mod recurse_provider;
 mod retry_policy;
 mod rpc;
+mod run_metrics;
 mod runtime;
 mod runtime_state;
 mod user_error;
@@ -101,6 +102,10 @@ pub struct Cli {
     /// Override the working directory.
     #[arg(short = 'C', long)]
     pub cwd: Option<PathBuf>,
+    /// Write a `RunMetrics` JSON artifact for this run to PATH (print
+    /// mode only). The eval harness sets this; see `docs/eval_harness/`.
+    #[arg(long, value_name = "PATH")]
+    pub metrics_out: Option<PathBuf>,
 }
 
 /// Supported top-level subcommands.
