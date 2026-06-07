@@ -859,25 +859,42 @@ impl InteractiveController {
                 }
             }
             UiAction::ListSessions => {
-                let sessions = self.state.session.list()?;
-                self.send_system_message(&format_sessions(&sessions, self.state.session.id()))
-                    .await;
+                // A listing failure (e.g. EACCES on the sessions dir) must
+                // not be fatal — degrade to a message, not a crash.
+                match self.state.session.list() {
+                    Ok(sessions) => {
+                        self.send_system_message(&format_sessions(
+                            &sessions,
+                            self.state.session.id(),
+                        ))
+                        .await;
+                    }
+                    Err(error) => {
+                        self.send_system_message(&format!("Could not list sessions: {error}"))
+                            .await;
+                    }
+                }
             }
             UiAction::OpenSessionPicker => {
                 // List sessions and hand them to the TUI picker. Mapping
                 // SessionInfo -> SessionSummary at this one boundary keeps
-                // anie-protocol free of an anie-session dependency.
-                let sessions = self
-                    .state
-                    .session
-                    .list()?
-                    .into_iter()
-                    .map(session_info_to_summary)
-                    .collect();
-                let _ = self
-                    .event_tx
-                    .send(AgentEvent::SessionList { sessions })
-                    .await;
+                // anie-protocol free of an anie-session dependency. A
+                // listing failure degrades to a message rather than
+                // terminating the controller (a bare `?` here would
+                // classify as Fatal and exit the app).
+                match self.state.session.list() {
+                    Ok(list) => {
+                        let sessions = list.into_iter().map(session_info_to_summary).collect();
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::SessionList { sessions })
+                            .await;
+                    }
+                    Err(error) => {
+                        self.send_system_message(&format!("Could not list sessions: {error}"))
+                            .await;
+                    }
+                }
             }
             UiAction::SwitchSession(session_id) => {
                 if self.current_run.is_some() {
