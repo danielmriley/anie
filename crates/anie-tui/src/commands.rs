@@ -16,6 +16,7 @@
 //! `UiAction`. Mirrors pi-mono's `slash-commands.ts` which also
 //! keeps metadata and dispatch separate.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 /// Where a registered slash command came from.
@@ -86,10 +87,15 @@ pub enum ArgumentSpec {
 }
 
 /// Metadata for one registered slash command.
+///
+/// `name`, `summary`, and `argument_hint` are `Cow<'static, str>` so
+/// builtins stay zero-alloc, const-constructible `Cow::Borrowed`,
+/// while runtime-registered commands (skills, future extensions) can
+/// supply `Cow::Owned` names without a second type.
 #[derive(Debug, Clone)]
 pub struct SlashCommandInfo {
-    pub name: &'static str,
-    pub summary: &'static str,
+    pub name: Cow<'static, str>,
+    pub summary: Cow<'static, str>,
     pub source: SlashCommandSource,
     /// Declarative argument shape. Drives validation and
     /// argument-value completions.
@@ -102,7 +108,7 @@ pub struct SlashCommandInfo {
     /// required ones (`<provider:id>`). `None` means the command
     /// takes no arguments or the hint would be redundant with the
     /// summary.
-    pub argument_hint: Option<&'static str>,
+    pub argument_hint: Option<Cow<'static, str>>,
 }
 
 impl SlashCommandInfo {
@@ -110,8 +116,8 @@ impl SlashCommandInfo {
     #[must_use]
     pub const fn builtin(name: &'static str, summary: &'static str) -> Self {
         Self {
-            name,
-            summary,
+            name: Cow::Borrowed(name),
+            summary: Cow::Borrowed(summary),
             source: SlashCommandSource::Builtin,
             arguments: ArgumentSpec::None,
             argument_hint: None,
@@ -126,12 +132,31 @@ impl SlashCommandInfo {
         arguments: ArgumentSpec,
         argument_hint: Option<&'static str>,
     ) -> Self {
+        // `Option::map` is not const; match instead.
+        let argument_hint = match argument_hint {
+            Some(hint) => Some(Cow::Borrowed(hint)),
+            None => None,
+        };
         Self {
-            name,
-            summary,
+            name: Cow::Borrowed(name),
+            summary: Cow::Borrowed(summary),
             source: SlashCommandSource::Builtin,
             arguments,
             argument_hint,
+        }
+    }
+
+    /// Constructor for a runtime-registered skill command. The command
+    /// is invoked as `/skill:<skill_name>`; the bare `skill_name` is
+    /// preserved on the source for dispatch.
+    #[must_use]
+    pub fn skill(skill_name: String, summary: String) -> Self {
+        Self {
+            name: Cow::Owned(format!("skill:{skill_name}")),
+            summary: Cow::Owned(summary),
+            source: SlashCommandSource::Skill { skill_name },
+            arguments: ArgumentSpec::None,
+            argument_hint: None,
         }
     }
 
@@ -305,6 +330,46 @@ mod tests {
 
         let text = info.validate(Some("wide")).expect_err("not an integer");
         assert!(text.contains("wide") && text.contains("reset"), "{text}");
+    }
+
+    #[test]
+    fn builtin_ctor_yields_borrowed_cow_name() {
+        let info = SlashCommandInfo::builtin("quit", "Quit anie");
+        assert!(matches!(info.name, Cow::Borrowed("quit")));
+        assert!(matches!(info.summary, Cow::Borrowed(_)));
+        assert!(info.argument_hint.is_none());
+
+        let with_args = SlashCommandInfo::builtin_with_args(
+            "model",
+            "Select model",
+            ArgumentSpec::FreeForm { required: false },
+            Some("<id>"),
+        );
+        assert!(matches!(
+            with_args.argument_hint,
+            Some(Cow::Borrowed("<id>"))
+        ));
+    }
+
+    #[test]
+    fn skill_ctor_yields_owned_prefixed_name() {
+        let info = SlashCommandInfo::skill("deploy".to_string(), "Deploy the app".to_string());
+        assert_eq!(info.name, "skill:deploy");
+        assert!(matches!(info.name, Cow::Owned(_)));
+        assert!(
+            matches!(&info.source, SlashCommandSource::Skill { skill_name } if skill_name == "deploy")
+        );
+    }
+
+    #[test]
+    fn slash_command_info_equality_unchanged_after_cow_migration() {
+        // Name comparisons against &str — the behavior every dispatch
+        // and lookup site relies on — must survive the Cow migration.
+        let info = SlashCommandInfo::builtin("help", "Show help");
+        assert!(info.name == "help");
+        assert!(info.name != "halt");
+        let skill = SlashCommandInfo::skill("foo".to_string(), "Foo".to_string());
+        assert!(skill.name == "skill:foo");
     }
 
     #[test]

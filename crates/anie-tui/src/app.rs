@@ -1337,11 +1337,11 @@ impl App {
     /// with custom dispatch, side effects, or argument parsing)
     /// stays in the main match.
     fn dispatch_validated_command(&mut self, info: &SlashCommandInfo, arg: Option<&str>) {
-        if let Some(action) = fixed_noarg_action(info.name) {
+        if let Some(action) = fixed_noarg_action(info.name.as_ref()) {
             let _ = self.action_tx.send(action);
             return;
         }
-        match info.name {
+        match info.name.as_ref() {
             "model" => match arg {
                 None => self.open_model_picker_for_current_provider(None),
                 Some(query) => {

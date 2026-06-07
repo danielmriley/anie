@@ -2686,8 +2686,8 @@ fn extension_registered_command_appears_in_popup() {
 
     let mut catalog = default_test_commands();
     catalog.push(SlashCommandInfo {
-        name: "ext-foo",
-        summary: "Test extension command",
+        name: "ext-foo".into(),
+        summary: "Test extension command".into(),
         source: crate::commands::SlashCommandSource::Extension {
             extension_name: "demo".into(),
         },

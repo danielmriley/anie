@@ -128,7 +128,7 @@ impl CommandRegistry {
             let hint_width = self
                 .all()
                 .iter()
-                .filter_map(|info| info.argument_hint)
+                .filter_map(|info| info.argument_hint.as_deref())
                 .map(|hint| hint.chars().count())
                 .max()
                 .unwrap_or(0);
@@ -137,7 +137,7 @@ impl CommandRegistry {
                 out.push_str(group_heading(key));
                 out.push_str(":\n");
                 for info in entries {
-                    let hint = info.argument_hint.unwrap_or("");
+                    let hint = info.argument_hint.as_deref().unwrap_or("");
                     if hint_width > 0 {
                         out.push_str(&format!(
                             "    /{:<12} {:<hint_width$}  {}\n",
@@ -369,8 +369,8 @@ mod tests {
         let mut registry = CommandRegistry::with_builtins();
         registry
             .register(SlashCommandInfo {
-                name: "mycmd",
-                summary: "Extension command",
+                name: "mycmd".into(),
+                summary: "Extension command".into(),
                 source: SlashCommandSource::Extension {
                     extension_name: "my-extension".to_string(),
                 },
@@ -393,7 +393,7 @@ mod tests {
             info.arguments,
             ArgumentSpec::ContextLengthOverride
         ));
-        assert_eq!(info.argument_hint, Some("[N|reset]"));
+        assert_eq!(info.argument_hint.as_deref(), Some("[N|reset]"));
     }
 
     #[test]
@@ -401,8 +401,8 @@ mod tests {
         let mut registry = CommandRegistry::with_builtins();
         registry
             .register(SlashCommandInfo {
-                name: "ext-a",
-                summary: "",
+                name: "ext-a".into(),
+                summary: "".into(),
                 source: SlashCommandSource::Extension {
                     extension_name: "a".into(),
                 },
@@ -412,8 +412,8 @@ mod tests {
             .expect("register a");
         registry
             .register(SlashCommandInfo {
-                name: "ext-b",
-                summary: "",
+                name: "ext-b".into(),
+                summary: "".into(),
                 source: SlashCommandSource::Extension {
                     extension_name: "b".into(),
                 },
@@ -449,8 +449,8 @@ mod tests {
         let mut registry = CommandRegistry::with_builtins();
         registry
             .register(SlashCommandInfo {
-                name: "ext-help",
-                summary: "Extension help",
+                name: "ext-help".into(),
+                summary: "Extension help".into(),
                 source: SlashCommandSource::Extension {
                     extension_name: "demo".into(),
                 },

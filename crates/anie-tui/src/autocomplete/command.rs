@@ -165,7 +165,7 @@ fn static_argument_suggestions(cmd: &CachedCommand, prefix: &str) -> Vec<Suggest
 
 fn description_for(info: &SlashCommandInfo) -> Option<String> {
     let summary = (!info.summary.is_empty()).then(|| info.summary.to_string());
-    match (info.argument_hint, summary) {
+    match (info.argument_hint.as_deref(), summary) {
         (Some(hint), Some(s)) => Some(format!("{hint} — {s}")),
         (Some(hint), None) => Some(hint.to_string()),
         (None, Some(s)) => Some(s),
