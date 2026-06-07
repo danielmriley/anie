@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{AssistantMessage, Message, StreamDelta, ToolResult, ToolResultMessage};
 
 /// Why a compaction fired. Attached to `CompactionStart` /
@@ -123,4 +125,78 @@ pub enum AgentEvent {
         delay_ms: u64,
         error: String,
     },
+    /// The controller's reply to a session-picker request: the list of
+    /// sessions to display, newest first. Carries a flat protocol-local
+    /// [`SessionSummary`] so `anie-protocol` stays free of an
+    /// `anie-session` dependency.
+    SessionList { sessions: Vec<SessionSummary> },
+}
+
+/// A flattened, display-ready summary of one session, mapped by the
+/// controller from `anie_session::SessionInfo` at the crate boundary.
+///
+/// Deliberately protocol-local (not a re-export of `SessionInfo`):
+/// `SessionInfo` carries a `PathBuf` and `SystemTime` and lives in
+/// `anie-session`, which `anie-protocol` must not depend on. The two
+/// shapes are small and the mapping lives at one controller boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    /// Session identifier (file stem).
+    pub id: String,
+    /// Working directory the session was created in.
+    pub cwd: String,
+    /// Header creation timestamp (RFC 3339 string).
+    pub created: String,
+    /// Last-modified filesystem time as Unix seconds.
+    pub modified_unix: u64,
+    /// Number of stored message entries.
+    pub message_count: u32,
+    /// First user-authored message, when available.
+    pub first_message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary() -> SessionSummary {
+        SessionSummary {
+            id: "sess-123".to_string(),
+            cwd: "/home/u/proj".to_string(),
+            created: "2026-06-06T12:00:00Z".to_string(),
+            modified_unix: 1_749_211_200,
+            message_count: 7,
+            first_message: "fix the bug".to_string(),
+        }
+    }
+
+    #[test]
+    fn session_summary_serializes_flat_fields() {
+        let value = serde_json::to_value(summary()).expect("serialize");
+        let object = value.as_object().expect("object");
+        // Flat scalar fields, no nested PathBuf/SystemTime.
+        assert_eq!(object["id"], "sess-123");
+        assert_eq!(object["cwd"], "/home/u/proj");
+        assert_eq!(object["modified_unix"], 1_749_211_200u64);
+        assert_eq!(object["message_count"], 7);
+        assert_eq!(object["first_message"], "fix the bug");
+        let back: SessionSummary = serde_json::from_value(value).expect("round-trips through JSON");
+        assert_eq!(back, summary());
+    }
+
+    #[test]
+    fn agent_event_session_list_round_trips() {
+        // AgentEvent is an in-process type (Clone + PartialEq, not
+        // serialized as a whole); assert the new variant clones and
+        // compares by value.
+        let event = AgentEvent::SessionList {
+            sessions: vec![summary()],
+        };
+        assert_eq!(event.clone(), event);
+        let AgentEvent::SessionList { sessions } = event else {
+            panic!("expected SessionList");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-123");
+    }
 }

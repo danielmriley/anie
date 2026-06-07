@@ -292,7 +292,10 @@ impl From<AgentEvent> for RpcEvent {
             | AgentEvent::MessageStart { .. }
             | AgentEvent::MessageEnd { .. }
             | AgentEvent::MessageDelta { .. }
-            | AgentEvent::ToolExecUpdate { .. } => Self::System {
+            | AgentEvent::ToolExecUpdate { .. }
+            // SessionList drives the interactive TUI picker only; the
+            // JSONL RPC stream has no picker, so it carries no payload.
+            | AgentEvent::SessionList { .. } => Self::System {
                 text: String::new(),
             },
         }

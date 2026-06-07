@@ -1012,6 +1012,8 @@ impl App {
                 }
             }
             AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
+            // Populated into the session picker in session-ux/3.
+            AgentEvent::SessionList { .. } => {}
         }
         Ok(())
     }
