@@ -33,15 +33,32 @@ const CRITIQUE: &str = "Before continuing: review your todo list against what yo
 pub(crate) struct VerifierPolicy {
     list: Arc<Mutex<TodoList>>,
     fired: AtomicBool,
+    /// Whether the plan trigger is armed: the plan has shown active work
+    /// during *this* run, so a later transition to all-done should fire.
+    /// Starts `false` only when the policy is constructed over a plan
+    /// that is already all-done (a completed plan carried over from a
+    /// previous run on the session-lifetime `TodoList`), so a follow-up
+    /// run doesn't fire at step 0 before doing any work.
+    armed: AtomicBool,
     enabled: bool,
     min_step: u64,
 }
 
 impl VerifierPolicy {
     pub(crate) fn new(list: Arc<Mutex<TodoList>>, enabled: bool, min_step: u64) -> Self {
+        // A non-empty, already-all-done plan at construction means the
+        // plan was completed in a prior run (the list outlives the
+        // per-run policy). Start disarmed so we don't critique work the
+        // model finished last turn; we re-arm once it does work this run.
+        let started_complete = {
+            let guard = list.lock().unwrap_or_else(PoisonError::into_inner);
+            let (_, total) = guard.counts();
+            total > 0 && guard.all_done()
+        };
         Self {
             list,
             fired: AtomicBool::new(false),
+            armed: AtomicBool::new(!started_complete),
             enabled,
             min_step,
         }
@@ -72,7 +89,14 @@ impl VerifierPolicy {
         let guard = self.list.lock().unwrap_or_else(PoisonError::into_inner);
         let (_, total) = guard.counts();
         if total > 0 {
-            guard.all_done()
+            if !guard.all_done() {
+                // Active work this run — arm so a later all-done fires.
+                self.armed.store(true, Ordering::Release);
+                return false;
+            }
+            // All done: fire only if the plan actually progressed this
+            // run, not if it was already complete at run start.
+            self.armed.load(Ordering::Acquire)
         } else {
             step_index >= self.min_step
         }
@@ -176,15 +200,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_fires_once_when_all_todos_done() {
+    async fn verifier_fires_once_when_plan_becomes_all_done_during_run() {
+        // The plan starts with active work (so the trigger is armed),
+        // then the model marks everything done this run.
         let list = list_with(vec![
+            item("a", TodoStatus::Pending),
+            item("b", TodoStatus::InProgress),
+        ]);
+        let policy = VerifierPolicy::new(Arc::clone(&list), true, DEFAULT_MIN_STEP);
+
+        // Not done yet — no fire (and this arms the trigger).
+        assert_eq!(
+            policy.before_model(request(0)).await,
+            BeforeModelResponse::Continue
+        );
+
+        // Model completes the plan this run.
+        list.lock().unwrap().replace(vec![
             item("a", TodoStatus::Done),
             item("b", TodoStatus::Done),
         ]);
-        let policy = VerifierPolicy::new(list, true, DEFAULT_MIN_STEP);
 
-        // First call (all done) fires with an appended critique.
-        match policy.before_model(request(0)).await {
+        // Now it fires once with an appended critique.
+        match policy.before_model(request(1)).await {
             BeforeModelResponse::AppendMessages(messages) => {
                 assert_eq!(messages.len(), 1);
                 assert!(matches!(&messages[0], Message::User(_)));
@@ -192,6 +230,26 @@ mod tests {
             other => panic!("expected AppendMessages, got {other:?}"),
         }
         // Second call is a no-op (one-shot latch).
+        assert_eq!(
+            policy.before_model(request(2)).await,
+            BeforeModelResponse::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier_does_not_fire_on_carried_over_all_done_plan() {
+        // A follow-up run: the policy is reconstructed, but the
+        // session-lifetime plan is already all-done from the previous
+        // run. It must NOT critique at step 0 before any work this run.
+        let list = list_with(vec![
+            item("a", TodoStatus::Done),
+            item("b", TodoStatus::Done),
+        ]);
+        let policy = VerifierPolicy::new(list, true, DEFAULT_MIN_STEP);
+        assert_eq!(
+            policy.before_model(request(0)).await,
+            BeforeModelResponse::Continue
+        );
         assert_eq!(
             policy.before_model(request(1)).await,
             BeforeModelResponse::Continue
