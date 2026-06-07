@@ -15,10 +15,24 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use anie_protocol::Message;
+use anie_protocol::{ContentBlock, Message};
 use anie_session::{
-    RestorePlan, SessionContext, SessionInfo, SessionManager, WorkspaceCheckpointStore,
+    RestorePlan, SessionContext, SessionEntry, SessionInfo, SessionManager,
+    WorkspaceCheckpointStore,
 };
+
+/// A selectable rewind anchor: a captured user turn or a named
+/// `/checkpoint`. Carries the session entry id to rewind to plus a
+/// short human label for the listing.
+pub(crate) struct RewindPoint {
+    /// Session entry id to pass to [`SessionHandle::rewind_to`].
+    pub entry_id: String,
+    /// User-supplied label, set by `/checkpoint <name>`.
+    pub label: Option<String>,
+    /// First line of the user message at this entry (empty for
+    /// non-message anchors).
+    pub summary: String,
+}
 
 /// Owns the currently-active session plus its directory context.
 pub(crate) struct SessionHandle {
@@ -211,7 +225,6 @@ impl SessionHandle {
     /// files the agent has written/edited on the active branch. Called
     /// at each user-turn boundary (and by `/checkpoint` with a label).
     /// Content addressing makes an unchanged file nearly free.
-    #[allow(dead_code)] // wired into the controller in session-ux/6 (/rewind, /checkpoint)
     pub(crate) fn capture_checkpoint(
         &mut self,
         entry_id: &str,
@@ -230,7 +243,6 @@ impl SessionHandle {
     /// [`SessionManager::fork`]. The working tree is restored first, so
     /// a drift refusal leaves the conversation untouched. Returns the
     /// [`RestorePlan`] describing what changed on disk.
-    #[allow(dead_code)] // wired into the controller in session-ux/6 (/rewind, /checkpoint)
     pub(crate) fn rewind_to(&mut self, entry_id: &str) -> Result<RestorePlan> {
         let store = self.open_checkpoint_store()?;
         // Restore (and drift-check) before mutating session state, so a
@@ -238,6 +250,55 @@ impl SessionHandle {
         let plan = store.restore(entry_id)?;
         self.session.fork(entry_id)?;
         Ok(plan)
+    }
+
+    /// Record a checkpoint at the current leaf with an optional label
+    /// (the `/checkpoint [name]` anchor). Returns the entry id anchored,
+    /// or `None` when the session has no leaf yet.
+    pub(crate) fn capture_named_checkpoint(
+        &mut self,
+        label: Option<String>,
+    ) -> Result<Option<String>> {
+        let Some(leaf) = self.session.leaf_id().map(str::to_string) else {
+            return Ok(None);
+        };
+        self.capture_checkpoint(&leaf, label)?;
+        Ok(Some(leaf))
+    }
+
+    /// The recorded rewind anchors, oldest first, each annotated with
+    /// the first line of its user turn for display.
+    pub(crate) fn rewind_points(&self) -> Result<Vec<RewindPoint>> {
+        let store = self.open_checkpoint_store()?;
+        let points = store
+            .entries()
+            .iter()
+            .map(|entry| RewindPoint {
+                entry_id: entry.entry_id.clone(),
+                label: entry.label.clone(),
+                summary: self.entry_summary(&entry.entry_id),
+            })
+            .collect();
+        Ok(points)
+    }
+
+    /// First line of the user message stored at `entry_id`, or empty
+    /// for anchors that don't point at a user turn.
+    fn entry_summary(&self, entry_id: &str) -> String {
+        let Some(SessionEntry::Message {
+            message: Message::User(user),
+            ..
+        }) = self.session.get_entry(entry_id)
+        else {
+            return String::new();
+        };
+        user.content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.lines().next().unwrap_or("").to_string()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }
 

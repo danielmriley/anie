@@ -2953,3 +2953,217 @@ async fn show_state_action_emits_summary_as_system_message() {
     assert!(msg.contains("Workspace cap:    32 768"), "{msg}");
     assert!(msg.contains("Files"), "{msg}");
 }
+
+/// Build an assistant turn whose single tool call touches `path` via
+/// `tool` (e.g. "write"/"edit") — enough to register the path in the
+/// session's tracked-modified set for checkpoint capture.
+fn assistant_tool_call(tool: &str, path: &str) -> Message {
+    Message::Assistant(anie_protocol::AssistantMessage {
+        content: vec![ContentBlock::ToolCall(anie_protocol::ToolCall {
+            id: format!("call-{tool}-{path}"),
+            name: tool.to_string(),
+            arguments: serde_json::json!({ "path": path }),
+        })],
+        usage: anie_protocol::Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        provider: "openai".into(),
+        model: "gpt-4o".into(),
+        timestamp: 1,
+        reasoning_details: None,
+    })
+}
+
+#[tokio::test]
+async fn checkpoint_command_records_named_anchor() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    // A leaf must exist for /checkpoint to anchor to.
+    controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&user_message("start"))
+        .expect("append user turn");
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::Checkpoint(Some("before-refactor".into())))
+            .await
+            .is_ok()
+    );
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("before-refactor"), "{msg}");
+    let points = controller
+        .state
+        .session
+        .rewind_points()
+        .expect("rewind points");
+    assert!(
+        points
+            .iter()
+            .any(|point| point.label.as_deref() == Some("before-refactor")),
+        "named anchor must be recorded in the store"
+    );
+}
+
+#[tokio::test]
+async fn rewind_command_lists_user_turns_and_named_checkpoints() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+
+    let turn = controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&user_message("do a thing"))
+        .expect("append turn");
+    controller
+        .state
+        .session
+        .capture_checkpoint(&turn, None)
+        .expect("capture turn checkpoint");
+
+    controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&user_message("second"))
+        .expect("append second turn");
+    controller
+        .state
+        .session
+        .capture_named_checkpoint(Some("anchor".into()))
+        .expect("capture named");
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::Rewind(None))
+            .await
+            .is_ok()
+    );
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("do a thing"), "turn summary listed: {msg}");
+    assert!(msg.contains("anchor"), "named anchor listed: {msg}");
+}
+
+#[tokio::test]
+async fn rewind_refused_during_active_run() {
+    use anie_agent::AgentRunResult;
+    use tokio_util::sync::CancellationToken;
+
+    let (mut controller, mut event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+
+    let entry = controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&user_message("turn"))
+        .expect("append turn");
+    controller
+        .state
+        .session
+        .capture_checkpoint(&entry, None)
+        .expect("capture");
+
+    let handle = tokio::spawn(async {
+        AgentRunResult {
+            generated_messages: Vec::new(),
+            final_context: Vec::new(),
+            terminal_error: None,
+            terminal_stop: None,
+        }
+    });
+    controller.current_run = Some(CurrentRun {
+        handle,
+        cancel: CancellationToken::new(),
+        already_compacted: false,
+        retry_attempt: 0,
+    });
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::Rewind(Some(entry)))
+            .await
+            .is_ok()
+    );
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("Cannot rewind while a run is active"), "{msg}");
+}
+
+#[tokio::test]
+async fn rewind_selection_restores_tree_and_emits_transcript_replace() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 32);
+    let cwd = controller.state.session.cwd().to_path_buf();
+    // `build_dispatch_controller` drops its TempDir guard on return; the
+    // checkpoint store recreates its own sidecar dirs, but the workspace
+    // cwd must be re-established before we seed a file under it.
+    fs::create_dir_all(&cwd).expect("recreate cwd");
+    let file = cwd.join("code.rs");
+    fs::write(&file, b"v1").expect("seed file");
+
+    // Turn 1: user prompt + an assistant edit of code.rs; checkpoint
+    // the pre-edit state keyed by the user entry.
+    let turn1 = controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&user_message("edit it"))
+        .expect("append turn1");
+    controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&assistant_tool_call("write", "code.rs"))
+        .expect("append assistant1");
+    controller
+        .state
+        .session
+        .capture_checkpoint(&turn1, None)
+        .expect("capture turn1");
+
+    // The agent's change lands, and a later turn checkpoints it so the
+    // most-recent captured state matches disk (no drift on rewind).
+    fs::write(&file, b"v2").expect("agent edit");
+    let turn2 = controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&user_message("again"))
+        .expect("append turn2");
+    controller
+        .state
+        .session
+        .inner_mut()
+        .append_message(&assistant_tool_call("edit", "code.rs"))
+        .expect("append assistant2");
+    controller
+        .state
+        .session
+        .capture_checkpoint(&turn2, None)
+        .expect("capture turn2");
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::Rewind(Some(turn1.clone())))
+            .await
+            .is_ok()
+    );
+
+    assert_eq!(fs::read(&file).expect("read file"), b"v1");
+    assert_eq!(
+        controller.state.session.inner().leaf_id(),
+        Some(turn1.as_str()),
+        "conversation leaf re-pointed to the rewound turn"
+    );
+
+    let mut saw_replace = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if matches!(event, AgentEvent::TranscriptReplace { .. }) {
+            saw_replace = true;
+        }
+    }
+    assert!(saw_replace, "rewind must emit a TranscriptReplace");
+}

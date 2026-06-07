@@ -287,6 +287,13 @@ pub enum UiAction {
         provider: Option<String>,
         model: Option<String>,
     },
+    /// Record a working-tree checkpoint at the current turn, with an
+    /// optional user label (`/checkpoint [name]`).
+    Checkpoint(Option<String>),
+    /// Rewind: with no argument, list the captured rewind anchors;
+    /// with an entry id, restore both the working tree and the
+    /// conversation to that point (`/rewind [id]`).
+    Rewind(Option<String>),
 }
 
 /// Status-bar display state.
@@ -1376,6 +1383,16 @@ impl App {
                         .send(UiAction::SwitchSession(session_id.to_string()));
                 }
             },
+            "checkpoint" => {
+                let _ = self
+                    .action_tx
+                    .send(UiAction::Checkpoint(arg.map(str::to_string)));
+            }
+            "rewind" => {
+                let _ = self
+                    .action_tx
+                    .send(UiAction::Rewind(arg.map(str::to_string)));
+            }
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
             "copy" => self.copy_last_assistant_to_clipboard(),

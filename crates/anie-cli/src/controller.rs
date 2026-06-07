@@ -36,7 +36,7 @@ use crate::{
     Cli,
     compaction::CompactionStrategy,
     model_catalog::{resolve_requested_model, upsert_model},
-    runtime::{ConfigState, SessionHandle, SystemPromptCache},
+    runtime::{ConfigState, RewindPoint, SessionHandle, SystemPromptCache},
     user_error::{HandleError, UserCommandError, render_user_facing_provider_error},
 };
 
@@ -885,6 +885,62 @@ impl InteractiveController {
                         .await;
                 }
             }
+            UiAction::Checkpoint(label) => {
+                match self.state.session.capture_named_checkpoint(label.clone())? {
+                    Some(_) => {
+                        let what = label
+                            .map(|name| format!("checkpoint '{name}'"))
+                            .unwrap_or_else(|| "checkpoint".to_string());
+                        self.send_system_message(&format!(
+                            "Recorded {what}. Use /rewind to restore it later."
+                        ))
+                        .await;
+                    }
+                    None => {
+                        self.send_system_message("Nothing to checkpoint yet.").await;
+                    }
+                }
+            }
+            UiAction::Rewind(target) => match target {
+                None => {
+                    let points = self.state.session.rewind_points()?;
+                    self.send_system_message(&format_rewind_points(&points))
+                        .await;
+                }
+                Some(entry_id) => {
+                    if self.current_run.is_some() {
+                        self.send_system_message("Cannot rewind while a run is active.")
+                            .await;
+                    } else {
+                        match self.state.session.rewind_to(&entry_id) {
+                            Ok(plan) => {
+                                self.cancel_pending_retry_for_run_affecting_change().await?;
+                                let transcript = self
+                                    .state
+                                    .session_context()
+                                    .messages
+                                    .into_iter()
+                                    .map(|message| message.message)
+                                    .collect::<Vec<_>>();
+                                let _ = self
+                                    .event_tx
+                                    .send(AgentEvent::TranscriptReplace {
+                                        messages: transcript,
+                                    })
+                                    .await;
+                                anie_agent::send_event(&self.event_tx, self.state.status_event())
+                                    .await;
+                                self.send_system_message(&format_rewind_outcome(&entry_id, &plan))
+                                    .await;
+                            }
+                            Err(error) => {
+                                self.send_system_message(&format!("Rewind failed: {error}"))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            },
             UiAction::ShowTools => {
                 let tools = self.state.tool_registry.definitions();
                 let body = if tools.is_empty() {
@@ -1069,6 +1125,17 @@ impl InteractiveController {
             .session
             .inner_mut()
             .append_message(&prompt_message)?;
+        // Capture a working-tree checkpoint at the user-turn boundary,
+        // keyed by this prompt's entry id, so `/rewind` can restore the
+        // tree to the state it had when the turn began. Best-effort:
+        // a checkpoint failure must never block the user's run.
+        if let Err(error) = self
+            .state
+            .session
+            .capture_checkpoint(&prompt_entry_id, None)
+        {
+            warn!(%error, "failed to capture rewind checkpoint at turn boundary");
+        }
         if self.state.config.anie_config().compaction.enabled
             && self.state.maybe_auto_compact(&self.event_tx).await?
         {
@@ -2450,6 +2517,44 @@ fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_rewind_points(points: &[RewindPoint]) -> String {
+    if points.is_empty() {
+        return "No rewind points yet. Checkpoints are recorded at each \
+                turn and via /checkpoint."
+            .into();
+    }
+    let mut out =
+        String::from("Rewind points (oldest first). Use /rewind <entry-id> to restore:\n");
+    let rows = points
+        .iter()
+        .map(|point| {
+            let label = point
+                .label
+                .as_deref()
+                .map(|name| format!(" [{name}]"))
+                .unwrap_or_default();
+            format!(
+                "  {}{}  {}",
+                point.entry_id,
+                label,
+                truncate_text(&point.summary, 60),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push_str(&rows);
+    out
+}
+
+fn format_rewind_outcome(entry_id: &str, plan: &anie_session::RestorePlan) -> String {
+    let restored = plan.written.len();
+    let removed = plan.deleted.len();
+    format!(
+        "Rewound to {entry_id}: {restored} file(s) restored, {removed} removed. \
+         Conversation and working tree are back to that point."
+    )
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {

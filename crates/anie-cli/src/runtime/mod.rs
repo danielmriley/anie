@@ -12,4 +12,4 @@ pub(crate) mod session_handle;
 
 pub(crate) use config_state::ConfigState;
 pub(crate) use prompt_cache::SystemPromptCache;
-pub(crate) use session_handle::SessionHandle;
+pub(crate) use session_handle::{RewindPoint, SessionHandle};
