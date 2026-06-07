@@ -438,11 +438,15 @@ impl ChainedBeforeModelPolicy {
 #[async_trait::async_trait]
 impl BeforeModelPolicy for ChainedBeforeModelPolicy {
     async fn before_model(&self, request: BeforeModelRequest<'_>) -> BeforeModelResponse {
-        let mut working = request.context.to_vec();
-        let mut changed = false;
+        // Defer cloning the context until a policy actually mutates it.
+        // An all-`Continue` chain then allocates nothing — matching the
+        // noop path's *cost*, not just its output. `None` means "no
+        // mutation yet; children read the original borrowed context."
+        let mut working: Option<Vec<Message>> = None;
         for policy in &self.policies {
+            let context: &[Message] = working.as_deref().unwrap_or(request.context);
             let child_request = BeforeModelRequest {
-                context: &working,
+                context,
                 generated_messages: request.generated_messages,
                 model: request.model,
                 step_index: request.step_index,
@@ -451,12 +455,12 @@ impl BeforeModelPolicy for ChainedBeforeModelPolicy {
             match policy.before_model(child_request).await {
                 BeforeModelResponse::Continue => {}
                 BeforeModelResponse::AppendMessages(messages) => {
-                    working.extend(messages);
-                    changed = true;
+                    working
+                        .get_or_insert_with(|| request.context.to_vec())
+                        .extend(messages);
                 }
                 BeforeModelResponse::ReplaceMessages(messages) => {
-                    working = messages;
-                    changed = true;
+                    working = Some(messages);
                 }
                 // A stop short-circuits the chain: no later policy runs,
                 // and the loop halts before the next model request.
@@ -465,10 +469,9 @@ impl BeforeModelPolicy for ChainedBeforeModelPolicy {
                 }
             }
         }
-        if changed {
-            BeforeModelResponse::ReplaceMessages(working)
-        } else {
-            BeforeModelResponse::Continue
+        match working {
+            Some(messages) => BeforeModelResponse::ReplaceMessages(messages),
+            None => BeforeModelResponse::Continue,
         }
     }
 }
