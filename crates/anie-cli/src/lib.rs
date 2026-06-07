@@ -29,6 +29,7 @@ mod rpc;
 mod run_metrics;
 mod runtime;
 mod runtime_state;
+mod skills;
 mod user_error;
 mod verifier;
 
