@@ -11,6 +11,7 @@ members = [
     "crates/anie-config",
     "crates/anie-auth",
     "crates/anie-mcp",
+    "crates/anie-evals",
     "crates/anie-tui",
     "crates/anie-cli",
     "crates/anie-integration-tests",

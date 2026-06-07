@@ -160,6 +160,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "anie-evals"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "anie-integration-tests"
 version = "0.1.0"
 dependencies = [
