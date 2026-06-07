@@ -61,9 +61,11 @@ pub enum SandboxError {
 }
 
 /// Install confinement into `cmd` so it applies to the spawned child
-/// only. A no-op (`Ok`) when `spec` is `None`; on a platform/build
-/// without backend support, returns `Unsupported` for a `Some(spec)`
-/// (fail closed) rather than silently running unconfined.
+/// only. A no-op (`Ok`) when `spec` is `None`. On a platform/build
+/// without backend support, the documented degrade-vs-fail knob applies:
+/// `require_kernel_support == true` (the default) returns `Unsupported`
+/// (fail closed), while `false` returns `Ok` and runs the child
+/// unconfined.
 ///
 /// # Errors
 /// Returns [`SandboxError`] when the spec cannot be applied.

@@ -82,6 +82,8 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> std::io::Result<
 /// Killing the group — not just the child — takes down grandchildren so
 /// the inherited stdout/stderr pipes close and the drain threads finish.
 fn kill_process_tree(pid: u32, child: &mut std::process::Child) {
+    #[cfg(not(unix))]
+    let _ = pid; // only used by the group-kill path on unix
     #[cfg(unix)]
     {
         // The child was spawned as its own group leader (pgid == pid),

@@ -210,8 +210,10 @@ impl WorkspaceCheckpointStore {
         else {
             return Ok(());
         };
-        // A synthetic, unique id (real session entry ids are UUIDs, so no
-        // collision); the `len()` suffix keeps repeated rewinds distinct.
+        // A synthetic, unique id. Real session entry ids are 8-char hex
+        // (`0-9a-f`), which can never contain the `#restored` infix, so a
+        // capture/restore lookup never matches a baseline; the `len()`
+        // suffix keeps repeated rewinds distinct.
         let id = format!("{entry_id}#restored{}", self.manifest.entries.len());
         self.manifest.entries.push(ManifestEntry {
             entry_id: id,
