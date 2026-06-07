@@ -5,11 +5,98 @@
 //! exercises the real CLI surface — `--harness-mode`, `--metrics-out` —
 //! exactly as a rival eval treats an agent.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::scenario::{Fixture, Scenario, all_passed, evaluate_checks};
 use crate::{EvalError, RunMetricsView, RunResult};
+
+/// Default wall-clock cap for a single scenario run. A misbehaving
+/// harness mode (network hang, tool loop, deadlock) is killed instead of
+/// wedging the whole eval run.
+pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Spawn `command`, drain stdout/stderr on reader threads (so a chatty
+/// child can't deadlock on a full pipe), and wait up to `timeout`.
+/// Returns `Ok(None)` after killing+reaping the child on timeout.
+fn run_with_timeout(mut command: Command, timeout: Duration) -> std::io::Result<Option<Output>> {
+    // Put the child in its own process group so a timeout can SIGKILL the
+    // whole tree (the child *and* any grandchildren it spawned). Killing
+    // only the immediate child orphans grandchildren that keep the stdout
+    // pipe open, which would block the drain threads indefinitely.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+
+    // Drain pipes concurrently; closing on kill lets these threads finish.
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            kill_process_tree(pid, &mut child);
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    Ok(Some(Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+/// SIGKILL the child's whole process group (Unix), then reap the child.
+/// Killing the group — not just the child — takes down grandchildren so
+/// the inherited stdout/stderr pipes close and the drain threads finish.
+fn kill_process_tree(pid: u32, child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child was spawned as its own group leader (pgid == pid),
+        // so a negative pid signals the entire group.
+        if let Ok(pgid) = i32::try_from(pid) {
+            // Safety: kill(2) with a valid pgid and signal; no memory
+            // is touched.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// Build the `anie` argv for one scenario run under `mode`. Pure (no
 /// spawn) so it is unit-tested directly.
@@ -136,17 +223,22 @@ pub fn run_scenario(
     scenario: &Scenario,
     mode: &str,
     model: Option<&str>,
+    timeout: Duration,
 ) -> Result<RunResult, EvalError> {
     let sandbox = setup_fixture(scenario.fixture.as_ref(), repo_root)?;
     let metrics_path = sandbox.cwd.join(".anie-metrics.json");
     let argv = build_anie_argv(mode, model, &metrics_path, &sandbox.cwd, &scenario.prompt);
 
-    let output = Command::new(anie_bin)
-        .args(&argv)
-        .output()
+    let mut command = Command::new(anie_bin);
+    command.args(&argv);
+    let output = run_with_timeout(command, timeout)
         .map_err(|source| EvalError::Spawn {
             command: anie_bin.display().to_string(),
             source,
+        })?
+        .ok_or_else(|| EvalError::Timeout {
+            scenario: scenario.name.clone(),
+            secs: timeout.as_secs(),
         })?;
     if !output.status.success() {
         return Err(EvalError::NonZeroExit {

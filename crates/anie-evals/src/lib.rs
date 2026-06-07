@@ -12,7 +12,9 @@ mod runner;
 mod scenario;
 
 pub use report::{to_json, to_markdown};
-pub use runner::{FixtureSandbox, build_anie_argv, run_scenario, setup_fixture};
+pub use runner::{
+    DEFAULT_RUN_TIMEOUT, FixtureSandbox, build_anie_argv, run_scenario, setup_fixture,
+};
 pub use scenario::{
     CheckOutcome, CheckResult, Expect, Fixture, Scenario, all_passed, evaluate_checks,
     load_scenario, parse_scenario, scenario_sha256,
@@ -41,6 +43,8 @@ pub enum EvalError {
     },
     #[error("anie exited with status {status} for scenario `{scenario}`")]
     NonZeroExit { scenario: String, status: String },
+    #[error("anie did not finish scenario `{scenario}` within {secs}s; killed")]
+    Timeout { scenario: String, secs: u64 },
     #[error("metrics file `{path}` was not produced")]
     MissingMetrics { path: String },
     #[error("could not parse metrics `{path}`: {message}")]

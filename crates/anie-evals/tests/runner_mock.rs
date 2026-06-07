@@ -56,7 +56,15 @@ fn mock_run_produces_pass_result_and_populated_metrics() {
     let fake = write_fake_anie(dir.path());
     let scenario = parse_scenario(PASSING_SCENARIO).expect("scenario");
 
-    let result = run_scenario(&fake, dir.path(), &scenario, "current", Some("mock")).expect("run");
+    let result = run_scenario(
+        &fake,
+        dir.path(),
+        &scenario,
+        "current",
+        Some("mock"),
+        anie_evals::DEFAULT_RUN_TIMEOUT,
+    )
+    .expect("run");
     assert!(result.pass, "checks: {:?}", result.checks);
     assert_eq!(result.metrics["tools"]["calls"], 2);
     assert_eq!(result.metrics["tokens"]["total_tokens"], 40000);
@@ -70,7 +78,17 @@ fn baseline_current_rlm_compared_on_one_scenario_yields_three_results() {
 
     let results: Vec<_> = ["baseline", "current", "rlm"]
         .iter()
-        .map(|mode| run_scenario(&fake, dir.path(), &scenario, mode, Some("mock")).expect("run"))
+        .map(|mode| {
+            run_scenario(
+                &fake,
+                dir.path(),
+                &scenario,
+                mode,
+                Some("mock"),
+                anie_evals::DEFAULT_RUN_TIMEOUT,
+            )
+            .expect("run")
+        })
         .collect();
     assert_eq!(results.len(), 3);
     assert!(results.iter().all(|r| r.pass));
@@ -93,7 +111,15 @@ fn failing_assertion_marks_run_failed_with_reason() {
     )
     .expect("scenario");
 
-    let result = run_scenario(&fake, dir.path(), &scenario, "current", Some("mock")).expect("run");
+    let result = run_scenario(
+        &fake,
+        dir.path(),
+        &scenario,
+        "current",
+        Some("mock"),
+        anie_evals::DEFAULT_RUN_TIMEOUT,
+    )
+    .expect("run");
     assert!(!result.pass);
     assert!(
         result
@@ -103,4 +129,41 @@ fn failing_assertion_marks_run_failed_with_reason() {
         "checks: {:?}",
         result.checks
     );
+}
+
+/// A fake anie that hangs forever — the runner must kill it on timeout
+/// rather than blocking the whole eval run.
+fn write_hanging_anie(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("hang-anie.sh");
+    std::fs::write(&path, "#!/usr/bin/env bash\nsleep 600\n").expect("write hang");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+    }
+    path
+}
+
+#[test]
+fn hung_anie_is_killed_and_reported_as_timeout() {
+    use anie_evals::EvalError;
+    let dir = tempfile::tempdir().expect("dir");
+    let fake = write_hanging_anie(dir.path());
+    let scenario = parse_scenario(PASSING_SCENARIO).expect("scenario");
+
+    let start = std::time::Instant::now();
+    let err = run_scenario(
+        &fake,
+        dir.path(),
+        &scenario,
+        "current",
+        Some("mock"),
+        std::time::Duration::from_millis(300),
+    )
+    .expect_err("a hung child must time out");
+    assert!(matches!(err, EvalError::Timeout { .. }), "{err:?}");
+    // The killed child returns promptly, well under the 600s it would sleep.
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
 }

@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use anie_evals::{
-    EVAL_REPORT_SCHEMA_VERSION, EvalReport, ScenarioReport, load_scenario, run_scenario,
-    scenario_sha256, to_json, to_markdown,
+    DEFAULT_RUN_TIMEOUT, EVAL_REPORT_SCHEMA_VERSION, EvalReport, ScenarioReport, load_scenario,
+    run_scenario, scenario_sha256, to_json, to_markdown,
 };
 
 #[derive(Debug, Parser)]
@@ -59,6 +59,7 @@ fn main() -> Result<()> {
                 &scenario,
                 mode,
                 args.model.as_deref(),
+                DEFAULT_RUN_TIMEOUT,
             ) {
                 Ok(result) => {
                     eprintln!("  {}: {}", mode, if result.pass { "PASS" } else { "FAIL" });
