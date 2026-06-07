@@ -3365,3 +3365,30 @@ async fn open_session_picker_action_emits_session_list() {
         "seeded session must appear in the summary list"
     );
 }
+
+#[tokio::test]
+async fn switching_to_the_current_session_is_a_no_op_not_an_error() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    let current = controller.state.session.id().to_string();
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::SwitchSession(current.clone()))
+            .await
+            .is_ok()
+    );
+
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("Already on session") && msg.contains(&current),
+        "{msg}"
+    );
+    // No TranscriptReplace should have been emitted for a no-op switch.
+    let mut saw_replace = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if matches!(event, AgentEvent::TranscriptReplace { .. }) {
+            saw_replace = true;
+        }
+    }
+    assert!(!saw_replace, "no-op switch must not replace the transcript");
+}

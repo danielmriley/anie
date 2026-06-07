@@ -883,6 +883,15 @@ impl InteractiveController {
                 if self.current_run.is_some() {
                     self.send_system_message("Cannot switch sessions while a run is active.")
                         .await;
+                } else if session_id == self.state.session.id() {
+                    // Already on this session. Re-opening it would acquire
+                    // a second exclusive lock on the file we already hold,
+                    // failing with AlreadyOpen (surfaced as a misleading
+                    // "unknown session"). The picker marks the current
+                    // session with a ✓ and lets it be selected, so this
+                    // is easy to hit.
+                    self.send_system_message(&format!("Already on session {session_id}."))
+                        .await;
                 } else {
                     self.state.switch_session(&session_id).await?;
                     self.cancel_pending_retry_for_run_affecting_change().await?;
