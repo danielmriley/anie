@@ -986,14 +986,23 @@ impl SessionManager {
         for entry in fs::read_dir(sessions_dir)
             .with_context(|| format!("failed to read {}", sessions_dir.display()))?
         {
-            let entry = entry?;
+            // Listing is best-effort: a single unreadable / removed /
+            // locked file (or a parse error below) skips that one entry
+            // rather than failing the whole listing. Callers like the
+            // session picker would otherwise propagate one bad file as a
+            // fatal error and exit the app.
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
             }
 
-            let content = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
+            let Ok(content) = fs::read_to_string(&path) else {
+                warn!(path = %path.display(), "skipping unreadable session file");
+                continue;
+            };
             let mut lines = content.lines();
             let Some(header_line) = lines.next() else {
                 continue;
@@ -1022,14 +1031,15 @@ impl SessionManager {
                 }
             }
 
-            let metadata = fs::metadata(&path)
-                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            let modified = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
             sessions.push(SessionInfo {
                 path,
                 id: header.id,
                 cwd: header.cwd,
                 created: header.timestamp,
-                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                modified,
                 message_count,
                 first_message,
             });
@@ -2183,6 +2193,26 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].first_message, "beta");
         assert_eq!(sessions[1].first_message, "alpha");
+    }
+
+    #[test]
+    fn list_sessions_skips_unreadable_entries_without_failing() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+
+        let mut good = SessionManager::new_session(tempdir.path(), &cwd).expect("good session");
+        good.append_message(&user_message("readable", 1))
+            .expect("append");
+
+        // A directory named like a session file: `read_to_string` errors
+        // on it. A single bad entry must not abort the whole listing
+        // (otherwise the picker would `?`-propagate it and exit the app).
+        fs::create_dir(tempdir.path().join("corrupt.jsonl")).expect("dir shaped like a session");
+
+        let sessions = SessionManager::list_sessions(tempdir.path()).expect("list is best-effort");
+        assert_eq!(sessions.len(), 1, "the good session still lists");
+        assert_eq!(sessions[0].first_message, "readable");
     }
 
     #[test]
