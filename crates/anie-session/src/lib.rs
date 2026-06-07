@@ -345,6 +345,16 @@ impl CompactionDetails {
 /// not picked up — correctness beats breadth here.
 #[must_use]
 pub fn extract_compaction_details(messages: &[Message]) -> CompactionDetails {
+    extract_compaction_details_from(messages.iter())
+}
+
+/// Borrowing core of [`extract_compaction_details`]: scans message
+/// references without requiring an owned slice. Lets callers that walk
+/// session entries (e.g. the rewind checkpoint store) avoid cloning the
+/// whole branch just to read tool-call paths.
+fn extract_compaction_details_from<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+) -> CompactionDetails {
     let mut read_files: Vec<String> = Vec::new();
     let mut modified_files: Vec<String> = Vec::new();
     for message in messages {
@@ -672,11 +682,7 @@ impl SessionManager {
     /// Read / modified file operations over the entire active branch.
     #[must_use]
     pub fn branch_compaction_details(&self) -> CompactionDetails {
-        let Some(leaf_id) = &self.leaf_id else {
-            return CompactionDetails::default();
-        };
-        let messages = self.branch_messages(leaf_id, None);
-        extract_compaction_details(&messages)
+        self.branch_details(None)
     }
 
     /// File operations of the descendants strictly after `entry_id` on
@@ -684,32 +690,31 @@ impl SessionManager {
     /// Returns empty details when `entry_id` is not on the branch.
     #[must_use]
     pub fn compaction_details_after(&self, entry_id: &str) -> CompactionDetails {
+        self.branch_details(Some(entry_id))
+    }
+
+    /// Compaction details over the branch ending at the active leaf,
+    /// optionally restricted to entries strictly after `after` (in
+    /// root→leaf order). Scans entry *references* — no per-turn clone of
+    /// the branch payload (which can be large: tool results, file
+    /// contents, web fetches).
+    fn branch_details(&self, after: Option<&str>) -> CompactionDetails {
         let Some(leaf_id) = &self.leaf_id else {
             return CompactionDetails::default();
         };
-        let messages = self.branch_messages(leaf_id, Some(entry_id));
-        extract_compaction_details(&messages)
-    }
-
-    /// Collect the `Message` payloads on the branch ending at `leaf_id`.
-    /// When `after` is `Some`, only messages strictly after that entry
-    /// (in root→leaf order) are returned.
-    fn branch_messages(&self, leaf_id: &str, after: Option<&str>) -> Vec<Message> {
         let branch = self.get_branch(leaf_id);
         let start = match after {
             Some(entry_id) => match branch.iter().position(|e| e.base().id == entry_id) {
                 Some(pos) => pos + 1,
-                None => return Vec::new(),
+                None => return CompactionDetails::default(),
             },
             None => 0,
         };
-        branch[start..]
-            .iter()
-            .filter_map(|entry| match entry {
-                SessionEntry::Message { message, .. } => Some(message.clone()),
-                _ => None,
-            })
-            .collect()
+        let messages = branch[start..].iter().filter_map(|entry| match entry {
+            SessionEntry::Message { message, .. } => Some(message),
+            _ => None,
+        });
+        extract_compaction_details_from(messages)
     }
 
     /// Current session-file schema version.

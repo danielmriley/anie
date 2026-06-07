@@ -189,9 +189,11 @@ impl WorkspaceCheckpointStore {
     /// Restore the working tree to the capture keyed by `entry_id`:
     /// rewrite each tracked path to its recorded blob, or delete it if
     /// it was absent. Refuses with [`CheckpointError::WorkingTreeDrifted`]
-    /// if any target path changed on disk since its most recent capture
-    /// (no silent clobber). Drift is checked for every path before any
-    /// write, so a refusal leaves the tree untouched.
+    /// if any target path changed on disk since its most recent capture,
+    /// and with [`CheckpointError::MissingBlob`] if a referenced blob is
+    /// absent from the store (no silent clobber). Both checks run for
+    /// every path *before* any write, so a refusal leaves the tree
+    /// untouched.
     pub fn restore(&self, entry_id: &str) -> Result<RestorePlan, CheckpointError> {
         let entry = self
             .manifest
@@ -208,16 +210,28 @@ impl WorkspaceCheckpointStore {
             }
         }
 
+        // Pre-load every referenced blob before touching the tree, so a
+        // missing blob (corruption / partial deletion of `blobs/`) refuses
+        // as a true no-op rather than leaving a half-restored tree.
+        let mut blobs: std::collections::HashMap<&str, Vec<u8>> = std::collections::HashMap::new();
+        for state in entry.files.values() {
+            if let FileState::Blob(hash) = state
+                && !blobs.contains_key(hash.as_str())
+            {
+                blobs.insert(hash.as_str(), self.read_blob(hash)?);
+            }
+        }
+
         let mut plan = RestorePlan::default();
         for (path, state) in &entry.files {
             let resolved = self.resolve(path);
             match state {
                 FileState::Blob(hash) => {
-                    let bytes = self.read_blob(hash)?;
+                    let bytes = &blobs[hash.as_str()];
                     if let Some(parent) = resolved.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    fs::write(&resolved, &bytes)?;
+                    fs::write(&resolved, bytes)?;
                     plan.written.push(path.clone());
                 }
                 FileState::Absent => {
@@ -368,6 +382,37 @@ mod tests {
         let plan = s.restore("turn1").unwrap();
         assert_eq!(plan.deleted, vec!["new.rs".to_string()]);
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn checkpoint_restore_refuses_cleanly_when_a_blob_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        let tracked = vec!["a.txt".to_string(), "b.txt".to_string()];
+
+        fs::write(&a, b"AAA").unwrap();
+        fs::write(&b, b"BBB").unwrap();
+        let mut s = store(dir.path());
+        s.capture("t1", &tracked, None).unwrap();
+        // A later turn changes both; the tree now matches t2 (no drift).
+        fs::write(&a, b"AAA2").unwrap();
+        fs::write(&b, b"BBB2").unwrap();
+        s.capture("t2", &tracked, None).unwrap();
+
+        // Corrupt the store: drop t1's `a.txt` blob (content "AAA").
+        let blobs = dir.path().join(".checkpoints").join("blobs");
+        for entry in fs::read_dir(&blobs).unwrap().filter_map(Result::ok) {
+            if fs::read(entry.path()).unwrap() == b"AAA" {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+
+        let err = s.restore("t1").unwrap_err();
+        assert!(matches!(err, CheckpointError::MissingBlob(_)), "{err:?}");
+        // The refusal is a true no-op: b.txt was NOT half-restored to BBB.
+        assert_eq!(fs::read(&b).unwrap(), b"BBB2");
+        assert_eq!(fs::read(&a).unwrap(), b"AAA2");
     }
 
     #[test]
