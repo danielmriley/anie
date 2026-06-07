@@ -90,6 +90,12 @@ pub struct ManifestEntry {
     /// State of each tracked path, keyed by the path string the caller
     /// passed (relative to the workspace root, or absolute).
     pub files: BTreeMap<String, FileState>,
+    /// Internal drift baseline recorded right after a restore — not a
+    /// user-selectable rewind anchor. It keeps `latest_state` in sync
+    /// with the tree a restore just wrote, so an immediate second rewind
+    /// isn't mistaken for user drift. Excluded from the `/rewind` listing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub baseline_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,16 +179,46 @@ impl WorkspaceCheckpointStore {
             entry_id: entry_id.to_string(),
             label,
             files,
+            baseline_only: false,
         };
         match self
             .manifest
             .entries
             .iter_mut()
-            .find(|e| e.entry_id == entry_id)
+            .find(|e| e.entry_id == entry_id && !e.baseline_only)
         {
             Some(existing) => *existing = entry,
             None => self.manifest.entries.push(entry),
         }
+        self.persist_manifest()
+    }
+
+    /// After a successful [`restore`](Self::restore) to `entry_id`, record
+    /// the now-current (restored) tree state as a fresh, newest drift
+    /// baseline. Without this, `latest_state` keeps returning the
+    /// pre-rewind capture, so a second consecutive `/rewind` (no prompt
+    /// in between) would be falsely refused as `WorkingTreeDrifted`. The
+    /// baseline is internal: it is excluded from the rewind-anchor
+    /// listing. No-op when `entry_id` has no capture.
+    pub fn record_restore_baseline(&mut self, entry_id: &str) -> Result<(), CheckpointError> {
+        let Some(files) = self
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.entry_id == entry_id && !e.baseline_only)
+            .map(|e| e.files.clone())
+        else {
+            return Ok(());
+        };
+        // A synthetic, unique id (real session entry ids are UUIDs, so no
+        // collision); the `len()` suffix keeps repeated rewinds distinct.
+        let id = format!("{entry_id}#restored{}", self.manifest.entries.len());
+        self.manifest.entries.push(ManifestEntry {
+            entry_id: id,
+            label: None,
+            files,
+            baseline_only: true,
+        });
         self.persist_manifest()
     }
 
@@ -382,6 +418,38 @@ mod tests {
         let plan = s.restore("turn1").unwrap();
         assert_eq!(plan.deleted, vec!["new.rs".to_string()]);
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn consecutive_restores_are_not_falsely_refused_as_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("code.rs");
+        let tracked = vec!["code.rs".to_string()];
+
+        fs::write(&file, b"v1").unwrap();
+        let mut s = store(dir.path());
+        s.capture("t1", &tracked, None).unwrap();
+        fs::write(&file, b"v2").unwrap();
+        s.capture("t2", &tracked, None).unwrap();
+
+        // First rewind to t1 + record the restored state as the baseline.
+        s.restore("t1").unwrap();
+        s.record_restore_baseline("t1").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"v1");
+
+        // A second rewind with no capture in between must NOT be refused:
+        // the tree (v1) matches the recorded baseline, not the stale t2.
+        s.restore("t1")
+            .expect("second consecutive rewind must succeed");
+        assert_eq!(fs::read(&file).unwrap(), b"v1");
+
+        // A genuine user edit between rewinds is still caught as drift.
+        fs::write(&file, b"user-edit").unwrap();
+        let err = s.restore("t1").unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::WorkingTreeDrifted { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

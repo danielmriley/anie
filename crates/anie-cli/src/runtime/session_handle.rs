@@ -251,10 +251,13 @@ impl SessionHandle {
     /// a drift refusal leaves the conversation untouched. Returns the
     /// [`RestorePlan`] describing what changed on disk.
     pub(crate) fn rewind_to(&mut self, entry_id: &str) -> Result<RestorePlan> {
-        let store = self.open_checkpoint_store()?;
+        let mut store = self.open_checkpoint_store()?;
         // Restore (and drift-check) before mutating session state, so a
         // refusal is a clean no-op.
         let plan = store.restore(entry_id)?;
+        // Record the restored tree as the new drift baseline so a second
+        // consecutive /rewind isn't falsely refused as drift.
+        store.record_restore_baseline(entry_id)?;
         // Capture the file ops of the descendants we're about to discard
         // before re-pointing the leaf.
         let discarded = self.session.compaction_details_after(entry_id);
@@ -292,6 +295,8 @@ impl SessionHandle {
         let points = store
             .entries()
             .iter()
+            // Internal post-restore drift baselines are not user anchors.
+            .filter(|entry| !entry.baseline_only)
             .map(|entry| RewindPoint {
                 entry_id: entry.entry_id.clone(),
                 label: entry.label.clone(),
