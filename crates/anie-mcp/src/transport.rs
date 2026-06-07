@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -32,6 +32,9 @@ pub struct StdioTransport {
     stdin: Mutex<ChildStdin>,
     pending: Pending,
     next_id: AtomicU64,
+    /// Set once the reader task exits (EOF or read error). New requests
+    /// fail fast with `Closed` instead of blocking until their timeout.
+    closed: Arc<AtomicBool>,
     reader: JoinHandle<()>,
 }
 
@@ -67,28 +70,45 @@ impl StdioTransport {
             .ok_or_else(|| McpError::Protocol("child stdout was not piped".to_string()))?;
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
         let reader_pending = Arc::clone(&pending);
+        let reader_closed = Arc::clone(&closed);
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    tracing::warn!(line = %line, "MCP: dropping non-JSON line from server");
-                    continue;
-                };
-                // Responses carry the request id; route to its waiter.
-                // Server-initiated messages have no pending id and are
-                // ignored in v1.
-                if let Some(id) = value.get("id").and_then(Value::as_u64)
-                    && let Some(tx) = reader_pending.lock().await.remove(&id)
-                {
-                    let _ = tx.send(value);
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                            tracing::warn!(line = %line, "MCP: dropping non-JSON line from server");
+                            continue;
+                        };
+                        // Only a *response* (no `method`) routes to a
+                        // waiter. A server-initiated request/notification
+                        // carries `method` and lives in the server's own
+                        // id-space — its id can collide with an in-flight
+                        // client id, so it must not be consumed as a
+                        // response. Such messages are ignored in v1.
+                        if value.get("method").is_none()
+                            && let Some(id) = value.get("id").and_then(Value::as_u64)
+                            && let Some(tx) = reader_pending.lock().await.remove(&id)
+                        {
+                            let _ = tx.send(value);
+                        }
+                    }
+                    Ok(None) => break, // EOF: server closed stdout.
+                    Err(error) => {
+                        tracing::warn!(%error, "MCP: reader stopped on stdout read error");
+                        break;
+                    }
                 }
             }
-            // stdout closed: fail every in-flight request fast by
-            // dropping its waiter (the receiver resolves to Closed).
+            // Reader is gone: mark closed so new requests fail fast, and
+            // drop every in-flight waiter (their receivers resolve to
+            // Closed) rather than leaving them to wait out the timeout.
+            reader_closed.store(true, Ordering::Release);
             reader_pending.lock().await.clear();
         });
 
@@ -97,6 +117,7 @@ impl StdioTransport {
             stdin: Mutex::new(stdin),
             pending,
             next_id: AtomicU64::new(1),
+            closed,
             reader,
         })
     }
@@ -117,9 +138,22 @@ impl StdioTransport {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, McpError> {
+        // Fast-fail once the reader has stopped: otherwise this request
+        // would write to a dead server and block on its waiter until the
+        // (up to 1-hour) timeout elapses.
+        if self.closed.load(Ordering::Acquire) {
+            return Err(McpError::Closed);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
+        // Re-check after inserting: the reader may have closed (and
+        // cleared `pending`) between the check and the insert, which
+        // would leave this entry unresolved.
+        if self.closed.load(Ordering::Acquire) {
+            self.pending.lock().await.remove(&id);
+            return Err(McpError::Closed);
+        }
 
         let payload = envelope(Some(id), method, params);
         if let Err(err) = self.write_line(&payload).await {
@@ -276,6 +310,26 @@ mod tests {
         assert!(
             matches!(result, Err(McpError::Timeout { .. })),
             "request must time out"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_after_server_exit_fails_fast_not_timeout() {
+        // The server exits immediately; the reader sees EOF and marks the
+        // transport closed. A subsequent request must fail fast with
+        // Closed rather than blocking until its (here, very long) timeout.
+        let t = spawn_script("exit 0");
+        // Let the reader task observe EOF and set the closed flag.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let start = std::time::Instant::now();
+        let result = t
+            .request("ping", json!({}), Duration::from_secs(3600))
+            .await;
+        assert!(matches!(result, Err(McpError::Closed)), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait out the long timeout"
         );
     }
 }

@@ -21,6 +21,11 @@ fn empty_object() -> Value {
 pub struct ListToolsResult {
     #[serde(default)]
     pub tools: Vec<McpToolSpec>,
+    /// Opaque pagination cursor. When present, the client must re-issue
+    /// `tools/list` with `{ "cursor": <nextCursor> }` to fetch the next
+    /// page until it is absent.
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 /// One tool advertised by an MCP server. `input_schema` is a JSON

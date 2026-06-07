@@ -64,15 +64,37 @@ impl McpClient {
         Ok(())
     }
 
-    /// List the server's tools.
+    /// List the server's tools, following `nextCursor` pagination until
+    /// the server stops returning a cursor.
     pub async fn list_tools(&self) -> Result<Vec<McpToolSpec>, McpError> {
-        let resp = self
-            .transport
-            .request("tools/list", json!({}), self.startup_timeout)
-            .await?;
-        let result = extract_result(resp, "tools/list")?;
-        let parsed: ListToolsResult = serde_json::from_value(result)?;
-        Ok(parsed.tools)
+        // Cap the page count so a buggy server that returns the same (or
+        // a forever-new) cursor can't loop indefinitely.
+        const MAX_PAGES: usize = 100;
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let params = match &cursor {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
+            let resp = self
+                .transport
+                .request("tools/list", params, self.startup_timeout)
+                .await?;
+            let result = extract_result(resp, "tools/list")?;
+            let parsed: ListToolsResult = serde_json::from_value(result)?;
+            tools.extend(parsed.tools);
+            match parsed.next_cursor {
+                // Stop on absent or repeated cursor (no forward progress).
+                Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                _ => return Ok(tools),
+            }
+        }
+        tracing::warn!(
+            pages = MAX_PAGES,
+            "MCP: tools/list exceeded the pagination cap; truncating"
+        );
+        Ok(tools)
     }
 
     /// Call a tool by its server-side name with JSON arguments.
@@ -165,6 +187,43 @@ done
         // notification both succeeded.
         let client = connect_mock().await;
         assert!(client.child_id().is_some());
+    }
+
+    /// A mock that paginates `tools/list`: first page returns `alpha`
+    /// plus a `nextCursor`; the second (cursor present) returns `beta`
+    /// with no cursor.
+    const PAGINATED_MOCK: &str = r#"
+page=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | grep -o '[0-9]*')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"mock\",\"version\":\"0\"}}}" ;;
+    *notifications/initialized*) : ;;
+    *'"method":"tools/list"'*)
+      if [ "$page" = "0" ]; then
+        page=1
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"alpha\",\"inputSchema\":{}}],\"nextCursor\":\"c1\"}}"
+      else
+        printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"beta\",\"inputSchema\":{}}]}}"
+      fi ;;
+  esac
+done
+"#;
+
+    #[tokio::test]
+    async fn client_follows_tools_list_pagination() {
+        let client = McpClient::connect(
+            "bash",
+            &["-c".to_string(), PAGINATED_MOCK.to_string()],
+            &HashMap::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("connect");
+        let tools = client.list_tools().await.expect("list tools");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"], "both pages must be gathered");
     }
 
     #[tokio::test]
