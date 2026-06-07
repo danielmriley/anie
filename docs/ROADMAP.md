@@ -159,12 +159,20 @@ and [docs/session_ux/README.md](session_ux/README.md)
 **Effort**: Medium-large — layout restructuring, theme tokens.
 **Details**: [docs/notes/tui_layout_and_visual_design.md](notes/tui_layout_and_visual_design.md)
 
-### 10. Skills system
-**What**: Agent Skills standard support — load SKILL.md files, register
-as `/skill:name` commands.
-**Why**: Enables repeatable, project-specific agent behaviors.
-**Effort**: Medium — file loading, frontmatter parsing, command registration.
-**Details**: [docs/notes/skills_system.md](notes/skills_system.md)
+### 10. Skills system — **shipped (thin loader)**
+Landed via docs/skills_loader/. `SKILL.md` files under `~/.anie/skills/`
+and the project `.anie/skills/` are discovered (project precedence),
+their `name`/`description`/`allowed-tools` frontmatter parsed by a
+hand-rolled subset parser (no YAML dependency), and each registered as a
+`/skill:<name>` command surfaced under the `Skills:` group in `/help`.
+Invoking `/skill:<name>` stages the skill body as a synthetic user turn
+injected ahead of the next prompt (via the session-append seam, not the
+single `BeforeModelPolicy` slot). Malformed files warn and are skipped,
+never panic. Deferred: hard `allowed-tools` enforcement, auto-injection
+into initial context, a `/skills` listing command, and the full
+out-of-process Plan-10 extension host.
+**Details**: [docs/skills_loader/README.md](skills_loader/README.md),
+[docs/notes/skills_system.md](notes/skills_system.md)
 
 ### 11. `/settings` command
 **What**: Interactive settings viewer/editor in the TUI.

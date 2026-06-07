@@ -277,6 +277,31 @@ controller must not know how a transcript block is rendered.
 New long-lived controller state should usually be introduced as another focused
 handle, not as a loose field on `ControllerState`.
 
+### Skills (`/skill:<name>`)
+
+A *skill* is a `SKILL.md` file in a subdirectory of a skills root —
+`~/.anie/skills/<dir>/SKILL.md` globally, or `.anie/skills/<dir>/SKILL.md` in a
+project (project skills shadow global ones of the same name). At bootstrap,
+`skills::discover_skills` scans both roots and `skills::parse_skill` reads each
+file's fenced frontmatter (`name`, `description`, `allowed-tools`) with a
+hand-rolled subset parser — no YAML dependency is added for three flat fields.
+Discovery is best-effort: a malformed file yields a typed `SkillLoadError`
+surfaced as a startup warning, and the rest still load.
+
+Each discovered skill becomes a `/skill:<name>` command via
+`CommandRegistry::with_builtins_and_skills`, constructing the
+`SlashCommandSource::Skill` variant (previously a stub). The TUI routes these on
+the command *source*, not the dynamic name, emitting `UiAction::ActivateSkill`.
+The controller resolves the body from its `SkillSet` and stages it in
+`pending_skill_injections`; the next `start_prompt_run` drains the buffer into
+synthetic `Message::User` turns appended just ahead of the prompt — reusing the
+session-append seam rather than the single, already-occupied
+`BeforeModelPolicy` slot. A skill therefore applies to the next turn only,
+reaches the model as an ordinary user turn, and persists in the session log
+with no new schema. `allowed-tools` is parsed and shown but not yet enforced;
+auto-injection and a `/skills` listing command are deferred. This is a thin
+subset of the deferred Plan-10 extension system.
+
 ### Retry state invariant
 
 The controller uses a `PendingRetry` state machine rather than sleeping inline.

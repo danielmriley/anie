@@ -3174,3 +3174,158 @@ async fn rewind_selection_restores_tree_and_emits_transcript_replace() {
     }
     assert!(saw_replace, "rewind must emit a TranscriptReplace");
 }
+
+fn test_skill(name: &str, body: &str) -> crate::skills::Skill {
+    crate::skills::Skill {
+        name: name.to_string(),
+        description: format!("{name} skill"),
+        allowed_tools: Vec::new(),
+        body: body.to_string(),
+    }
+}
+
+/// Pull the text of every user message currently in the session, in
+/// branch order — for asserting skill-injection placement.
+fn user_message_texts(controller: &InteractiveController) -> Vec<String> {
+    controller
+        .state
+        .session
+        .inner()
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            anie_session::SessionEntry::Message {
+                message: Message::User(user),
+                ..
+            } => user.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn activate_skill_stages_body_without_starting_a_run() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    controller.state.skills =
+        crate::skills::SkillSet::from_skills(vec![test_skill("foo", "FOO BODY")]);
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::ActivateSkill("foo".into()))
+            .await
+            .is_ok()
+    );
+
+    assert!(controller.current_run.is_none(), "no run is started");
+    assert_eq!(controller.pending_skill_injections.len(), 1);
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("foo"), "{msg}");
+}
+
+#[tokio::test]
+async fn activating_unknown_skill_name_surfaces_error_not_panic() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::ActivateSkill("ghost".into()))
+            .await
+            .is_ok()
+    );
+
+    assert!(controller.pending_skill_injections.is_empty());
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(msg.contains("Unknown skill: ghost"), "{msg}");
+}
+
+#[tokio::test]
+async fn staged_skill_body_is_prepended_to_next_prompt_turn() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller.state.skills =
+        crate::skills::SkillSet::from_skills(vec![test_skill("foo", "FOO BODY")]);
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::ActivateSkill("foo".into()))
+            .await
+            .is_ok()
+    );
+
+    // No mock provider for this API, so the run errors after the session
+    // appends — which is all this test inspects.
+    let _ = controller.start_prompt_run("real prompt".into()).await;
+
+    let texts = user_message_texts(&controller);
+    let skill_idx = texts
+        .iter()
+        .position(|t| t.contains("FOO BODY"))
+        .expect("skill body injected");
+    let prompt_idx = texts
+        .iter()
+        .position(|t| t == "real prompt")
+        .expect("prompt appended");
+    assert!(skill_idx < prompt_idx, "skill body precedes the prompt");
+    assert_eq!(
+        texts.iter().filter(|t| t.contains("FOO BODY")).count(),
+        1,
+        "skill body injected exactly once"
+    );
+    assert!(texts[skill_idx].contains("<skill name=\"foo\">"));
+}
+
+#[tokio::test]
+async fn activating_two_skills_injects_both_in_order_once() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller.state.skills = crate::skills::SkillSet::from_skills(vec![
+        test_skill("alpha", "ALPHA BODY"),
+        test_skill("beta", "BETA BODY"),
+    ]);
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::ActivateSkill("alpha".into()))
+            .await
+            .is_ok()
+    );
+    assert!(
+        controller
+            .try_handle_action(UiAction::ActivateSkill("beta".into()))
+            .await
+            .is_ok()
+    );
+    assert_eq!(controller.pending_skill_injections.len(), 2);
+
+    let _ = controller.start_prompt_run("go".into()).await;
+
+    let texts = user_message_texts(&controller);
+    let alpha = texts.iter().position(|t| t.contains("ALPHA BODY"));
+    let beta = texts.iter().position(|t| t.contains("BETA BODY"));
+    assert!(alpha.is_some() && beta.is_some(), "both injected");
+    assert!(alpha < beta, "activation order preserved");
+}
+
+#[tokio::test]
+async fn pending_skill_buffer_is_cleared_after_injection() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller.state.skills =
+        crate::skills::SkillSet::from_skills(vec![test_skill("foo", "FOO BODY")]);
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::ActivateSkill("foo".into()))
+            .await
+            .is_ok()
+    );
+    let _ = controller.start_prompt_run("once".into()).await;
+
+    assert!(
+        controller.pending_skill_injections.is_empty(),
+        "skill applies to the next turn only"
+    );
+}

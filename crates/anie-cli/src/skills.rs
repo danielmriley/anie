@@ -27,11 +27,6 @@
 //! [`SkillLoadError`] that the caller surfaces as a startup warning;
 //! the remaining skills still load. Nothing here panics on user files.
 
-// The loader is unwired in skills/2 (this PR); bootstrap/registry/
-// dispatch wiring lands in skills/3 and skills/4, which exercise every
-// item below. Scoped allow until then.
-#![allow(dead_code)]
-
 use std::{
     collections::BTreeMap,
     fs,
@@ -71,10 +66,12 @@ impl SkillSet {
         self.skills.get(name)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.skills.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }

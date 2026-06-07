@@ -2904,3 +2904,35 @@ fn bounded_agent_event_drain_preserves_order_and_leaves_remainder() {
         (MAX_AGENT_EVENTS_PER_FRAME + EXTRA_EVENTS - 1).to_string()
     );
 }
+
+#[test]
+fn skill_source_command_dispatches_activate_skill_action() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut catalog = default_test_commands();
+    catalog.push(SlashCommandInfo::skill(
+        "deploy".to_string(),
+        "Deploy the service".to_string(),
+    ));
+    let mut app = App::new(event_rx, action_tx, sample_models(), catalog);
+
+    for ch in "/skill:deploy".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type skill command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit skill command");
+
+    // A skill command routes on its source, not its name, and yields
+    // the bare skill name.
+    assert!(matches!(
+        action_rx.try_recv().expect("activate skill action"),
+        crate::UiAction::ActivateSkill(name) if name == "deploy"
+    ));
+}

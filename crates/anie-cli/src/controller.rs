@@ -99,6 +99,12 @@ pub(crate) struct InteractiveController {
     /// `--harness-mode=rlm`. Plan
     /// `docs/rlm_2026-04-29/02_recurse_tool.md`.
     recursions_remaining_this_run: Arc<AtomicU32>,
+    /// Skill bodies staged by `/skill:<name>` for the next prompt.
+    /// Drained in `start_prompt_run` into synthetic user turns injected
+    /// just ahead of the prompt, then cleared — a skill activates for
+    /// the next turn only. In-memory; not persisted as its own type
+    /// (the injected message is an ordinary `Message::User`).
+    pending_skill_injections: Vec<String>,
 }
 
 /// Default recursion budget per top-level run. Plan 02
@@ -194,6 +200,7 @@ impl InteractiveController {
             queued_prompts: VecDeque::new(),
             compactions_remaining_this_turn: Arc::new(AtomicU32::new(max_per_turn)),
             recursions_remaining_this_run: Arc::new(AtomicU32::new(RECURSION_BUDGET_DEFAULT)),
+            pending_skill_injections: Vec::new(),
         }
     }
 
@@ -986,6 +993,29 @@ impl InteractiveController {
                     self.send_system_message("Configuration reloaded.").await;
                 }
             }
+            UiAction::ActivateSkill(name) => {
+                match self.state.skills.get(&name) {
+                    Some(skill) => {
+                        // Wrap so the model can attribute the injected
+                        // context to the skill it came from.
+                        self.pending_skill_injections
+                            .push(format!("<skill name=\"{name}\">\n{}\n</skill>", skill.body));
+                        let tools = if skill.allowed_tools.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (suggested tools: {})", skill.allowed_tools.join(", "))
+                        };
+                        self.send_system_message(&format!(
+                            "Skill '{name}' staged for your next message{tools}."
+                        ))
+                        .await;
+                    }
+                    None => {
+                        self.send_system_message(&format!("Unknown skill: {name}."))
+                            .await;
+                    }
+                }
+            }
             UiAction::ClearOutput => {}
         }
         Ok(())
@@ -1115,6 +1145,18 @@ impl InteractiveController {
         self.compactions_remaining_this_turn
             .store(max_per_turn, Ordering::Release);
         self.state.refresh_system_prompt_if_needed();
+        // Inject any skill bodies staged by `/skill:<name>` as synthetic
+        // user turns ahead of this prompt. Reuses the session-append
+        // seam (does NOT touch the single BeforeModelPolicy slot held by
+        // context virtualization). Drained here so a skill applies to
+        // the next turn only.
+        for body in std::mem::take(&mut self.pending_skill_injections) {
+            let injected = Message::User(UserMessage {
+                content: vec![ContentBlock::Text { text: body }],
+                timestamp: now_millis(),
+            });
+            self.state.session.inner_mut().append_message(&injected)?;
+        }
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],
             timestamp: now_millis(),
@@ -1336,7 +1378,6 @@ pub(crate) struct ControllerState {
     /// project `.anie/skills/`. Their `/skill:<name>` commands are
     /// registered in `command_registry`; activation resolves the body
     /// from here. Re-discovered each launch; not persisted.
-    #[allow(dead_code)] // read by the ActivateSkill handler wired in skills/4
     pub(crate) skills: crate::skills::SkillSet,
 }
 

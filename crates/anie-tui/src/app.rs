@@ -40,7 +40,7 @@ use crate::{
     InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
     OnboardingScreen, OutputPane, ProviderManagementAction, ProviderManagementScreen,
     autocomplete::CommandCompletionProvider,
-    commands::SlashCommandInfo,
+    commands::{SlashCommandInfo, SlashCommandSource},
     input::InputAction,
     output::RenderedBlock,
     overlay::{OverlayOutcome, OverlayScreen},
@@ -294,6 +294,9 @@ pub enum UiAction {
     /// with an entry id, restore both the working tree and the
     /// conversation to that point (`/rewind [id]`).
     Rewind(Option<String>),
+    /// Activate a skill by (bare) name: stage its body as context for
+    /// the next prompt. Dispatched by `/skill:<name>`.
+    ActivateSkill(String),
 }
 
 /// Status-bar display state.
@@ -1337,6 +1340,14 @@ impl App {
     /// with custom dispatch, side effects, or argument parsing)
     /// stays in the main match.
     fn dispatch_validated_command(&mut self, info: &SlashCommandInfo, arg: Option<&str>) {
+        // Skill commands carry a dynamic `skill:<name>` name, so route
+        // on the source rather than the name string.
+        if let SlashCommandSource::Skill { skill_name } = &info.source {
+            let _ = self
+                .action_tx
+                .send(UiAction::ActivateSkill(skill_name.clone()));
+            return;
+        }
         if let Some(action) = fixed_noarg_action(info.name.as_ref()) {
             let _ = self.action_tx.send(action);
             return;
