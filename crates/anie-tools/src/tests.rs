@@ -1894,3 +1894,70 @@ async fn apply_patch_preserves_crlf_and_bom_on_update() {
     let text = String::from_utf8(got[3..].to_vec()).expect("utf8");
     assert_eq!(text, "one\r\nTWO\r\n", "CRLF preserved");
 }
+
+// ===================== bash sandbox (sandbox/PR5) =====================
+
+async fn run_bash(tool: &BashTool, command: &str) -> Result<anie_protocol::ToolResult, ToolError> {
+    tool.execute(
+        "call",
+        serde_json::json!({ "command": command }),
+        CancellationToken::new(),
+        None,
+        &ToolExecutionContext::default(),
+    )
+    .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_with_sandbox_disabled_behaves_identically_to_today() {
+    let dir = tempdir().expect("tempdir");
+    // No sandbox spec => today's behavior; details record sandboxed=false.
+    let tool = BashTool::with_sandbox(dir.path(), BashPolicy::default(), None);
+    let result = run_bash(&tool, "echo hello").await.expect("runs");
+    assert!(text_content(&result).contains("hello"));
+    assert_eq!(result.details["sandboxed"], serde_json::json!(false));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_sandbox_setup_failure_surfaces_typed_sandbox_setup_error() {
+    let dir = tempdir().expect("tempdir");
+    // A writable_root that cannot be opened (nonexistent) makes sandbox
+    // setup fail; on a build without the backend it fails as Unsupported.
+    // Either way the command never runs and the error is typed
+    // SandboxSetup — not ExecutionFailed, not a panic.
+    let spec = anie_sandbox::SandboxSpec {
+        writable_roots: vec![dir.path().join("does-not-exist-xyz")],
+        allow_network: false,
+        require_kernel_support: true,
+    };
+    let tool = BashTool::with_sandbox(dir.path(), BashPolicy::default(), Some(spec));
+    let err = run_bash(&tool, "echo hi")
+        .await
+        .expect_err("setup must fail");
+    assert!(matches!(err, ToolError::SandboxSetup(_)), "got {err:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bash_sandboxed_write_outside_workspace_returns_error_not_panic() {
+    let dir = tempdir().expect("tempdir");
+    let outside = tempdir().expect("outside");
+    let target = outside.path().join("denied.txt");
+    let spec = anie_sandbox::SandboxSpec {
+        writable_roots: vec![dir.path().to_path_buf()],
+        allow_network: true,
+        require_kernel_support: true,
+    };
+    let tool = BashTool::with_sandbox(dir.path(), BashPolicy::default(), Some(spec));
+    // Run a command that writes outside the workspace. With Landlock the
+    // write is denied (the command exits non-zero); without Landlock the
+    // sandbox setup fails closed. Neither path may panic, and the file
+    // must not be created.
+    let _ = run_bash(&tool, &format!("echo x > {}", target.display())).await;
+    assert!(
+        !target.exists(),
+        "write outside writable roots must be blocked"
+    );
+}

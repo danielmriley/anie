@@ -28,6 +28,12 @@ tracing.workspace = true
 which.workspace = true
 anie-agent.workspace = true
 anie-protocol.workspace = true
+anie-sandbox.workspace = true
+
+# Enable the Linux sandbox backend (Landlock + seccomp) only on Linux;
+# other targets get the fail-closed no-op `apply`.
+[target.'cfg(target_os = "linux")'.dependencies]
+anie-sandbox = { workspace = true, features = ["sandbox-linux"] }
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -52,6 +52,7 @@ anie-mcp.workspace = true
 anie-provider.workspace = true
 anie-protocol.workspace = true
 anie-providers-builtin.workspace = true
+anie-sandbox.workspace = true
 anie-session.workspace = true
 anie-tools.workspace = true
 anie-tools-web = { workspace = true, optional = true }

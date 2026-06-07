@@ -23,6 +23,9 @@ use crate::shared::{
 pub struct BashTool {
     cwd: Arc<PathBuf>,
     policy: BashPolicy,
+    /// Optional process-sandbox confinement applied to the spawned shell
+    /// child (Linux Landlock + seccomp). `None` = today's behavior.
+    sandbox: Option<anie_sandbox::SandboxSpec>,
 }
 
 /// Pre-spawn bash command deny policy.
@@ -65,6 +68,22 @@ impl BashTool {
         Self {
             cwd: Arc::new(cwd.into()),
             policy,
+            sandbox: None,
+        }
+    }
+
+    /// Create a bash tool with a deny policy and optional process-sandbox
+    /// confinement for the spawned shell child.
+    #[must_use]
+    pub fn with_sandbox<P: Into<PathBuf>>(
+        cwd: P,
+        policy: BashPolicy,
+        sandbox: Option<anie_sandbox::SandboxSpec>,
+    ) -> Self {
+        Self {
+            cwd: Arc::new(cwd.into()),
+            policy,
+            sandbox,
         }
     }
 }
@@ -109,6 +128,12 @@ impl Tool for BashTool {
             .kill_on_drop(true);
         #[cfg(unix)]
         child_command.process_group(0);
+
+        // Confine the spawned child (Landlock + seccomp) when configured.
+        // A setup failure (e.g. fail-closed on a kernel without support)
+        // is a typed, distinct error — the command never runs.
+        anie_sandbox::apply(&mut child_command, self.sandbox.as_ref())
+            .map_err(|error| ToolError::SandboxSetup(error.to_string()))?;
 
         let mut child = child_command.spawn().map_err(|error| {
             ToolError::ExecutionFailed(format!("Failed to spawn shell command: {error}"))
@@ -225,6 +250,9 @@ impl Tool for BashTool {
                 "exit_code": exit_code,
                 "truncated": collector.was_truncated(),
                 "elapsed_ms": started.elapsed().as_millis(),
+                // Provenance: did this command run under the process
+                // sandbox? Freeform details — no session-schema change.
+                "sandboxed": self.sandbox.is_some(),
             }),
         ))
     }

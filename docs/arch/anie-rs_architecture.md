@@ -24,11 +24,14 @@ small:
 - avoid stringly typed provider recovery logic by using the structured
   `ProviderError` taxonomy.
 
-The project currently chooses simplicity over isolation: tools intentionally run
-in the current process user's security context without sandboxing or approval
-prompts. Relative paths resolve from the session cwd, but absolute paths and
-parent traversal are allowed. WASM/containerized tool execution is a future
-isolation direction, not current behavior.
+By default, tools run in the current process user's security context without
+approval prompts; relative paths resolve from the session cwd, but absolute
+paths and parent traversal are allowed. An **opt-in** process sandbox
+(`[tools.sandbox]`, off by default, Linux-only) can now confine the `bash`
+tool's spawned child via Landlock + seccomp (filesystem writes restricted to
+configured roots, network off by default) — see "Process sandbox" below. The
+approval/permission layer and WASM/containerized execution remain future
+directions.
 
 ## Workspace map
 
@@ -592,6 +595,27 @@ execute commands anywhere the process user has access.
 Future isolation work should be designed as a separate tool-execution layer.
 The preferred direction is WASM/containerized tool execution rather than
 quietly changing today's path resolver into a partial sandbox.
+
+### Process sandbox
+
+The `anie-sandbox` crate is that separate tool-execution layer (opt-in, off by
+default). It exposes a platform-agnostic `SandboxSpec` (writable roots +
+network toggle + fail-closed flag) and an `apply(cmd, spec)` that confines
+**only the spawned tool child**, never the trusted `anie` host: on Linux
+(behind the `sandbox-linux` feature, enabled per-target) it compiles a Landlock
+ruleset + a seccomp network-deny filter in the parent and installs them in the
+child via `Command::pre_exec`/`restrict_self` before `exec`. Reads are allowed
+everywhere; writes are confined to `writable_roots`; `socket()` is denied
+unless `allow_network`. `require_kernel_support` (default true) fails closed
+(`SandboxError` → `ToolError::SandboxSetup`) when the kernel lacks Landlock,
+rather than running unconfined. `bash` calls `apply` before spawning; the
+registered spec is built once per process from `[tools.sandbox]` + cwd in
+`bootstrap.rs`. Disabled (the default) is byte-identical to before; sandbox
+provenance rides in the bash result's freeform `details` (no schema bump).
+`write`/`edit`/`read` run in anie's own address space and are not covered by
+this process-level confinement. The interactive *escalation* seam ("relax for
+this one call") is left open (the spec is per-invocation) for the future
+approval layer. Plan: `docs/tool_sandbox/`.
 
 ### Web tool network boundary
 

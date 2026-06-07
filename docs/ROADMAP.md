@@ -5,6 +5,15 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] Process sandbox for tool execution (docs/tool_sandbox/): opt-in,
+      Linux-only `[tools.sandbox]` that confines the `bash` tool's spawned
+      child via Landlock (writes restricted to roots) + seccomp (network
+      off by default), installed child-only via `pre_exec` in the new
+      `anie-sandbox` crate. Fail-closed by default; typed
+      `ToolError::SandboxSetup`. Off by default = unchanged behavior. The
+      approval layer (#1) is the recommended companion; escalation seam
+      left open. macOS/Windows and in-process file-tool confinement
+      deferred.
 - [x] Eval harness + metrics export (docs/eval_harness/): `--metrics-out`
       writes a per-run `RunMetrics` JSON (tokens/latency/tool success/cost/
       compaction); the new leaf `anie-evals` crate runs TOML scenarios via

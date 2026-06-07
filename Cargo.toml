@@ -116,6 +116,7 @@ anie-mcp = { path = "crates/anie-mcp" }
 anie-provider = { path = "crates/anie-provider" }
 anie-protocol = { path = "crates/anie-protocol" }
 anie-providers-builtin = { path = "crates/anie-providers-builtin" }
+anie-sandbox = { path = "crates/anie-sandbox" }
 anie-session = { path = "crates/anie-session" }
 anie-tools = { path = "crates/anie-tools" }
 anie-tools-web = { path = "crates/anie-tools-web" }

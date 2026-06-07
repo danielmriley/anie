@@ -96,6 +96,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         config.tools.web.clone(),
         mcp_tools,
         Arc::clone(&todo_list),
+        sandbox_spec_from_config(&config.tools.sandbox, &cwd),
     );
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
@@ -151,7 +152,30 @@ pub(crate) fn build_tool_registry(cwd: &Path, no_tools: bool) -> Arc<ToolRegistr
         anie_config::WebToolConfig::default(),
         Vec::new(),
         Arc::new(std::sync::Mutex::new(TodoList::default())),
+        None,
     )
+}
+
+/// Build a `SandboxSpec` from `[tools.sandbox]` + cwd. Returns `None`
+/// when the sandbox is disabled (the common default), preserving today's
+/// behavior. Empty `writable_roots` defaults to `[cwd, $TMPDIR]`.
+fn sandbox_spec_from_config(
+    sandbox: &anie_config::SandboxToolConfig,
+    cwd: &Path,
+) -> Option<anie_sandbox::SandboxSpec> {
+    if !sandbox.enabled {
+        return None;
+    }
+    let writable_roots = if sandbox.writable_roots.is_empty() {
+        vec![cwd.to_path_buf(), std::env::temp_dir()]
+    } else {
+        sandbox.writable_roots.clone()
+    };
+    Some(anie_sandbox::SandboxSpec {
+        writable_roots,
+        allow_network: sandbox.allow_network,
+        require_kernel_support: sandbox.require_kernel_support,
+    })
 }
 
 /// Convert the `[mcp]` config into manager launch specs (sorted by name
@@ -199,6 +223,7 @@ fn build_tool_registry_with_policy(
     web_config: anie_config::WebToolConfig,
     mcp_tools: Vec<Arc<dyn anie_agent::Tool>>,
     todo_list: Arc<std::sync::Mutex<TodoList>>,
+    sandbox: Option<anie_sandbox::SandboxSpec>,
 ) -> Arc<ToolRegistry> {
     let mut tools = ToolRegistry::new();
     if no_tools {
@@ -225,9 +250,10 @@ fn build_tool_registry_with_policy(
         cwd.to_path_buf(),
         Arc::clone(&queue),
     )));
-    tools.register(Arc::new(BashTool::with_policy(
+    tools.register(Arc::new(BashTool::with_sandbox(
         cwd.to_path_buf(),
         bash_policy,
+        sandbox,
     )));
     tools.register(Arc::new(GrepTool::new(cwd.to_path_buf())));
     tools.register(Arc::new(FindTool::new(cwd.to_path_buf())));
@@ -367,6 +393,7 @@ done
             anie_config::WebToolConfig::default(),
             mcp_tools,
             Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
+            None,
         )
     }
 
@@ -413,6 +440,49 @@ done
 }
 
 #[cfg(test)]
+mod sandbox_bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn bash_sandbox_spec_built_from_config_uses_cwd_when_roots_empty() {
+        // Disabled => no spec (today's behavior).
+        let disabled = anie_config::SandboxToolConfig::default();
+        assert!(sandbox_spec_from_config(&disabled, Path::new("/work")).is_none());
+
+        // Enabled with empty roots => [cwd, $TMPDIR].
+        let enabled = anie_config::SandboxToolConfig {
+            enabled: true,
+            ..anie_config::SandboxToolConfig::default()
+        };
+        let spec = sandbox_spec_from_config(&enabled, Path::new("/work")).expect("spec");
+        assert!(
+            spec.writable_roots
+                .contains(&Path::new("/work").to_path_buf())
+        );
+        assert!(spec.writable_roots.contains(&std::env::temp_dir()));
+        assert!(!spec.allow_network);
+        assert!(spec.require_kernel_support);
+    }
+
+    #[test]
+    fn bash_sandbox_spec_uses_explicit_roots_when_provided() {
+        let cfg = anie_config::SandboxToolConfig {
+            enabled: true,
+            writable_roots: vec![std::path::PathBuf::from("/explicit")],
+            allow_network: true,
+            require_kernel_support: false,
+        };
+        let spec = sandbox_spec_from_config(&cfg, Path::new("/work")).expect("spec");
+        assert_eq!(
+            spec.writable_roots,
+            vec![std::path::PathBuf::from("/explicit")]
+        );
+        assert!(spec.allow_network);
+        assert!(!spec.require_kernel_support);
+    }
+}
+
+#[cfg(test)]
 mod todo_bootstrap_tests {
     use super::*;
     use anie_tools::{TodoList, TodoStatus};
@@ -429,6 +499,7 @@ mod todo_bootstrap_tests {
             anie_config::WebToolConfig::default(),
             Vec::new(),
             todo_list,
+            None,
         )
     }
 

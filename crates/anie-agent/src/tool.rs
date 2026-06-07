@@ -133,6 +133,12 @@ pub enum ToolError {
     /// The tool timed out.
     #[error("Timeout after {0} seconds")]
     Timeout(u64),
+    /// Setting up the process sandbox for the tool failed (e.g. the
+    /// kernel lacks the required confinement support and the operator
+    /// configured fail-closed). Distinct from `ExecutionFailed`: the tool
+    /// never ran.
+    #[error("Sandbox setup failed: {0}")]
+    SandboxSetup(String),
 }
 
 /// Registry of tools keyed by name.
