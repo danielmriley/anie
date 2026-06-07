@@ -83,10 +83,16 @@ pub fn apply(
     #[cfg(not(all(target_os = "linux", feature = "sandbox-linux")))]
     {
         let _ = cmd;
-        let _ = spec;
-        Err(SandboxError::Unsupported(
-            "built without `sandbox-linux` support (Linux only)".to_string(),
-        ))
+        // Honor the documented degrade-vs-fail knob off the Linux backend
+        // too: when the caller opted into running unconfined on missing
+        // support, do so rather than hard-failing every command.
+        if spec.require_kernel_support {
+            Err(SandboxError::Unsupported(
+                "built without `sandbox-linux` support (Linux only)".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -120,6 +126,20 @@ mod tests {
         // that path is covered by the linux backend tests.)
         #[cfg(all(target_os = "linux", feature = "sandbox-linux"))]
         let _ = result;
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "sandbox-linux")))]
+    #[test]
+    fn require_kernel_support_false_degrades_to_unconfined_off_backend() {
+        // The documented degrade-vs-fail knob must work off the Linux
+        // backend too: opt-out of strictness => run unconfined, not fail.
+        let spec = SandboxSpec {
+            writable_roots: vec![PathBuf::from("/tmp")],
+            require_kernel_support: false,
+            ..SandboxSpec::default()
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        assert!(apply(&mut cmd, Some(&spec)).is_ok());
     }
 
     #[test]

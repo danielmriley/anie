@@ -8,6 +8,20 @@
 //!
 //! Filesystem confinement (Landlock) lands here in PR2; network
 //! confinement (seccomp) extends this file in PR3.
+//!
+//! ## Known limitation: `truncate(2)` (Landlock ABI)
+//!
+//! The ruleset is pinned to [`ABI::V1`]. The `LANDLOCK_ACCESS_FS_TRUNCATE`
+//! right (which governs the path-based `truncate(2)` syscall) was only
+//! added in ABI V3, so under V1 a confined child can `truncate` a file
+//! *outside* `writable_roots` to zero/shrink it — it cannot write new
+//! content there, but it can destroy existing content. Raising the
+//! handled set toward V3 best-effort (so newer kernels gain truncate
+//! confinement while V1 kernels still load) is a follow-up; doing it
+//! correctly also requires granting truncate under the writable roots so
+//! ordinary `O_TRUNC` opens there keep working. Tracked but not yet
+//! closed; the "write only under writable_roots" contract is otherwise
+//! enforced (open + write go through `WRITE_FILE`, which V1 covers).
 
 use std::io;
 
@@ -70,20 +84,23 @@ pub(crate) fn apply(
     // Move the created ruleset + filter into the child's `pre_exec`.
     // `restrict_self` consumes the ruleset, so wrap in `Option`.
     let mut created = Some(created);
-    // SAFETY: the closure runs post-fork, pre-exec. It performs only the
-    // `restrict_self` + `seccomp(apply)` syscalls (no allocation, no
-    // locks); the ruleset, path fds, and BPF program were built in the
-    // parent.
+    // SAFETY: the closure runs post-fork, pre-exec, where `malloc` is not
+    // async-signal-safe (it can deadlock if another thread held the
+    // allocator lock at fork time). It is allocation-free on ALL paths:
+    // the happy path is just the `restrict_self` + `seccomp(apply)`
+    // syscalls, and the error paths construct an `io::Error` from a bare
+    // `ErrorKind` (no `format!`, no boxed message). The ruleset, path
+    // fds, and BPF program were all built in the parent.
     unsafe {
         cmd.pre_exec(move || {
             if let Some(ruleset) = created.take() {
-                ruleset.restrict_self().map_err(|error| {
-                    io::Error::other(format!("landlock restrict_self: {error}"))
-                })?;
+                ruleset
+                    .restrict_self()
+                    .map_err(|_| io::Error::from(io::ErrorKind::PermissionDenied))?;
             }
             if let Some(program) = network_filter.as_ref() {
                 seccompiler::apply_filter(program)
-                    .map_err(|error| io::Error::other(format!("seccomp apply: {error}")))?;
+                    .map_err(|_| io::Error::from(io::ErrorKind::PermissionDenied))?;
             }
             Ok(())
         });
@@ -91,19 +108,38 @@ pub(crate) fn apply(
     Ok(())
 }
 
-/// Build a seccomp BPF program that denies socket creation (so the child
-/// cannot open outbound network connections). Everything else is allowed;
-/// a denied `socket()` returns `EACCES`.
+/// Build a seccomp BPF program that denies *network* socket creation so
+/// the child cannot open outbound network connections. Only `AF_INET` /
+/// `AF_INET6` are denied (returning `EACCES`); local families — `AF_UNIX`
+/// (git↔ssh-agent/gpg-agent, D-Bus, syslog) and others — stay allowed, so
+/// the filter matches the documented "no network sockets" intent without
+/// breaking legitimate local IPC.
 fn build_network_deny_filter() -> Result<seccompiler::BpfProgram, String> {
-    use seccompiler::{SeccompAction, SeccompFilter};
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
 
-    // An empty rule vec for a syscall means "match unconditionally".
-    // Denying `socket` is sufficient: no socket, no outbound connection.
-    let rules = [(libc::SYS_socket, Vec::new())].into_iter().collect();
+    // socket(domain, type, protocol): match on arg0 (domain). A rule
+    // matches when its single condition holds; the filter denies a match
+    // and allows a mismatch, so AF_UNIX (and e.g. netlink) fall through.
+    let deny_family = |family: libc::c_int| -> Result<SeccompRule, String> {
+        SeccompRule::new(vec![
+            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family as u64)
+                .map_err(|error| format!("seccomp condition: {error}"))?,
+        ])
+        .map_err(|error| format!("seccomp rule: {error}"))
+    };
+
+    let rules = [(
+        libc::SYS_socket,
+        vec![deny_family(libc::AF_INET)?, deny_family(libc::AF_INET6)?],
+    )]
+    .into_iter()
+    .collect();
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow, // default: allow everything else
-        SeccompAction::Errno(libc::EACCES as u32), // matched: socket -> EACCES
+        SeccompAction::Allow, // mismatch (e.g. AF_UNIX) -> allowed
+        SeccompAction::Errno(libc::EACCES as u32), // matched (AF_INET/AF_INET6) -> EACCES
         std::env::consts::ARCH
             .try_into()
             .map_err(|error| format!("seccomp target arch: {error}"))?,
@@ -259,6 +295,27 @@ mod tests {
 
     const OPEN_SOCKET: &str =
         "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()";
+
+    const OPEN_UNIX_SOCKET: &str =
+        "import socket; socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close()";
+
+    #[test]
+    fn network_denied_still_allows_unix_sockets() {
+        if !landlock_available() || python3().is_none() {
+            return;
+        }
+        let dir = tempfile_dir();
+        // Network off must NOT block AF_UNIX — local IPC (ssh-agent, etc.)
+        // has to keep working.
+        let ok = run_confined(
+            &net_spec(false, vec![dir]),
+            &format!("python3 -c '{OPEN_UNIX_SOCKET}'"),
+        );
+        assert!(
+            ok,
+            "AF_UNIX sockets must remain allowed when network is off"
+        );
+    }
 
     #[test]
     fn network_denied_blocks_outbound_socket() {
