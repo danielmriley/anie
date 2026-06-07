@@ -863,6 +863,22 @@ impl InteractiveController {
                 self.send_system_message(&format_sessions(&sessions, self.state.session.id()))
                     .await;
             }
+            UiAction::OpenSessionPicker => {
+                // List sessions and hand them to the TUI picker. Mapping
+                // SessionInfo -> SessionSummary at this one boundary keeps
+                // anie-protocol free of an anie-session dependency.
+                let sessions = self
+                    .state
+                    .session
+                    .list()?
+                    .into_iter()
+                    .map(session_info_to_summary)
+                    .collect();
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::SessionList { sessions })
+                    .await;
+            }
             UiAction::SwitchSession(session_id) => {
                 if self.current_run.is_some() {
                     self.send_system_message("Cannot switch sessions while a run is active.")
@@ -2564,6 +2580,25 @@ fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Map an `anie_session::SessionInfo` to the flat protocol
+/// `SessionSummary` the TUI picker consumes. `modified` (a
+/// `SystemTime`) collapses to Unix seconds; a pre-epoch time floors to 0.
+fn session_info_to_summary(info: anie_session::SessionInfo) -> anie_protocol::SessionSummary {
+    let modified_unix = info
+        .modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    anie_protocol::SessionSummary {
+        id: info.id,
+        cwd: info.cwd,
+        created: info.created,
+        modified_unix,
+        message_count: info.message_count,
+        first_message: info.first_message,
+    }
 }
 
 fn format_rewind_points(points: &[RewindPoint]) -> String {

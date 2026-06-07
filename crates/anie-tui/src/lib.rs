@@ -21,8 +21,8 @@ pub use output::{OutputPane, RenderedBlock, ToolCallResult};
 pub use overlays::{
     ConfiguredProvider, ConfiguredProviderKind, ModelPickerAction, ModelPickerPane,
     OnboardingAction, OnboardingCompletion, OnboardingScreen, ProviderEntry,
-    ProviderManagementAction, ProviderManagementScreen, ProviderType, TestResult,
-    write_configured_providers,
+    ProviderManagementAction, ProviderManagementScreen, ProviderType, SessionPickerAction,
+    SessionPickerPane, TestResult, write_configured_providers,
 };
 pub use terminal::{TerminalGuard, install_panic_hook, restore_terminal, setup_terminal};
 pub use terminal_capabilities::{ImageProtocol, TerminalCapabilities};

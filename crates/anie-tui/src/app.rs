@@ -39,6 +39,7 @@ pub(crate) const MAX_AGENT_EVENTS_PER_FRAME: usize = 256;
 use crate::{
     InputPane, ModelPickerAction, ModelPickerPane, OnboardingAction, OnboardingCompletion,
     OnboardingScreen, OutputPane, ProviderManagementAction, ProviderManagementScreen,
+    SessionPickerAction, SessionPickerPane,
     autocomplete::CommandCompletionProvider,
     commands::{SlashCommandInfo, SlashCommandSource},
     input::InputAction,
@@ -179,6 +180,7 @@ impl RenderDirty {
 enum BottomPane {
     Editor,
     ModelPicker(ModelPickerSession),
+    SessionPicker(SessionPickerPane),
 }
 
 struct ModelPickerSession {
@@ -268,6 +270,9 @@ pub enum UiAction {
     Compact,
     /// Request a session listing.
     ListSessions,
+    /// Request the session list to populate the interactive picker
+    /// (`/session` with no argument).
+    OpenSessionPicker,
     /// Switch to another session by ID.
     SwitchSession(String),
     /// Show registered tools.
@@ -645,6 +650,9 @@ impl App {
                 .picker
                 .preferred_height(frame.area().width)
                 .clamp(8, half_height.max(8)),
+            BottomPane::SessionPicker(picker) => picker
+                .preferred_height(frame.area().width)
+                .clamp(8, half_height.max(8)),
         };
         // Compute the status bar's wrapped height before
         // the layout so it can grow into multiple rows when
@@ -685,6 +693,7 @@ impl App {
                     .picker
                     .render(bottom_area, frame.buffer_mut(), spinner_frame)
             }
+            BottomPane::SessionPicker(picker) => picker.render(bottom_area, frame.buffer_mut()),
         };
         // status_text was built earlier for sizing; reuse
         // it here rather than reformatting.
@@ -752,6 +761,9 @@ impl App {
             Event::Key(key) => {
                 if matches!(self.bottom_pane, BottomPane::ModelPicker(_)) {
                     self.handle_model_picker_key(key);
+                    Ok(RenderDirty::full())
+                } else if matches!(self.bottom_pane, BottomPane::SessionPicker(_)) {
+                    self.handle_session_picker_key(key);
                     Ok(RenderDirty::full())
                 } else {
                     Ok(self.handle_key_event(key))
@@ -1012,8 +1024,9 @@ impl App {
                 }
             }
             AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
-            // Populated into the session picker in session-ux/3.
-            AgentEvent::SessionList { .. } => {}
+            AgentEvent::SessionList { sessions } => {
+                self.open_session_picker(sessions);
+            }
         }
         Ok(())
     }
@@ -1385,7 +1398,7 @@ impl App {
             }
             "session" => match arg {
                 None => {
-                    let _ = self.action_tx.send(UiAction::GetState);
+                    let _ = self.action_tx.send(UiAction::OpenSessionPicker);
                 }
                 Some("list") => {
                     let _ = self.action_tx.send(UiAction::ListSessions);
@@ -1627,10 +1640,43 @@ impl App {
         self.bottom_pane = BottomPane::Editor;
     }
 
+    /// Open the session picker once the controller's session list
+    /// arrives (`AgentEvent::SessionList`). Refuses while a run is
+    /// active — switching sessions mid-run is rejected by the
+    /// controller anyway.
+    fn open_session_picker(&mut self, sessions: Vec<anie_protocol::SessionSummary>) {
+        if self.agent_state != AgentUiState::Idle {
+            self.output_pane
+                .add_system_message("Cannot switch sessions while a run is active.".to_string());
+            return;
+        }
+        let picker = SessionPickerPane::new(sessions, self.status_bar.session_id.clone(), None);
+        self.bottom_pane = BottomPane::SessionPicker(picker);
+    }
+
+    fn close_session_picker(&mut self) {
+        self.bottom_pane = BottomPane::Editor;
+    }
+
+    fn handle_session_picker_key(&mut self, key: KeyEvent) {
+        let action = match &mut self.bottom_pane {
+            BottomPane::SessionPicker(picker) => picker.handle_key(key),
+            _ => return,
+        };
+        match action {
+            SessionPickerAction::Continue => {}
+            SessionPickerAction::Cancelled => self.close_session_picker(),
+            SessionPickerAction::Selected(session_id) => {
+                self.close_session_picker();
+                let _ = self.action_tx.send(UiAction::SwitchSession(session_id));
+            }
+        }
+    }
+
     fn handle_model_picker_key(&mut self, key: KeyEvent) {
         let action = match &mut self.bottom_pane {
-            BottomPane::Editor => return,
             BottomPane::ModelPicker(session) => session.picker.handle_key(key),
+            _ => return,
         };
 
         match action {
@@ -1643,14 +1689,14 @@ impl App {
                         session.picker.set_error(None);
                         session.context.clone()
                     }
-                    BottomPane::Editor => return,
+                    _ => return,
                 };
                 self.spawn_model_discovery(context);
             }
             ModelPickerAction::Selected(model_info) => {
                 let context = match &self.bottom_pane {
                     BottomPane::ModelPicker(session) => session.context.clone(),
-                    BottomPane::Editor => return,
+                    _ => return,
                 };
                 let model = self.resolve_selected_model(&context, &model_info);
                 self.upsert_known_model(model.clone());

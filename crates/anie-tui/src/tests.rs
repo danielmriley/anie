@@ -4,8 +4,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 
 use anie_protocol::{
-    AgentEvent, AssistantMessage, CompactionPhase, ContentBlock, Message, StreamDelta, Usage,
-    UserMessage,
+    AgentEvent, AssistantMessage, CompactionPhase, ContentBlock, Message, SessionSummary,
+    StreamDelta, Usage, UserMessage,
 };
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat};
 
@@ -2935,4 +2935,139 @@ fn skill_source_command_dispatches_activate_skill_action() {
         action_rx.try_recv().expect("activate skill action"),
         crate::UiAction::ActivateSkill(name) if name == "deploy"
     ));
+}
+
+fn session_summary(id: &str, first_message: &str) -> SessionSummary {
+    SessionSummary {
+        id: id.to_string(),
+        cwd: "/proj".to_string(),
+        created: "2026-06-06T00:00:00Z".to_string(),
+        modified_unix: 0,
+        message_count: 1,
+        first_message: first_message.to_string(),
+    }
+}
+
+#[test]
+fn session_no_arg_opens_picker_not_get_state() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
+
+    for ch in "/session".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type session command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit session command");
+
+    assert!(matches!(
+        action_rx.try_recv().expect("session action"),
+        crate::UiAction::OpenSessionPicker
+    ));
+}
+
+#[test]
+fn session_list_event_populates_bottom_pane() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
+
+    app.handle_agent_event(AgentEvent::SessionList {
+        sessions: vec![session_summary("sess-aaa", "fix the parser")],
+    })
+    .expect("session list");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+    assert!(
+        screen.contains("Switch Session"),
+        "picker title not rendered:\n{screen}"
+    );
+    assert!(
+        screen.contains("fix the parser"),
+        "session row not rendered:\n{screen}"
+    );
+}
+
+#[test]
+fn session_picker_enter_dispatches_switch_session() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
+
+    app.handle_agent_event(AgentEvent::SessionList {
+        sessions: vec![
+            session_summary("sess-aaa", "first"),
+            session_summary("sess-bbb", "second"),
+        ],
+    })
+    .expect("session list");
+
+    // Move to the second row and select it.
+    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+        .expect("navigate");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("select");
+
+    assert!(matches!(
+        action_rx.try_recv().expect("switch action"),
+        crate::UiAction::SwitchSession(id) if id == "sess-bbb"
+    ));
+}
+
+#[test]
+fn session_picker_escape_returns_to_editor() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
+
+    app.handle_agent_event(AgentEvent::SessionList {
+        sessions: vec![session_summary("sess-aaa", "first")],
+    })
+    .expect("session list");
+    app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("cancel");
+
+    // After cancel, typing routes to the editor again (no SwitchSession).
+    for ch in "hi".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type into editor");
+    }
+    assert!(action_rx.try_recv().is_err());
 }

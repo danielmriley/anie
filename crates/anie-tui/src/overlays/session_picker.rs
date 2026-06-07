@@ -6,10 +6,6 @@
 //! (`SearchField`) and the small display helpers are shared with the
 //! model picker rather than duplicated.
 
-// Wired into `app.rs` (the `BottomPane::SessionPicker` variant) in
-// session-ux/3; the widget is unit-tested in isolation here first.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,

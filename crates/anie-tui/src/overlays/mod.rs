@@ -26,3 +26,4 @@ pub use onboarding::{
 pub use providers::{
     ProviderEntry, ProviderManagementAction, ProviderManagementScreen, ProviderType, TestResult,
 };
+pub use session_picker::{SessionPickerAction, SessionPickerPane};

@@ -3329,3 +3329,39 @@ async fn pending_skill_buffer_is_cleared_after_injection() {
         "skill applies to the next turn only"
     );
 }
+
+#[tokio::test]
+async fn open_session_picker_action_emits_session_list() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    // build_dispatch_controller drops its TempDir; recreate the sessions
+    // dir (via the reserved accessor) and seed a second session file.
+    let dir = controller.state.session.sessions_dir().to_path_buf();
+    fs::create_dir_all(&dir).expect("recreate sessions dir");
+    let header = serde_json::json!({
+        "type": "session",
+        "version": 4,
+        "id": "other-sess",
+        "timestamp": "2026-06-06T00:00:00Z",
+        "cwd": "/proj",
+    });
+    fs::write(dir.join("other-sess.jsonl"), format!("{header}\n")).expect("seed session");
+
+    assert!(
+        controller
+            .try_handle_action(UiAction::OpenSessionPicker)
+            .await
+            .is_ok()
+    );
+
+    let mut sessions = None;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::SessionList { sessions: list } = event {
+            sessions = Some(list);
+        }
+    }
+    let sessions = sessions.expect("a SessionList event was emitted");
+    assert!(
+        sessions.iter().any(|summary| summary.id == "other-sess"),
+        "seeded session must appear in the summary list"
+    );
+}
