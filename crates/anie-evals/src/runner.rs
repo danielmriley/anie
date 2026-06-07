@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::scenario::{Fixture, Scenario, all_passed, evaluate_checks};
+use crate::scenario::{CheckOutcome, CheckResult, Fixture, Scenario, all_passed, evaluate_checks};
 use crate::{EvalError, RunMetricsView, RunResult};
 
 /// Default wall-clock cap for a single scenario run. A misbehaving
@@ -241,9 +241,24 @@ pub fn run_scenario(
             secs: timeout.as_secs(),
         })?;
     if !output.status.success() {
-        return Err(EvalError::NonZeroExit {
-            scenario: scenario.name.clone(),
-            status: output.status.to_string(),
+        // A crashing mode is a meaningful negative result, not absent
+        // data — record it as a FAIL so it appears in the comparison
+        // report (with any metrics it managed to emit), rather than
+        // returning early and silently dropping the mode.
+        let metrics = std::fs::read(&metrics_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or(serde_json::Value::Null);
+        return Ok(RunResult {
+            mode: mode.to_string(),
+            pass: false,
+            checks: vec![CheckResult {
+                check: "process_exit".into(),
+                outcome: CheckOutcome::Fail {
+                    reason: format!("anie exited with {}", output.status),
+                },
+            }],
+            metrics,
         });
     }
     let final_text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -261,6 +276,15 @@ pub fn run_scenario(
             path: metrics_path.display().to_string(),
             message: error.to_string(),
         })?;
+    // Fail loudly on a metrics schema the runner doesn't understand,
+    // rather than silently mis-scoring a changed shape.
+    if metrics.schema_version != crate::EXPECTED_RUN_METRICS_SCHEMA_VERSION {
+        return Err(EvalError::MetricsSchemaMismatch {
+            path: metrics_path.display().to_string(),
+            found: metrics.schema_version,
+            expected: crate::EXPECTED_RUN_METRICS_SCHEMA_VERSION,
+        });
+    }
 
     let checks = evaluate_checks(&scenario.expect, &final_text, &metrics);
     Ok(RunResult {

@@ -167,3 +167,94 @@ fn hung_anie_is_killed_and_reported_as_timeout() {
     // The killed child returns promptly, well under the 600s it would sleep.
     assert!(start.elapsed() < std::time::Duration::from_secs(30));
 }
+
+/// A fake anie that writes valid metrics but exits non-zero.
+fn write_crashing_anie(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("crash-anie.sh");
+    let script = r#"#!/usr/bin/env bash
+metrics=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[i]}" in --metrics-out) metrics="${args[i+1]}" ;; esac
+done
+cat > "$metrics" <<EOM
+{"schema_version":1,"harness_mode":"current","model":"mock","provider":"mock","wall_clock_ms":1,"turns":1,"tokens":{"input_tokens":1,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":1},"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"tools":{"calls":0,"failures":0,"by_tool":{}},"compaction":{"pre_prompt":0,"mid_turn":0,"reactive_overflow":0,"total":0}}
+EOM
+exit 3
+"#;
+    std::fs::write(&path, script).expect("write crash");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+    }
+    path
+}
+
+#[test]
+fn non_zero_exit_records_a_failed_result_not_a_dropped_mode() {
+    let dir = tempfile::tempdir().expect("dir");
+    let fake = write_crashing_anie(dir.path());
+    let scenario = parse_scenario(PASSING_SCENARIO).expect("scenario");
+
+    let result = run_scenario(
+        &fake,
+        dir.path(),
+        &scenario,
+        "current",
+        Some("mock"),
+        anie_evals::DEFAULT_RUN_TIMEOUT,
+    )
+    .expect("a crash is recorded, not returned as Err");
+    assert!(!result.pass, "a non-zero exit is a FAIL");
+    assert!(result.checks.iter().any(|c| c.check == "process_exit"));
+}
+
+/// A fake anie whose metrics declare an unsupported schema version.
+fn write_future_schema_anie(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("future-anie.sh");
+    let script = r#"#!/usr/bin/env bash
+metrics=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[i]}" in --metrics-out) metrics="${args[i+1]}" ;; esac
+done
+cat > "$metrics" <<EOM
+{"schema_version":99,"harness_mode":"current","model":"mock","provider":"mock","wall_clock_ms":1,"turns":1,"tokens":{"total_tokens":1},"tools":{"calls":0,"failures":0,"by_tool":{}}}
+EOM
+echo done
+"#;
+    std::fs::write(&path, script).expect("write future");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+    }
+    path
+}
+
+#[test]
+fn unsupported_metrics_schema_version_fails_loudly() {
+    use anie_evals::EvalError;
+    let dir = tempfile::tempdir().expect("dir");
+    let fake = write_future_schema_anie(dir.path());
+    let scenario = parse_scenario(PASSING_SCENARIO).expect("scenario");
+
+    let err = run_scenario(
+        &fake,
+        dir.path(),
+        &scenario,
+        "current",
+        Some("mock"),
+        anie_evals::DEFAULT_RUN_TIMEOUT,
+    )
+    .expect_err("a future schema must not be silently scored");
+    assert!(
+        matches!(err, EvalError::MetricsSchemaMismatch { found: 99, .. }),
+        "{err:?}"
+    );
+}

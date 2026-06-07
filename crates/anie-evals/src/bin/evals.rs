@@ -82,8 +82,11 @@ fn main() -> Result<()> {
         scenarios,
     };
 
-    let json_path = args.out.with_extension("json");
-    let md_path = args.out.with_extension("md");
+    // Append the suffix rather than `with_extension`, which would replace
+    // a dotted stem ("report.v2" -> "report.json", "runs/2026.06.07" ->
+    // "runs/2026.06.json") and could collide two intended-distinct runs.
+    let json_path = PathBuf::from(format!("{}.json", args.out.display()));
+    let md_path = PathBuf::from(format!("{}.md", args.out.display()));
     std::fs::write(&json_path, to_json(&report).context("serialize report")?)
         .with_context(|| format!("writing {}", json_path.display()))?;
     std::fs::write(&md_path, to_markdown(&report))

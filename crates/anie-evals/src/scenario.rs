@@ -50,6 +50,19 @@ pub struct Expect {
     pub max_wall_clock_ms: Option<u64>,
 }
 
+impl Expect {
+    /// Whether at least one assertion is set. An `[expect]` block with
+    /// none would score a vacuous PASS (`all_passed` is true over an
+    /// empty result set), so it is rejected at load time.
+    #[must_use]
+    pub fn has_assertions(&self) -> bool {
+        !self.contains.is_empty()
+            || self.must_call_tool.is_some()
+            || self.max_tokens.is_some()
+            || self.max_wall_clock_ms.is_some()
+    }
+}
+
 /// Outcome of one check.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -75,6 +88,13 @@ pub fn parse_scenario(text: &str) -> Result<Scenario, String> {
         && fixture.git_ref.is_some()
     {
         return Err("[fixture] must set at most one of `dir` or `git_ref`".to_string());
+    }
+    if !scenario.expect.has_assertions() {
+        return Err(
+            "[expect] defines no assertions; a scenario that asserts nothing would always \
+             report PASS — add contains / must_call_tool / max_tokens / max_wall_clock_ms"
+                .to_string(),
+        );
     }
     Ok(scenario)
 }
@@ -209,6 +229,13 @@ mod tests {
         assert_eq!(s.name, "x");
         assert!(s.fixture.is_none());
         assert_eq!(s.expect.contains, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn rejects_expect_with_no_assertions() {
+        let err = parse_scenario("name = \"x\"\nfamily = \"f\"\nprompt = \"p\"\n[expect]\n")
+            .expect_err("assertion-free expect must be rejected");
+        assert!(err.contains("no assertions"), "{err}");
     }
 
     #[test]

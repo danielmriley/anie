@@ -49,7 +49,21 @@ pub enum EvalError {
     MissingMetrics { path: String },
     #[error("could not parse metrics `{path}`: {message}")]
     MetricsParse { path: String, message: String },
+    #[error(
+        "metrics `{path}` declare schema version {found}, but this runner supports {expected}; \
+         re-generate the metrics or update anie-evals"
+    )]
+    MetricsSchemaMismatch {
+        path: String,
+        found: u32,
+        expected: u32,
+    },
 }
+
+/// The `RunMetrics` schema version this runner understands. Mirrors
+/// `anie-cli`'s `RUN_METRICS_SCHEMA_VERSION`; a mismatch means the metrics
+/// JSON may have changed field semantics and must not be silently scored.
+pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 1;
 
 /// A deserialization view of anie-cli's `RunMetrics` JSON. anie-specific
 /// (deviation): this mirrors `anie-cli/src/run_metrics.rs` rather than
