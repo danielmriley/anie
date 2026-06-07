@@ -117,8 +117,36 @@ pub fn persist_and_reopen(cwd: &Path, prompt: &Message, result: &AgentRunResult)
         // `session` drops here, releasing its advisory file lock so the
         // reopen below can acquire it.
     };
-    let reopened = SessionManager::open_session(&session_path).expect("reopen");
+    // The advisory lock is released on `session`'s drop (file close), but
+    // under heavy parallel test load the kernel's flock release can lag
+    // the reopen's non-blocking `try_lock`, surfacing a spurious
+    // `AlreadyOpen`. The production behavior (reject a contended lock) is
+    // correct; this helper just needs to wait out the brief window, so
+    // retry the reopen a few times before giving up.
+    let reopened = open_session_with_retry(&session_path);
     reopened.build_context()
+}
+
+fn open_session_with_retry(path: &Path) -> SessionManager {
+    for attempt in 0..50 {
+        match SessionManager::open_session(path) {
+            Ok(session) => return session,
+            Err(error) => {
+                let is_lock_contention = error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<anie_session::SessionError>(),
+                        Some(anie_session::SessionError::AlreadyOpen(_))
+                    )
+                });
+                if is_lock_contention && attempt < 49 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                panic!("reopen failed: {error}");
+            }
+        }
+    }
+    unreachable!("retry loop returns or panics")
 }
 
 /// Create a tool registry with all four real tools rooted at the given directory.
