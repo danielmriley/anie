@@ -3160,11 +3160,23 @@ async fn rewind_selection_restores_tree_and_emits_transcript_replace() {
     );
 
     assert_eq!(fs::read(&file).expect("read file"), b"v1");
-    assert_eq!(
-        controller.state.session.inner().leaf_id(),
-        Some(turn1.as_str()),
-        "conversation leaf re-pointed to the rewound turn"
-    );
+    // The rewind re-points at turn1 and appends a BranchSummary marking
+    // the discarded descendants, which becomes the new leaf.
+    let leaf = controller.state.session.inner().leaf_id().expect("leaf");
+    let entry = controller
+        .state
+        .session
+        .inner()
+        .get_entry(leaf)
+        .expect("leaf entry");
+    assert!(matches!(
+        entry,
+        anie_session::SessionEntry::BranchSummary {
+            reason: anie_session::BranchSummaryReason::Rewind,
+            base,
+            ..
+        } if base.parent_id.as_deref() == Some(turn1.as_str())
+    ));
 
     let mut saw_replace = false;
     while let Ok(event) = event_rx.try_recv() {

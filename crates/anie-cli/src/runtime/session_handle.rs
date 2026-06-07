@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 
 use anie_protocol::{ContentBlock, Message};
 use anie_session::{
-    RestorePlan, SessionContext, SessionEntry, SessionInfo, SessionManager,
+    BranchSummaryReason, RestorePlan, SessionContext, SessionEntry, SessionInfo, SessionManager,
     WorkspaceCheckpointStore,
 };
 
@@ -135,9 +135,16 @@ impl SessionHandle {
     }
 
     /// Fork the current session into a new child. Returns the child
-    /// session id after making the fork active.
+    /// session id after making the fork active. Records a
+    /// `BranchSummary` on the child preserving the forked-from branch's
+    /// file operations (the child is freshly created at the current
+    /// schema, so the append is never gated out).
     pub(crate) fn fork(&mut self) -> Result<String> {
-        let child = self.session.fork_to_child_session(&self.sessions_dir)?;
+        let mut child = self.session.fork_to_child_session(&self.sessions_dir)?;
+        let details = self.session.branch_compaction_details();
+        if !details.is_empty() {
+            child.append_branch_summary(BranchSummaryReason::Fork, String::new(), details)?;
+        }
         let child_id = child.id().to_string();
         self.session = child;
         Ok(child_id)
@@ -248,7 +255,19 @@ impl SessionHandle {
         // Restore (and drift-check) before mutating session state, so a
         // refusal is a clean no-op.
         let plan = store.restore(entry_id)?;
+        // Capture the file ops of the descendants we're about to discard
+        // before re-pointing the leaf.
+        let discarded = self.session.compaction_details_after(entry_id);
         self.session.fork(entry_id)?;
+        // Record what the rewind discarded (a no-op on legacy v4
+        // sessions, which can't carry the v5 entry).
+        if !discarded.is_empty() {
+            self.session.append_branch_summary(
+                BranchSummaryReason::Rewind,
+                String::new(),
+                discarded,
+            )?;
+        }
         Ok(plan)
     }
 
@@ -397,8 +416,73 @@ mod tests {
         let plan = h.rewind_to(&uid1).unwrap();
         assert_eq!(plan.written, vec!["code.rs".to_string()]);
         assert_eq!(std::fs::read(&file).unwrap(), b"v1");
-        // The conversation leaf is re-pointed at the rewound turn.
-        assert_eq!(h.inner().leaf_id(), Some(uid1.as_str()));
+        // The conversation is re-pointed at the rewound turn; a
+        // BranchSummary marking the discarded descendants becomes the
+        // new leaf, parented at the target.
+        let leaf = h.inner().leaf_id().expect("leaf");
+        let entry = h.inner().get_entry(leaf).expect("leaf entry");
+        assert!(matches!(
+            entry,
+            SessionEntry::BranchSummary { reason: BranchSummaryReason::Rewind, base, .. }
+                if base.parent_id.as_deref() == Some(uid1.as_str())
+        ));
+    }
+
+    #[test]
+    fn fork_appends_branch_summary_with_file_ops_on_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handle(dir.path());
+        h.inner_mut().append_message(&user("go")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("write", "a.rs")]))
+            .unwrap();
+
+        h.fork().unwrap();
+
+        // The (now-active) child carries a Fork BranchSummary preserving
+        // the forked-from branch's file ops.
+        let has_summary = h.inner().entries().iter().any(|entry| {
+            matches!(
+                entry,
+                SessionEntry::BranchSummary { reason: BranchSummaryReason::Fork, details, .. }
+                    if details.modified_files.contains(&"a.rs".to_string())
+            )
+        });
+        assert!(has_summary, "child should record the forked-from file ops");
+    }
+
+    #[test]
+    fn rewind_appends_branch_summary_for_discarded_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("code.rs");
+        std::fs::write(&file, b"v1").unwrap();
+
+        let mut h = handle(dir.path());
+        let uid1 = h.inner_mut().append_message(&user("t1")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("write", "code.rs")]))
+            .unwrap();
+        h.capture_checkpoint(&uid1, None).unwrap();
+
+        std::fs::write(&file, b"v2").unwrap();
+        h.inner_mut().append_message(&user("t2")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("edit", "later.rs")]))
+            .unwrap();
+        h.capture_checkpoint("t2", None).unwrap();
+
+        h.rewind_to(&uid1).unwrap();
+
+        let leaf = h.inner().leaf_id().expect("leaf");
+        let SessionEntry::BranchSummary {
+            reason, details, ..
+        } = h.inner().get_entry(leaf).expect("leaf entry")
+        else {
+            panic!("rewind leaf should be a BranchSummary");
+        };
+        assert_eq!(*reason, BranchSummaryReason::Rewind);
+        // `later.rs` was edited after the rewind point, so it is discarded.
+        assert!(details.modified_files.contains(&"later.rs".to_string()));
     }
 
     #[test]
