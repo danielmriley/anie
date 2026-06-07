@@ -99,6 +99,13 @@ pub(crate) enum SkillLoadError {
     UnterminatedFrontmatter(PathBuf),
     #[error("skill file {path} is missing required frontmatter field `{field}`")]
     MissingField { path: PathBuf, field: &'static str },
+    #[error(
+        "skill file {path} has an invalid `name` ({name:?}): a skill name must be a single \
+         token with no whitespace so `/skill:<name>` is invocable"
+    )]
+    InvalidName { path: PathBuf, name: String },
+    #[error("skill name `{name}` is declared by more than one skill in the same root ({path})")]
+    DuplicateName { path: PathBuf, name: String },
     #[error("failed to read skill file {path}: {source}")]
     Io {
         path: PathBuf,
@@ -133,6 +140,11 @@ fn load_dir(dir: &Path, skills: &mut BTreeMap<String, Skill>, errors: &mut Vec<S
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    // Names declared in *this* root. A clash here is a same-root
+    // collision (two dirs declaring `name: deploy`) and is surfaced as
+    // an error; a clash against an earlier root is intentional
+    // project-over-global shadowing and stays silent.
+    let mut seen_in_root: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -144,6 +156,13 @@ fn load_dir(dir: &Path, skills: &mut BTreeMap<String, Skill>, errors: &mut Vec<S
         }
         match parse_skill(&skill_md) {
             Ok(skill) => {
+                if !seen_in_root.insert(skill.name.clone()) {
+                    errors.push(SkillLoadError::DuplicateName {
+                        path: skill_md,
+                        name: skill.name,
+                    });
+                    continue;
+                }
                 skills.insert(skill.name.clone(), skill);
             }
             Err(error) => errors.push(error),
@@ -236,6 +255,15 @@ pub(crate) fn parse_skill(path: &Path) -> Result<Skill, SkillLoadError> {
             path: path.to_path_buf(),
             field: "name",
         })?;
+    // The command is `/skill:<name>`, and slash-command dispatch splits
+    // the input on the first whitespace — a name with a space would
+    // produce a permanently uninvokable command. Reject it loudly.
+    if name.chars().any(char::is_whitespace) {
+        return Err(SkillLoadError::InvalidName {
+            path: path.to_path_buf(),
+            name,
+        });
+    }
     let description =
         description
             .filter(|value| !value.is_empty())
@@ -326,6 +354,71 @@ mod tests {
         let skill = parse_skill(&dir.path().join("s/SKILL.md")).unwrap();
         assert_eq!(skill.body, "line one\nline two");
         assert!(!skill.body.contains("---"));
+    }
+
+    #[test]
+    fn whitespace_in_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(
+            dir.path(),
+            "s",
+            "---\nname: my skill\ndescription: d\n---\nbody\n",
+        );
+        let err = parse_skill(&dir.path().join("s/SKILL.md")).unwrap_err();
+        assert!(
+            matches!(&err, SkillLoadError::InvalidName { name, .. } if name == "my skill"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn same_root_duplicate_name_surfaces_an_error_not_silent_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(
+            dir.path(),
+            "deploy-staging",
+            "---\nname: deploy\ndescription: staging\n---\nbody\n",
+        );
+        write_skill(
+            dir.path(),
+            "deploy-prod",
+            "---\nname: deploy\ndescription: prod\n---\nbody\n",
+        );
+        let (set, errors) = discover_skills(dir.path(), None);
+        // Exactly one `deploy` survives, and the collision is reported.
+        assert_eq!(set.len(), 1);
+        assert!(set.get("deploy").is_some());
+        assert!(
+            errors.iter().any(
+                |e| matches!(e, SkillLoadError::DuplicateName { name, .. } if name == "deploy")
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn cross_root_same_name_still_shadows_silently() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_skill(
+            global.path(),
+            "dup",
+            "---\nname: dup\ndescription: global\n---\nbody\n",
+        );
+        write_skill(
+            project.path(),
+            "dup",
+            "---\nname: dup\ndescription: project\n---\nbody\n",
+        );
+        let (set, errors) = discover_skills(global.path(), Some(project.path()));
+        // Project wins; no DuplicateName error (cross-root shadow is intentional).
+        assert_eq!(set.get("dup").unwrap().description, "project");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, SkillLoadError::DuplicateName { .. })),
+            "cross-root shadowing must stay silent: {errors:?}"
+        );
     }
 
     #[test]
