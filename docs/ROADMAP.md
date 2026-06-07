@@ -15,8 +15,16 @@ ratio — smallest impactful changes first. Check off items as they ship.
       tracks. Restore refuses on a typed `WorkingTreeDrifted` (no silent
       clobber) and reuses the existing append-only `SessionManager::fork`
       for the conversation half. Ships at session schema v4 (no bump), no
-      new third-party crate. Fork branch-summaries (Workstream C) remain
-      deferred.
+      new third-party crate.
+- [x] Fork / rewind branch summaries (docs/session_ux/, Workstream C):
+      both `/fork` and `/rewind` now leave a `SessionEntry::BranchSummary`
+      (schema bump 4→5) preserving the forked-from / discarded branch's
+      file operations, so abandoned work isn't lost from the log. `/fork`
+      records it on the child (always current schema); `/rewind` records
+      the discarded descendants on the rewound branch, gated on the file
+      already being v5 so legacy v4 sessions stay readable by older
+      binaries. Metadata only — context reconstruction ignores it.
+      Closes SESSION-4.
 - [x] Interactive session picker (docs/session_ux/, Workstream A):
       `/session` with no argument opens a search-first `BottomPane`
       picker (fuzzy filter over id + first message, wraparound
@@ -152,10 +160,11 @@ File-path `@` completion remains a follow-up.
 **Why**: Session management currently requires CLI flags or filesystem
 knowledge.
 **Effort**: Medium — session listing UI, metadata display.
-**Status**: Mostly shipped. `/rewind` + `/checkpoint` (Workstream B)
-and the interactive `/session` **picker** (Workstream A) both landed via
-docs/session_ux/ — see Completed. Remaining: per-session display names
-(`/name`) and fork branch-summaries (Workstream C).
+**Status**: Shipped. `/rewind` + `/checkpoint` (Workstream B), the
+interactive `/session` **picker** (Workstream A), and fork/rewind branch
+summaries (Workstream C) all landed via docs/session_ux/ — see Completed.
+Only per-session display names (`/name`) remain, and the deferred
+tree-overlay branch visualization (SESSION-2).
 **Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
 and [docs/session_ux/README.md](session_ux/README.md)
 

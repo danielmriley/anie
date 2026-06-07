@@ -725,6 +725,7 @@ Current schema version:
 | 2 | Optional thinking signatures and redacted thinking blocks |
 | 3 | Optional assistant `reasoning_details` for OpenRouter encrypted reasoning replay |
 | 4 | Optional `CompactionDetails` on compaction entries |
+| 5 | `SessionEntry::BranchSummary` variant (fork/rewind file-op record). A new variant, so older binaries can't parse a file containing one — the `open_session` guard refuses version > CURRENT. Appended only to files already at v5 (new sessions and `/fork` children) so a legacy v4 file is never given an undeclarable entry. |
 
 Session invariants:
 
@@ -776,8 +777,16 @@ The session JSONL is **not** touched — binary file content does not belong in
 the message log — so this feature ships at schema **v4** (no bump). Deliberate
 bounds: capture is turn-granular (not per-edit), only `write`/`edit` paths are
 tracked (bash-driven `mv`/`>`/`rm` are not), and the store is self-contained
-with no `git` dependency (works in non-git trees). Fork branch-summaries from
-the same plan are deferred; `/rewind` and `/checkpoint` are text commands today.
+with no `git` dependency (works in non-git trees). `/rewind` and `/checkpoint`
+are text commands today.
+
+Both `/fork` and `/rewind` leave a `SessionEntry::BranchSummary` (schema v5)
+preserving the forked-from / discarded branch's `CompactionDetails` (file ops),
+so abandoned work isn't lost from the log. `/fork` writes it on the child
+(always current schema); `/rewind` writes it on the rewound branch, gated on
+the file already being v5 so legacy sessions stay readable by older binaries.
+The summary is metadata — `build_context` ignores it, so the rewound/forked
+transcript is unchanged.
 
 ### Session picker (`/session`)
 
