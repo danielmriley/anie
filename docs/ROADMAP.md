@@ -15,8 +15,17 @@ ratio — smallest impactful changes first. Check off items as they ship.
       tracks. Restore refuses on a typed `WorkingTreeDrifted` (no silent
       clobber) and reuses the existing append-only `SessionManager::fork`
       for the conversation half. Ships at session schema v4 (no bump), no
-      new third-party crate. The interactive session *picker* (Workstream
-      A) and fork branch-summaries (Workstream C) are deferred.
+      new third-party crate. Fork branch-summaries (Workstream C) remain
+      deferred.
+- [x] Interactive session picker (docs/session_ux/, Workstream A):
+      `/session` with no argument opens a search-first `BottomPane`
+      picker (fuzzy filter over id + first message, wraparound
+      navigation, current-session marker) instead of dumping state. A
+      new flat `AgentEvent::SessionList` / `SessionSummary` protocol pair
+      carries the list from the controller (which maps `SessionInfo` at
+      one boundary) to the TUI; `Enter` switches, `Esc` cancels. The
+      `/session list` and `/session <id>` text paths are retained.
+      Closes SESSION-1.
 - [x] Process sandbox for tool execution (docs/tool_sandbox/): opt-in,
       Linux-only `[tools.sandbox]` that confines the `bash` tool's spawned
       child via Landlock (writes restricted to roots) + seccomp (network
@@ -143,11 +152,10 @@ File-path `@` completion remains a follow-up.
 **Why**: Session management currently requires CLI flags or filesystem
 knowledge.
 **Effort**: Medium — session listing UI, metadata display.
-**Status**: Partially shipped. `/rewind` + `/checkpoint` (working-tree
-rewind, the rival-distinguishing piece) landed via docs/session_ux/
-Workstream B — see Completed. The interactive session **picker**
-(Workstream A) and per-session display names remain; `/session list`
-and `/session <id>` text paths already work.
+**Status**: Mostly shipped. `/rewind` + `/checkpoint` (Workstream B)
+and the interactive `/session` **picker** (Workstream A) both landed via
+docs/session_ux/ — see Completed. Remaining: per-session display names
+(`/name`) and fork branch-summaries (Workstream C).
 **Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
 and [docs/session_ux/README.md](session_ux/README.md)
 

@@ -776,9 +776,23 @@ The session JSONL is **not** touched — binary file content does not belong in
 the message log — so this feature ships at schema **v4** (no bump). Deliberate
 bounds: capture is turn-granular (not per-edit), only `write`/`edit` paths are
 tracked (bash-driven `mv`/`>`/`rm` are not), and the store is self-contained
-with no `git` dependency (works in non-git trees). The interactive session
-*picker* and fork branch-summaries from the same plan are deferred; `/rewind`
-and `/checkpoint` are text commands today.
+with no `git` dependency (works in non-git trees). Fork branch-summaries from
+the same plan are deferred; `/rewind` and `/checkpoint` are text commands today.
+
+### Session picker (`/session`)
+
+`/session` with no argument opens a search-first picker rather than printing
+state. Because the TUI cannot read session files directly and `anie-protocol`
+must not depend on `anie-session`, the data flow mirrors the model picker's
+request → event → populate shape: the TUI emits `UiAction::OpenSessionPicker`,
+the controller lists sessions and maps each `anie_session::SessionInfo` to a
+flat protocol-local `SessionSummary` at that one boundary, then emits
+`AgentEvent::SessionList`. The TUI builds a `BottomPane::SessionPicker`
+(fuzzy filter over id + first message, wraparound navigation, current-session
+marker), and `Enter` dispatches the existing `UiAction::SwitchSession`. No
+background worker is needed — listing is a cheap local dir read, unlike model
+discovery. The `/session list` and `/session <id>` text paths are retained for
+scripted use.
 
 ## Config and runtime state
 

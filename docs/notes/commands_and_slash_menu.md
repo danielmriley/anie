@@ -40,7 +40,8 @@ free once they land. Max visible items defaults to 5.
 | `/resume` | Browse and select a previous session | Not implemented |
 | `/new` | Start a fresh session | Not implemented |
 | `/name <name>` | Set session display name | Not implemented |
-| `/session` | Show session info, `list`, or switch by id | Implemented (text command; interactive picker deferred) |
+| `/session` | No-arg opens an interactive searchable picker; `list` / `<id>` text paths retained | Implemented |
+| `/resume` | Browse and select a previous session | Covered by `/session` picker (no separate command) |
 | `/rewind [<entry-id>]` | List rewind anchors, or restore tree + conversation to one | Implemented (text command) |
 | `/checkpoint [name]` | Record a working-tree checkpoint to rewind to | Implemented |
 | `/tree` | Navigate session history tree | Not implemented |
