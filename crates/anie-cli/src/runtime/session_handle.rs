@@ -16,7 +16,9 @@ use std::{
 use anyhow::{Context, Result};
 
 use anie_protocol::Message;
-use anie_session::{SessionContext, SessionInfo, SessionManager};
+use anie_session::{
+    RestorePlan, SessionContext, SessionInfo, SessionManager, WorkspaceCheckpointStore,
+};
 
 /// Owns the currently-active session plus its directory context.
 pub(crate) struct SessionHandle {
@@ -190,5 +192,162 @@ impl SessionHandle {
     /// Flush buffered session writes to disk.
     pub(crate) fn flush(&mut self) -> Result<()> {
         self.session.flush()
+    }
+
+    /// Sidecar directory holding this session's checkpoint store.
+    fn checkpoint_dir(&self) -> PathBuf {
+        self.sessions_dir
+            .join(format!("{}.checkpoints", self.session.id()))
+    }
+
+    /// Open (or create) the working-tree checkpoint store for the
+    /// current session, with tracked paths resolved against `cwd`.
+    fn open_checkpoint_store(&self) -> Result<WorkspaceCheckpointStore> {
+        WorkspaceCheckpointStore::open(self.checkpoint_dir(), &self.cwd)
+            .context("failed to open checkpoint store")
+    }
+
+    /// Snapshot the working tree at a session entry, over the set of
+    /// files the agent has written/edited on the active branch. Called
+    /// at each user-turn boundary (and by `/checkpoint` with a label).
+    /// Content addressing makes an unchanged file nearly free.
+    #[allow(dead_code)] // wired into the controller in session-ux/6 (/rewind, /checkpoint)
+    pub(crate) fn capture_checkpoint(
+        &mut self,
+        entry_id: &str,
+        label: Option<String>,
+    ) -> Result<()> {
+        let tracked = self.session.tracked_modified_files();
+        let mut store = self.open_checkpoint_store()?;
+        store
+            .capture(entry_id, &tracked, label)
+            .context("failed to capture checkpoint")
+    }
+
+    /// Rewind both the working tree and the conversation to a prior
+    /// entry: restore tracked files to their captured state, then
+    /// re-point the active leaf via the existing append-only
+    /// [`SessionManager::fork`]. The working tree is restored first, so
+    /// a drift refusal leaves the conversation untouched. Returns the
+    /// [`RestorePlan`] describing what changed on disk.
+    #[allow(dead_code)] // wired into the controller in session-ux/6 (/rewind, /checkpoint)
+    pub(crate) fn rewind_to(&mut self, entry_id: &str) -> Result<RestorePlan> {
+        let store = self.open_checkpoint_store()?;
+        // Restore (and drift-check) before mutating session state, so a
+        // refusal is a clean no-op.
+        let plan = store.restore(entry_id)?;
+        self.session.fork(entry_id)?;
+        Ok(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use anie_protocol::{AssistantMessage, ContentBlock, StopReason, ToolCall, Usage, UserMessage};
+    use anie_session::CheckpointError;
+    use serde_json::json;
+
+    fn handle(dir: &Path) -> SessionHandle {
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session = SessionManager::new_session(&sessions_dir, dir).unwrap();
+        SessionHandle::from_manager(session, sessions_dir, dir.to_path_buf())
+    }
+
+    fn user(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: 1,
+        })
+    }
+
+    /// An assistant turn whose tool calls touch `(tool_name, path)`.
+    fn assistant_tool_calls(calls: &[(&str, &str)]) -> Message {
+        let content = calls
+            .iter()
+            .map(|(name, path)| {
+                ContentBlock::ToolCall(ToolCall {
+                    id: format!("call-{name}-{path}"),
+                    name: (*name).to_string(),
+                    arguments: json!({ "path": path }),
+                })
+            })
+            .collect();
+        Message::Assistant(AssistantMessage {
+            content,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        })
+    }
+
+    #[test]
+    fn turn_boundary_captures_tracked_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), b"written").unwrap();
+        std::fs::write(dir.path().join("b.rs"), b"edited").unwrap();
+
+        let mut h = handle(dir.path());
+        h.inner_mut().append_message(&user("go")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[
+                ("read", "c.rs"),
+                ("write", "a.rs"),
+                ("edit", "b.rs"),
+            ]))
+            .unwrap();
+
+        h.capture_checkpoint("turn1", None).unwrap();
+
+        let store = h.open_checkpoint_store().unwrap();
+        let files = &store.entries()[0].files;
+        // write/edit paths are tracked; the read-only path is not.
+        assert!(files.contains_key("a.rs"));
+        assert!(files.contains_key("b.rs"));
+        assert!(!files.contains_key("c.rs"));
+    }
+
+    #[test]
+    fn rewind_to_restores_working_tree_and_forks_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("code.rs");
+        std::fs::write(&file, b"v1").unwrap();
+
+        let mut h = handle(dir.path());
+        let uid1 = h.inner_mut().append_message(&user("turn1")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("write", "code.rs")]))
+            .unwrap();
+        h.capture_checkpoint(&uid1, None).unwrap();
+
+        std::fs::write(&file, b"v2").unwrap();
+        h.inner_mut().append_message(&user("turn2")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("edit", "code.rs")]))
+            .unwrap();
+        h.capture_checkpoint("turn2", None).unwrap();
+
+        let plan = h.rewind_to(&uid1).unwrap();
+        assert_eq!(plan.written, vec!["code.rs".to_string()]);
+        assert_eq!(std::fs::read(&file).unwrap(), b"v1");
+        // The conversation leaf is re-pointed at the rewound turn.
+        assert_eq!(h.inner().leaf_id(), Some(uid1.as_str()));
+    }
+
+    #[test]
+    fn rewind_to_unknown_entry_returns_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handle(dir.path());
+        let err = h.rewind_to("ghost").unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<CheckpointError>(),
+            Some(CheckpointError::UnknownCheckpoint(id)) if id == "ghost"
+        ));
     }
 }

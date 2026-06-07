@@ -605,6 +605,26 @@ impl SessionManager {
         self.by_id.get(id).map(|index| &self.entries[*index])
     }
 
+    /// Paths the agent has written or edited on the active branch, in
+    /// first-seen order. Reuses [`extract_compaction_details`] so the
+    /// rewind checkpoint store and the compaction summary agree on
+    /// exactly which files the agent touched.
+    #[must_use]
+    pub fn tracked_modified_files(&self) -> Vec<String> {
+        let Some(leaf_id) = &self.leaf_id else {
+            return Vec::new();
+        };
+        let messages: Vec<Message> = self
+            .get_branch(leaf_id)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        extract_compaction_details(&messages).modified_files
+    }
+
     /// Point the active branch at an earlier entry to allow a new branch.
     pub fn fork(&mut self, from_entry_id: &str) -> Result<()> {
         if !self.by_id.contains_key(from_entry_id) {
