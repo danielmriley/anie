@@ -1,0 +1,258 @@
+//! Subprocess runner: invoke the real `anie` binary as a black box,
+//! read its `--metrics-out` sidecar, and score the scenario.
+//!
+//! Subprocess (not library linkage) keeps `anie-evals` a leaf crate and
+//! exercises the real CLI surface — `--harness-mode`, `--metrics-out` —
+//! exactly as a rival eval treats an agent.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::scenario::{Fixture, Scenario, all_passed, evaluate_checks};
+use crate::{EvalError, RunMetricsView, RunResult};
+
+/// Build the `anie` argv for one scenario run under `mode`. Pure (no
+/// spawn) so it is unit-tested directly.
+#[must_use]
+pub fn build_anie_argv(
+    mode: &str,
+    model: Option<&str>,
+    metrics_path: &Path,
+    cwd: &Path,
+    prompt: &str,
+) -> Vec<String> {
+    let mut argv = vec![
+        "--print".to_string(),
+        "--harness-mode".to_string(),
+        mode.to_string(),
+    ];
+    if let Some(model) = model {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    argv.push("--metrics-out".to_string());
+    argv.push(metrics_path.display().to_string());
+    argv.push("-C".to_string());
+    argv.push(cwd.display().to_string());
+    argv.push(prompt.to_string());
+    argv
+}
+
+/// A prepared fixture sandbox: the temp cwd plus optional cleanup (a git
+/// worktree to remove). The `TempDir` cleans itself on drop.
+pub struct FixtureSandbox {
+    pub cwd: PathBuf,
+    _temp: tempfile::TempDir,
+    worktree_to_remove: Option<PathBuf>,
+}
+
+impl Drop for FixtureSandbox {
+    fn drop(&mut self) {
+        if let Some(worktree) = &self.worktree_to_remove {
+            // Best-effort: detach the worktree so git's metadata doesn't
+            // dangle. The temp dir itself is removed by `_temp`.
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(worktree)
+                .output();
+        }
+    }
+}
+
+/// Set up a fixture into a fresh temp cwd. `None` → empty dir; `dir` →
+/// copy a tree from `repo_root`; `git_ref` → detached worktree at the
+/// ref. Both leave the repo working tree untouched.
+pub fn setup_fixture(
+    fixture: Option<&Fixture>,
+    repo_root: &Path,
+) -> Result<FixtureSandbox, EvalError> {
+    let temp = tempfile::tempdir().map_err(|source| EvalError::Spawn {
+        command: "tempdir".to_string(),
+        source,
+    })?;
+    let cwd = temp.path().to_path_buf();
+    let mut worktree_to_remove = None;
+
+    match fixture {
+        None => {}
+        Some(Fixture { dir: Some(dir), .. }) => {
+            copy_dir_all(&repo_root.join(dir), &cwd).map_err(|source| EvalError::Spawn {
+                command: format!("copy fixture {dir}"),
+                source,
+            })?;
+        }
+        Some(Fixture {
+            git_ref: Some(git_ref),
+            ..
+        }) => {
+            let output = Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&cwd)
+                .arg(git_ref)
+                .current_dir(repo_root)
+                .output()
+                .map_err(|source| EvalError::Spawn {
+                    command: "git worktree add".to_string(),
+                    source,
+                })?;
+            if !output.status.success() {
+                return Err(EvalError::NonZeroExit {
+                    scenario: format!("git worktree add {git_ref}"),
+                    status: output.status.to_string(),
+                });
+            }
+            worktree_to_remove = Some(cwd.clone());
+        }
+        Some(_) => {}
+    }
+
+    Ok(FixtureSandbox {
+        cwd,
+        _temp: temp,
+        worktree_to_remove,
+    })
+}
+
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run one scenario under one harness mode against `anie_bin`, score it,
+/// and return the [`RunResult`]. `repo_root` is the base for `dir`/
+/// `git_ref` fixtures.
+pub fn run_scenario(
+    anie_bin: &Path,
+    repo_root: &Path,
+    scenario: &Scenario,
+    mode: &str,
+    model: Option<&str>,
+) -> Result<RunResult, EvalError> {
+    let sandbox = setup_fixture(scenario.fixture.as_ref(), repo_root)?;
+    let metrics_path = sandbox.cwd.join(".anie-metrics.json");
+    let argv = build_anie_argv(mode, model, &metrics_path, &sandbox.cwd, &scenario.prompt);
+
+    let output = Command::new(anie_bin)
+        .args(&argv)
+        .output()
+        .map_err(|source| EvalError::Spawn {
+            command: anie_bin.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(EvalError::NonZeroExit {
+            scenario: scenario.name.clone(),
+            status: output.status.to_string(),
+        });
+    }
+    let final_text = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    let metrics_bytes = std::fs::read(&metrics_path).map_err(|_| EvalError::MissingMetrics {
+        path: metrics_path.display().to_string(),
+    })?;
+    let metrics_json: serde_json::Value =
+        serde_json::from_slice(&metrics_bytes).map_err(|error| EvalError::MetricsParse {
+            path: metrics_path.display().to_string(),
+            message: error.to_string(),
+        })?;
+    let metrics: RunMetricsView =
+        serde_json::from_value(metrics_json.clone()).map_err(|error| EvalError::MetricsParse {
+            path: metrics_path.display().to_string(),
+            message: error.to_string(),
+        })?;
+
+    let checks = evaluate_checks(&scenario.expect, &final_text, &metrics);
+    Ok(RunResult {
+        mode: mode.to_string(),
+        pass: all_passed(&checks),
+        checks,
+        metrics: metrics_json,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scenario::Fixture;
+
+    #[test]
+    fn runner_builds_expected_anie_argv_for_mode_and_metrics_out() {
+        let argv = build_anie_argv(
+            "rlm",
+            Some("gpt-4o"),
+            Path::new("/tmp/m.json"),
+            Path::new("/tmp/cwd"),
+            "do the thing",
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "--print",
+                "--harness-mode",
+                "rlm",
+                "--model",
+                "gpt-4o",
+                "--metrics-out",
+                "/tmp/m.json",
+                "-C",
+                "/tmp/cwd",
+                "do the thing",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_anie_argv_omits_model_when_absent() {
+        let argv = build_anie_argv("current", None, Path::new("/m"), Path::new("/c"), "p");
+        assert!(!argv.iter().any(|a| a == "--model"));
+    }
+
+    #[test]
+    fn fixture_dir_is_copied_into_temp_cwd_and_cleaned_up() {
+        let repo = tempfile::tempdir().expect("repo");
+        let fixture_dir = repo.path().join("fix");
+        std::fs::create_dir_all(fixture_dir.join("sub")).expect("mkdir");
+        std::fs::write(fixture_dir.join("a.txt"), "hello").expect("write");
+        std::fs::write(fixture_dir.join("sub/b.txt"), "world").expect("write");
+
+        let cwd_path;
+        {
+            let sandbox = setup_fixture(
+                Some(&Fixture {
+                    dir: Some("fix".to_string()),
+                    git_ref: None,
+                }),
+                repo.path(),
+            )
+            .expect("setup");
+            cwd_path = sandbox.cwd.clone();
+            assert_eq!(
+                std::fs::read_to_string(sandbox.cwd.join("a.txt")).unwrap(),
+                "hello"
+            );
+            assert_eq!(
+                std::fs::read_to_string(sandbox.cwd.join("sub/b.txt")).unwrap(),
+                "world"
+            );
+        }
+        // TempDir cleaned up on drop.
+        assert!(!cwd_path.exists());
+    }
+
+    #[test]
+    fn no_fixture_yields_empty_temp_cwd() {
+        let repo = tempfile::tempdir().expect("repo");
+        let sandbox = setup_fixture(None, repo.path()).expect("setup");
+        assert!(sandbox.cwd.is_dir());
+        assert_eq!(std::fs::read_dir(&sandbox.cwd).unwrap().count(), 0);
+    }
+}

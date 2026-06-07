@@ -7,8 +7,12 @@
 //! `docs/eval_harness/README.md`.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+mod report;
+mod runner;
 mod scenario;
 
+pub use report::{to_json, to_markdown};
+pub use runner::{FixtureSandbox, build_anie_argv, run_scenario, setup_fixture};
 pub use scenario::{
     CheckOutcome, CheckResult, Expect, Fixture, Scenario, all_passed, evaluate_checks,
     load_scenario, parse_scenario, scenario_sha256,
