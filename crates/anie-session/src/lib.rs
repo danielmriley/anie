@@ -92,7 +92,27 @@ pub use checkpoint::{
 /// |         | `CompactionDetails` shape at                          |
 /// |         | `packages/coding-agent/src/core/compaction/           |
 /// |         | compaction.ts:~33`.                                   |
-pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 4;
+/// | 5       | `SessionEntry::BranchSummary` variant — a record      |
+/// |         | left when a branch is forked from (`/fork`, written   |
+/// |         | on the child) or rewound away from (`/rewind`,        |
+/// |         | written on the active branch), preserving the         |
+/// |         | discarded/forked branch's `CompactionDetails`.        |
+/// |         | A NEW VARIANT, so older binaries cannot parse a       |
+/// |         | file containing one — hence a version bump (the       |
+/// |         | `open_session` guard refuses version > CURRENT with   |
+/// |         | a clear "upgrade" message). To keep that contract     |
+/// |         | sound, a `BranchSummary` is only ever appended to a   |
+/// |         | file whose header version is already >= 5 (new        |
+/// |         | sessions, and `/fork` children, are always current;   |
+/// |         | a resumed v4 session keeps its version and is not     |
+/// |         | given branch summaries). Mirrors pi's                 |
+/// |         | `BranchSummaryEntry` (file operations preserved).     |
+pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 5;
+
+/// First schema version that can carry a `SessionEntry::BranchSummary`.
+/// Appends are gated on the file's own header reaching this version so a
+/// legacy v4 file is never given an entry it can't declare.
+const BRANCH_SUMMARY_MIN_VERSION: u32 = 5;
 
 /// Session-file header. Always the first line in a session JSONL file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,6 +143,20 @@ pub struct EntryBase {
     pub parent_id: Option<String>,
     /// Entry timestamp.
     pub timestamp: String,
+}
+
+/// Why a [`SessionEntry::BranchSummary`] was recorded.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchSummaryReason {
+    /// A `/fork` created a child session from this branch. The summary
+    /// is written on the **child**, preserving the forked-from branch's
+    /// file operations.
+    Fork,
+    /// A `/rewind` re-pointed the active leaf to an earlier entry,
+    /// discarding the descendants. The summary is written on the rewound
+    /// branch, preserving the discarded descendants' file operations.
+    Rewind,
 }
 
 /// All append-only session entry variants.
@@ -189,6 +223,26 @@ pub enum SessionEntry {
         /// Optional label text.
         label: Option<String>,
     },
+    /// A record left when a branch is forked from or rewound away from,
+    /// preserving the affected branch's file operations so the work
+    /// isn't lost from the log. Metadata only — ignored by context
+    /// reconstruction. Schema v5.
+    #[serde(rename = "branch_summary")]
+    BranchSummary {
+        /// Shared entry metadata.
+        #[serde(flatten)]
+        base: EntryBase,
+        /// Whether this records a fork or a rewind.
+        reason: BranchSummaryReason,
+        /// Optional prose summary. Empty when no summarizer ran; the
+        /// file-op details are the durable value.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        summary: String,
+        /// File operations (read / modified paths) of the forked-from or
+        /// discarded branch.
+        #[serde(default, skip_serializing_if = "CompactionDetails::is_empty")]
+        details: CompactionDetails,
+    },
 }
 
 impl SessionEntry {
@@ -200,7 +254,8 @@ impl SessionEntry {
             | Self::Compaction { base, .. }
             | Self::ModelChange { base, .. }
             | Self::ThinkingChange { base, .. }
-            | Self::Label { base, .. } => base,
+            | Self::Label { base, .. }
+            | Self::BranchSummary { base, .. } => base,
         }
     }
 }
@@ -611,18 +666,83 @@ impl SessionManager {
     /// exactly which files the agent touched.
     #[must_use]
     pub fn tracked_modified_files(&self) -> Vec<String> {
+        self.branch_compaction_details().modified_files
+    }
+
+    /// Read / modified file operations over the entire active branch.
+    #[must_use]
+    pub fn branch_compaction_details(&self) -> CompactionDetails {
         let Some(leaf_id) = &self.leaf_id else {
-            return Vec::new();
+            return CompactionDetails::default();
         };
-        let messages: Vec<Message> = self
-            .get_branch(leaf_id)
-            .into_iter()
+        let messages = self.branch_messages(leaf_id, None);
+        extract_compaction_details(&messages)
+    }
+
+    /// File operations of the descendants strictly after `entry_id` on
+    /// the active branch — the work a `/rewind` to `entry_id` discards.
+    /// Returns empty details when `entry_id` is not on the branch.
+    #[must_use]
+    pub fn compaction_details_after(&self, entry_id: &str) -> CompactionDetails {
+        let Some(leaf_id) = &self.leaf_id else {
+            return CompactionDetails::default();
+        };
+        let messages = self.branch_messages(leaf_id, Some(entry_id));
+        extract_compaction_details(&messages)
+    }
+
+    /// Collect the `Message` payloads on the branch ending at `leaf_id`.
+    /// When `after` is `Some`, only messages strictly after that entry
+    /// (in root→leaf order) are returned.
+    fn branch_messages(&self, leaf_id: &str, after: Option<&str>) -> Vec<Message> {
+        let branch = self.get_branch(leaf_id);
+        let start = match after {
+            Some(entry_id) => match branch.iter().position(|e| e.base().id == entry_id) {
+                Some(pos) => pos + 1,
+                None => return Vec::new(),
+            },
+            None => 0,
+        };
+        branch[start..]
+            .iter()
             .filter_map(|entry| match entry {
                 SessionEntry::Message { message, .. } => Some(message.clone()),
                 _ => None,
             })
-            .collect();
-        extract_compaction_details(&messages).modified_files
+            .collect()
+    }
+
+    /// Current session-file schema version.
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        self.header.version
+    }
+
+    /// Append a [`SessionEntry::BranchSummary`] at the current leaf.
+    /// Returns `Ok(None)` (a no-op) when the file's schema predates
+    /// branch summaries — a legacy v4 file is never given an entry it
+    /// cannot declare. Otherwise returns the new entry id.
+    pub fn append_branch_summary(
+        &mut self,
+        reason: BranchSummaryReason,
+        summary: String,
+        details: CompactionDetails,
+    ) -> Result<Option<String>> {
+        if self.header.version < BRANCH_SUMMARY_MIN_VERSION {
+            return Ok(None);
+        }
+        let entry = SessionEntry::BranchSummary {
+            base: EntryBase {
+                id: self.generate_id(),
+                parent_id: self.leaf_id.clone(),
+                timestamp: now_iso8601()?,
+            },
+            reason,
+            summary,
+            details,
+        };
+        let mut ids = self.add_entries(vec![entry])?;
+        Ok(ids.pop())
     }
 
     /// Point the active branch at an earlier entry to allow a new branch.
@@ -2196,6 +2316,160 @@ mod tests {
     }
 
     #[test]
+    fn new_session_records_branch_summary_with_file_ops() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
+
+        // Seed an assistant turn that writes a file, so the branch has
+        // file-ops to preserve.
+        session
+            .append_message(&assistant_with_write("src/main.rs"))
+            .expect("append assistant");
+        let details = session.branch_compaction_details();
+        assert_eq!(details.modified_files, vec!["src/main.rs".to_string()]);
+
+        let id = session
+            .append_branch_summary(BranchSummaryReason::Fork, String::new(), details)
+            .expect("append summary")
+            .expect("v5 session records a summary");
+
+        // The entry is retrievable and carries the file-ops; it is not a
+        // Message, so context reconstruction ignores it.
+        let entry = session.get_entry(&id).expect("entry exists");
+        let SessionEntry::BranchSummary {
+            reason, details, ..
+        } = entry
+        else {
+            panic!("expected BranchSummary");
+        };
+        assert_eq!(*reason, BranchSummaryReason::Fork);
+        assert_eq!(details.modified_files, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn branch_summary_append_is_noop_on_legacy_v4_session() {
+        let tempdir = tempdir().expect("tempdir");
+        // Hand-write a v4 session file (predates branch summaries).
+        let path = tempdir.path().join("legacy.jsonl");
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 4,
+            "id": "legacy04",
+            "timestamp": "2026-06-06T00:00:00Z",
+            "cwd": "/proj",
+        });
+        fs::write(&path, format!("{header}\n")).expect("write legacy session");
+
+        let mut session = SessionManager::open_session(&path).expect("open v4");
+        assert_eq!(session.schema_version(), 4);
+        let appended = session
+            .append_branch_summary(
+                BranchSummaryReason::Rewind,
+                String::new(),
+                CompactionDetails {
+                    modified_files: vec!["x.rs".into()],
+                    ..Default::default()
+                },
+            )
+            .expect("no-op append succeeds");
+        assert!(
+            appended.is_none(),
+            "a v4 file must not be given a v5-only entry"
+        );
+        assert!(
+            !session
+                .entries()
+                .iter()
+                .any(|e| matches!(e, SessionEntry::BranchSummary { .. })),
+            "nothing was appended"
+        );
+    }
+
+    #[test]
+    fn v4_session_loads_without_branch_summary() {
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("v4.jsonl");
+        let header = serde_json::json!({
+            "type": "session", "version": 4, "id": "v4sess",
+            "timestamp": "2026-06-06T00:00:00Z", "cwd": "/proj",
+        });
+        let msg = serde_json::json!({
+            "type": "message", "id": "m1", "parentId": null,
+            "timestamp": "2026-06-06T00:00:01Z",
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}],
+            "timestamp_ms": 0,
+        });
+        fs::write(&path, format!("{header}\n{msg}\n")).expect("write v4 session");
+
+        let session = SessionManager::open_session(&path).expect("v4 loads cleanly");
+        assert!(
+            !session
+                .entries()
+                .iter()
+                .any(|e| matches!(e, SessionEntry::BranchSummary { .. })),
+            "older sessions simply have no branch summaries"
+        );
+    }
+
+    #[test]
+    fn compaction_details_after_captures_only_discarded_descendants() {
+        let tempdir = tempdir().expect("tempdir");
+        let cwd = tempdir.path().join("project");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let mut session = SessionManager::new_session(tempdir.path(), &cwd).expect("session");
+
+        session
+            .append_message(&user_message("turn1", 1))
+            .expect("u1");
+        // Rewinding to this assistant entry discards everything after it.
+        let keep = session
+            .append_message(&assistant_with_write("kept.rs"))
+            .expect("a1");
+        session
+            .append_message(&user_message("turn2", 2))
+            .expect("u2");
+        session
+            .append_message(&assistant_with_write("discarded.rs"))
+            .expect("a2");
+
+        let discarded = session.compaction_details_after(&keep);
+        assert!(
+            discarded
+                .modified_files
+                .contains(&"discarded.rs".to_string())
+        );
+        assert!(
+            !discarded.modified_files.contains(&"kept.rs".to_string()),
+            "files before the rewind point are retained, not discarded"
+        );
+    }
+
+    #[test]
+    fn branch_summary_entry_round_trips_through_serde() {
+        let entry = SessionEntry::BranchSummary {
+            base: EntryBase {
+                id: "bs1".into(),
+                parent_id: Some("m1".into()),
+                timestamp: "2026-06-06T00:00:00Z".into(),
+            },
+            reason: BranchSummaryReason::Rewind,
+            summary: "undid the refactor".into(),
+            details: CompactionDetails {
+                modified_files: vec!["a.rs".into()],
+                ..Default::default()
+            },
+        };
+        let line = serde_json::to_string(&entry).expect("serialize");
+        assert!(line.contains("\"type\":\"branch_summary\""));
+        assert!(line.contains("\"reason\":\"rewind\""));
+        let back: SessionEntry = serde_json::from_str(&line).expect("deserialize");
+        assert_eq!(back, entry);
+    }
+
+    #[test]
     fn list_sessions_skips_unreadable_entries_without_failing() {
         let tempdir = tempdir().expect("tempdir");
         let cwd = tempdir.path().join("project");
@@ -2288,6 +2562,10 @@ mod tests {
 
     fn assistant_with_tool_calls(calls: Vec<(&str, serde_json::Value)>, timestamp: u64) -> Message {
         assistant_with_tool_calls_and_text("", calls, timestamp)
+    }
+
+    fn assistant_with_write(path: &str) -> Message {
+        assistant_with_tool_calls(vec![("write", serde_json::json!({ "path": path }))], 1)
     }
 
     fn assistant_with_tool_calls_and_text(
