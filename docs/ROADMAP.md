@@ -5,6 +5,12 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] Eval harness + metrics export (docs/eval_harness/): `--metrics-out`
+      writes a per-run `RunMetrics` JSON (tokens/latency/tool success/cost/
+      compaction); the new leaf `anie-evals` crate runs TOML scenarios via
+      the real `anie` binary under each `--harness-mode`, scores them with
+      deterministic automated checks, and emits a JSON + Markdown
+      comparison report. First cut — LLM-as-judge and multi-turn deferred.
 - [x] Cost / token-budget enforcement (docs/cost_budget/): derive
       `Usage.cost` from catalog pricing, a session cost meter surfaced in
       `/state` and the TUI status bar, and optional `[budget]` run/session

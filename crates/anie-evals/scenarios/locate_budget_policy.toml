@@ -1,0 +1,11 @@
+name = "locate_budget_policy"
+family = "repo_navigation"
+description = "Find where the optional cost ceilings are enforced."
+
+prompt = "Which type enforces optional per-run/session cost ceilings in anie, and which BeforeModelResponse variant does it return to stop a run?"
+
+[expect]
+contains = ["BudgetPolicy", "StopRun"]
+must_call_tool = "grep"
+min_tool_calls = 1
+max_tokens = 90000

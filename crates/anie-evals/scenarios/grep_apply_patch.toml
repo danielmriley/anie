@@ -1,0 +1,11 @@
+name = "grep_apply_patch"
+family = "tool_use"
+description = "Use grep to find the apply_patch tool and report its envelope markers."
+
+prompt = "Find the apply_patch tool in anie-tools. What marker opens and closes its patch envelope?"
+
+[expect]
+contains = ["Begin Patch", "End Patch"]
+must_call_tool = "grep"
+min_tool_calls = 1
+max_tokens = 90000

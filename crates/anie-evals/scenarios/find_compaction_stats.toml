@@ -1,0 +1,12 @@
+name = "find_compaction_stats"
+family = "repo_navigation"
+description = "Locate the per-phase compaction counter type."
+
+prompt = "Which struct tracks per-phase compaction counts in anie, and in which file? Answer concisely."
+
+[expect]
+contains = ["CompactionStatsAtomic", "compaction_stats.rs"]
+must_call_tool = "grep"
+min_tool_calls = 1
+max_tokens = 80000
+max_wall_clock_ms = 240000

@@ -1,0 +1,11 @@
+name = "read_readme_highlights"
+family = "tool_use"
+description = "Read the README and summarize a specific capability."
+
+prompt = "Read README.md and tell me whether anie supports MCP. Quote the relevant highlight line."
+
+[expect]
+contains = ["MCP"]
+must_call_tool = "read"
+min_tool_calls = 1
+max_tokens = 80000
