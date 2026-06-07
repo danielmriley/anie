@@ -174,6 +174,42 @@ pub struct ToolsConfig {
     /// Web tool settings (`web_read`, `web_search`).
     #[serde(default)]
     pub web: WebToolConfig,
+    /// Process-sandbox settings for the `bash` tool. Off by default;
+    /// opt-in, Linux-only (Landlock + seccomp). `anie-cli` translates
+    /// this to a `SandboxSpec`; this crate holds plain data. See
+    /// `docs/tool_sandbox/`.
+    #[serde(default)]
+    pub sandbox: SandboxToolConfig,
+}
+
+/// Opt-in process-sandbox confinement for tool execution. Plain config
+/// data — the actual OS isolation lives in `anie-sandbox`, driven from a
+/// `SandboxSpec` that `anie-cli` builds from these fields + cwd. Disabled
+/// by default, so the default build/behavior is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SandboxToolConfig {
+    /// Confine spawned shell commands. Default false.
+    pub enabled: bool,
+    /// Roots the confined child may WRITE under. Empty => `anie-cli`
+    /// derives `[cwd, $TMPDIR]` at runtime.
+    pub writable_roots: Vec<PathBuf>,
+    /// Allow the confined child to open network sockets. Default false.
+    pub allow_network: bool,
+    /// Fail closed (refuse to spawn) when the kernel lacks the required
+    /// sandbox support, rather than running unconfined. Default true.
+    pub require_kernel_support: bool,
+}
+
+impl Default for SandboxToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            writable_roots: Vec::new(),
+            allow_network: false,
+            require_kernel_support: true,
+        }
+    }
 }
 
 /// Configuration for the built-in `web_read` and `web_search`
@@ -999,7 +1035,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 /// Return the default config template written on first run.
 #[must_use]
 pub fn default_config_template() -> &'static str {
-    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Ollama-wide settings (only meaningful for OllamaChatApi models).\n# Optional cap on the num_ctx anie sends to Ollama. Useful on\n# constrained hardware: a 16 GB Mac with a 32B+ model can hit\n# load failures at the 262144-token architectural max from\n# /api/show. Setting this lets anie clamp every Ollama model's\n# context window at catalog-load time. Per-model runtime\n# overrides via /context-length still win over this cap.\n# Acceptable values: >= 2048 (matches the /context-length minimum).\n# [ollama]\n# default_max_num_ctx = 32768\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# External MCP servers (stdio transport). Each enabled server is\n# spawned at startup; its tools register as mcp__<name>__<tool>.\n# A server that fails to start is skipped with a warning.\n# [mcp.servers.everything]\n# command = \"npx\"\n# args = [\"-y\", \"@modelcontextprotocol/server-everything\"]\n# enabled = true\n# startup_timeout_ms = 10000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
+    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Process sandbox for the bash tool (Linux only; Landlock + seccomp).\n# Opt-in, off by default. When enabled, confined commands may read\n# anywhere but write only under writable_roots (empty => [cwd, TMPDIR]),\n# and cannot open network sockets unless allow_network = true. With\n# require_kernel_support = true (default) anie refuses to spawn if the\n# kernel lacks Landlock, rather than running unconfined.\n# [tools.sandbox]\n# enabled = false\n# writable_roots = []\n# allow_network = false\n# require_kernel_support = true\n\n# Ollama-wide settings (only meaningful for OllamaChatApi models).\n# Optional cap on the num_ctx anie sends to Ollama. Useful on\n# constrained hardware: a 16 GB Mac with a 32B+ model can hit\n# load failures at the 262144-token architectural max from\n# /api/show. Setting this lets anie clamp every Ollama model's\n# context window at catalog-load time. Per-model runtime\n# overrides via /context-length still win over this cap.\n# Acceptable values: >= 2048 (matches the /context-length minimum).\n# [ollama]\n# default_max_num_ctx = 32768\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# External MCP servers (stdio transport). Each enabled server is\n# spawned at startup; its tools register as mcp__<name>__<tool>.\n# A server that fails to start is skipped with a warning.\n# [mcp.servers.everything]\n# command = \"npx\"\n# args = [\"-y\", \"@modelcontextprotocol/server-everything\"]\n# enabled = true\n# startup_timeout_ms = 10000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
 }
 
 fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
@@ -1103,6 +1139,20 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             }
             if let Some(value) = web.allow_private_ips {
                 config.tools.web.allow_private_ips = value;
+            }
+        }
+        if let Some(sandbox) = tools.sandbox {
+            if let Some(value) = sandbox.enabled {
+                config.tools.sandbox.enabled = value;
+            }
+            if let Some(value) = sandbox.writable_roots {
+                config.tools.sandbox.writable_roots = value;
+            }
+            if let Some(value) = sandbox.allow_network {
+                config.tools.sandbox.allow_network = value;
+            }
+            if let Some(value) = sandbox.require_kernel_support {
+                config.tools.sandbox.require_kernel_support = value;
             }
         }
     }
@@ -1238,6 +1288,15 @@ struct PartialContextConfig {
 struct PartialToolsConfig {
     bash: Option<PartialBashToolConfig>,
     web: Option<PartialWebToolConfig>,
+    sandbox: Option<PartialSandboxToolConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialSandboxToolConfig {
+    enabled: Option<bool>,
+    writable_roots: Option<Vec<PathBuf>>,
+    allow_network: Option<bool>,
+    require_kernel_support: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2182,6 +2241,50 @@ mod tests {
         let path = tempdir.path().join("config.toml");
         fs::write(&path, body).expect("write config");
         load_config_with_paths(Some(&path), None, CliOverrides::default()).expect("load config")
+    }
+
+    #[test]
+    fn sandbox_config_defaults_to_disabled() {
+        let s = SandboxToolConfig::default();
+        assert!(!s.enabled);
+        assert!(!s.allow_network);
+        assert!(s.require_kernel_support, "fail-closed is the default");
+        assert!(s.writable_roots.is_empty());
+        // Absent [tools.sandbox] also yields the disabled default.
+        assert_eq!(
+            load_body("[ui]\nmarkdown_enabled = true\n").tools.sandbox,
+            SandboxToolConfig::default()
+        );
+    }
+
+    #[test]
+    fn sandbox_config_roundtrips_through_toml() {
+        let config = load_body(
+            "[tools.sandbox]\nenabled = true\nallow_network = true\nrequire_kernel_support = false\nwritable_roots = [\"/work\"]\n",
+        );
+        assert!(config.tools.sandbox.enabled);
+        assert!(config.tools.sandbox.allow_network);
+        assert!(!config.tools.sandbox.require_kernel_support);
+        assert_eq!(
+            config.tools.sandbox.writable_roots,
+            vec![std::path::PathBuf::from("/work")]
+        );
+    }
+
+    #[test]
+    fn sandbox_config_partial_merge_overrides_only_set_fields() {
+        // Setting only `enabled` must leave require_kernel_support at its
+        // safe default (true), not zero-initialize it.
+        let config = load_body("[tools.sandbox]\nenabled = true\n");
+        assert!(config.tools.sandbox.enabled);
+        assert!(config.tools.sandbox.require_kernel_support);
+        assert!(!config.tools.sandbox.allow_network);
+    }
+
+    #[test]
+    fn sandbox_writable_roots_default_is_empty() {
+        let config = load_body("[tools.sandbox]\nenabled = true\n");
+        assert!(config.tools.sandbox.writable_roots.is_empty());
     }
 
     #[test]
