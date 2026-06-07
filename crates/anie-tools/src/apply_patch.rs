@@ -370,7 +370,7 @@ async fn apply_under_lock(
                 planned.push(PlannedWrite::Delete { abs: abs.clone() });
             }
             FileOp::Update { path, hunks } => {
-                let bytes = std::fs::read(abs).map_err(|error| {
+                let bytes = tokio::fs::read(abs).await.map_err(|error| {
                     err(format!("apply_patch: could not read `{path}`: {error}"))
                 })?;
                 if bytes.len() > MAX_EDIT_INPUT_FILE_BYTES {
@@ -421,9 +421,10 @@ async fn apply_under_lock(
     }
 
     // Write phase — every file validated. anie-specific (documented):
-    // writes are direct, matching `edit`/`write`, not temp-then-rename;
-    // validate-before-write is the atomicity guarantee, and the residual
-    // multi-file crash window is documented in the plan, not closed here.
+    // writes are direct (not temp-then-rename); validate-before-write is
+    // the atomicity guarantee, and the residual multi-file crash window
+    // is documented in the plan, not closed here. Uses `tokio::fs` (like
+    // `edit`/`write`) so per-file I/O doesn't block the runtime worker.
     for write in planned {
         match write {
             PlannedWrite::Write {
@@ -432,14 +433,14 @@ async fn apply_under_lock(
                 create_parents,
             } => {
                 if create_parents && let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| {
+                    tokio::fs::create_dir_all(parent).await.map_err(|error| {
                         err(format!(
                             "apply_patch: could not create {}: {error}",
                             parent.display()
                         ))
                     })?;
                 }
-                std::fs::write(&abs, &bytes).map_err(|error| {
+                tokio::fs::write(&abs, &bytes).await.map_err(|error| {
                     err(format!(
                         "apply_patch: failed to write {}: {error}",
                         abs.display()
@@ -447,7 +448,7 @@ async fn apply_under_lock(
                 })?;
             }
             PlannedWrite::Delete { abs } => {
-                std::fs::remove_file(&abs).map_err(|error| {
+                tokio::fs::remove_file(&abs).await.map_err(|error| {
                     err(format!(
                         "apply_patch: failed to delete {}: {error}",
                         abs.display()
