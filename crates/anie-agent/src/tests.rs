@@ -391,6 +391,7 @@ fn event_kinds(events: &[AgentEvent]) -> Vec<&'static str> {
             AgentEvent::CompactionStart { .. } => "CompactionStart",
             AgentEvent::CompactionEnd { .. } => "CompactionEnd",
             AgentEvent::RetryScheduled { .. } => "RetryScheduled",
+            AgentEvent::SessionList { .. } => "SessionList",
         })
         .collect()
 }

@@ -435,7 +435,9 @@ fn display_label(model: &ModelInfo) -> String {
     }
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+/// Truncate to at most `max_chars`, appending an ellipsis when cut.
+/// Shared with sibling pickers.
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_string()
     } else if max_chars <= 1 {
@@ -449,59 +451,64 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn is_text_input_modifiers(modifiers: KeyModifiers) -> bool {
+/// Whether a key's modifiers represent ordinary text input (no Ctrl/
+/// Alt). Shared with sibling pickers (e.g. the session picker).
+pub(crate) fn is_text_input_modifiers(modifiers: KeyModifiers) -> bool {
     matches!(modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
 }
 
+/// A single-line search/input buffer with a UTF-8-safe cursor. Shared
+/// by the model and session pickers so the text-editing behavior stays
+/// in one place.
 #[derive(Debug, Clone, Default)]
-struct SearchField {
+pub(crate) struct SearchField {
     value: String,
     cursor: usize,
 }
 
 impl SearchField {
-    fn from(value: String) -> Self {
+    pub(crate) fn from(value: String) -> Self {
         let cursor = value.len();
         Self { value, cursor }
     }
 
-    fn value(&self) -> &str {
+    pub(crate) fn value(&self) -> &str {
         &self.value
     }
 
-    fn render_value(&self) -> String {
+    pub(crate) fn render_value(&self) -> String {
         self.value.clone()
     }
 
-    fn cursor_x(&self) -> u16 {
+    pub(crate) fn cursor_x(&self) -> u16 {
         u16::try_from(self.value[..self.cursor].chars().count()).unwrap_or(u16::MAX)
     }
 
-    fn insert_char(&mut self, ch: char) {
+    pub(crate) fn insert_char(&mut self, ch: char) {
         self.value.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
     }
 
-    fn backspace(&mut self) {
+    pub(crate) fn backspace(&mut self) {
         if let Some(previous) = previous_boundary(&self.value, self.cursor) {
             self.value.drain(previous..self.cursor);
             self.cursor = previous;
         }
     }
 
-    fn delete(&mut self) {
+    pub(crate) fn delete(&mut self) {
         if let Some(next) = next_boundary(&self.value, self.cursor) {
             self.value.drain(self.cursor..next);
         }
     }
 
-    fn move_left(&mut self) {
+    pub(crate) fn move_left(&mut self) {
         if let Some(previous) = previous_boundary(&self.value, self.cursor) {
             self.cursor = previous;
         }
     }
 
-    fn move_right(&mut self) {
+    pub(crate) fn move_right(&mut self) {
         if let Some(next) = next_boundary(&self.value, self.cursor) {
             self.cursor = next;
         }
