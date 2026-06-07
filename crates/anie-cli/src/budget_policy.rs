@@ -8,6 +8,27 @@
 //! — a typed terminal condition, never a panic or a `ProviderError`.
 //! Opt-in: installed only when at least one ceiling is configured, so an
 //! unset `[budget]` is byte-identical to today. See `docs/cost_budget/`.
+//!
+//! ## Known enforcement limitations (review-tracked, not yet closed)
+//!
+//! Both stem from reconstructing spend from the active context rather
+//! than persisting a running total, and both are budget-evasion gaps a
+//! follow-up should close (likely by stamping a cumulative usage/cost
+//! total into the session log at compaction time):
+//!
+//! - **Compacted-session undercount.** On `--continue`, the session
+//!   baseline is summed over the *compacted* context (`rebuild_session`),
+//!   which replaces pre-cut turns with a usage-less summary message. So
+//!   token/cost usage from compacted-away turns is dropped from the
+//!   baseline, and a user can evade `max_session_tokens` /
+//!   `max_session_cost_usd` by compacting and resuming.
+//! - **Dollar ceiling re-prices history.** The dollar baseline is
+//!   re-derived from summed token counts at the *current* model's rates,
+//!   not from each message's already-stamped `usage.cost` (priced at
+//!   generation time). After a `/model` switch the whole token history is
+//!   re-priced, so a `max_session_cost_usd` ceiling no longer reflects
+//!   actual dollars spent. Token-count ceilings are rate-independent and
+//!   unaffected.
 
 use async_trait::async_trait;
 

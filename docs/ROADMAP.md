@@ -132,6 +132,20 @@ observations / decisions.
 
 ## Next Up — Small, High-Impact
 
+### 0b. Persist a running session usage/cost total (budget-evasion fix)
+**What**: Stamp a cumulative usage+cost total into the session log (e.g.
+on the compaction entry) and seed the cost meter / budget baseline from
+it on resume, instead of re-summing the (compacted) active context at the
+current model's rates.
+**Why**: Two review-confirmed budget-enforcement gaps (documented in
+`budget_policy.rs`): (a) compacting and resuming drops compacted-away
+turns from the session total, so `max_session_tokens` /
+`max_session_cost_usd` can be evaded; (b) the dollar ceiling re-prices
+history at the current model's rate, so a `/model` switch breaks it. Both
+are budget-evasion, not display nits.
+**Effort**: Medium — a persisted total + seed-on-resume; the per-message
+`usage.cost` already exists, stamped at generation time.
+
 ### 1. Automatic context compaction
 **What**: Trigger compaction automatically when approaching the context limit.
 **Why**: Prevents context overflow errors. Currently compaction exists but
