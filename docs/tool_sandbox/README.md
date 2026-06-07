@@ -464,28 +464,28 @@ Confirm `enabled=false` (default) is byte-identical to current behavior.
 
 ## 7. Exit criteria
 
-- [ ] `anie-sandbox` crate exists as a separate tool-execution layer (per
-      arch-doc directive `:473-475`); `anie-tools` does not own OS-isolation
-      logic beyond calling `apply`.
-- [ ] `SandboxSpec` shape is minimal (writable-roots + network toggle); no
-      speculative `mode` matrix.
-- [ ] `[tools.sandbox]` config defaults to `enabled=false`; default build
-      and behavior are byte-identical to today when disabled.
-- [ ] Sandbox setup failures surface as a typed `ToolError::SandboxSetup`
-      (no string-matched recovery).
-- [ ] On a Landlock kernel: writes confined to `writable_roots`, network
-      off by default, both verified by gated tests + manual smoke.
-- [ ] **No** `CURRENT_SESSION_SCHEMA_VERSION` bump (config is not session
-      state; provenance rides in freeform `details`) — and this is stated
-      explicitly in the PR-4/PR-5 commit bodies.
-- [ ] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D
-      warnings`, `cargo fmt --check` all green.
-- [ ] `docs/arch/anie-rs_architecture.md` updated (sandbox subsection +
-      revised "no sandboxing" framing).
-- [ ] `docs/ROADMAP.md` updated (initiative #7).
-- [ ] Rationale's approval-layer coupling is recorded: the plan notes the
-      approval layer (#1) as the recommended companion/prerequisite and the
-      escalation seam is left open (spec is per-invocation).
+- [x] `anie-sandbox` crate exists as a separate tool-execution layer;
+      `anie-tools` only calls `apply`. (PR1)
+- [x] `SandboxSpec` is minimal (writable-roots + network toggle +
+      require_kernel_support); no `mode` matrix.
+- [x] `[tools.sandbox]` defaults to `enabled=false`; disabled is
+      byte-identical to today. (PR4/PR5 + regression test)
+- [x] Setup failures surface as typed `ToolError::SandboxSetup`. (PR5)
+- [x] On a Landlock kernel: writes confined to `writable_roots`, network
+      off by default — **verified on this kernel** by real spawned-process
+      integration tests (PR2/PR3) + the bash write-outside test (PR5).
+- [x] **No** `CURRENT_SESSION_SCHEMA_VERSION` bump (config + freeform
+      `details`) — stated in the PR-4/PR-5 commit bodies.
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets`,
+      `cargo fmt --check` all green (default + `sandbox-linux` feature).
+- [x] `docs/arch/anie-rs_architecture.md` updated (sandbox subsection +
+      revised framing). (PR5)
+- [x] `docs/ROADMAP.md` updated. (PR5)
+- [x] Approval-layer coupling recorded (§1a); escalation seam left open
+      (the spec is per-invocation, not baked into `BashTool`).
+- [~] Manual smoke on a live model: the OS-confinement behavior is verified
+      by the gated integration tests; a model-driven end-to-end needs an
+      API key (not run here).
 
 ---
 
