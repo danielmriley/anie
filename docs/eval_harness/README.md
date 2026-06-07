@@ -586,43 +586,33 @@ smoke per `docs/smoke_protocol_2026-05-01.md`.
 
 ## 7. Exit criteria
 
-- [ ] `--metrics-out PATH` writes a valid `RunMetrics` JSON
-      (schema v1) from a print-mode run; absent flag writes
-      nothing.
-- [ ] `RunMetrics` covers token usage, latency, tool
-      success/failure (overall + per-tool), cost (exported,
-      may be 0), and compaction counts by phase.
-- [ ] Compaction counts in the sink agree with
-      `CompactionStatsAtomic` on the same event stream (test).
-- [ ] `anie-evals` crate exists, is a workspace member, and is
-      a leaf (no `anie-cli` dependency).
-- [ ] Scenario TOML format loads with `deny_unknown_fields`;
-      automated checks (`contains`, `must_call_tool` +
-      `min_tool_calls`, `max_tokens`, `max_wall_clock_ms`)
-      evaluate to pass/fail.
-- [ ] Runner executes a scenario via the real `anie` binary
-      under a chosen `--harness-mode`, scores it, and writes a
-      JSON + Markdown report.
-- [ ] 4–6 scenarios across ≥2 families committed under
-      `crates/anie-evals/scenarios/`.
-- [ ] A 3-mode (`baseline`/`current`/`rlm`) comparison report
-      from a real local-model run is checked in under
-      `crates/anie-evals/results/`.
-- [ ] Mock-provider golden test green in
-      `cargo test --workspace`.
-- [ ] `cargo test --workspace`, `cargo clippy --workspace
-      --all-targets -- -D warnings`, `cargo fmt --check` all
-      clean.
-- [ ] `CURRENT_SESSION_SCHEMA_VERSION` unchanged (sidecar
-      artifact — no persisted-type field added).
-- [ ] `docs/arch/anie-rs_architecture.md` updated: new
-      `anie-evals` crate + `run_metrics` module + the
-      `--metrics-out` flag.
-- [ ] `docs/ROADMAP.md` updated: eval-harness item moved to
-      shipped with a pointer to this plan.
-- [ ] Any anie-specific deviation (cost-always-zero, call-id
-      attribution, sink-counts-events-not-atomic) called out
-      in code comments with rationale.
+- [x] `--metrics-out PATH` writes a valid `RunMetrics` JSON (schema v1)
+      from a print-mode run; absent flag writes nothing (gated). (PR1)
+- [x] `RunMetrics` covers token usage, latency, tool success/failure
+      (overall + per-tool), cost (now populated by the cost initiative;
+      0 for free models, exported either way), and compaction by phase.
+- [x] Compaction counts agree with `CompactionStatsAtomic` on the same
+      event stream (`compaction_metrics_match_compaction_stats_atomic_*`).
+- [x] `anie-evals` crate exists, is a workspace member, and is a leaf
+      (no internal `anie-*` dep; cargo tree confirms).
+- [x] Scenario TOML loads with `deny_unknown_fields`; the four automated
+      checks evaluate to pass/fail. (PR2)
+- [x] Runner executes a scenario via the real `anie` binary under a
+      chosen `--harness-mode`, scores it, and writes JSON + Markdown. (PR3)
+- [x] 5 scenarios across 2 families committed under `scenarios/`;
+      `tests/corpus.rs` guards them. (PR4)
+- [~] A live 3-mode report under `results/` requires a configured model;
+      `results/README.md` documents generating it (operator step, not run
+      here — no model/API key available).
+- [x] Mock-provider (fake-binary) golden test green in
+      `cargo test --workspace`. (PR4)
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets
+      -- -D warnings`, `cargo fmt --check` all clean.
+- [x] `CURRENT_SESSION_SCHEMA_VERSION` unchanged (sidecar artifact).
+- [x] `docs/arch/anie-rs_architecture.md` updated (anie-evals crate). (PR4)
+- [x] `docs/ROADMAP.md` updated (eval harness shipped). (PR4)
+- [x] Deviations (cost note, call-id attribution, sink-counts-events,
+      RunMetricsView mirror) called out in code comments.
 
 ---
 
