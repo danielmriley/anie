@@ -50,6 +50,10 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 syntect = { version = "5", default-features = false, features = ["default-fancy", "parsing"] }
 jsonschema = "0.30"
 keyring = "3"
+# Linux process-sandbox backends, used only by anie-sandbox behind its
+# `sandbox-linux` feature (kept out of default builds and non-Linux).
+landlock = "0.4"
+seccompiler = "0.5"
 nix = { version = "0.30", features = ["signal", "process"] }
 # opener — cross-platform "open this URL in the default
 # browser" for the OAuth login flow. Pure-Rust wrapper around

@@ -14,8 +14,10 @@ workspace = true
 # platform crates only when explicitly enabled. Without it, `apply`
 # fails closed (Unsupported) for a configured spec.
 default = []
-sandbox-linux = []
+sandbox-linux = ["dep:landlock", "dep:seccompiler"]
 
 [dependencies]
 thiserror.workspace = true
 tokio.workspace = true
+landlock = { workspace = true, optional = true }
+seccompiler = { workspace = true, optional = true }

@@ -77,7 +77,7 @@ pub fn apply(
 
     #[cfg(all(target_os = "linux", feature = "sandbox-linux"))]
     {
-        return linux::apply(cmd, spec);
+        linux::apply(cmd, spec)
     }
 
     #[cfg(not(all(target_os = "linux", feature = "sandbox-linux")))]
