@@ -66,6 +66,11 @@ fn try_acquire_session_lock(file: &File, path: &Path) -> Result<bool, SessionErr
 use anie_protocol::{ContentBlock, Message, UserMessage, now_millis};
 use anie_provider::ThinkingLevel;
 
+mod checkpoint;
+pub use checkpoint::{
+    CheckpointError, FileState, ManifestEntry, RestorePlan, WorkspaceCheckpointStore,
+};
+
 /// Current session-file schema version. Bump every time a change is
 /// made that affects how older binaries should interpret the file, and
 /// update the table in docs/api_integrity_plans/05_session_schema_migration.md.
