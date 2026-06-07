@@ -303,6 +303,24 @@ async fn apply_under_lock(
     cancel: &CancellationToken,
     dry_run: bool,
 ) -> Result<ToolResult, ToolError> {
+    // Reject a patch that targets the same file in more than one section.
+    // Each Update is validated independently against the original on-disk
+    // bytes, and the write phase applies sections sequentially to the same
+    // path, so a second section would silently clobber the first — data
+    // loss reported as success. Codex semantics are one operation per file.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for (op, abs) in &resolved {
+            if !seen.insert(abs.as_path()) {
+                return Err(err(format!(
+                    "apply_patch: `{}` is targeted by more than one patch section; \
+                     combine the changes into a single section (one operation per file)",
+                    op.path()
+                )));
+            }
+        }
+    }
+
     let mut planned = Vec::new();
     let mut reports = Vec::new();
 
@@ -591,5 +609,40 @@ mod tests {
         let e = parse_patch("*** Begin Patch\n*** Update File: a.rs\nbroken line\n*** End Patch")
             .expect_err("bad prefix");
         assert!(matches!(e, ToolError::ExecutionFailed(m) if m.contains("must start with")));
+    }
+
+    #[tokio::test]
+    async fn duplicate_target_path_across_sections_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let abs = dir.path().join("a.rs");
+        std::fs::write(&abs, "x\n").expect("seed");
+
+        // Two sections targeting the same resolved path. Without the
+        // guard the second write would silently clobber the first; the
+        // guard fires before any per-op validation or write.
+        let resolved = vec![
+            (
+                FileOp::Delete {
+                    path: "a.rs".into(),
+                },
+                abs.clone(),
+            ),
+            (
+                FileOp::Delete {
+                    path: "a.rs".into(),
+                },
+                abs.clone(),
+            ),
+        ];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let e = apply_under_lock(resolved, &cancel, false)
+            .await
+            .expect_err("duplicate path must be rejected");
+        let ToolError::ExecutionFailed(message) = &e else {
+            panic!("expected ExecutionFailed, got {e:?}");
+        };
+        assert!(message.contains("more than one patch section"), "{message}");
+        // The guard is a pure no-op: the file is untouched.
+        assert!(abs.exists());
     }
 }
