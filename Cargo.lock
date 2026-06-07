@@ -256,6 +256,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "anie-sandbox"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "anie-session"
 version = "0.1.0"
 dependencies = [
