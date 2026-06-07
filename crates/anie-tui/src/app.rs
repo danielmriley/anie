@@ -1650,6 +1650,13 @@ impl App {
                 .add_system_message("Cannot switch sessions while a run is active.".to_string());
             return;
         }
+        // `SessionList` arrives asynchronously after `/session`. If the
+        // user opened another pane (e.g. the model picker, which opens
+        // synchronously) in that gap, drop the stale list rather than
+        // clobbering the live pane.
+        if !matches!(self.bottom_pane, BottomPane::Editor) {
+            return;
+        }
         let picker = SessionPickerPane::new(sessions, self.status_bar.session_id.clone(), None);
         self.bottom_pane = BottomPane::SessionPicker(picker);
     }

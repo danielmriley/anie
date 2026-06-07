@@ -342,12 +342,22 @@ fn render_session_row(
 /// Display label for a session row: the first message if present, else
 /// a short id fallback, always suffixed with a shortened id for
 /// disambiguation.
+///
+/// `first_message` is uncontrolled user text and may contain newlines or
+/// runs of whitespace; collapse them to single spaces so a multi-line
+/// first prompt can't break the one-row-per-session layout (the list
+/// renders with `Wrap`).
 fn session_label(session: &SessionSummary) -> String {
     let short_id = session.id.chars().take(8).collect::<String>();
-    if session.first_message.trim().is_empty() {
+    let first = session
+        .first_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if first.is_empty() {
         format!("(no messages) — {short_id}")
     } else {
-        format!("{} — {short_id}", session.first_message)
+        format!("{first} — {short_id}")
     }
 }
 
@@ -489,6 +499,22 @@ mod tests {
         assert!(
             rendered.contains("No sessions yet"),
             "expected empty hint:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn session_picker_collapses_multiline_first_message_in_row() {
+        // A multi-line first prompt must not break the one-row layout:
+        // the rendered row collapses newlines to spaces.
+        let pane = SessionPickerPane::new(
+            vec![summary("aaa111", "line one\nline two\n\tindented", 1)],
+            "aaa111".into(),
+            None,
+        );
+        let rendered = render_to_string(&pane, 70, 12);
+        assert!(
+            rendered.contains("line one line two indented"),
+            "newlines should collapse to spaces:\n{rendered}"
         );
     }
 

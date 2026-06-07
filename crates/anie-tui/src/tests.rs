@@ -3071,3 +3071,51 @@ fn session_picker_escape_returns_to_editor() {
     }
     assert!(action_rx.try_recv().is_err());
 }
+
+#[test]
+fn late_session_list_does_not_clobber_an_open_model_picker() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, _action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
+    app.status_bar_mut().provider_name = "ollama".into();
+    app.status_bar_mut().model_name = "qwen3:32b".into();
+
+    // Open the model picker synchronously via /model.
+    for ch in "/model".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type model command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("open model picker");
+
+    // A SessionList for a /session request issued earlier now arrives.
+    app.handle_agent_event(AgentEvent::SessionList {
+        sessions: vec![session_summary("sess-aaa", "stale")],
+    })
+    .expect("late session list");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 14)).expect("terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw frame");
+    let screen = render_to_string(terminal.backend());
+    assert!(
+        screen.contains("Select Model"),
+        "model picker must survive a late SessionList:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Switch Session"),
+        "session picker must not clobber the model picker:\n{screen}"
+    );
+}
