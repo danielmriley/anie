@@ -105,6 +105,100 @@ pub(crate) struct InteractiveController {
     /// the next turn only. In-memory; not persisted as its own type
     /// (the injected message is an ordinary `Message::User`).
     pending_skill_injections: Vec<String>,
+    /// Active recurring-prompt loop (`/loop`), if any. The main `select!`
+    /// fires its timer in every state branch; `None` leaves that arm
+    /// inert.
+    loop_state: Option<LoopState>,
+}
+
+/// A scheduled recurring prompt (`/loop <interval> <message>`).
+struct LoopState {
+    interval: Duration,
+    message: String,
+    /// When the next fire is due (a `tokio::time::Instant`).
+    next_fire: Instant,
+    /// Hard safety cap — remaining fires before the loop self-stops. Not
+    /// the normal stopping mechanism (`/loop stop` is); guards a runaway.
+    fires_remaining: u32,
+}
+
+/// Runaway guard: a loop self-stops after this many fires. High enough to
+/// be a pure safety net, not a normal stop (use `/loop stop`).
+const LOOP_MAX_ITERATIONS: u32 = 1000;
+
+/// Parsed `/loop` argument.
+#[derive(Debug, PartialEq, Eq)]
+enum LoopCommand {
+    /// Start (or replace) the loop.
+    Start { interval: Duration, message: String },
+    /// Cancel the active loop.
+    Stop,
+    /// Report the active loop's status.
+    Status,
+}
+
+/// Parse a `/loop` argument. `None`/empty → `Status`; `stop`/`off`/
+/// `cancel` → `Stop`; otherwise `<Nm|Ns> <message>`. Returns a
+/// human-readable error for a malformed interval or empty message.
+fn parse_loop_command(arg: Option<&str>) -> Result<LoopCommand, String> {
+    let arg = arg.map(str::trim).filter(|value| !value.is_empty());
+    let Some(arg) = arg else {
+        return Ok(LoopCommand::Status);
+    };
+    if matches!(arg.to_ascii_lowercase().as_str(), "stop" | "off" | "cancel") {
+        return Ok(LoopCommand::Stop);
+    }
+    let (interval_token, message) = arg
+        .split_once(char::is_whitespace)
+        .map(|(token, rest)| (token, rest.trim()))
+        .unwrap_or((arg, ""));
+    let interval = parse_interval(interval_token)?;
+    if message.is_empty() {
+        return Err(
+            "usage: /loop <interval> <message>  (e.g. /loop 3m continue), or /loop stop".into(),
+        );
+    }
+    Ok(LoopCommand::Start {
+        interval,
+        message: message.to_string(),
+    })
+}
+
+/// Parse an interval token: `<N>m` (minutes) or `<N>s` (seconds), `N` a
+/// positive integer.
+fn parse_interval(token: &str) -> Result<Duration, String> {
+    let invalid =
+        || format!("`{token}` is not a valid interval; use `<N>m` or `<N>s` (e.g. 3m, 30s)");
+    let (number, unit) = token.split_at(token.len().saturating_sub(1));
+    let secs_per_unit = match unit {
+        "m" | "M" => 60,
+        "s" | "S" => 1,
+        _ => return Err(invalid()),
+    };
+    let n: u64 = number.parse().map_err(|_| invalid())?;
+    if n == 0 {
+        return Err("interval must be greater than zero".into());
+    }
+    Ok(Duration::from_secs(n * secs_per_unit))
+}
+
+/// A future that resolves at `deadline`, or never when `None` (so a
+/// `select!` arm guarded by it is inert while no loop is armed).
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Human-readable interval for status/confirmation messages.
+fn format_interval(interval: Duration) -> String {
+    let secs = interval.as_secs();
+    if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// Default recursion budget per top-level run. Plan 02
@@ -201,7 +295,95 @@ impl InteractiveController {
             compactions_remaining_this_turn: Arc::new(AtomicU32::new(max_per_turn)),
             recursions_remaining_this_run: Arc::new(AtomicU32::new(RECURSION_BUDGET_DEFAULT)),
             pending_skill_injections: Vec::new(),
+            loop_state: None,
         }
+    }
+
+    /// The next `/loop` fire deadline, or `None` when no loop is armed.
+    fn next_loop_fire(&self) -> Option<Instant> {
+        self.loop_state.as_ref().map(|state| state.next_fire)
+    }
+
+    /// Dispatch a `/loop` command: start (replacing any existing loop),
+    /// stop, or report status.
+    async fn handle_loop_command(&mut self, arg: Option<String>) {
+        match parse_loop_command(arg.as_deref()) {
+            Ok(LoopCommand::Start { interval, message }) => {
+                let replacing = self.loop_state.is_some();
+                self.loop_state = Some(LoopState {
+                    interval,
+                    message: message.clone(),
+                    next_fire: Instant::now() + interval,
+                    fires_remaining: LOOP_MAX_ITERATIONS,
+                });
+                let verb = if replacing { "Replaced" } else { "Started" };
+                self.send_system_message(&format!(
+                    "{verb} loop: re-sending {:?} every {} (up to {LOOP_MAX_ITERATIONS} times). \
+                     Stop with /loop stop.",
+                    message,
+                    format_interval(interval),
+                ))
+                .await;
+            }
+            Ok(LoopCommand::Stop) => {
+                if self.loop_state.take().is_some() {
+                    self.send_system_message("Loop stopped.").await;
+                } else {
+                    self.send_system_message("No loop is active.").await;
+                }
+            }
+            Ok(LoopCommand::Status) => {
+                let text = match &self.loop_state {
+                    Some(state) => format!(
+                        "Loop active: re-sending {:?} every {} ({} fire(s) remaining). \
+                         Stop with /loop stop.",
+                        state.message,
+                        format_interval(state.interval),
+                        state.fires_remaining,
+                    ),
+                    None => "No loop is active. Start one with /loop <interval> <message>.".into(),
+                };
+                self.send_system_message(&text).await;
+            }
+            Err(message) => self.send_system_message(&message).await,
+        }
+    }
+
+    /// Fire the recurring loop: re-submit its message (queued if a run is
+    /// active, started if idle — the `QueuePrompt` contract), advance the
+    /// next-fire deadline, and self-stop once the iteration cap is hit.
+    async fn on_loop_fire(&mut self) -> Result<()> {
+        let message = {
+            let Some(state) = self.loop_state.as_mut() else {
+                return Ok(());
+            };
+            // Always advance the schedule, even on a skipped fire.
+            state.next_fire = Instant::now() + state.interval;
+            state.message.clone()
+        };
+        // Don't pile up: if a run is active and this message is already the
+        // next queued prompt, let the in-flight/queued work proceed rather
+        // than stacking duplicates that would run back-to-back. The fire is
+        // skipped without consuming an iteration.
+        if self.current_run.is_some() && self.queued_prompts.back() == Some(&message) {
+            return Ok(());
+        }
+        let remaining = {
+            let Some(state) = self.loop_state.as_mut() else {
+                return Ok(());
+            };
+            state.fires_remaining = state.fires_remaining.saturating_sub(1);
+            state.fires_remaining
+        };
+        self.handle_action(UiAction::QueuePrompt(message)).await?;
+        if remaining == 0 {
+            self.loop_state = None;
+            self.send_system_message(&format!(
+                "Loop reached its {LOOP_MAX_ITERATIONS}-iteration cap and stopped."
+            ))
+            .await;
+        }
+        Ok(())
     }
 
     /// Read-only accessor for the per-turn compaction budget.
@@ -289,6 +471,10 @@ impl InteractiveController {
             .await;
 
         loop {
+            // The `/loop` recurring-prompt timer fires in every state
+            // branch below. Computed as a local before the field borrows
+            // so the `select!` arm doesn't re-borrow `self`.
+            let loop_fire = self.next_loop_fire();
             // Three-way state dispatch. Each arm polls
             // `ui_action_rx` so user actions are never ignored
             // while a run is in flight or a retry is armed.
@@ -302,6 +488,9 @@ impl InteractiveController {
                                 current_run.cancel.cancel();
                             }
                         }
+                    }
+                    _ = wait_until(loop_fire) => {
+                        self.on_loop_fire().await?;
                     }
                     run_result = &mut current_run.handle => {
                         let already_compacted = current_run.already_compacted;
@@ -533,15 +722,27 @@ impl InteractiveController {
                             }
                         }
                     }
+                    _ = wait_until(loop_fire) => {
+                        self.on_loop_fire().await?;
+                    }
                     _ = sleep_until(deadline) => {
                         self.pending_retry = PendingRetry::Idle;
                         self.start_continuation_run(already_compacted, attempt).await?;
                     }
                 }
             } else {
-                match self.ui_action_rx.recv().await {
-                    Some(action) => self.handle_action(action).await?,
-                    None => break,
+                // Idle: poll UI actions and the loop timer together so a
+                // recurring `/loop` can fire while nothing else is running.
+                tokio::select! {
+                    maybe_action = self.ui_action_rx.recv() => {
+                        match maybe_action {
+                            Some(action) => self.handle_action(action).await?,
+                            None => break,
+                        }
+                    }
+                    _ = wait_until(loop_fire) => {
+                        self.on_loop_fire().await?;
+                    }
                 }
             }
 
@@ -1058,6 +1259,7 @@ impl InteractiveController {
                     }
                 }
             }
+            UiAction::Loop(arg) => self.handle_loop_command(arg).await,
             UiAction::ClearOutput => {}
         }
         Ok(())

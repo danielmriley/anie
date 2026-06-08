@@ -62,6 +62,12 @@ fn default_test_commands() -> Vec<SlashCommandInfo> {
             Some("[list|<id>]"),
         ),
         SlashCommandInfo::builtin("tools", "List tools"),
+        SlashCommandInfo::builtin_with_args(
+            "loop",
+            "Recurring prompt",
+            ArgumentSpec::FreeForm { required: false },
+            Some("[<Nm|Ns> <message> | stop]"),
+        ),
         SlashCommandInfo::builtin("onboard", "Onboarding"),
         SlashCommandInfo::builtin("providers", "Manage providers"),
         SlashCommandInfo::builtin("clear", "Clear output"),
@@ -3118,4 +3124,34 @@ fn late_session_list_does_not_clobber_an_open_model_picker() {
         !screen.contains("Switch Session"),
         "session picker must not clobber the model picker:\n{screen}"
     );
+}
+
+#[test]
+fn loop_command_routes_loop_action_with_args() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
+
+    for ch in "/loop 3m keep going".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type loop command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit loop command");
+
+    assert!(matches!(
+        action_rx.try_recv().expect("loop action"),
+        crate::UiAction::Loop(Some(arg)) if arg == "3m keep going"
+    ));
 }

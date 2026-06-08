@@ -3430,3 +3430,198 @@ async fn new_session_resets_the_session_cost_meter() {
     // "run /new to clear" hint could never clear an over-budget block.
     assert_eq!(controller.state.cost_meter.snapshot().session_tokens, 0);
 }
+
+// ---- /loop recurring-prompt command ----
+
+#[test]
+fn parse_loop_command_parses_minutes_and_seconds() {
+    use std::time::Duration;
+    assert_eq!(
+        parse_loop_command(Some("3m continue")),
+        Ok(LoopCommand::Start {
+            interval: Duration::from_secs(180),
+            message: "continue".into()
+        })
+    );
+    assert_eq!(
+        parse_loop_command(Some("30s keep going")),
+        Ok(LoopCommand::Start {
+            interval: Duration::from_secs(30),
+            message: "keep going".into()
+        })
+    );
+}
+
+#[test]
+fn parse_loop_command_recognizes_stop_aliases_and_status() {
+    assert_eq!(parse_loop_command(Some("stop")), Ok(LoopCommand::Stop));
+    assert_eq!(parse_loop_command(Some("OFF")), Ok(LoopCommand::Stop));
+    assert_eq!(parse_loop_command(Some("cancel")), Ok(LoopCommand::Stop));
+    assert_eq!(parse_loop_command(None), Ok(LoopCommand::Status));
+    assert_eq!(parse_loop_command(Some("   ")), Ok(LoopCommand::Status));
+}
+
+#[test]
+fn parse_loop_command_rejects_bad_interval_and_empty_message() {
+    assert!(parse_loop_command(Some("5x hello")).is_err(), "bad unit");
+    assert!(parse_loop_command(Some("0m hello")).is_err(), "zero");
+    assert!(parse_loop_command(Some("abc go")).is_err(), "non-numeric");
+    assert!(parse_loop_command(Some("3m")).is_err(), "empty message");
+}
+
+#[tokio::test]
+async fn loop_command_starts_and_replaces_schedule() {
+    use std::time::Duration;
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+
+    controller
+        .handle_action(UiAction::Loop(Some("2m work".into())))
+        .await
+        .expect("start loop");
+    {
+        let state = controller.loop_state.as_ref().expect("loop armed");
+        assert_eq!(state.interval, Duration::from_secs(120));
+        assert_eq!(state.message, "work");
+        assert_eq!(state.fires_remaining, LOOP_MAX_ITERATIONS);
+    }
+
+    // Re-issuing replaces (does not stack).
+    controller
+        .handle_action(UiAction::Loop(Some("30s other".into())))
+        .await
+        .expect("replace loop");
+    let state = controller.loop_state.as_ref().expect("loop still armed");
+    assert_eq!(state.interval, Duration::from_secs(30));
+    assert_eq!(state.message, "other");
+}
+
+#[tokio::test]
+async fn loop_stop_clears_the_schedule() {
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    controller
+        .handle_action(UiAction::Loop(Some("1m go".into())))
+        .await
+        .expect("start");
+    assert!(controller.loop_state.is_some());
+    controller
+        .handle_action(UiAction::Loop(Some("stop".into())))
+        .await
+        .expect("stop");
+    assert!(controller.loop_state.is_none());
+}
+
+fn fake_active_run() -> CurrentRun {
+    use anie_agent::AgentRunResult;
+    use tokio_util::sync::CancellationToken;
+    let handle = tokio::spawn(async {
+        AgentRunResult {
+            generated_messages: Vec::new(),
+            final_context: Vec::new(),
+            terminal_error: None,
+            terminal_stop: None,
+        }
+    });
+    CurrentRun {
+        handle,
+        cancel: CancellationToken::new(),
+        already_compacted: false,
+        retry_attempt: 0,
+    }
+}
+
+#[tokio::test]
+async fn loop_fire_queues_message_when_a_run_is_active() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller
+        .handle_action(UiAction::Loop(Some("1m do work".into())))
+        .await
+        .expect("start");
+    controller.current_run = Some(fake_active_run());
+
+    let before = controller.loop_state.as_ref().unwrap().fires_remaining;
+    let first_fire = controller.loop_state.as_ref().unwrap().next_fire;
+    controller.on_loop_fire().await.expect("fire");
+
+    // A run is active, so the message is queued (not interrupting), and
+    // the loop advanced its deadline + decremented its budget.
+    assert_eq!(
+        controller.queued_prompts.back().map(String::as_str),
+        Some("do work")
+    );
+    assert_eq!(
+        controller.loop_state.as_ref().unwrap().fires_remaining,
+        before - 1
+    );
+    assert!(controller.loop_state.as_ref().unwrap().next_fire > first_fire);
+}
+
+#[tokio::test]
+async fn loop_fire_caps_iterations_and_self_stops() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller
+        .handle_action(UiAction::Loop(Some("1m go".into())))
+        .await
+        .expect("start");
+    // One fire away from the cap; keep a run active so the fire just queues.
+    controller.loop_state.as_mut().unwrap().fires_remaining = 1;
+    controller.current_run = Some(fake_active_run());
+
+    controller.on_loop_fire().await.expect("fire");
+    assert!(
+        controller.loop_state.is_none(),
+        "loop must self-stop at the iteration cap"
+    );
+}
+
+#[tokio::test]
+async fn wait_until_resolves_at_deadline_and_is_inert_when_none() {
+    use tokio::time::{Duration, Instant, timeout};
+    // A due (past) deadline resolves promptly — the loop arm fires.
+    let due = Instant::now();
+    assert!(
+        timeout(Duration::from_secs(1), wait_until(Some(due)))
+            .await
+            .is_ok()
+    );
+    // `None` never resolves — the arm is inert while no loop is armed.
+    assert!(
+        timeout(Duration::from_millis(50), wait_until(None))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn loop_fire_does_not_pile_up_duplicate_queued_messages() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller
+        .handle_action(UiAction::Loop(Some("1m continue".into())))
+        .await
+        .expect("start");
+    controller.current_run = Some(fake_active_run());
+
+    // First fire queues the message.
+    controller.on_loop_fire().await.expect("fire 1");
+    // A second fire (run still active, message still queued) must not stack
+    // a duplicate, and must not consume an iteration.
+    let remaining_after_first = controller.loop_state.as_ref().unwrap().fires_remaining;
+    controller.on_loop_fire().await.expect("fire 2");
+
+    assert_eq!(
+        controller
+            .queued_prompts
+            .iter()
+            .filter(|m| m.as_str() == "continue")
+            .count(),
+        1,
+        "duplicate loop messages must not pile up"
+    );
+    assert_eq!(
+        controller.loop_state.as_ref().unwrap().fires_remaining,
+        remaining_after_first,
+        "a skipped fire must not consume an iteration"
+    );
+}

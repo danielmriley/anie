@@ -302,6 +302,9 @@ pub enum UiAction {
     /// Activate a skill by (bare) name: stage its body as context for
     /// the next prompt. Dispatched by `/skill:<name>`.
     ActivateSkill(String),
+    /// Manage the recurring-prompt loop (`/loop [<interval> <message> |
+    /// stop]`). `None` shows status; the controller parses the argument.
+    Loop(Option<String>),
 }
 
 /// Status-bar display state.
@@ -1391,6 +1394,9 @@ impl App {
                 let _ = self
                     .action_tx
                     .send(UiAction::ContextLength(arg.map(str::to_string)));
+            }
+            "loop" => {
+                let _ = self.action_tx.send(UiAction::Loop(arg.map(str::to_string)));
             }
             "clear" => {
                 self.output_pane.clear();

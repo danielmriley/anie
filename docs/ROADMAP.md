@@ -5,6 +5,17 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] `/loop` recurring-prompt command (docs/loop_command/): `/loop
+      <Nm|Ns> <message>` re-submits a prompt on a fixed interval so the
+      agent keeps working a goal across turns. Modeled on Codex's `/loop`
+      (issue #15679): it **queues** rather than interrupts a running turn
+      (reusing the existing `QueuePrompt` "start-if-idle / queue-if-busy"
+      contract), **replaces** on re-issue, dedups so duplicate loop
+      messages don't pile up, and carries a hard iteration cap
+      (anie-specific runaway guard; `[budget]` ceilings also still apply).
+      `/loop stop` cancels; `/loop` reports status. Timer lives in the
+      controller's `select!` (the `PendingRetry` arm's precedent). Self-
+      removal on task completion and a status-bar segment are deferred.
 - [x] Working-tree checkpoint / rewind (docs/session_ux/, Workstream B):
       `/rewind` restores **both** the conversation and the working tree to
       a prior user turn; `/checkpoint [name]` records a labeled anchor. A
