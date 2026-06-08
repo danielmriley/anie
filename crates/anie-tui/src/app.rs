@@ -305,6 +305,9 @@ pub enum UiAction {
     /// Manage the recurring-prompt loop (`/loop [<interval> <message> |
     /// stop]`). `None` shows status; the controller parses the argument.
     Loop(Option<String>),
+    /// Manage the autonomous goal loop (`/goal [<description> | stop]`).
+    /// `None` shows status; the controller parses the argument.
+    Goal(Option<String>),
 }
 
 /// Status-bar display state.
@@ -1397,6 +1400,9 @@ impl App {
             }
             "loop" => {
                 let _ = self.action_tx.send(UiAction::Loop(arg.map(str::to_string)));
+            }
+            "goal" => {
+                let _ = self.action_tx.send(UiAction::Goal(arg.map(str::to_string)));
             }
             "clear" => {
                 self.output_pane.clear();

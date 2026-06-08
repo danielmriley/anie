@@ -109,6 +109,13 @@ pub(crate) struct InteractiveController {
     /// fires its timer in every state branch; `None` leaves that arm
     /// inert.
     loop_state: Option<LoopState>,
+    /// Active autonomous goal loop (`/goal`), if any. Drives a fresh run
+    /// at each clean run-completion boundary until the goal signals
+    /// done/blocked or a cap is hit. Mutually exclusive with `loop_state`.
+    goal_state: Option<GoalState>,
+    /// The goal decision computed from the just-completed run (where
+    /// `result` is in scope), applied after the queued-prompt drain.
+    pending_goal_decision: Option<GoalDecision>,
 }
 
 /// A scheduled recurring prompt (`/loop <interval> <message>`).
@@ -199,6 +206,130 @@ fn format_interval(interval: Duration) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+/// An active autonomous goal loop (`/goal`).
+struct GoalState {
+    goal: String,
+    /// Remaining autonomous continuations before the turn cap stops it.
+    turns_remaining: u32,
+}
+
+/// Runaway guard: a goal self-stops after this many continuations. Each
+/// turn is a full agent run, so this is far lower than `/loop`'s cap.
+const GOAL_MAX_TURNS: u32 = 50;
+
+/// Sentinels the model emits to end an autonomous goal loop.
+const GOAL_COMPLETE_MARKER: &str = "GOAL_COMPLETE";
+const GOAL_BLOCKED_MARKER: &str = "GOAL_BLOCKED";
+
+/// Parsed `/goal` argument.
+#[derive(Debug, PartialEq, Eq)]
+enum GoalCommand {
+    Start(String),
+    Stop,
+    Status,
+}
+
+/// What a just-completed goal turn signalled.
+#[derive(Debug, PartialEq, Eq)]
+enum GoalOutcome {
+    Complete,
+    Blocked(String),
+}
+
+/// The deferred decision applied after the run-completion drain.
+#[derive(Debug, PartialEq, Eq)]
+enum GoalDecision {
+    /// Stop the goal with this user-facing message.
+    Stop(String),
+    /// Keep going (subject to the cap / budget at apply time).
+    Continue,
+}
+
+/// Parse a `/goal` argument. `None`/empty → `Status`; `stop`/`off`/
+/// `cancel` → `Stop`; anything else is the goal description.
+fn parse_goal_command(arg: Option<&str>) -> GoalCommand {
+    let arg = arg.map(str::trim).filter(|value| !value.is_empty());
+    let Some(arg) = arg else {
+        return GoalCommand::Status;
+    };
+    if matches!(arg.to_ascii_lowercase().as_str(), "stop" | "off" | "cancel") {
+        return GoalCommand::Stop;
+    }
+    GoalCommand::Start(arg.to_string())
+}
+
+/// Scan a completed run's messages for a goal-completion sentinel.
+/// `Complete` wins over `Blocked` if both somehow appear.
+fn detect_goal_outcome(messages: &[Message]) -> Option<GoalOutcome> {
+    let mut blocked: Option<GoalOutcome> = None;
+    for message in messages {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        for block in &assistant.content {
+            let ContentBlock::Text { text } = block else {
+                continue;
+            };
+            if text.contains(GOAL_COMPLETE_MARKER) {
+                return Some(GoalOutcome::Complete);
+            }
+            if blocked.is_none()
+                && let Some(idx) = text.find(GOAL_BLOCKED_MARKER)
+            {
+                let reason = text[idx + GOAL_BLOCKED_MARKER.len()..]
+                    .trim_start_matches([':', ' '])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                blocked = Some(GoalOutcome::Blocked(reason));
+            }
+        }
+    }
+    blocked
+}
+
+/// The continuation decision for a goal that is not yet complete: keep
+/// going, or stop because the cap or budget says so. Pure for testing.
+fn next_goal_step(turns_remaining: u32, budget_blocked: bool) -> GoalDecision {
+    if turns_remaining == 0 {
+        GoalDecision::Stop(format!(
+            "Goal stopped: reached the {GOAL_MAX_TURNS}-turn cap. Run /goal again to keep going."
+        ))
+    } else if budget_blocked {
+        GoalDecision::Stop("Goal stopped: the session budget ceiling was reached.".to_string())
+    } else {
+        GoalDecision::Continue
+    }
+}
+
+/// The framing for the first turn of an autonomous goal.
+fn initial_goal_prompt(goal: &str) -> String {
+    format!(
+        "You are working autonomously toward the goal below until it is fully achieved. \
+         Plan the steps, execute them with your tools, and VERIFY your work (run tests, \
+         re-read files, check outputs). You will be automatically prompted to continue after \
+         each turn — keep going without waiting for me.\n\n\
+         <goal>\n{goal}\n</goal>\n\n\
+         When the goal is fully achieved AND verified, end your message with the exact line:\n\
+         {GOAL_COMPLETE_MARKER}\n\n\
+         If you are genuinely blocked and need my input to proceed, end your message with:\n\
+         {GOAL_BLOCKED_MARKER}: <one-line reason>"
+    )
+}
+
+/// The framing for each autonomous continuation turn.
+fn goal_continuation_prompt(goal: &str) -> String {
+    format!(
+        "Continue working autonomously toward the goal. Review and verify what you've done so \
+         far, then take the next step.\n\n\
+         <goal>\n{goal}\n</goal>\n\n\
+         End with `{GOAL_COMPLETE_MARKER}` when fully done and verified, or \
+         `{GOAL_BLOCKED_MARKER}: <reason>` if you need my input."
+    )
 }
 
 /// Default recursion budget per top-level run. Plan 02
@@ -296,6 +427,8 @@ impl InteractiveController {
             recursions_remaining_this_run: Arc::new(AtomicU32::new(RECURSION_BUDGET_DEFAULT)),
             pending_skill_injections: Vec::new(),
             loop_state: None,
+            goal_state: None,
+            pending_goal_decision: None,
         }
     }
 
@@ -309,6 +442,11 @@ impl InteractiveController {
     async fn handle_loop_command(&mut self, arg: Option<String>) {
         match parse_loop_command(arg.as_deref()) {
             Ok(LoopCommand::Start { interval, message }) => {
+                // A loop and a goal would fight over run starts.
+                if self.goal_state.take().is_some() {
+                    self.send_system_message("Stopped the active /goal to start a loop.")
+                        .await;
+                }
                 let replacing = self.loop_state.is_some();
                 self.loop_state = Some(LoopState {
                     interval,
@@ -382,6 +520,117 @@ impl InteractiveController {
                 "Loop reached its {LOOP_MAX_ITERATIONS}-iteration cap and stopped."
             ))
             .await;
+        }
+        Ok(())
+    }
+
+    /// Dispatch a `/goal` command: start an autonomous loop (replacing any
+    /// active loop/goal), stop, or report status.
+    async fn handle_goal_command(&mut self, arg: Option<String>) -> Result<()> {
+        match parse_goal_command(arg.as_deref()) {
+            GoalCommand::Start(goal) => {
+                if self.loop_state.take().is_some() {
+                    self.send_system_message("Stopped the active /loop to start a goal.")
+                        .await;
+                }
+                self.goal_state = Some(GoalState {
+                    goal: goal.clone(),
+                    turns_remaining: GOAL_MAX_TURNS,
+                });
+                self.pending_goal_decision = None;
+                self.send_system_message(&format!(
+                    "Goal started (autonomous, up to {GOAL_MAX_TURNS} turns): {goal:?}. \
+                     I'll keep working and verifying until it's done. Stop with /goal stop."
+                ))
+                .await;
+                // Kick off the first turn now (idle → starts; if a run is
+                // somehow active, QueuePrompt queues behind it). Boxed to
+                // break the async-recursion type cycle (this is dispatched
+                // from `handle_action` → `try_handle_action`).
+                Box::pin(self.handle_action(UiAction::QueuePrompt(initial_goal_prompt(&goal))))
+                    .await?;
+            }
+            GoalCommand::Stop => {
+                self.pending_goal_decision = None;
+                if self.goal_state.take().is_some() {
+                    self.send_system_message("Goal stopped.").await;
+                } else {
+                    self.send_system_message("No goal is active.").await;
+                }
+            }
+            GoalCommand::Status => {
+                let text = match &self.goal_state {
+                    Some(state) => format!(
+                        "Goal active ({} turn(s) remaining): {:?}. Stop with /goal stop.",
+                        state.turns_remaining, state.goal,
+                    ),
+                    None => "No goal is active. Start one with /goal <description>.".into(),
+                };
+                self.send_system_message(&text).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the goal decision implied by a just-completed run's output.
+    /// Called from the run-completion branch where `result` is in scope;
+    /// the decision is applied after the queued-prompt drain.
+    fn record_goal_decision(&mut self, messages: &[Message]) {
+        if self.goal_state.is_none() {
+            return;
+        }
+        self.pending_goal_decision = Some(match detect_goal_outcome(messages) {
+            Some(GoalOutcome::Complete) => {
+                GoalDecision::Stop("Goal achieved \u{2713}. Stopping the autonomous loop.".into())
+            }
+            Some(GoalOutcome::Blocked(reason)) => GoalDecision::Stop(if reason.is_empty() {
+                "Goal paused: the agent reported it is blocked and needs your input.".into()
+            } else {
+                format!("Goal paused: blocked — {reason}. Give input, then /goal again to resume.")
+            }),
+            None => GoalDecision::Continue,
+        });
+    }
+
+    /// Apply the deferred goal decision after the run-completion drain.
+    /// `followup_started` is true when a queued user prompt already began
+    /// a new run (which takes priority; the goal resumes after it).
+    async fn apply_goal_decision(&mut self, followup_started: bool) -> Result<()> {
+        let Some(decision) = self.pending_goal_decision.take() else {
+            return Ok(());
+        };
+        match decision {
+            // A finished/blocked goal stops regardless of any queued work.
+            GoalDecision::Stop(message) => {
+                self.goal_state = None;
+                self.send_system_message(&message).await;
+            }
+            GoalDecision::Continue => {
+                if followup_started {
+                    // User input runs first; the goal resumes when it
+                    // completes and re-records a decision.
+                    return Ok(());
+                }
+                let budget_blocked = self.session_budget_block().is_some();
+                let turns_remaining = self.goal_state.as_ref().map_or(0, |s| s.turns_remaining);
+                match next_goal_step(turns_remaining, budget_blocked) {
+                    GoalDecision::Stop(message) => {
+                        self.goal_state = None;
+                        self.send_system_message(&message).await;
+                    }
+                    GoalDecision::Continue => {
+                        let goal = match self.goal_state.as_mut() {
+                            Some(state) => {
+                                state.turns_remaining = state.turns_remaining.saturating_sub(1);
+                                state.goal.clone()
+                            }
+                            None => return Ok(()),
+                        };
+                        self.start_prompt_run(goal_continuation_prompt(&goal))
+                            .await?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -658,6 +907,12 @@ impl InteractiveController {
                                             text: format_run_stop(stop),
                                         }).await;
                                     }
+                                    // Autonomous goal: a clean completion is
+                                    // where the agent may have signalled
+                                    // done/blocked. Record the decision now
+                                    // (while `result` is in scope); apply it
+                                    // after the queued-prompt drain below.
+                                    self.record_goal_decision(&result.generated_messages);
                                 }
                             }
                             Err(error) => {
@@ -675,10 +930,17 @@ impl InteractiveController {
                         // Skipped when a transient retry is
                         // armed; PR 2.3 will give queued
                         // prompts priority over stale retries.
+                        let mut followup_started = false;
                         if self.current_run.is_none()
                             && matches!(self.pending_retry, PendingRetry::Idle)
                         {
-                            self.try_drain_queued_prompt().await?;
+                            followup_started = self.try_drain_queued_prompt().await?;
+                        }
+                        // Apply the autonomous-goal decision: stop on
+                        // done/blocked/cap/budget, or start the next turn
+                        // when no user follow-up took priority.
+                        if matches!(self.pending_retry, PendingRetry::Idle) {
+                            self.apply_goal_decision(followup_started).await?;
                         }
 
                         if self.exit_after_run
@@ -1260,6 +1522,7 @@ impl InteractiveController {
                 }
             }
             UiAction::Loop(arg) => self.handle_loop_command(arg).await,
+            UiAction::Goal(arg) => self.handle_goal_command(arg).await?,
             UiAction::ClearOutput => {}
         }
         Ok(())

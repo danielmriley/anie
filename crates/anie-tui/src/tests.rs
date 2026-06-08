@@ -68,6 +68,12 @@ fn default_test_commands() -> Vec<SlashCommandInfo> {
             ArgumentSpec::FreeForm { required: false },
             Some("[<Nm|Ns> <message> | stop]"),
         ),
+        SlashCommandInfo::builtin_with_args(
+            "goal",
+            "Autonomous goal",
+            ArgumentSpec::FreeForm { required: false },
+            Some("[<description> | stop]"),
+        ),
         SlashCommandInfo::builtin("onboard", "Onboarding"),
         SlashCommandInfo::builtin("providers", "Manage providers"),
         SlashCommandInfo::builtin("clear", "Clear output"),
@@ -3153,5 +3159,35 @@ fn loop_command_routes_loop_action_with_args() {
     assert!(matches!(
         action_rx.try_recv().expect("loop action"),
         crate::UiAction::Loop(Some(arg)) if arg == "3m keep going"
+    ));
+}
+
+#[test]
+fn goal_command_routes_goal_action_with_description() {
+    let (_event_tx, event_rx) = mpsc::channel(8);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        event_rx,
+        action_tx,
+        sample_models(),
+        default_test_commands(),
+    );
+
+    for ch in "/goal ship the parser".chars() {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )))
+        .expect("type goal command");
+    }
+    app.handle_terminal_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit goal command");
+
+    assert!(matches!(
+        action_rx.try_recv().expect("goal action"),
+        crate::UiAction::Goal(Some(arg)) if arg == "ship the parser"
     ));
 }

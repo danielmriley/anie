@@ -3625,3 +3625,156 @@ async fn loop_fire_does_not_pile_up_duplicate_queued_messages() {
         "a skipped fire must not consume an iteration"
     );
 }
+
+// ---- /goal autonomous loop ----
+
+fn assistant_with_text(text: &str) -> Message {
+    Message::Assistant(assistant_message(text))
+}
+
+#[test]
+fn parse_goal_command_handles_start_stop_and_status() {
+    assert_eq!(
+        parse_goal_command(Some("build a REST API")),
+        GoalCommand::Start("build a REST API".into())
+    );
+    assert_eq!(parse_goal_command(Some("stop")), GoalCommand::Stop);
+    assert_eq!(parse_goal_command(Some("CANCEL")), GoalCommand::Stop);
+    assert_eq!(parse_goal_command(None), GoalCommand::Status);
+    assert_eq!(parse_goal_command(Some("   ")), GoalCommand::Status);
+}
+
+#[test]
+fn detect_goal_outcome_finds_markers_and_prefers_complete() {
+    assert_eq!(
+        detect_goal_outcome(&[assistant_with_text("All tests pass.\nGOAL_COMPLETE")]),
+        Some(GoalOutcome::Complete)
+    );
+    assert_eq!(
+        detect_goal_outcome(&[assistant_with_text("Stuck.\nGOAL_BLOCKED: need an API key")]),
+        Some(GoalOutcome::Blocked("need an API key".into()))
+    );
+    // Complete wins if both somehow appear.
+    assert_eq!(
+        detect_goal_outcome(&[
+            assistant_with_text("GOAL_BLOCKED: x"),
+            assistant_with_text("GOAL_COMPLETE"),
+        ]),
+        Some(GoalOutcome::Complete)
+    );
+    assert_eq!(
+        detect_goal_outcome(&[assistant_with_text("still working")]),
+        None
+    );
+}
+
+#[test]
+fn next_goal_step_caps_turns_and_respects_budget() {
+    assert_eq!(next_goal_step(5, false), GoalDecision::Continue);
+    assert!(
+        matches!(next_goal_step(0, false), GoalDecision::Stop(_)),
+        "turn cap"
+    );
+    assert!(
+        matches!(next_goal_step(5, true), GoalDecision::Stop(_)),
+        "budget"
+    );
+}
+
+#[tokio::test]
+async fn goal_command_starts_and_clears_any_active_loop() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 32);
+    controller
+        .handle_action(UiAction::Loop(Some("1m x".into())))
+        .await
+        .expect("loop");
+    assert!(controller.loop_state.is_some());
+    // A run is active so the goal's first turn queues (no provider needed).
+    controller.current_run = Some(fake_active_run());
+
+    controller
+        .handle_action(UiAction::Goal(Some("ship the feature".into())))
+        .await
+        .expect("goal");
+
+    let state = controller.goal_state.as_ref().expect("goal armed");
+    assert_eq!(state.goal, "ship the feature");
+    assert_eq!(state.turns_remaining, GOAL_MAX_TURNS);
+    assert!(controller.loop_state.is_none(), "goal clears the loop");
+    assert!(
+        controller
+            .queued_prompts
+            .iter()
+            .any(|m| m.contains("ship the feature")),
+        "the first goal turn is queued"
+    );
+}
+
+#[tokio::test]
+async fn goal_stop_clears_the_state() {
+    let (mut controller, _event_rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller.current_run = Some(fake_active_run());
+    controller
+        .handle_action(UiAction::Goal(Some("do it".into())))
+        .await
+        .expect("start");
+    assert!(controller.goal_state.is_some());
+    controller
+        .handle_action(UiAction::Goal(Some("stop".into())))
+        .await
+        .expect("stop");
+    assert!(controller.goal_state.is_none());
+}
+
+#[tokio::test]
+async fn goal_complete_marker_stops_the_loop() {
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    controller.goal_state = Some(GoalState {
+        goal: "x".into(),
+        turns_remaining: 5,
+    });
+    controller.record_goal_decision(&[assistant_with_text("Done and verified.\nGOAL_COMPLETE")]);
+    assert!(matches!(
+        controller.pending_goal_decision,
+        Some(GoalDecision::Stop(_))
+    ));
+    controller.apply_goal_decision(false).await.expect("apply");
+    assert!(
+        controller.goal_state.is_none(),
+        "GOAL_COMPLETE stops the goal"
+    );
+}
+
+#[tokio::test]
+async fn goal_continue_yields_to_a_queued_followup() {
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    controller.goal_state = Some(GoalState {
+        goal: "x".into(),
+        turns_remaining: 5,
+    });
+    controller.record_goal_decision(&[assistant_with_text("still working")]);
+    assert_eq!(
+        controller.pending_goal_decision,
+        Some(GoalDecision::Continue)
+    );
+    // A user follow-up started a run; the goal must not also start one, and
+    // must not consume a turn — it resumes after the follow-up completes.
+    controller.apply_goal_decision(true).await.expect("apply");
+    let state = controller.goal_state.as_ref().expect("goal still active");
+    assert_eq!(state.turns_remaining, 5);
+}
+
+#[tokio::test]
+async fn goal_stops_at_turn_cap() {
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    controller.goal_state = Some(GoalState {
+        goal: "x".into(),
+        turns_remaining: 0,
+    });
+    controller.record_goal_decision(&[assistant_with_text("more to do")]);
+    // Continue decision, but the cap (0 turns) converts it to a stop.
+    controller.apply_goal_decision(false).await.expect("apply");
+    assert!(controller.goal_state.is_none(), "turn cap stops the goal");
+}

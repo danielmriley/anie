@@ -5,6 +5,17 @@ ratio — smallest impactful changes first. Check off items as they ship.
 
 ## Completed
 
+- [x] `/goal` autonomous goal loop (docs/goal_command/): `/goal
+      <description>` puts the agent into an autonomous "Ralph loop" — it
+      works toward the goal, **re-prompts itself to continue after every
+      turn** (no interval), verifies its own work, and **stops on a
+      completion signal** (`GOAL_COMPLETE` / `GOAL_BLOCKED: <reason>`
+      sentinels it emits), a turn cap (`GOAL_MAX_TURNS = 50`), or the
+      `[budget]` ceiling. User follow-ups always take priority (the goal
+      resumes after them); `/goal stop` cancels; mutually exclusive with
+      `/loop`. Modeled on Codex's `/goal`. Continuation reuses the
+      run-completion boundary; completion detection is a text sentinel
+      (a structured `goal_complete` tool is a deferred refinement).
 - [x] `/loop` recurring-prompt command (docs/loop_command/): `/loop
       <Nm|Ns> <message>` re-submits a prompt on a fixed interval so the
       agent keeps working a goal across turns. Modeled on Codex's `/loop`
