@@ -139,11 +139,18 @@ impl WorkspaceCheckpointStore {
             Err(e) if e.kind() == ErrorKind::NotFound => Manifest::default(),
             Err(e) => return Err(e.into()),
         };
-        Ok(Self {
+        let mut store = Self {
             root,
             workspace_root: workspace_root.as_ref().to_path_buf(),
             manifest,
-        })
+        };
+        // Compact any accumulated drift baselines on open (cheap in-memory
+        // pass; a missing-fix or long-lived manifest can carry stale ones).
+        // Persist only when something was actually removed.
+        if store.gc_shadowed_baselines() {
+            store.persist_manifest()?;
+        }
+        Ok(store)
     }
 
     /// The capture points recorded so far, in chronological order.
@@ -221,7 +228,47 @@ impl WorkspaceCheckpointStore {
             files,
             baseline_only: true,
         });
+        // The new baseline shadows older ones (per path); drop any that are
+        // now fully superseded so the manifest doesn't grow per-rewind.
+        self.gc_shadowed_baselines();
         self.persist_manifest()
+    }
+
+    /// Remove `baseline_only` entries that are fully shadowed — i.e. every
+    /// path they record also appears in a strictly-later entry, so they can
+    /// never be returned by [`latest_state`](Self::latest_state) and
+    /// contribute nothing. Returns whether any entry was removed.
+    ///
+    /// Safe and behavior-preserving: each path's newest-mentioning entry is
+    /// never fully shadowed (it has no later mention), so it is always kept,
+    /// and `latest_state` for every path is unchanged. Only baselines are
+    /// removed — real captures are user-facing rewind anchors / restore
+    /// targets and stay. This bounds baseline growth by the number of live
+    /// tracked paths, not by the number of `/rewind`s.
+    fn gc_shadowed_baselines(&mut self) -> bool {
+        let entries = &self.manifest.entries;
+        let mut remove = vec![false; entries.len()];
+        for i in 0..entries.len() {
+            if !entries[i].baseline_only {
+                continue;
+            }
+            let fully_shadowed = entries[i].files.keys().all(|path| {
+                entries[i + 1..]
+                    .iter()
+                    .any(|later| later.files.contains_key(path))
+            });
+            remove[i] = fully_shadowed;
+        }
+        if !remove.iter().any(|&r| r) {
+            return false;
+        }
+        let mut index = 0;
+        self.manifest.entries.retain(|_| {
+            let keep = !remove[index];
+            index += 1;
+            keep
+        });
+        true
     }
 
     /// Restore the working tree to the capture keyed by `entry_id`:
@@ -451,6 +498,82 @@ mod tests {
         assert!(
             matches!(err, CheckpointError::WorkingTreeDrifted { .. }),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_rewinds_do_not_grow_the_baseline_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("code.rs");
+        let tracked = vec!["code.rs".to_string()];
+
+        fs::write(&file, b"v1").unwrap();
+        let mut s = store(dir.path());
+        s.capture("t1", &tracked, None).unwrap();
+        fs::write(&file, b"v2").unwrap();
+        s.capture("t2", &tracked, None).unwrap();
+
+        // Many consecutive rewinds: each appends a baseline, but the new one
+        // shadows the prior (same path), which GC removes — so the baseline
+        // count stays bounded instead of growing per rewind.
+        for _ in 0..8 {
+            s.restore("t1").unwrap();
+            s.record_restore_baseline("t1").unwrap();
+        }
+        let baselines = s.entries().iter().filter(|e| e.baseline_only).count();
+        assert!(
+            baselines <= 1,
+            "baselines must not grow per rewind: {baselines}"
+        );
+        // Real captures (the user-facing anchors) are untouched.
+        assert_eq!(s.entries().iter().filter(|e| !e.baseline_only).count(), 2);
+
+        // Drift detection still works after GC: tree is v1, a user edit is
+        // still refused.
+        assert_eq!(fs::read(&file).unwrap(), b"v1");
+        fs::write(&file, b"edited").unwrap();
+        assert!(matches!(
+            s.restore("t1").unwrap_err(),
+            CheckpointError::WorkingTreeDrifted { .. }
+        ));
+    }
+
+    #[test]
+    fn open_compacts_legacy_shadowed_baselines() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join(".checkpoints");
+        fs::create_dir_all(cp.join("blobs")).unwrap();
+        // A manifest accumulated by a pre-GC binary: two shadowed baselines.
+        let manifest = serde_json::json!({
+            "entries": [
+                {"entry_id":"t1","files":{"a.rs":{"kind":"blob","hash":"h1"}}},
+                {"entry_id":"t1#restored1","files":{"a.rs":{"kind":"blob","hash":"h1"}},"baseline_only":true},
+                {"entry_id":"t1#restored2","files":{"a.rs":{"kind":"blob","hash":"h1"}},"baseline_only":true}
+            ]
+        });
+        fs::write(
+            cp.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let s = WorkspaceCheckpointStore::open(&cp, dir.path()).unwrap();
+        // The older fully-shadowed baseline is dropped; the newest is kept.
+        assert_eq!(s.entries().iter().filter(|e| e.baseline_only).count(), 1);
+        assert!(
+            s.entries()
+                .iter()
+                .any(|e| e.entry_id == "t1" && !e.baseline_only)
+        );
+        // The compaction was persisted, not just in-memory.
+        let reopened = WorkspaceCheckpointStore::open(&cp, dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .entries()
+                .iter()
+                .filter(|e| e.baseline_only)
+                .count(),
+            1
         );
     }
 
