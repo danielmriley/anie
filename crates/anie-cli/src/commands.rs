@@ -65,7 +65,7 @@ impl CommandRegistry {
     /// skill. A skill whose command name collides with an already
     /// registered command is skipped with a warning (`register` dedups,
     /// first registration wins — matching pi).
-    pub(crate) fn with_builtins_and_skills(skills: &crate::skills::SkillSet) -> Self {
+    pub(crate) fn with_builtins_and_skills(skills: &crate::skills::SkillRegistry) -> Self {
         let mut registry = Self::with_builtins();
         for skill in skills.iter() {
             let info = SlashCommandInfo::skill(skill.name.clone(), skill.description.clone());
@@ -282,6 +282,10 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
         SlashCommandInfo::builtin("fork", "Create a child session branched from now"),
         SlashCommandInfo::builtin("diff", "Show file changes made in this session"),
         SlashCommandInfo::builtin("new", "Start a fresh session"),
+        SlashCommandInfo::builtin(
+            "resume",
+            "Switch to the most recently modified other session",
+        ),
         SlashCommandInfo::builtin_with_args(
             "session",
             "Show session info, list sessions, or switch",
@@ -314,6 +318,13 @@ fn builtin_commands() -> Vec<SlashCommandInfo> {
             ArgumentSpec::FreeForm { required: false },
             Some("[<description> | stop]"),
         ),
+        SlashCommandInfo::builtin_with_args(
+            "name",
+            "Set or clear the display name for this session",
+            ArgumentSpec::FreeForm { required: false },
+            Some("[<name>]"),
+        ),
+        SlashCommandInfo::builtin("skills", "List installed skills"),
         SlashCommandInfo::builtin("tools", "List active tools"),
         SlashCommandInfo::builtin("onboard", "Reopen the onboarding flow"),
         SlashCommandInfo::builtin("providers", "Manage configured providers"),
@@ -366,9 +377,22 @@ mod tests {
         crate::skills::Skill {
             name: name.to_string(),
             description: description.to_string(),
+            disable_model_invocation: false,
+            license: None,
             allowed_tools: Vec::new(),
             body: "body".to_string(),
+            source: crate::skills::SkillSource::Bundled,
+            root_dir: std::path::PathBuf::new(),
+            manifest_path: std::path::PathBuf::new(),
         }
+    }
+
+    fn registry_of(skills: Vec<crate::skills::Skill>) -> crate::skills::SkillRegistry {
+        let mut registry = crate::skills::SkillRegistry::empty();
+        for skill in skills {
+            registry.insert_for_test(skill);
+        }
+        registry
     }
 
     #[test]
@@ -406,10 +430,7 @@ mod tests {
 
     #[test]
     fn with_builtins_and_skills_registers_one_command_per_skill() {
-        let skills = crate::skills::SkillSet::from_skills(vec![
-            test_skill("alpha", "A"),
-            test_skill("beta", "B"),
-        ]);
+        let skills = registry_of(vec![test_skill("alpha", "A"), test_skill("beta", "B")]);
         let registry = CommandRegistry::with_builtins_and_skills(&skills);
         assert!(registry.lookup("skill:alpha").is_some());
         assert!(registry.lookup("skill:beta").is_some());
@@ -419,7 +440,7 @@ mod tests {
 
     #[test]
     fn empty_skill_set_leaves_registry_builtin_only() {
-        let skills = crate::skills::SkillSet::default();
+        let skills = crate::skills::SkillRegistry::empty();
         let with_skills = CommandRegistry::with_builtins_and_skills(&skills);
         let builtin_only = CommandRegistry::with_builtins();
         assert_eq!(with_skills.all().len(), builtin_only.all().len());
@@ -427,7 +448,7 @@ mod tests {
 
     #[test]
     fn skill_command_groups_under_skills_heading_in_help() {
-        let skills = crate::skills::SkillSet::from_skills(vec![test_skill("deploy", "Deploy it")]);
+        let skills = registry_of(vec![test_skill("deploy", "Deploy it")]);
         let registry = CommandRegistry::with_builtins_and_skills(&skills);
         let help = registry.format_help();
         assert!(help.contains("  Skills:\n"), "{help}");
@@ -529,6 +550,17 @@ mod tests {
         assert_eq!(groups[1].1.len(), 2);
     }
 
+    /// PR 4 of `docs/skills_2026-05-02/`. Pin that the
+    /// `/skills` builtin is registered so the slash-command
+    /// dispatcher recognizes it.
+    #[test]
+    fn skills_command_registered_as_no_arg_builtin() {
+        let registry = CommandRegistry::with_builtins();
+        let info = registry.lookup("skills").expect("skills builtin");
+        assert_eq!(info.summary, "List installed skills");
+        assert!(matches!(info.arguments, ArgumentSpec::None));
+    }
+
     #[test]
     fn format_help_starts_with_commands_heading() {
         let registry = CommandRegistry::with_builtins();
@@ -623,11 +655,13 @@ mod tests {
             "fork",
             "diff",
             "new",
+            "resume",
             "session",
             "checkpoint",
             "rewind",
             "loop",
             "goal",
+            "name",
             "tools",
             "onboard",
             "providers",

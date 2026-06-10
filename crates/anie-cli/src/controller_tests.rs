@@ -121,8 +121,9 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
     config.compaction.enabled = false;
     config.compaction.keep_recent_tokens = 2_000;
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("prompt cache");
 
     let mut session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     preload_compactable_history(&mut session);
@@ -145,6 +146,8 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         model_catalog: vec![model("gpt-4o", "openai")],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
+        active_skills: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig {
@@ -162,7 +165,6 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
-        skills: crate::skills::SkillSet::default(),
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -211,8 +213,9 @@ fn controller_with_runtime_state_path(
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let mut config_state = ConfigState::new(
         config.clone(),
@@ -229,6 +232,8 @@ fn controller_with_runtime_state_path(
         model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
+        active_skills: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -240,7 +245,6 @@ fn controller_with_runtime_state_path(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
-        skills: crate::skills::SkillSet::default(),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -401,6 +405,164 @@ fn compose_system_prompt_only_augments_in_rlm_mode() {
     assert!(
         composed.contains("(id=ollama_tool_call_8_2)"),
         "augment should include a concrete entry example: {composed}"
+    );
+    // PR 3 of `docs/harness_mitigations_2026-05-01/`. The
+    // augment also has a verify-before-claiming-success
+    // section that ties to the [tool error] ledger entries
+    // and the `[loop warning]` system-reminder PR 2 emits.
+    assert!(
+        composed.contains("Verify before claiming success"),
+        "rlm augment should include the verify-before-claim section: {composed}"
+    );
+    assert!(
+        composed.contains("[loop warning]"),
+        "rlm augment should reference the failure-loop warning: {composed}"
+    );
+    assert!(
+        composed.contains("re-execute it before claiming"),
+        "rlm augment should instruct re-execution after edit/write: {composed}"
+    );
+}
+
+/// PR 4 of `docs/skills_2026-05-02/`. The `/skills`
+/// command lists every registered skill with its source
+/// label, plus an `Active in this run:` summary when the
+/// active set is non-empty. Hidden skills
+/// (disable_model_invocation) are listed with a
+/// `[..., hidden]` tag so the user can see they exist
+/// but the model can't auto-invoke them.
+#[test]
+fn render_skills_listing_includes_all_skills_with_source_labels() {
+    use crate::skills::{SkillRegistry, SkillSource};
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("skills");
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::write(
+        root.join("alpha.md"),
+        "---\nname: alpha\ndescription: Alpha skill.\n---\nbody\n",
+    )
+    .expect("write alpha");
+    fs::write(
+        root.join("hidden-one.md"),
+        "---\nname: hidden-one\ndescription: Hidden skill.\ndisable_model_invocation: true\n---\nbody\n",
+    )
+    .expect("write hidden");
+
+    let mut registry = SkillRegistry::empty();
+    registry.absorb_root_for_test(&root, SkillSource::Bundled);
+    let active = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+
+    let listing = crate::controller::render_skills_listing(&registry, &active);
+    assert!(listing.starts_with("Available skills:"), "{listing}");
+    assert!(listing.contains("alpha"), "{listing}");
+    assert!(listing.contains("hidden-one"), "{listing}");
+    assert!(listing.contains("[bundled]"), "{listing}");
+    assert!(listing.contains("[bundled, hidden]"), "{listing}");
+    assert!(
+        !listing.contains("Active in this run:"),
+        "no active skills → no summary line: {listing}"
+    );
+}
+
+#[test]
+fn render_skills_listing_appends_active_summary_when_set_nonempty() {
+    use crate::skills::{SkillRegistry, SkillSource};
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("skills");
+    fs::create_dir_all(&root).expect("mkdir");
+    fs::write(
+        root.join("first.md"),
+        "---\nname: first\ndescription: First.\n---\nbody\n",
+    )
+    .expect("write first");
+    fs::write(
+        root.join("second.md"),
+        "---\nname: second\ndescription: Second.\n---\nbody\n",
+    )
+    .expect("write second");
+
+    let mut registry = SkillRegistry::empty();
+    registry.absorb_root_for_test(&root, SkillSource::Bundled);
+    let mut set = std::collections::HashSet::new();
+    set.insert("first".to_string());
+    set.insert("second".to_string());
+    let active = std::sync::Arc::new(std::sync::RwLock::new(set));
+
+    let listing = crate::controller::render_skills_listing(&registry, &active);
+    assert!(
+        listing.contains("Active in this run: first, second"),
+        "{listing}"
+    );
+}
+
+#[test]
+fn render_skills_listing_handles_empty_registry() {
+    use crate::skills::SkillRegistry;
+    let registry = SkillRegistry::empty();
+    let active = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+    let listing = crate::controller::render_skills_listing(&registry, &active);
+    assert_eq!(listing, "No skills are currently registered.");
+}
+
+/// PR 1 of `docs/skills_2026-05-02/`. When the skill
+/// registry is empty, the base prompt has no skill catalog
+/// section — keeps the prompt narrow when no skills are
+/// installed.
+#[test]
+fn build_system_prompt_omits_skill_catalog_when_registry_empty() {
+    use anie_agent::ToolRegistry;
+    use anie_config::AnieConfig;
+    use std::path::Path;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
+    let skills = crate::skills::SkillRegistry::empty();
+    let config = AnieConfig::default();
+    let prompt =
+        crate::controller::build_system_prompt(Path::new("/tmp"), &tools, &skills, &config)
+            .expect("build_system_prompt");
+
+    assert!(
+        !prompt.contains("Available skills"),
+        "empty registry should not render a catalog section: {prompt}"
+    );
+}
+
+/// PR 3 of `docs/harness_mitigations_2026-05-01/` (revised
+/// post-smoke). Pin that the base (non-rlm) system prompt
+/// does NOT carry the re-test-after-edit rule — the smoke
+/// against qwen3.5:9b showed that an emphatic "MUST re-run"
+/// line in the base prompt shifted the model into a rigid
+/// "I am a coding assistant" frame and made it refuse non-
+/// coding questions ("what should I wear?" → outright
+/// refusal). The rule lives only in the rlm-mode augment
+/// now (see `compose_system_prompt_only_augments_in_rlm_mode`
+/// for the augment-side assertions).
+#[test]
+fn build_system_prompt_omits_retest_directive_in_base_prompt() {
+    use anie_agent::ToolRegistry;
+    use anie_config::AnieConfig;
+    use std::path::Path;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
+    let skills = crate::skills::SkillRegistry::empty();
+    let config = AnieConfig::default();
+    let prompt =
+        crate::controller::build_system_prompt(Path::new("/tmp"), &tools, &skills, &config)
+            .expect("build_system_prompt");
+
+    assert!(
+        !prompt.contains("you MUST re-run the most recent verification command"),
+        "base prompt should NOT contain the rlm-specific re-test rule \
+         (re-running tests is rlm-mode behavior — keep base prompt \
+         framing-neutral): {prompt}"
     );
 }
 
@@ -683,8 +845,9 @@ fn build_dispatch_controller_with_runtime_state_path(
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let default_model = catalog
         .first()
@@ -712,6 +875,8 @@ fn build_dispatch_controller_with_runtime_state_path(
         },
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
+        active_skills: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -723,7 +888,6 @@ fn build_dispatch_controller_with_runtime_state_path(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
-        skills: crate::skills::SkillSet::default(),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -746,8 +910,9 @@ fn build_state_with_registry(
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
 
     ControllerState {
@@ -762,6 +927,8 @@ fn build_state_with_registry(
         model_catalog: vec![model],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
+        active_skills: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -773,7 +940,6 @@ fn build_state_with_registry(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
-        skills: crate::skills::SkillSet::default(),
     }
 }
 
@@ -1708,8 +1874,9 @@ fn controller_for_context_length_test_with_cap(
     config.ollama.default_max_num_ctx = Some(cap);
 
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let default_model = ollama_model();
 
@@ -1728,6 +1895,8 @@ fn controller_for_context_length_test_with_cap(
         model_catalog: vec![default_model],
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
+        active_skills: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -1739,7 +1908,6 @@ fn controller_for_context_length_test_with_cap(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
-        skills: crate::skills::SkillSet::default(),
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2181,8 +2349,9 @@ async fn help_command_emits_system_message_with_registry_output() {
 
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("build prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let command_registry = crate::commands::CommandRegistry::with_builtins();
     let expected = command_registry.format_help();
@@ -2199,6 +2368,8 @@ async fn help_command_emits_system_message_with_registry_output() {
         model_catalog: vec![model("gpt-4o", "openai")],
         provider_registry: Arc::new(ProviderRegistry::new()),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
+        active_skills: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -2210,7 +2381,6 @@ async fn help_command_emits_system_message_with_registry_output() {
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
-        skills: crate::skills::SkillSet::default(),
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -2317,8 +2487,9 @@ fn spawn_live_controller(
     let mut config = AnieConfig::default();
     config.compaction.enabled = false;
     let tool_registry = build_tool_registry(&cwd, true);
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &config).expect("prompt cache");
+        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("prompt cache");
 
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
 
@@ -2340,6 +2511,8 @@ fn spawn_live_controller(
         model_catalog: vec![model("gpt-4o", "openai"), model("gpt-4.1", "openai")],
         provider_registry: Arc::new(provider_registry),
         tool_registry,
+        skill_registry: Arc::clone(&skill_registry),
+        active_skills: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         request_options_resolver: Arc::new(AuthResolver::new(None, config)),
         prompt_cache,
         retry_config,
@@ -2351,7 +2524,6 @@ fn spawn_live_controller(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
-        skills: crate::skills::SkillSet::default(),
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);
@@ -3191,9 +3363,22 @@ fn test_skill(name: &str, body: &str) -> crate::skills::Skill {
     crate::skills::Skill {
         name: name.to_string(),
         description: format!("{name} skill"),
+        disable_model_invocation: false,
+        license: None,
         allowed_tools: Vec::new(),
         body: body.to_string(),
+        source: crate::skills::SkillSource::Bundled,
+        root_dir: std::path::PathBuf::new(),
+        manifest_path: std::path::PathBuf::new(),
     }
+}
+
+fn skill_registry_of(skills: Vec<crate::skills::Skill>) -> Arc<crate::skills::SkillRegistry> {
+    let mut registry = crate::skills::SkillRegistry::empty();
+    for skill in skills {
+        registry.insert_for_test(skill);
+    }
+    Arc::new(registry)
 }
 
 /// Pull the text of every user message currently in the session, in
@@ -3221,8 +3406,7 @@ fn user_message_texts(controller: &InteractiveController) -> Vec<String> {
 #[tokio::test]
 async fn activate_skill_stages_body_without_starting_a_run() {
     let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
-    controller.state.skills =
-        crate::skills::SkillSet::from_skills(vec![test_skill("foo", "FOO BODY")]);
+    controller.state.skill_registry = skill_registry_of(vec![test_skill("foo", "FOO BODY")]);
 
     assert!(
         controller
@@ -3257,8 +3441,7 @@ async fn activating_unknown_skill_name_surfaces_error_not_panic() {
 async fn staged_skill_body_is_prepended_to_next_prompt_turn() {
     let (mut controller, _event_rx, _tx) =
         build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
-    controller.state.skills =
-        crate::skills::SkillSet::from_skills(vec![test_skill("foo", "FOO BODY")]);
+    controller.state.skill_registry = skill_registry_of(vec![test_skill("foo", "FOO BODY")]);
 
     assert!(
         controller
@@ -3293,7 +3476,7 @@ async fn staged_skill_body_is_prepended_to_next_prompt_turn() {
 async fn activating_two_skills_injects_both_in_order_once() {
     let (mut controller, _event_rx, _tx) =
         build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
-    controller.state.skills = crate::skills::SkillSet::from_skills(vec![
+    controller.state.skill_registry = skill_registry_of(vec![
         test_skill("alpha", "ALPHA BODY"),
         test_skill("beta", "BETA BODY"),
     ]);
@@ -3325,8 +3508,7 @@ async fn activating_two_skills_injects_both_in_order_once() {
 async fn pending_skill_buffer_is_cleared_after_injection() {
     let (mut controller, _event_rx, _tx) =
         build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
-    controller.state.skills =
-        crate::skills::SkillSet::from_skills(vec![test_skill("foo", "FOO BODY")]);
+    controller.state.skill_registry = skill_registry_of(vec![test_skill("foo", "FOO BODY")]);
 
     assert!(
         controller
@@ -3777,4 +3959,59 @@ async fn goal_stops_at_turn_cap() {
     // Continue decision, but the cap (0 turns) converts it to a stop.
     controller.apply_goal_decision(false).await.expect("apply");
     assert!(controller.goal_state.is_none(), "turn cap stops the goal");
+}
+
+/// `/resume` (UiAction::ResumeMostRecent) on a fresh
+/// controller — only the active session exists, so there's
+/// nothing to switch to. The controller must surface a
+/// SystemMessage breadcrumb explaining that, and stay on
+/// the original session.
+#[tokio::test]
+async fn resume_most_recent_with_no_other_sessions_reports_and_stays_put() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    let original_id = controller.state.session.id().to_string();
+    controller
+        .handle_action(UiAction::ResumeMostRecent)
+        .await
+        .expect("resume must not terminate controller");
+    let msg = drain_next_system_message(&mut event_rx).await;
+    assert!(
+        msg.contains("No other sessions"),
+        "expected no-other-sessions breadcrumb, got: {msg}"
+    );
+    // Active session unchanged.
+    assert_eq!(controller.state.session.id(), original_id);
+}
+
+/// `/resume` switches to the most-recently-modified other
+/// session in `sessions_dir`. We seed a sibling session
+/// after the controller is up; `list_sessions` sorts by
+/// modified-desc, so the sibling is at index 0 and the
+/// current session at index 1. The handler filters out
+/// current and picks the first remaining — which must be
+/// the sibling.
+#[tokio::test]
+async fn resume_most_recent_switches_to_sibling_session() {
+    let (mut controller, mut event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    let original_id = controller.state.session.id().to_string();
+    let sessions_dir = controller.state.session.sessions_dir().to_path_buf();
+    let cwd = controller.state.session.cwd().to_path_buf();
+    // Seed a sibling. The mtime is >= the original (created
+    // strictly after), so list_sessions returns it first.
+    let sibling = SessionManager::new_session(&sessions_dir, &cwd).expect("seed sibling");
+    let sibling_id = sibling.id().to_string();
+    drop(sibling); // release the lock so the controller can re-open it.
+
+    controller
+        .handle_action(UiAction::ResumeMostRecent)
+        .await
+        .expect("resume must succeed");
+    // Drain the breadcrumb. The active session should now
+    // be the sibling.
+    let _ = drain_next_system_message(&mut event_rx).await;
+    assert_eq!(
+        controller.state.session.id(),
+        sibling_id,
+        "controller should have switched away from {original_id} to {sibling_id}"
+    );
 }

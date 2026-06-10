@@ -12,7 +12,7 @@ use anie_tools::{
     ReadTool, TodoList, TodoWriteTool, WriteTool,
 };
 use anie_tui::UiAction;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     Cli,
@@ -98,7 +98,35 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         Arc::clone(&todo_list),
         sandbox_spec_from_config(&config.tools.sandbox, &cwd),
     );
-    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &config)?;
+    let skill_registry = Arc::new(crate::skills::SkillRegistry::discover(&cwd));
+    if !skill_registry.is_empty() {
+        info!(skills = skill_registry.len(), "loaded skills from disk");
+    }
+    let active_skills: crate::skill_tool::ActiveSkills = Arc::new(std::sync::RwLock::new(
+        std::collections::HashSet::new(),
+    ));
+    // PR 2 of `docs/skills_2026-05-02/`: register the `skill`
+    // tool when the registry has at least one skill. Without
+    // skills the tool would be advertised in the catalog with
+    // nothing to load, which is just noise.
+    let tool_registry = if skill_registry.is_empty() {
+        tool_registry
+    } else {
+        // ToolRegistry isn't Clone; rebuild via the same
+        // pattern build_agent uses for rlm extras.
+        let mut new_registry = anie_agent::ToolRegistry::new();
+        for def in tool_registry.definitions() {
+            if let Some(tool) = tool_registry.get(&def.name) {
+                new_registry.register(tool);
+            }
+        }
+        new_registry.register(Arc::new(crate::skill_tool::SkillTool::new(
+            Arc::clone(&skill_registry),
+            Arc::clone(&active_skills),
+        )));
+        Arc::new(new_registry)
+    };
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
 
@@ -114,19 +142,11 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         .collect();
     cost_meter.rebuild_session(&persisted);
 
-    // Discover skills from the global (`~/.anie/skills/`) and project
-    // (`.anie/skills/`) roots, then register a `/skill:<name>` command
-    // for each. Best-effort: malformed files warn and are skipped.
-    let global_skills_dir = anie_config::anie_dir().map(|dir| dir.join("skills"));
-    let project_skills_dir = project_skills_dir(&cwd);
-    let (skills, skill_errors) = crate::skills::discover_skills(
-        global_skills_dir.as_deref().unwrap_or(Path::new("")),
-        project_skills_dir.as_deref(),
-    );
-    for error in &skill_errors {
-        warn!(%error, "skipping malformed skill");
-    }
-    let command_registry = crate::commands::CommandRegistry::with_builtins_and_skills(&skills);
+    // Register a `/skill:<name>` command for each discovered skill so
+    // skills are user-invocable as well as model-invocable (the `skill`
+    // tool above). Both paths resolve bodies from the same registry.
+    let command_registry =
+        crate::commands::CommandRegistry::with_builtins_and_skills(&skill_registry);
 
     let mut state = ControllerState {
         config: ConfigState::new(
@@ -140,6 +160,8 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         model_catalog,
         provider_registry,
         tool_registry,
+        skill_registry,
+        active_skills,
         request_options_resolver,
         prompt_cache,
         retry_config: RetryConfig::default(),
@@ -149,22 +171,12 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         todo_list,
         cost_meter,
-        skills,
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {
         warn!(%error, "failed to persist runtime state during bootstrap");
     }
     Ok(state)
-}
-
-/// Locate a project skills directory by walking upward from `cwd` for
-/// the first ancestor containing a `.anie/skills/` directory. Mirrors
-/// the upward-walk convention used for project config discovery.
-fn project_skills_dir(cwd: &Path) -> Option<std::path::PathBuf> {
-    cwd.ancestors()
-        .map(|ancestor| ancestor.join(".anie").join("skills"))
-        .find(|candidate| candidate.is_dir())
 }
 
 #[cfg(test)]

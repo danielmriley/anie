@@ -1,5 +1,4 @@
 use std::{
-    io::Stdout,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -11,12 +10,13 @@ use crossterm::event::{
 use futures::{FutureExt, StreamExt};
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
+
+use crate::terminal::TerminalBackend;
 use tokio::sync::{Mutex, mpsc};
 
 use anie_auth::CredentialStore;
@@ -160,16 +160,21 @@ impl RenderDirty {
         self.composer || self.full
     }
 
-    fn clear_after_render(&mut self, mode: RenderMode) {
-        match mode {
-            RenderMode::Full => {
-                self.composer = false;
-                self.full = false;
-            }
-            RenderMode::UrgentInput => {
-                self.composer = false;
-            }
-        }
+    /// Clear every dirty flag after a successful [`Terminal::draw`].
+    ///
+    /// [`run_tui`] distinguishes `composer` vs `full` **only so the outer
+    /// loop knows whether to bypass [`FRAME_BUDGET`]**. The urgent render
+    /// path still invokes the same [`App::render_with_mode`] closure —
+    /// it redraws output, spinner, editor, overlay, cursor in one pass.
+    /// Leaving `full` sticky after [`RenderMode::UrgentInput`] therefore
+    /// scheduled a redundant [`crate::terminal::draw_synchronized`] pass
+    /// on the next budget tick (often 8 ms later) even though pixels were
+    /// already merged. GPU terminals compound that hit with BSU/ESU waits,
+    /// which reads as a periodic hitch while typing during streaming or
+    /// any other `"full"` dirty reason.
+    fn clear_after_render(&mut self) {
+        self.composer = false;
+        self.full = false;
     }
 }
 
@@ -275,8 +280,21 @@ pub enum UiAction {
     OpenSessionPicker,
     /// Switch to another session by ID.
     SwitchSession(String),
+    /// Set or clear the user-facing display name on the
+    /// current session. `None` clears; `Some(empty /
+    /// whitespace)` is normalised to clear by the
+    /// session manager.
+    SetSessionName(Option<String>),
+    /// Switch to the most-recently-modified other session
+    /// — the slash-command equivalent of `--resume <id>`
+    /// without typing the ID. Errors with a SystemMessage
+    /// when no other sessions exist.
+    ResumeMostRecent,
     /// Show registered tools.
     ShowTools,
+    /// Show installed skills (catalog + active set).
+    /// PR 4 of `docs/skills_2026-05-02/`.
+    ShowSkills,
     /// Show slash-command help.
     ShowHelp,
     /// Request the current controller state.
@@ -354,6 +372,48 @@ pub struct StatusBarState {
     /// every render. Skipped during serialization-style
     /// equality checks since it's a derived view of `cwd`.
     cached_short_cwd: Option<(String, String)>,
+    /// Cached `(text, height)` for the formatted status bar.
+    /// Invalidates when any contributing input field, the
+    /// `transcript_scrolled` flag, or the terminal `width`
+    /// changes. PR 1 of `docs/code_review_2026-05-03.md`:
+    /// the previous shape rebuilt the status `String` and
+    /// ran two full `Paragraph::wrap` passes (one for sizing,
+    /// one for rendering) on every keystroke paint even
+    /// though the contributing state changes only on a
+    /// `StatusUpdate` agent event or a scroll. The cache
+    /// collapses the steady-state cost to one field-equality
+    /// check per paint. A derived view of the inputs, so it
+    /// participates in `PartialEq` only by accident — no
+    /// callers compare two whole `StatusBarState`s today
+    /// (same precedent as `cached_short_cwd` above).
+    cached_render: Option<StatusRenderCache>,
+    /// Counts how many times `cached_render` had to rebuild
+    /// (cache miss). Used by the dedupe regression test to
+    /// assert that repeated paints at the same state hit the
+    /// cache. Same `cfg(test)` shape as `InputPane::layout_misses`.
+    #[cfg(test)]
+    render_misses: std::cell::Cell<u64>,
+}
+
+/// Snapshot of the inputs that produced a cached status-bar
+/// render plus the cached outputs. Two structs compare equal
+/// iff their snapshots match — the `text` / `height` are
+/// pure functions of the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusRenderCache {
+    provider_name: String,
+    model_name: String,
+    thinking: String,
+    last_known_input_tokens: Option<u64>,
+    estimated_context_tokens: u64,
+    context_window: u64,
+    cwd: String,
+    harness_mode: String,
+    rlm_archived_messages: u64,
+    transcript_scrolled: bool,
+    width: u16,
+    text: String,
+    height: u16,
 }
 
 impl Default for StatusBarState {
@@ -373,6 +433,9 @@ impl Default for StatusBarState {
             todo_total: 0,
             session_cost: 0.0,
             cached_short_cwd: None,
+            cached_render: None,
+            #[cfg(test)]
+            render_misses: std::cell::Cell::new(0),
         }
     }
 }
@@ -393,6 +456,80 @@ impl StatusBarState {
         self.cached_short_cwd
             .as_ref()
             .map_or("", |(_, shortened)| shortened.as_str())
+    }
+
+    /// Return the formatted status text + paragraph height for
+    /// the current state at the given terminal `width`. Caches
+    /// the result keyed by every contributing input field plus
+    /// `(transcript_scrolled, width)`. The steady-state
+    /// keystroke paint pays only the per-field equality check;
+    /// neither the `format!` allocation nor the
+    /// `Paragraph::wrap` sizing pass fires when no input has
+    /// changed. PR 1 of `docs/code_review_2026-05-03.md`.
+    fn cached_render(&mut self, transcript_scrolled: bool, width: u16) -> (&str, u16) {
+        // Disjoint-field borrow: `self.cached_render` is read
+        // through the inline match; the field comparisons use
+        // independent `&self.<field>` borrows, which the
+        // borrow checker treats as non-overlapping under
+        // Rust 2021 disjoint-borrow rules.
+        let stale = match &self.cached_render {
+            Some(c) => {
+                c.width != width
+                    || c.transcript_scrolled != transcript_scrolled
+                    || c.provider_name != self.provider_name
+                    || c.model_name != self.model_name
+                    || c.thinking != self.thinking
+                    || c.last_known_input_tokens != self.last_known_input_tokens
+                    || c.estimated_context_tokens != self.estimated_context_tokens
+                    || c.context_window != self.context_window
+                    || c.cwd != self.cwd
+                    || c.harness_mode != self.harness_mode
+                    || c.rlm_archived_messages != self.rlm_archived_messages
+            }
+            None => true,
+        };
+        if stale {
+            let text = build_status_text(self, transcript_scrolled);
+            let height = measure_status_height(&text, width);
+            #[cfg(test)]
+            self.render_misses.set(self.render_misses.get() + 1);
+            self.cached_render = Some(StatusRenderCache {
+                provider_name: self.provider_name.clone(),
+                model_name: self.model_name.clone(),
+                thinking: self.thinking.clone(),
+                last_known_input_tokens: self.last_known_input_tokens,
+                estimated_context_tokens: self.estimated_context_tokens,
+                context_window: self.context_window,
+                cwd: self.cwd.clone(),
+                harness_mode: self.harness_mode.clone(),
+                rlm_archived_messages: self.rlm_archived_messages,
+                transcript_scrolled,
+                width,
+                text,
+                height,
+            });
+        }
+        // After the populate above, `cached_render` is always
+        // `Some`; mirror the `get_or_insert_with` pattern used
+        // by `InputPane::layout` to keep the borrow checker
+        // happy without panic-shaped paths (clippy
+        // `expect_used` lint).
+        let cached = self.cached_render.get_or_insert_with(|| StatusRenderCache {
+            provider_name: String::new(),
+            model_name: String::new(),
+            thinking: String::new(),
+            last_known_input_tokens: None,
+            estimated_context_tokens: 0,
+            context_window: 0,
+            cwd: String::new(),
+            harness_mode: String::new(),
+            rlm_archived_messages: 0,
+            transcript_scrolled,
+            width,
+            text: String::new(),
+            height: 1,
+        });
+        (&cached.text, cached.height)
     }
 }
 
@@ -582,11 +719,74 @@ impl App {
         &self.agent_state
     }
 
+    /// Snapshot of the two predicates that drive
+    /// `needs_tick_redraw` — used by the
+    /// `ANIE_TRACE_DIRTY=1` instrumentation in `run_tui` so
+    /// the log line that records "tick set dirty.full" also
+    /// records the reason. Cheap; reads private fields the
+    /// run loop can't inspect directly.
+    #[must_use]
+    pub fn dirty_trace_state(&self) -> (bool, &'static str) {
+        let overlay_active = self.overlay.is_some();
+        let agent_label = match &self.agent_state {
+            AgentUiState::Idle => "Idle",
+            AgentUiState::Streaming => "Streaming",
+            AgentUiState::ToolExecuting { .. } => "ToolExecuting",
+            AgentUiState::Compacting { .. } => "Compacting",
+        };
+        (overlay_active, agent_label)
+    }
+
     /// Read-only view of the current transcript blocks in the
     /// output pane.
     #[must_use]
     pub fn output_blocks(&self) -> &[RenderedBlock] {
         self.output_pane.blocks()
+    }
+
+    /// Try to handle a printable character via the typing
+    /// fast path. Returns `true` when eligible — the caller
+    /// is then responsible for writing `ch` directly to
+    /// stdout. The fast path bypasses
+    /// `handle_terminal_event_dirty`, the render closure, and
+    /// ratatui's diff entirely; per-keystroke cost drops from
+    /// ~22 bytes (cursor move + char + SGR resets) to 1 byte
+    /// (the char alone, riding the natural cursor advance).
+    /// Reconciliation happens on the next non-fast-path paint
+    /// — sync-wrapped, so the re-emit is atomic and invisible.
+    ///
+    /// Round 9 of `docs/code_review_2026-05-03.md`. The
+    /// `typing_repro` example confirmed the byte stream itself
+    /// is fast enough; the felt drag was anie's pipeline cost
+    /// (tokio scheduling + render closure + ratatui diff +
+    /// flush chain ≈ 250 µs/key) which the fast path
+    /// short-circuits down to "stdout.write_all(ch); flush".
+    ///
+    /// Eligibility (refusing any one returns `false` and lets
+    /// the event fall through to the normal path):
+    /// - agent state must be `Idle`
+    /// - no overlay (model picker, onboarding, etc.) active
+    /// - bottom pane is the editor (not the model picker)
+    /// - autocomplete popup is closed
+    /// - `ch` is not `/` (would start a slash command)
+    pub fn try_fast_typing(&mut self, ch: char) -> bool {
+        if !matches!(self.agent_state, AgentUiState::Idle) {
+            return false;
+        }
+        if self.overlay.is_some() {
+            return false;
+        }
+        if !matches!(self.bottom_pane, BottomPane::Editor) {
+            return false;
+        }
+        if self.input_pane.autocomplete_popup().is_some() {
+            return false;
+        }
+        if ch == '/' {
+            return false;
+        }
+        self.input_pane.fast_insert_char(ch);
+        true
     }
 
     /// Current input-pane contents. Intended for tests that
@@ -631,7 +831,13 @@ impl App {
         self.input_pane.tick_autocomplete();
         // `Spinner::tick` returns a `&'static str` — borrow it
         // directly instead of allocating a `String` per frame.
-        // Plan 04 PR-F.
+        // Plan 04 PR-F. The spinner frame is also consumed by
+        // tool-call rendering inside the output pane (see
+        // `output.rs::tool_call_bullet_spans`), so we always
+        // tick — F-7 of `docs/code_review_2026-05-03.md` was
+        // considered but skipping the tick when idle would
+        // make tool bullets render with an empty animation
+        // frame on the rare abort-mid-execution edge.
         let spinner_frame: &'static str = self.spinner.tick();
         let half_height = frame.area().height.saturating_sub(2).max(8) / 2;
         let bottom_height = match &self.bottom_pane {
@@ -664,9 +870,19 @@ impl App {
         // the layout so it can grow into multiple rows when
         // the status string overflows the terminal width.
         // Capped at MAX_STATUS_BAR_HEIGHT so a single
-        // overlong line can't claim half the screen.
-        let status_text = format_status_text(&mut self.status_bar, self.output_pane.is_scrolled());
-        let status_height = status_bar_height(&status_text, frame.area().width);
+        // overlong line can't claim half the screen. The
+        // text + height come from a paint-stable cache (PR 1
+        // of `docs/code_review_2026-05-03.md`); cache hits
+        // skip the `format!` and the `Paragraph::wrap` sizing
+        // pass entirely.
+        let scrolled = self.output_pane.is_scrolled();
+        let frame_width = frame.area().width;
+        let (status_text, status_height) = self.status_bar.cached_render(scrolled, frame_width);
+        // The render call below needs an owned `String` to
+        // build a `Paragraph<'static>`; clone the cached text
+        // here. One clone vs. the previous shape's two
+        // (`format!` output + `text.to_string()` for sizing).
+        let status_text = status_text.to_string();
         let (output_area, spinner_area, bottom_area, status_area) =
             layout(frame.area(), bottom_height, status_height);
 
@@ -702,8 +918,25 @@ impl App {
             BottomPane::SessionPicker(picker) => picker.render(bottom_area, frame.buffer_mut()),
         };
         // status_text was built earlier for sizing; reuse
-        // it here rather than reformatting.
-        build_status_paragraph(status_text).render(status_area, frame.buffer_mut());
+        // it here rather than reformatting. PR 5 of
+        // `docs/code_review_2026-05-03.md` (F-14): when the
+        // text fits one row (the dominant case at any
+        // reasonable terminal width), write it directly via
+        // `buf.set_line` and skip the `Paragraph::wrap` pass
+        // entirely. The two paths must agree on row count, so
+        // the wrap fallback is gated on the same predicate
+        // used inside `measure_status_height`.
+        if status_height == 1 && status_text_fits_one_row(&status_text, status_area.width) {
+            let line = Line::from(Span::styled(
+                status_text,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            frame
+                .buffer_mut()
+                .set_line(status_area.x, status_area.y, &line, status_area.width);
+        } else {
+            build_status_paragraph(status_text).render(status_area, frame.buffer_mut());
+        }
         frame.set_cursor_position(cursor);
 
         // Draw the inline autocomplete popup on top of the
@@ -1314,6 +1547,11 @@ impl App {
         self.output_pane.flat_build_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn output_snapshot_reuse_count(&self) -> u64 {
+        self.output_pane.snapshot_reuse_count()
+    }
+
     fn handle_slash_command(&mut self, command: &str) {
         let mut parts = command.splitn(2, char::is_whitespace);
         let raw_cmd = parts.next().unwrap_or_default();
@@ -1430,6 +1668,15 @@ impl App {
                 let _ = self
                     .action_tx
                     .send(UiAction::Rewind(arg.map(str::to_string)));
+            }
+            "name" => {
+                // `/name` (no arg) clears the display name.
+                // `/name <text>` sets it. The session
+                // manager trims + treats whitespace-only as
+                // a clear, so the dispatcher just forwards
+                // the raw payload.
+                let payload = arg.map(str::to_string);
+                let _ = self.action_tx.send(UiAction::SetSessionName(payload));
             }
             "onboard" => self.open_onboarding_overlay(),
             "providers" => self.open_provider_management_overlay(),
@@ -2126,10 +2373,7 @@ const IDLE_TICK: Duration = Duration::from_millis(100);
 /// size gets a single rebuild. Plan 05 PR-C.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
 
-pub async fn run_tui(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+pub async fn run_tui(terminal: &mut Terminal<TerminalBackend>, app: &mut App) -> Result<()> {
     let mut term_events = EventStream::new();
     // Request-based rendering: handlers set `dirty` when they
     // change visible state; the render below draws as soon as
@@ -2159,6 +2403,15 @@ pub async fn run_tui(
     // `t_key_to_paint_us`. Off by default (one atomic load
     // per loop when unset).
     let trace_typing = std::env::var("ANIE_TRACE_TYPING")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    // Opt-in tracing of which select! arm sets `dirty.full`
+    // each iteration. Goal: pin down which background source
+    // is causing the ~10 Hz idle paint cadence observed in
+    // `ANIE_TRACE_FLUSH=1` data — see round 4 of
+    // `docs/code_review_2026-05-03.md`. Off by default; the
+    // env-var read happens once.
+    let trace_dirty = std::env::var("ANIE_TRACE_DIRTY")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
     // Time of the most recent key arrival in the term-events
@@ -2206,7 +2459,7 @@ pub async fn run_tui(
                     "keystroke paint",
                 );
             }
-            dirty.clear_after_render(render_mode);
+            dirty.clear_after_render();
             input_urgent = false;
             last_render_at = Instant::now();
             last_resize_at = None;
@@ -2230,6 +2483,79 @@ pub async fn run_tui(
 
         tokio::select! {
             Some(Ok(event)) = term_events.next() => {
+                // Round 9 typing fast-path: for an unmodified
+                // printable keypress on the editor in idle
+                // state, bypass `handle_terminal_event_dirty`,
+                // the render closure, and ratatui's diff
+                // entirely. Write the char straight to stdout
+                // (1 byte) and let the natural cursor advance
+                // do the rest. The next non-fast-path paint
+                // (which always uses sync wrap when not
+                // urgent) reconciles ratatui's view with the
+                // updated `InputPane` state atomically — no
+                // visible flicker. See
+                // `crates/anie-tui/examples/typing_repro.rs`
+                // for the empirical case that motivated this:
+                // the same 22-byte pattern emitted from a
+                // bare loop felt instant where anie's
+                // pipeline (~250 µs/key) felt draggy.
+                let fast_char: Option<char> = match &event {
+                    Event::Key(ke) => {
+                        let plain = ke.modifiers.is_empty()
+                            || ke.modifiers == KeyModifiers::SHIFT;
+                        let press = matches!(
+                            ke.kind,
+                            crossterm::event::KeyEventKind::Press
+                        );
+                        if plain && press {
+                            if let KeyCode::Char(ch) = ke.code {
+                                Some(ch)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(ch) = fast_char
+                    && app.try_fast_typing(ch)
+                {
+                    // Single byte (or up to 4 for non-ASCII)
+                    // straight to stdout. Bypassing
+                    // `terminal.backend_mut()` is fine here
+                    // because the previous paint cycle
+                    // already flushed the deferred buffer
+                    // and no draw is in flight (this loop is
+                    // single-threaded).
+                    let mut buf = [0u8; 4];
+                    let s = ch.encode_utf8(&mut buf);
+                    let mut out = std::io::stdout().lock();
+                    let _ = std::io::Write::write_all(&mut out, s.as_bytes());
+                    let _ = std::io::Write::flush(&mut out);
+                    drop(out);
+                    // Mark dirty so the next paint cycle
+                    // reconciles ratatui's view. We don't
+                    // set `input_urgent`: the next paint
+                    // intentionally goes through the sync-
+                    // wrapped Full path so the re-emit is
+                    // atomic, and we don't want to bypass
+                    // `FRAME_BUDGET` — it lets the user keep
+                    // typing fast-path bytes without an
+                    // intervening full repaint.
+                    dirty.full = true;
+                    if trace_dirty {
+                        tracing::info!(
+                            target: "anie_tui::dirty_source",
+                            source = "fast_typing",
+                            ch = %ch,
+                            "fast path",
+                        );
+                    }
+                    continue;
+                }
+
                 let mut saw_resize = matches!(event, Event::Resize(_, _));
                 let mut render_dirty = app.handle_terminal_event_dirty(event)?;
                 // Drain any terminal events already buffered in
@@ -2259,6 +2585,15 @@ pub async fn run_tui(
                         key_arrival_at = Some(Instant::now());
                     }
                 }
+                if trace_dirty && render_dirty.any() {
+                    tracing::info!(
+                        target: "anie_tui::dirty_source",
+                        source = "term_events",
+                        composer = render_dirty.composer,
+                        full = render_dirty.full,
+                        "dirty set",
+                    );
+                }
                 dirty.merge(render_dirty);
             }
             Some(event) = app.event_rx.recv() => {
@@ -2276,6 +2611,17 @@ pub async fn run_tui(
                 // per contiguous delta-run rather than once per
                 // delta.
                 let events = drain_agent_event_batch(&mut app.event_rx, event);
+                if trace_dirty {
+                    let event_count = events.len();
+                    let first_kind = events.first().map(agent_event_label).unwrap_or("?");
+                    tracing::info!(
+                        target: "anie_tui::dirty_source",
+                        source = "agent_event",
+                        count = event_count,
+                        first_kind = first_kind,
+                        "dirty set",
+                    );
+                }
                 app.handle_agent_event_batch(events)?;
                 dirty.full = true;
             }
@@ -2287,6 +2633,16 @@ pub async fn run_tui(
                 // these redraws eliminates 10fps background work
                 // that otherwise scales with transcript size.
                 if app.needs_tick_redraw() {
+                    if trace_dirty {
+                        let (overlay_active, agent_label) = app.dirty_trace_state();
+                        tracing::info!(
+                            target: "anie_tui::dirty_source",
+                            source = "tick_redraw",
+                            overlay_active,
+                            agent_state = agent_label,
+                            "dirty set",
+                        );
+                    }
                     dirty.full = true;
                 }
             }
@@ -2297,6 +2653,35 @@ pub async fn run_tui(
         }
     }
     Ok(())
+}
+
+/// Stable label for an [`AgentEvent`] variant, used by the
+/// `ANIE_TRACE_DIRTY=1` instrumentation in `run_tui` so each
+/// agent-event-driven dirty-set log line records *which kind*
+/// of event fired. A fixed `&'static str` lookup avoids
+/// allocating a Debug-formatted string per event on the hot
+/// path.
+fn agent_event_label(event: &AgentEvent) -> &'static str {
+    match event {
+        AgentEvent::AgentStart => "AgentStart",
+        AgentEvent::AgentEnd { .. } => "AgentEnd",
+        AgentEvent::TurnStart => "TurnStart",
+        AgentEvent::TurnEnd { .. } => "TurnEnd",
+        AgentEvent::MessageStart { .. } => "MessageStart",
+        AgentEvent::MessageDelta { .. } => "MessageDelta",
+        AgentEvent::MessageEnd { .. } => "MessageEnd",
+        AgentEvent::ToolExecStart { .. } => "ToolExecStart",
+        AgentEvent::ToolExecUpdate { .. } => "ToolExecUpdate",
+        AgentEvent::ToolExecEnd { .. } => "ToolExecEnd",
+        AgentEvent::TranscriptReplace { .. } => "TranscriptReplace",
+        AgentEvent::SystemMessage { .. } => "SystemMessage",
+        AgentEvent::RlmStatsUpdate { .. } => "RlmStatsUpdate",
+        AgentEvent::StatusUpdate { .. } => "StatusUpdate",
+        AgentEvent::CompactionStart { .. } => "CompactionStart",
+        AgentEvent::CompactionEnd { .. } => "CompactionEnd",
+        AgentEvent::RetryScheduled { .. } => "RetryScheduled",
+        AgentEvent::SessionList { .. } => "SessionList",
+    }
 }
 
 /// Vertical layout: output transcript takes the flexible top
@@ -2380,11 +2765,11 @@ fn resolve_provider_api_key(provider_name: &str) -> Option<String> {
 const MAX_STATUS_BAR_HEIGHT: u16 = 4;
 
 /// Build the single concatenated status string without
-/// rendering. Used both to size the status bar (via
-/// `Paragraph::line_count`) and to render it. Takes
-/// `&mut StatusBarState` because the cached short-cwd
-/// accessor is `&mut self`.
-fn format_status_text(state: &mut StatusBarState, transcript_scrolled: bool) -> String {
+/// rendering. Pure function over `StatusBarState`; called
+/// from inside `StatusBarState::cached_render` only when the
+/// cache is stale. Takes `&mut StatusBarState` because the
+/// cached short-cwd accessor is `&mut self`.
+fn build_status_text(state: &mut StatusBarState, transcript_scrolled: bool) -> String {
     let used_tokens = state
         .last_known_input_tokens
         .unwrap_or(state.estimated_context_tokens);
@@ -2458,13 +2843,38 @@ fn build_status_paragraph(text: String) -> Paragraph<'static> {
 /// Number of rows the status bar needs to render `text` at
 /// the given terminal `width`. Capped at
 /// [`MAX_STATUS_BAR_HEIGHT`] so a single overlong line
-/// can't claim half the screen on a narrow terminal.
-fn status_bar_height(text: &str, width: u16) -> u16 {
+/// can't claim half the screen on a narrow terminal. Pure
+/// function called from inside the status-bar cache; on the
+/// hot path the cache short-circuits this entirely.
+///
+/// PR 5 of `docs/code_review_2026-05-03.md` (F-14): fast-
+/// path skips `Paragraph::wrap` when the text contains no
+/// embedded newlines AND its unicode display width fits in
+/// one row. Most paints land on this path (the status bar
+/// fits on one row at any reasonable terminal width); the
+/// wrap pass is only paid when the user makes the terminal
+/// narrower than the bar.
+fn measure_status_height(text: &str, width: u16) -> u16 {
     if width == 0 {
+        return 1;
+    }
+    if status_text_fits_one_row(text, width) {
         return 1;
     }
     let measured = build_status_paragraph(text.to_string()).line_count(width) as u16;
     measured.clamp(1, MAX_STATUS_BAR_HEIGHT)
+}
+
+/// Whether `text` will render on a single row at terminal
+/// `width`. Cheap: one unicode-width pass via ratatui's
+/// `Span::width` (no allocation, no wrap), plus a `\n`
+/// scan. Used by both the sizing and render paths so they
+/// agree on which row count applies.
+fn status_text_fits_one_row(text: &str, width: u16) -> bool {
+    if text.contains('\n') {
+        return false;
+    }
+    Span::raw(text).width() <= width as usize
 }
 
 /// Render the 1-row activity strip that sits directly above
@@ -2489,16 +2899,30 @@ fn render_spinner_row(
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
 ) {
-    let label: String = match agent_state {
-        AgentUiState::Idle => String::new(),
-        AgentUiState::Streaming => "Responding".into(),
-        AgentUiState::ToolExecuting { tool_name } => format!("Running {tool_name}"),
+    // PR 7 of `docs/code_review_2026-05-03.md` (F-10):
+    // `Cow<'static, str>` instead of always-owning `String`
+    // so the dominant `Streaming` case (label = "Responding")
+    // borrows a `&'static str` and skips the per-frame
+    // allocation. Tool/compacting branches still allocate
+    // because their labels embed the tool name or elapsed
+    // seconds.
+    let label: std::borrow::Cow<'static, str> = match agent_state {
+        // PR 7 of `docs/code_review_2026-05-03.md` (F-8):
+        // ratatui's `swap_buffers` resets the back buffer
+        // before each frame, so an empty spinner area is
+        // already empty without a redundant
+        // `Paragraph::new(Line::default()).render(...)` pass.
+        AgentUiState::Idle => return,
+        AgentUiState::Streaming => std::borrow::Cow::Borrowed("Responding"),
+        AgentUiState::ToolExecuting { tool_name } => {
+            std::borrow::Cow::Owned(format!("Running {tool_name}"))
+        }
         AgentUiState::Compacting { started_at, phase } => {
             // Plan 06 PR C: phase-specific suffix so users can
             // distinguish proactive compactions from reactive
             // overflow recovery without inspecting logs.
             let elapsed = started_at.elapsed().as_secs();
-            match phase {
+            std::borrow::Cow::Owned(match phase {
                 anie_protocol::CompactionPhase::PrePrompt => format!("compacting {elapsed}s"),
                 anie_protocol::CompactionPhase::MidTurn => {
                     format!("compacting (mid-turn) {elapsed}s")
@@ -2506,15 +2930,9 @@ fn render_spinner_row(
                 anie_protocol::CompactionPhase::ReactiveOverflow => {
                     format!("compacting after overflow {elapsed}s")
                 }
-            }
+            })
         }
     };
-    if label.is_empty() {
-        // Still render an empty paragraph so ratatui clears
-        // any previous content in this cell region on a paint.
-        Paragraph::new(Line::default()).render(area, buf);
-        return;
-    }
     let elapsed = animation_reference().elapsed();
     let bullet = breathing_bullet(elapsed);
     let mut spans = vec![
@@ -2622,7 +3040,9 @@ fn fixed_noarg_action(name: &str) -> Option<UiAction> {
         "fork" => UiAction::ForkSession,
         "diff" => UiAction::ShowDiff,
         "new" => UiAction::NewSession,
+        "resume" => UiAction::ResumeMostRecent,
         "tools" => UiAction::ShowTools,
+        "skills" => UiAction::ShowSkills,
         "state" => UiAction::ShowState,
         "help" => UiAction::ShowHelp,
         "reload" => UiAction::ReloadConfig {
@@ -2669,29 +3089,41 @@ fn shorten_path(path: &str) -> String {
     }
 }
 
+/// PR 7 of `docs/code_review_2026-05-03.md` (F-11): single
+/// allocation. The previous shape collected into a temporary
+/// `Vec<&str>` just to hand to `.join("\n")` — two
+/// allocations where one suffices.
 fn extract_text(content: &[ContentBlock]) -> String {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_blocks_with_newline(content.iter().filter_map(|block| match block {
+        ContentBlock::Text { text } => Some(text.as_str()),
+        _ => None,
+    }))
 }
 
 fn extract_thinking(content: &[ContentBlock]) -> String {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
-            // Redacted thinking is encrypted; the UI shows a placeholder
-            // rather than the opaque base64 payload.
-            ContentBlock::RedactedThinking { .. } => Some("[reasoning redacted]"),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_blocks_with_newline(content.iter().filter_map(|block| match block {
+        ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+        // Redacted thinking is encrypted; the UI shows a placeholder
+        // rather than the opaque base64 payload.
+        ContentBlock::RedactedThinking { .. } => Some("[reasoning redacted]"),
+        _ => None,
+    }))
+}
+
+fn join_blocks_with_newline<'a, I>(parts: I) -> String
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut out = String::new();
+    let mut first = true;
+    for part in parts {
+        if !first {
+            out.push('\n');
+        }
+        out.push_str(part);
+        first = false;
+    }
+    out
 }
 
 fn format_tool_args(args: &serde_json::Value) -> String {
@@ -2814,7 +3246,7 @@ mod tests {
             todo_total: 5,
             ..StatusBarState::default()
         };
-        let text = format_status_text(&mut state, false);
+        let text = build_status_text(&mut state, false);
         assert!(text.contains("todo: 2/5"), "{text}");
     }
 
@@ -2825,7 +3257,7 @@ mod tests {
             todo_total: 0,
             ..StatusBarState::default()
         };
-        let text = format_status_text(&mut state, false);
+        let text = build_status_text(&mut state, false);
         assert!(
             !text.contains("todo:"),
             "plan-less runs hide the segment: {text}"
@@ -2838,7 +3270,7 @@ mod tests {
             session_cost: 0.0123,
             ..StatusBarState::default()
         };
-        let text = format_status_text(&mut state, false);
+        let text = build_status_text(&mut state, false);
         assert!(text.contains("$0.0123"), "{text}");
     }
 
@@ -2848,7 +3280,7 @@ mod tests {
             session_cost: 0.0,
             ..StatusBarState::default()
         };
-        let text = format_status_text(&mut state, false);
+        let text = build_status_text(&mut state, false);
         assert!(
             !text.contains('$'),
             "free/local models hide the cost segment: {text}"
@@ -2922,6 +3354,170 @@ mod tests {
             let d = Duration::new(0, nanos);
             assert!(known.contains(&pick_run_verb(d)), "nanos={nanos}");
         }
+    }
+
+    /// PR 1 of `docs/code_review_2026-05-03.md` (F-1).
+    /// The status bar's text + height live behind a paint-
+    /// stable cache; repeat renders at unchanged state should
+    /// not rebuild the formatted string or run the wrap pass.
+    #[test]
+    fn cached_status_render_does_not_rebuild_when_state_is_unchanged() {
+        let mut state = StatusBarState {
+            provider_name: "anthropic".into(),
+            model_name: "claude-opus".into(),
+            thinking: "high".into(),
+            session_id: "session-1".into(),
+            last_known_input_tokens: Some(12_345),
+            estimated_context_tokens: 12_345,
+            context_window: 200_000,
+            cwd: "/home/dev/project".into(),
+            harness_mode: "current".into(),
+            rlm_archived_messages: 0,
+            todo_done: 0,
+            todo_total: 0,
+            session_cost: 0.0,
+            cached_short_cwd: None,
+            cached_render: None,
+            render_misses: std::cell::Cell::new(0),
+        };
+
+        let (text_a, height_a) = state.cached_render(false, 120);
+        let snapshot_a = (text_a.to_string(), height_a);
+        let misses_after_first = state.render_misses.get();
+        assert_eq!(misses_after_first, 1, "first paint must miss");
+
+        for _ in 0..16 {
+            let (text_n, height_n) = state.cached_render(false, 120);
+            assert_eq!(text_n, snapshot_a.0);
+            assert_eq!(height_n, snapshot_a.1);
+        }
+        assert_eq!(
+            state.render_misses.get(),
+            misses_after_first,
+            "subsequent identical paints must hit the cache"
+        );
+    }
+
+    /// PR 1 of `docs/code_review_2026-05-03.md` (F-1).
+    /// Width changes invalidate the cache because the
+    /// paragraph wrap pass depends on width — even if the
+    /// text is unchanged, the height may differ.
+    #[test]
+    fn cached_status_render_invalidates_on_width_change() {
+        let mut state = StatusBarState {
+            provider_name: "openai".into(),
+            model_name: "gpt-4".into(),
+            ..StatusBarState::default()
+        };
+        let _ = state.cached_render(false, 80);
+        let misses_after_first = state.render_misses.get();
+        let _ = state.cached_render(false, 40);
+        assert_eq!(
+            state.render_misses.get(),
+            misses_after_first + 1,
+            "different width must rebuild"
+        );
+    }
+
+    /// PR 1 of `docs/code_review_2026-05-03.md` (F-1).
+    /// Mutating any contributing input field must invalidate
+    /// the cache so a stale text never gets rendered.
+    #[test]
+    fn cached_status_render_invalidates_when_input_field_changes() {
+        let mut state = StatusBarState {
+            provider_name: "openai".into(),
+            model_name: "gpt-4".into(),
+            ..StatusBarState::default()
+        };
+        let _ = state.cached_render(false, 100);
+        let baseline = state.render_misses.get();
+
+        state.last_known_input_tokens = Some(999);
+        let _ = state.cached_render(false, 100);
+        assert_eq!(
+            state.render_misses.get(),
+            baseline + 1,
+            "token-count change must invalidate"
+        );
+
+        state.cwd = "/elsewhere".into();
+        let _ = state.cached_render(false, 100);
+        assert_eq!(
+            state.render_misses.get(),
+            baseline + 2,
+            "cwd change must invalidate"
+        );
+
+        let _ = state.cached_render(true, 100);
+        assert_eq!(
+            state.render_misses.get(),
+            baseline + 3,
+            "transcript_scrolled flip must invalidate"
+        );
+    }
+
+    /// PR 7 of `docs/code_review_2026-05-03.md` (F-11).
+    /// The single-allocation join must produce exactly the
+    /// same output as the previous `Vec::join("\n")` shape
+    /// for both Text and Thinking blocks.
+    #[test]
+    fn extract_text_matches_legacy_join_shape() {
+        use anie_protocol::ContentBlock;
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "alpha".into(),
+            },
+            ContentBlock::Text {
+                text: "beta".into(),
+            },
+            ContentBlock::Text {
+                text: "gamma".into(),
+            },
+        ];
+        assert_eq!(extract_text(&blocks), "alpha\nbeta\ngamma");
+        assert_eq!(extract_text(&[]), "");
+    }
+
+    #[test]
+    fn extract_thinking_includes_redacted_placeholder() {
+        use anie_protocol::ContentBlock;
+        let blocks = vec![
+            ContentBlock::Thinking {
+                thinking: "first thought".into(),
+                signature: None,
+            },
+            ContentBlock::RedactedThinking { data: "x".into() },
+            ContentBlock::Thinking {
+                thinking: "third thought".into(),
+                signature: None,
+            },
+        ];
+        assert_eq!(
+            extract_thinking(&blocks),
+            "first thought\n[reasoning redacted]\nthird thought",
+        );
+    }
+
+    /// PR 5 of `docs/code_review_2026-05-03.md` (F-14). The
+    /// fast-path predicate must agree with the wrap pass on
+    /// the row count: a text wider than `width` must NOT
+    /// take the fast path; one that fits MUST. Newline-
+    /// containing text always takes the wrap pass even when
+    /// otherwise short, since it spans multiple rows.
+    #[test]
+    fn status_text_fits_one_row_matches_actual_wrap() {
+        let short = " anthropic:claude │ 1k/200k";
+        assert!(status_text_fits_one_row(short, 80));
+        assert_eq!(measure_status_height(short, 80), 1);
+
+        // Wider than terminal: must wrap.
+        let long = "x".repeat(200);
+        assert!(!status_text_fits_one_row(&long, 80));
+        assert!(measure_status_height(&long, 80) > 1);
+
+        // Newline-containing text never takes the fast path.
+        let newline = "alpha\nbeta";
+        assert!(!status_text_fits_one_row(newline, 80));
     }
 
     #[test]

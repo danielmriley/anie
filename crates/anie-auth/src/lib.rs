@@ -102,6 +102,28 @@ pub enum AuthCredential {
         /// don't repeat the discovery request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<String>,
+        /// RFC 3339 UTC timestamp when `refresh_token` itself
+        /// expires. Set when the provider issues a
+        /// short-lived refresh token (GitHub Copilot's
+        /// `ghu_` device-flow access token has an 8-hour
+        /// default expiry); `None` for providers that issue
+        /// long-lived refresh tokens. Forward / backward
+        /// compatible — older auth files load with `None`,
+        /// in which case the refresh code falls back to the
+        /// pre-2026-05-08 behaviour of treating
+        /// `refresh_token` as long-lived.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refresh_token_expires_at: Option<String>,
+        /// Provider-specific second-tier refresh token used
+        /// to refresh `refresh_token` itself when it expires.
+        /// For GitHub Copilot this is the `ghr_` token
+        /// returned alongside the device-flow `ghu_` (~6
+        /// month lifetime); exchanging it at GitHub's
+        /// `grant_type=refresh_token` endpoint yields a fresh
+        /// `ghu_` and a new `ghr_`. `None` for providers
+        /// whose refresh tokens don't expire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_refresh_token: Option<String>,
     },
 }
 
@@ -683,6 +705,8 @@ mod tests {
             account: Some("user@example.com".into()),
             api_base_url: None,
             project_id: None,
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         }
     }
 
@@ -718,6 +742,8 @@ mod tests {
             account: None,
             api_base_url: None,
             project_id: None,
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         };
         let json = serde_json::to_string(&cred).expect("serialize");
         assert!(!json.contains("\"account\""), "None account leaked: {json}");

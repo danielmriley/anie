@@ -54,6 +54,21 @@ pub fn find_link_ranges(lines: &[Line<'static>], theme: &MarkdownTheme) -> Vec<V
         .collect()
 }
 
+/// Like [`find_link_ranges`], but for lines already wrapped in [`Arc`]
+/// (`OutputPane`'s streaming assistant path keeps one refcounted slab
+/// between frames so markdown isn't deep-cloned on every cache-hit
+/// repaint).
+#[must_use]
+pub(crate) fn find_link_ranges_for_arcs(
+    lines: &[std::sync::Arc<Line<'static>>],
+    theme: &MarkdownTheme,
+) -> Vec<Vec<LinkRange>> {
+    lines
+        .iter()
+        .map(|arc| find_link_ranges_in_line(arc.as_ref(), theme))
+        .collect()
+}
+
 fn find_link_ranges_in_line(line: &Line<'static>, theme: &MarkdownTheme) -> Vec<LinkRange> {
     let mut ranges = Vec::new();
     let mut col: u16 = 0;

@@ -2,8 +2,10 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod agent_loop;
+mod failure_loop;
 mod hooks;
 mod recurse;
+mod recurse_depth;
 mod tool;
 
 pub use agent_loop::{
@@ -12,6 +14,8 @@ pub use agent_loop::{
     ChainedBeforeModelPolicy, CompactionGate, CompactionGateOutcome, NoopBeforeModelPolicy,
     RunStopReason, ToolExecutionMode, send_event,
 };
+pub use failure_loop::{DEFAULT_FAILURE_LOOP_THRESHOLD, stable_args_hash};
+pub use recurse_depth::DEFAULT_RECURSE_DEPTH_WARN_AT;
 pub use recurse::{ContextProvider, RecurseScope, SubAgentBuildContext, SubAgentFactory};
 pub use tool::{
     MIN_TOOL_OUTPUT_BUDGET_BYTES, Tool, ToolError, ToolExecutionContext, ToolRegistry,

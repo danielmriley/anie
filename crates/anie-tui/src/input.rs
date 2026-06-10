@@ -4,8 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, Paragraph, Widget},
+    text::{Line, Span},
+    widgets::{Block, Borders, Widget},
 };
 
 use crate::autocomplete::{AutocompletePopup, AutocompleteProvider, SuggestionKind};
@@ -29,16 +29,52 @@ struct AutocompleteState {
     popup: Option<AutocompletePopup>,
 }
 
-/// Cached output of `layout_lines_uncached`, keyed by the
-/// triple that affects what the layout renders: width, cursor
-/// position, and content. The triple covers every observable
-/// mutation; we don't have to instrument individual mutators.
+/// Cached output of `layout_lines_uncached`, keyed by
+/// `(width, content_revision)`. The revision is bumped by
+/// every editor mutator (insert / delete / cursor move /
+/// history nav / autocomplete apply / clear), so a cache hit
+/// means width is unchanged AND no mutator has fired since
+/// the cache was populated. PR 2 of
+/// `docs/code_review_2026-05-03.md`: replaces the previous
+/// `(width, cursor, content_clone)` key, which paid an O(N)
+/// `String == String` compare and an O(N) clone on every
+/// keystroke even when the cache was hit.
 struct CachedLayout {
     width: u16,
-    cursor: usize,
-    content: String,
-    lines: Vec<String>,
+    revision: u64,
+    /// Pre-styled lines ready to write directly into the
+    /// frame buffer via `buf.set_line`. PR 3 of
+    /// `docs/code_review_2026-05-03.md`: previously the
+    /// render path cloned each `String` line, wrapped each in
+    /// a `Line::styled(...)`, and built a fresh
+    /// `Vec<Line<'static>>` per paint just to hand to
+    /// `Paragraph::new`. Pre-styling once per cache miss
+    /// removes 2N allocations per keystroke (one `String`
+    /// clone + one `Line`/`Span` per visible row).
+    styled_lines: Vec<Line<'static>>,
     cursor_visual: (u16, u16),
+}
+
+impl CachedLayout {
+    /// Number of laid-out rows. Used by `preferred_height`
+    /// for sizing.
+    fn line_count(&self) -> usize {
+        self.styled_lines.len()
+    }
+}
+
+#[cfg(test)]
+impl CachedLayout {
+    /// Test helper: extract the joined text of a laid-out
+    /// row. Only the input-pane tests reach into this; the
+    /// hot path uses `styled_lines` directly.
+    fn line_text(&self, idx: usize) -> String {
+        self.styled_lines[idx]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
 }
 
 /// Maximum prompt-history entries kept on disk. The whole
@@ -52,6 +88,12 @@ pub const MAX_PROMPT_HISTORY_ENTRIES: usize = 1_000;
 pub struct InputPane {
     content: String,
     cursor: usize,
+    /// Monotonically increasing revision bumped by every
+    /// mutator that changes `content` or `cursor`. Serves as
+    /// the cheap cache key for `cached_layout` (PR 2 of
+    /// `docs/code_review_2026-05-03.md`). `wrapping_add` so a
+    /// pathologically long session can't overflow.
+    content_revision: u64,
     history: Vec<String>,
     history_index: Option<usize>,
     saved_content: Option<String>,
@@ -79,6 +121,7 @@ impl InputPane {
         Self {
             content: String::new(),
             cursor: 0,
+            content_revision: 0,
             history: Vec::new(),
             history_index: None,
             saved_content: None,
@@ -88,6 +131,18 @@ impl InputPane {
             #[cfg(test)]
             layout_misses: std::cell::Cell::new(0),
         }
+    }
+
+    /// Bump the layout-cache revision. Called by every
+    /// mutator that touches `content` or `cursor`. Cheap
+    /// (`u64` add); the layout cache then misses on the next
+    /// `layout(width)` call and rebuilds. Some mutators bump
+    /// even when the no-op branch fires (e.g. arrow at
+    /// boundary): a stray miss costs one extra layout pass
+    /// vs. dozens of clones+compares previously, so the
+    /// trade is favorable.
+    fn bump_revision(&mut self) {
+        self.content_revision = self.content_revision.wrapping_add(1);
     }
 
     /// Bind a path for cross-session prompt history. On call,
@@ -169,6 +224,7 @@ impl InputPane {
         self.cursor = 0;
         self.history_index = None;
         self.saved_content = None;
+        self.bump_revision();
     }
 
     /// Handle a key press while the editor is focused.
@@ -343,7 +399,7 @@ impl InputPane {
     pub fn preferred_height(&mut self, width: u16) -> u16 {
         let width = width.max(1);
         let cached = self.layout(width);
-        let line_count = u16::try_from(cached.lines.len()).unwrap_or(u16::MAX);
+        let line_count = u16::try_from(cached.line_count()).unwrap_or(u16::MAX);
         line_count.clamp(1, 8)
     }
 
@@ -378,14 +434,26 @@ impl InputPane {
         block.render(area, buf);
 
         let cached = self.layout(inner.width.max(1));
-        let rendered_lines = cached
-            .lines
-            .iter()
-            .take(inner.height as usize)
-            .map(|line| Line::styled(line.clone(), Style::default().fg(Color::White)))
-            .collect::<Vec<_>>();
+        // PR 3 of `docs/code_review_2026-05-03.md`: write
+        // pre-styled lines directly into the buffer instead
+        // of building a fresh `Paragraph` per paint. The
+        // styled lines live in the layout cache, so cache
+        // hits do zero allocation; cache misses pay the
+        // styling cost once. Same shape as `OutputPane::render`
+        // (`output.rs` — `buf.set_line` at the end of the
+        // visible-rows loop).
         let cursor = cached.cursor_visual;
-        Paragraph::new(rendered_lines).render(inner, buf);
+        let visible = inner.height as usize;
+        for (offset, line) in cached.styled_lines.iter().take(visible).enumerate() {
+            let Ok(offset_u16) = u16::try_from(offset) else {
+                break;
+            };
+            let y = inner.y.saturating_add(offset_u16);
+            if y >= inner.y.saturating_add(inner.height) {
+                break;
+            }
+            buf.set_line(inner.x, y, line, inner.width);
+        }
 
         Position::new(
             inner
@@ -398,23 +466,54 @@ impl InputPane {
     }
 
     /// Return the cached layout for `width`, recomputing only
-    /// when the cache is missing or any of (width, cursor,
-    /// content) changed since the last hit. Both `preferred_height`
+    /// when the cache is missing or `(width, content_revision)`
+    /// has changed since the last hit. Both `preferred_height`
     /// and `render` go through here, so the doubled work that
     /// used to happen per keystroke paint is eliminated.
+    /// PR 2 of `docs/code_review_2026-05-03.md`: the cache key
+    /// is now `(u16, u64)` instead of `(u16, usize, String)`,
+    /// so the per-paint hit check is two machine-word
+    /// comparisons (no `String == String` memcmp, no clone).
     fn layout(&mut self, width: u16) -> &CachedLayout {
-        let stale = self.cached_layout.as_ref().is_none_or(|c| {
-            c.width != width || c.cursor != self.cursor || c.content != self.content
-        });
+        let revision = self.content_revision;
+        let stale = self
+            .cached_layout
+            .as_ref()
+            .is_none_or(|c| c.width != width || c.revision != revision);
         if stale {
             let (lines, cursor_visual) = self.layout_lines_uncached(width);
+            // PR 3 of `docs/code_review_2026-05-03.md`:
+            // pre-style each laid-out row into a Line<'static>
+            // so `render` can hand them straight to
+            // `buf.set_line` without per-paint cloning. The
+            // input pane uses one solid foreground style per
+            // row — no syntax highlighting — so this is just a
+            // wrap of `Span::styled(content, style)`.
+            //
+            // Round 6 of `docs/code_review_2026-05-03.md`:
+            // foreground was `Color::White` previously. Real-
+            // terminal byte-dump (`ANIE_TRACE_FLUSH_BYTES=1`)
+            // showed every keystroke emitting
+            // `\e[38;5;15;49m` ... `\e[39m\e[49m` (21 bytes)
+            // around the typed character because ratatui's
+            // diff sees `White != Reset` and writes
+            // SetColors. Visually identical to default
+            // foreground in every terminal where unstyled
+            // text is light-on-dark, so we drop the explicit
+            // color and let the cell render with the
+            // terminal's default — eliminating the per-frame
+            // SGR set + matching reset on the keystroke hot
+            // path.
+            let styled_lines: Vec<Line<'static>> = lines
+                .into_iter()
+                .map(|s| Line::from(Span::raw(s)))
+                .collect();
             #[cfg(test)]
             self.layout_misses.set(self.layout_misses.get() + 1);
             self.cached_layout = Some(CachedLayout {
                 width,
-                cursor: self.cursor,
-                content: self.content.clone(),
-                lines,
+                revision,
+                styled_lines,
                 cursor_visual,
             });
         }
@@ -423,9 +522,8 @@ impl InputPane {
         // see that without a panic-on-None unwrap.
         self.cached_layout.get_or_insert_with(|| CachedLayout {
             width,
-            cursor: self.cursor,
-            content: self.content.clone(),
-            lines: Vec::new(),
+            revision,
+            styled_lines: Vec::new(),
             cursor_visual: (0, 0),
         })
     }
@@ -450,6 +548,7 @@ impl InputPane {
         self.cursor = 0;
         self.history_index = None;
         self.saved_content = None;
+        self.bump_revision();
         InputAction::Submit(content)
     }
 
@@ -457,30 +556,48 @@ impl InputPane {
         self.content.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
         self.history_index = None;
+        self.bump_revision();
+    }
+
+    /// Round 9 of `docs/code_review_2026-05-03.md`. Used by
+    /// `App::try_fast_typing` when bypassing the
+    /// `handle_key` → `dispatch_editor_key` → ratatui diff
+    /// chain for printable characters. Same end state as a
+    /// regular `Char` keypress flowing through `handle_key` —
+    /// `insert_char` updates `content` + `cursor` + revision,
+    /// then `refresh_autocomplete` short-circuits cheaply for
+    /// non-slash buffers.
+    pub(crate) fn fast_insert_char(&mut self, ch: char) {
+        self.insert_char(ch);
+        self.refresh_autocomplete();
     }
 
     fn backspace(&mut self) {
         if let Some(previous) = previous_boundary(&self.content, self.cursor) {
             self.content.drain(previous..self.cursor);
             self.cursor = previous;
+            self.bump_revision();
         }
     }
 
     fn delete(&mut self) {
         if let Some(next) = next_boundary(&self.content, self.cursor) {
             self.content.drain(self.cursor..next);
+            self.bump_revision();
         }
     }
 
     fn move_left(&mut self) {
         if let Some(previous) = previous_boundary(&self.content, self.cursor) {
             self.cursor = previous;
+            self.bump_revision();
         }
     }
 
     fn move_right(&mut self) {
         if let Some(next) = next_boundary(&self.content, self.cursor) {
             self.cursor = next;
+            self.bump_revision();
         }
     }
 
@@ -488,12 +605,19 @@ impl InputPane {
         let line_start = self.content[..self.cursor]
             .rfind('\n')
             .map_or(0, |index| index + 1);
-        self.cursor = line_start;
+        if self.cursor != line_start {
+            self.cursor = line_start;
+            self.bump_revision();
+        }
     }
 
     fn move_to_line_end(&mut self) {
         let suffix = &self.content[self.cursor..];
-        self.cursor += suffix.find('\n').unwrap_or(suffix.len());
+        let new_cursor = self.cursor + suffix.find('\n').unwrap_or(suffix.len());
+        if self.cursor != new_cursor {
+            self.cursor = new_cursor;
+            self.bump_revision();
+        }
     }
 
     fn move_word_left(&mut self) {
@@ -509,6 +633,7 @@ impl InputPane {
             }
             if index == 0 {
                 self.cursor = 0;
+                self.bump_revision();
                 return;
             }
         }
@@ -523,6 +648,7 @@ impl InputPane {
             }
         }
         self.cursor = index;
+        self.bump_revision();
     }
 
     fn move_word_right(&mut self) {
@@ -538,6 +664,7 @@ impl InputPane {
             }
             if index >= self.content.len() {
                 self.cursor = self.content.len();
+                self.bump_revision();
                 return;
             }
         }
@@ -552,12 +679,14 @@ impl InputPane {
             }
         }
         self.cursor = index;
+        self.bump_revision();
     }
 
     fn delete_line(&mut self) {
         self.content.clear();
         self.cursor = 0;
         self.history_index = None;
+        self.bump_revision();
     }
 
     fn delete_to_line_end(&mut self) {
@@ -565,7 +694,10 @@ impl InputPane {
             + self.content[self.cursor..]
                 .find('\n')
                 .unwrap_or(self.content[self.cursor..].len());
-        self.content.drain(self.cursor..line_end);
+        if line_end > self.cursor {
+            self.content.drain(self.cursor..line_end);
+            self.bump_revision();
+        }
     }
 
     fn delete_word_backward(&mut self) {
@@ -596,6 +728,7 @@ impl InputPane {
         }
         self.content.drain(index..self.cursor);
         self.cursor = index;
+        self.bump_revision();
     }
 
     /// Move to the previous history item.
@@ -614,6 +747,7 @@ impl InputPane {
         if let Some(index) = self.history_index {
             self.content = self.history[index].clone();
             self.cursor = self.content.len();
+            self.bump_revision();
         }
     }
 
@@ -625,12 +759,14 @@ impl InputPane {
                 self.history_index = None;
                 self.content = self.saved_content.take().unwrap_or_default();
                 self.cursor = self.content.len();
+                self.bump_revision();
             }
             Some(index) => {
                 let next = index + 1;
                 self.history_index = Some(next);
                 self.content = self.history[next].clone();
                 self.cursor = self.content.len();
+                self.bump_revision();
             }
         }
     }
@@ -768,10 +904,25 @@ impl InputPane {
     ///
     /// Called after every mutating keypress so the visible list
     /// stays in sync. A no-op when no provider is installed.
+    ///
+    /// PR 4 of `docs/code_review_2026-05-03.md` (F-9):
+    /// short-circuits when the buffer doesn't start with `/`
+    /// and no popup is currently open. Plain-prose typing
+    /// (the common case) avoids the virtual dispatch into
+    /// the provider entirely. The popup-open branch still
+    /// runs the provider so a slash buffer that just stopped
+    /// matching (e.g. user pressed Backspace through the
+    /// leading `/`) closes the popup correctly. Slash
+    /// commands are the only autocomplete trigger anie
+    /// supports today; if a future provider triggers on
+    /// non-`/` prefixes, this guard must become per-provider.
     fn refresh_autocomplete(&mut self) {
         let Some(state) = self.autocomplete.as_mut() else {
             return;
         };
+        if !self.content.starts_with('/') && state.popup.is_none() {
+            return;
+        }
         let suggestions = state.provider.suggestions(&self.content, self.cursor);
         state.popup = suggestions.map(AutocompletePopup::from_suggestions);
     }
@@ -822,6 +973,7 @@ impl InputPane {
             }
         }
         self.history_index = None;
+        self.bump_revision();
         self.refresh_autocomplete();
     }
 
@@ -1093,14 +1245,21 @@ mod tests {
     /// to update this test.
     #[test]
     fn autocomplete_fires_synchronously_per_keystroke() {
+        // PR 4 of `docs/code_review_2026-05-03.md` (F-9):
+        // the provider only runs while the buffer starts
+        // with `/` (or the popup is already open). The
+        // original "fires synchronously without debounce"
+        // intent is preserved: each keystroke that's eligible
+        // for autocomplete dispatches immediately, no tick
+        // needed. Five `/` + char keystrokes → five calls.
         let (mut pane, calls) = input_with_counter();
-        for ch in ['h', 'e', 'l', 'l', 'o'] {
+        for ch in ['/', 'h', 'e', 'l', 'p'] {
             type_char(&mut pane, ch);
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
             5,
-            "every keystroke must query the provider exactly once"
+            "every eligible keystroke must query the provider exactly once",
         );
     }
 
@@ -1110,14 +1269,17 @@ mod tests {
     /// work.
     #[test]
     fn tick_autocomplete_is_noop() {
+        // Use a slash buffer so the PR-4 guard doesn't elide
+        // the per-keystroke dispatch we want to count.
         let (mut pane, calls) = input_with_counter();
-        type_char(&mut pane, 'a');
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        type_char(&mut pane, '/');
+        let after_first = calls.load(Ordering::SeqCst);
+        assert!(after_first >= 1);
         assert!(!pane.tick_autocomplete());
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "tick must not fire an extra refresh"
+            after_first,
+            "tick must not fire an extra refresh",
         );
     }
 
@@ -1237,9 +1399,9 @@ mod tests {
         // fills row 0, then the space wraps to row 1 and is
         // dropped, then "world" starts row 1.
         let cached = pane.layout(7);
-        assert_eq!(cached.lines.len(), 2);
-        assert_eq!(cached.lines[0], "> hello");
-        assert_eq!(cached.lines[1], "world");
+        assert_eq!(cached.line_count(), 2);
+        assert_eq!(cached.line_text(0), "> hello");
+        assert_eq!(cached.line_text(1), "world");
     }
 
     /// A word longer than the available width still hard-breaks
@@ -1253,9 +1415,9 @@ mod tests {
         // Effective width 5; 10-char unbreakable word occupies
         // two rows.
         let cached = pane.layout(7);
-        assert_eq!(cached.lines.len(), 2);
-        assert_eq!(cached.lines[0], "> abcde");
-        assert_eq!(cached.lines[1], "fghij");
+        assert_eq!(cached.line_count(), 2);
+        assert_eq!(cached.line_text(0), "> abcde");
+        assert_eq!(cached.line_text(1), "fghij");
     }
 
     /// When the cursor sits inside a word that gets retro-moved
@@ -1296,5 +1458,149 @@ mod tests {
             after_pref,
             "render must not recompute the layout already cached by preferred_height",
         );
+    }
+
+    /// PR 2 of `docs/code_review_2026-05-03.md` (F-3). The
+    /// layout cache key is now `(width, content_revision)`
+    /// — a `(u16, u64)` pair — so consecutive paints at the
+    /// same buffer state never trigger a rebuild even when
+    /// the buffer is large. Previously the key included
+    /// `content: String`, costing an O(N) compare + clone
+    /// per hit.
+    #[test]
+    fn layout_cache_hits_repeatedly_without_mutation_for_large_buffer() {
+        let mut pane = InputPane::new();
+        // Several KB of content — the previous shape paid an
+        // O(N) memcmp + clone here on every cache check.
+        for _ in 0..2_000 {
+            type_char(&mut pane, 'a');
+        }
+        let _ = pane.layout(80);
+        let baseline = miss_count(&pane);
+        for _ in 0..32 {
+            let _ = pane.layout(80);
+        }
+        assert_eq!(
+            miss_count(&pane),
+            baseline,
+            "repeated paints at unchanged state must hit the cache regardless of buffer size",
+        );
+    }
+
+    /// PR 3 of `docs/code_review_2026-05-03.md` (F-2). The
+    /// styled rendering lines live in the layout cache, so
+    /// repeat paints at unchanged state must not rebuild
+    /// them. The render path also no longer goes through
+    /// `Paragraph::new`, which previously allocated a fresh
+    /// `Vec<Line<'static>>` per paint plus N `String` clones.
+    #[test]
+    fn render_does_not_rebuild_styled_lines_when_state_unchanged() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut pane = InputPane::new();
+        for ch in "hello world".chars() {
+            type_char(&mut pane, ch);
+        }
+        let area = Rect::new(0, 0, 80, 5);
+        let mut buf = Buffer::empty(area);
+        let _ = pane.render(area, &mut buf, false);
+        let after_first = miss_count(&pane);
+        for _ in 0..16 {
+            let mut buf = Buffer::empty(area);
+            let _ = pane.render(area, &mut buf, false);
+        }
+        assert_eq!(
+            miss_count(&pane),
+            after_first,
+            "repeat renders at unchanged state must hit the styled-line cache",
+        );
+    }
+
+    /// PR 4 of `docs/code_review_2026-05-03.md` (F-9).
+    /// Plain-prose typing must not invoke the autocomplete
+    /// provider; the slash-command shape never matches a
+    /// non-`/` buffer, and the trait dispatch + allocations
+    /// were happening on every keystroke before the guard.
+    #[test]
+    fn typing_plain_prose_does_not_invoke_autocomplete_provider() {
+        let (mut pane, calls) = input_with_counter();
+        for ch in "hello world".chars() {
+            type_char(&mut pane, ch);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "non-slash typing must skip the provider entirely",
+        );
+    }
+
+    /// PR 4 of `docs/code_review_2026-05-03.md` (F-9). The
+    /// guard is "no leading slash AND no popup". Typing the
+    /// first `/` must re-engage the provider so the popup
+    /// opens; subsequent characters keep dispatching while
+    /// the buffer still starts with `/`.
+    #[test]
+    fn typing_a_slash_re_engages_the_autocomplete_provider() {
+        let (mut pane, calls) = input_with_counter();
+        type_char(&mut pane, '/');
+        let after_slash = calls.load(Ordering::SeqCst);
+        assert!(
+            after_slash >= 1,
+            "leading `/` must trigger the provider; got {after_slash} calls"
+        );
+        type_char(&mut pane, 'h');
+        assert!(
+            calls.load(Ordering::SeqCst) > after_slash,
+            "typing while the buffer starts with `/` must keep dispatching"
+        );
+    }
+
+    /// Round 6 of `docs/code_review_2026-05-03.md`. The
+    /// input-pane spans must NOT carry an explicit foreground
+    /// color — the previous `Color::White` style cost
+    /// 21 bytes of SGR set + reset traffic per keystroke
+    /// (`\e[38;5;15;49m...\e[39m\e[49m`) for no visible
+    /// gain over the terminal's default foreground. This test
+    /// pins the byte-budget contract: a cache hit must yield
+    /// spans with `fg = None`. If a future change adds back a
+    /// foreground color it'll show up as a flush-bytes
+    /// regression on the typing hot path.
+    #[test]
+    fn cached_styled_lines_use_default_foreground() {
+        let mut pane = InputPane::new();
+        for ch in "hi".chars() {
+            type_char(&mut pane, ch);
+        }
+        let cached = pane.layout(80);
+        let span = &cached.styled_lines[0].spans[0];
+        assert_eq!(
+            span.style.fg, None,
+            "input spans must inherit terminal default fg, not set Color::White"
+        );
+    }
+
+    /// PR 2 of `docs/code_review_2026-05-03.md` (F-3). Every
+    /// observable mutation (typing, deleting, cursor moves)
+    /// must bump the revision so the cache rebuilds. Without
+    /// this the cache would render stale lines after editing.
+    #[test]
+    fn editor_mutations_bump_layout_cache_revision() {
+        let mut pane = InputPane::new();
+        type_char(&mut pane, 'h');
+        let _ = pane.layout(80);
+        let m1 = miss_count(&pane);
+
+        type_char(&mut pane, 'i');
+        let _ = pane.layout(80);
+        assert_eq!(miss_count(&pane), m1 + 1, "typing must invalidate");
+
+        pane.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        let _ = pane.layout(80);
+        assert_eq!(miss_count(&pane), m1 + 2, "backspace must invalidate");
+
+        pane.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let _ = pane.layout(80);
+        assert_eq!(miss_count(&pane), m1 + 3, "cursor move must invalidate");
     }
 }

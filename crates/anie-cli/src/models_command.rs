@@ -353,6 +353,8 @@ mod tests {
                     account: Some("octocat".into()),
                     api_base_url: Some("https://api.individual.githubcopilot.com".into()),
                     project_id: None,
+                    refresh_token_expires_at: None,
+                    extra_refresh_token: None,
                 },
             )
             .expect("save oauth");
@@ -387,6 +389,8 @@ mod tests {
                     account: None,
                     api_base_url: Some("https://api.individual.githubcopilot.com".into()),
                     project_id: None,
+                    refresh_token_expires_at: None,
+                    extra_refresh_token: None,
                 },
             )
             .expect("save");

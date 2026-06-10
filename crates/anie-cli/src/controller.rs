@@ -1360,41 +1360,59 @@ impl InteractiveController {
                 }
             }
             UiAction::SwitchSession(session_id) => {
+                self.switch_to_session(&session_id).await?;
+            }
+            UiAction::ResumeMostRecent => {
                 if self.current_run.is_some() {
                     self.send_system_message("Cannot switch sessions while a run is active.")
                         .await;
-                } else if session_id == self.state.session.id() {
-                    // Already on this session. Re-opening it would acquire
-                    // a second exclusive lock on the file we already hold,
-                    // failing with AlreadyOpen (surfaced as a misleading
-                    // "unknown session"). The picker marks the current
-                    // session with a ✓ and lets it be selected, so this
-                    // is easy to hit.
-                    self.send_system_message(&format!("Already on session {session_id}."))
-                        .await;
                 } else {
-                    self.state.switch_session(&session_id).await?;
-                    self.cancel_pending_retry_for_run_affecting_change().await?;
-                    let transcript = self
-                        .state
-                        .session_context()
-                        .messages
-                        .into_iter()
-                        .map(|message| message.message)
-                        .collect::<Vec<_>>();
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::TranscriptReplace {
-                            messages: transcript,
-                        })
-                        .await;
-                    anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::SystemMessage {
-                            text: format!("Switched to session {session_id}"),
-                        })
-                        .await;
+                    let current_id = self.state.session.id().to_string();
+                    let target = match self.state.session.list() {
+                        Ok(sessions) => sessions
+                            .into_iter()
+                            .find(|info| info.id != current_id)
+                            .map(|info| (info.id, info.name)),
+                        Err(error) => {
+                            self.send_system_message(&format!(
+                                "Failed to list sessions: {error}"
+                            ))
+                            .await;
+                            return Ok(());
+                        }
+                    };
+                    match target {
+                        Some((session_id, _)) => {
+                            self.switch_to_session(&session_id).await?;
+                        }
+                        None => {
+                            self.send_system_message(
+                                "No other sessions to resume — this is the only one.",
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+            UiAction::SetSessionName(payload) => {
+                // Forward the user's raw `/name` argument
+                // (or `None` when no arg was given) to the
+                // session manager. It trims and treats empty
+                // / whitespace as a clear, so the dispatcher
+                // doesn't have to special-case those here.
+                match self.state.session.set_name(payload.as_deref()) {
+                    Ok(()) => {
+                        let breadcrumb = match self.state.session.name() {
+                            Some(name) => format!("Session display name set to {name:?}."),
+                            None => "Session display name cleared.".to_string(),
+                        };
+                        self.send_system_message(&breadcrumb).await;
+                        anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+                    }
+                    Err(error) => {
+                        self.send_system_message(&format!("Failed to set session name: {error}"))
+                            .await;
+                    }
                 }
             }
             UiAction::Checkpoint(label) => {
@@ -1466,6 +1484,13 @@ impl InteractiveController {
                 };
                 self.send_system_message(&body).await;
             }
+            UiAction::ShowSkills => {
+                let body = render_skills_listing(
+                    &self.state.skill_registry,
+                    &self.state.active_skills,
+                );
+                self.send_system_message(&body).await;
+            }
             UiAction::ShowHelp => {
                 let help = self.state.command_registry.format_help();
                 self.send_system_message(&help).await;
@@ -1499,7 +1524,7 @@ impl InteractiveController {
                 }
             }
             UiAction::ActivateSkill(name) => {
-                match self.state.skills.get(&name) {
+                match self.state.skill_registry.get(&name) {
                     Some(skill) => {
                         // Wrap so the model can attribute the injected
                         // context to the skill it came from.
@@ -1525,6 +1550,67 @@ impl InteractiveController {
             UiAction::Goal(arg) => self.handle_goal_command(arg).await?,
             UiAction::ClearOutput => {}
         }
+        Ok(())
+    }
+
+    /// Shared switch flow used by `UiAction::SwitchSession`
+    /// (explicit session ID) and `UiAction::ResumeMostRecent`
+    /// (most-recently-modified other session). Loads the
+    /// target session's transcript, replays it through the
+    /// TUI via `TranscriptReplace`, refreshes the status
+    /// bar, and emits a SystemMessage breadcrumb so the user
+    /// knows which session they ended up on.
+    ///
+    /// Refuses while a run is active — ditto the inline
+    /// guard `SwitchSession` used to have. The caller is
+    /// expected to have already messaged the user about
+    /// that case before reaching here.
+    async fn switch_to_session(&mut self, session_id: &str) -> Result<()> {
+        if self.current_run.is_some() {
+            self.send_system_message("Cannot switch sessions while a run is active.")
+                .await;
+            return Ok(());
+        }
+        if session_id == self.state.session.id() {
+            // Already on this session. Re-opening it would acquire
+            // a second exclusive lock on the file we already hold,
+            // failing with AlreadyOpen (surfaced as a misleading
+            // "unknown session"). The picker marks the current
+            // session with a ✓ and lets it be selected, so this
+            // is easy to hit.
+            self.send_system_message(&format!("Already on session {session_id}."))
+                .await;
+            return Ok(());
+        }
+        self.state.switch_session(session_id).await?;
+        self.cancel_pending_retry_for_run_affecting_change().await?;
+        let transcript = self
+            .state
+            .session_context()
+            .messages
+            .into_iter()
+            .map(|message| message.message)
+            .collect::<Vec<_>>();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::TranscriptReplace {
+                messages: transcript,
+            })
+            .await;
+        anie_agent::send_event(&self.event_tx, self.state.status_event()).await;
+        // Surface the user-set display name when present
+        // so the breadcrumb reads as the topic the user
+        // recognises rather than the UUID prefix.
+        let label = match self.state.session.name() {
+            Some(name) => format!("{name:?} ({session_id})"),
+            None => session_id.to_string(),
+        };
+        let _ = self
+            .event_tx
+            .send(AgentEvent::SystemMessage {
+                text: format!("Switched to session {label}"),
+            })
+            .await;
         Ok(())
     }
 
@@ -1614,6 +1700,75 @@ impl InteractiveController {
         None
     }
 
+    /// PR 5 + 5.1 of `docs/rlm_subagents_2026-05-01/`. Given
+    /// the raw decompose plan from PR 4, decide whether to:
+    /// 1. Run the concurrent executor (parallel + safe
+    ///    concurrency > 1): build a sub-agent factory, fan
+    ///    out sub-tasks across topological rounds, compose
+    ///    completed results into a `<system-reminder>` block.
+    /// 2. Render dry-run round annotations (parallel enabled
+    ///    but Ollama-clamped to N=1 sequential).
+    /// 3. Pass the plain plan through (parallel not enabled).
+    async fn maybe_run_parallel_decompose(
+        &self,
+        decompose_plan: Option<String>,
+    ) -> Option<String> {
+        let plan = decompose_plan.as_deref()?;
+        if !crate::parallel_decompose::parallel_decompose_enabled() {
+            return decompose_plan;
+        }
+        let Some(parsed) = crate::parallel_decompose::parse_plan(plan) else {
+            return decompose_plan;
+        };
+
+        let max_concurrency = crate::parallel_decompose::safe_max_concurrency(
+            self.state.config.current_model().api,
+        );
+        let has_round_with_multiple = parsed.rounds.iter().any(|r| r.len() > 1);
+        if max_concurrency < 2 || !has_round_with_multiple {
+            // PR 5 dry-run: annotate, don't execute. Either
+            // we're clamped (Ollama default) or the plan is
+            // strictly sequential.
+            return Some(crate::parallel_decompose::render_with_rounds(&parsed));
+        }
+
+        // PR 5.1 concurrent execution. Build the factory the
+        // same way build_rlm_extras does — the executor
+        // doesn't share the recurse-tool's factory because
+        // recurse_extras isn't built yet at this point in
+        // start_prompt_run.
+        let factory = Arc::new(crate::recurse_factory::ControllerSubAgentFactory {
+            provider_registry: Arc::clone(&self.state.provider_registry),
+            model: self.state.config.current_model().clone(),
+            system_prompt: self.state.prompt_cache.current().to_string(),
+            thinking: self.state.config.current_thinking(),
+            request_options_resolver: Arc::clone(&self.state.request_options_resolver),
+            ollama_num_ctx_override: self.state.config.active_ollama_num_ctx_override(),
+            parent_tools: Arc::clone(&self.state.tool_registry),
+            recurse_inherit_limit: recurse_inherit_limit_from_env(),
+        });
+        // Sub-agents start from empty parent context. The
+        // task text is everything they need (system prompt
+        // already has the catalog + skills); pulling parent
+        // history would defeat the prefix-cache benefit when
+        // the API does support it (see concurrency_decisions.md).
+        let parent_context = Vec::new();
+        let recursion_budget = Arc::clone(&self.recursions_remaining_this_run);
+        let cancel = CancellationToken::new();
+        let results = crate::parallel_decompose::execute_parallel_plan(
+            &parsed,
+            factory,
+            parent_context,
+            recursion_budget,
+            max_concurrency,
+            &cancel,
+        )
+        .await;
+        Some(crate::parallel_decompose::render_completed_results(
+            &parsed, &results,
+        ))
+    }
+
     async fn start_prompt_run(&mut self, text: String) -> Result<()> {
         // Pre-run session-budget gate: if the session has already reached
         // a configured session ceiling, refuse to start a new prompt
@@ -1664,6 +1819,42 @@ impl InteractiveController {
             });
             self.state.session.inner_mut().append_message(&injected)?;
         }
+
+        // PR 4 of `docs/rlm_subagents_2026-05-01/`. When
+        // `ANIE_DECOMPOSE=1` is set in --harness-mode=rlm,
+        // run a one-shot pre-loop decompose call on the
+        // user's task before driving the agent. The plan is
+        // injected as a leading <system-reminder> message
+        // the model sees alongside the user's original
+        // prompt. Best-effort: any failure (timeout,
+        // provider error, empty output, NO_PLAN_NEEDED) just
+        // skips the injection.
+        let decompose_plan = self.state.maybe_run_decompose(&text).await;
+        // PR 5 + 5.1 of `docs/rlm_subagents_2026-05-01/`.
+        //
+        // - If parallel-decompose is enabled AND the plan
+        //   parses AND `safe_max_concurrency > 1` (API
+        //   provider, or Ollama with FORCE), run the
+        //   concurrent executor: each sub-task gets its own
+        //   sub-agent run, results are composed back into a
+        //   `<system-reminder source="decompose-executed">`
+        //   block that the main agent synthesizes.
+        // - If parallel-decompose is enabled but concurrency
+        //   is clamped to 1 (Ollama default), render the
+        //   round structure as an annotation (PR 5 dry-run
+        //   behavior) and let the main agent execute the
+        //   sub-tasks itself.
+        // - Otherwise: pass-through to PR 4's plain plan.
+        let decompose_plan = self.maybe_run_parallel_decompose(decompose_plan).await;
+        if let Some(plan) = decompose_plan.as_deref() {
+            let _ = self
+                .event_tx
+                .send(AgentEvent::SystemMessage {
+                    text: format!("[decompose plan]\n{plan}"),
+                })
+                .await;
+        }
+
         let prompt_message = Message::User(UserMessage {
             content: vec![ContentBlock::Text { text }],
             timestamp: now_millis(),
@@ -1720,15 +1911,25 @@ impl InteractiveController {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
+        // PR 4 of `docs/rlm_subagents_2026-05-01/`: if a
+        // decompose plan was produced above, prepend it to
+        // the prompts the agent sees. The plan is a
+        // <system-reminder>-tagged user message — same
+        // channel as the per-turn ledger and skill loads, so
+        // the model treats it as injected guidance.
+        let prompts = if let Some(plan) = decompose_plan {
+            let plan_message = Message::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: crate::decompose::render_plan_as_system_reminder(&plan),
+                }],
+                timestamp: now_millis(),
+            });
+            vec![plan_message, prompt_message]
+        } else {
+            vec![prompt_message]
+        };
         let handle = tokio::spawn(async move {
-            run_via_step_machine(
-                &agent,
-                vec![prompt_message],
-                context,
-                &event_tx,
-                &task_cancel,
-            )
-            .await
+            run_via_step_machine(&agent, prompts, context, &event_tx, &task_cancel).await
         });
         self.current_run = Some(CurrentRun {
             handle,
@@ -1836,6 +2037,19 @@ pub(crate) struct ControllerState {
     pub(crate) model_catalog: Vec<Model>,
     pub(crate) provider_registry: Arc<ProviderRegistry>,
     pub(crate) tool_registry: Arc<ToolRegistry>,
+    /// Skills discovered from disk at startup. PR 1 of
+    /// `docs/skills_2026-05-02/`. Read-only for the lifetime
+    /// of the run; hot reload is deferred (skill iteration
+    /// today requires restart). Surfaced in the system
+    /// prompt as a catalog (name + description, no body).
+    /// Also backs the per-skill `/skill:<name>` commands in
+    /// `command_registry`; activation resolves the body here.
+    pub(crate) skill_registry: Arc<crate::skills::SkillRegistry>,
+    /// Set of skills the agent has loaded this run via the
+    /// `skill` tool. PR 2 of `docs/skills_2026-05-02/`
+    /// installs it; PR 4 reads it from the `/skills`
+    /// slash-command handler.
+    pub(crate) active_skills: crate::skill_tool::ActiveSkills,
     pub(crate) request_options_resolver: Arc<dyn RequestOptionsResolver>,
     pub(crate) prompt_cache: SystemPromptCache,
     pub(crate) retry_config: RetryConfig,
@@ -1881,11 +2095,6 @@ pub(crate) struct ControllerState {
     /// session, rebuilt from persisted usage on resume. Surfaced in
     /// `/state` and the TUI status bar.
     pub(crate) cost_meter: Arc<crate::cost_meter::CostMeter>,
-    /// Skills discovered at startup from `~/.anie/skills/` and the
-    /// project `.anie/skills/`. Their `/skill:<name>` commands are
-    /// registered in `command_registry`; activation resolves the body
-    /// from here. Re-discovered each launch; not persisted.
-    pub(crate) skills: crate::skills::SkillSet,
 }
 
 impl ControllerState {
@@ -2456,17 +2665,48 @@ impl ControllerState {
             self.config.anie_config().clone(),
         ));
         let cwd = self.session.cwd().to_path_buf();
-        self.prompt_cache
-            .replace(&cwd, &self.tool_registry, self.config.anie_config())?;
+        self.prompt_cache.replace(
+            &cwd,
+            &self.tool_registry,
+            &self.skill_registry,
+            self.config.anie_config(),
+        )?;
         self.persist_runtime_state_logged("reload_config");
         Ok(())
+    }
+
+    /// PR 4 of `docs/rlm_subagents_2026-05-01/`. When
+    /// `ANIE_DECOMPOSE=1` is set and the harness installs
+    /// rlm features, run a one-shot pre-loop call asking
+    /// the model to decompose the user's task. Returns the
+    /// plan text (sub-task list) on success; `None` on any
+    /// failure mode or when the model returns
+    /// NO_PLAN_NEEDED.
+    async fn maybe_run_decompose(&self, user_task: &str) -> Option<String> {
+        if !self.harness_mode.installs_rlm_features() {
+            return None;
+        }
+        if !crate::decompose::decompose_env_enabled() {
+            return None;
+        }
+        let decomposer = crate::decompose::Decomposer::new(
+            Arc::clone(&self.provider_registry),
+            self.config.current_model().clone(),
+            Arc::clone(&self.request_options_resolver),
+            self.config.active_ollama_num_ctx_override(),
+        );
+        decomposer.decompose(user_task).await
     }
 
     /// Rebuild the system prompt if the set of context files or any of their mtimes changed.
     fn refresh_system_prompt_if_needed(&mut self) {
         let cwd = self.session.cwd().to_path_buf();
-        self.prompt_cache
-            .refresh_if_stale(&cwd, &self.tool_registry, self.config.anie_config());
+        self.prompt_cache.refresh_if_stale(
+            &cwd,
+            &self.tool_registry,
+            &self.skill_registry,
+            self.config.anie_config(),
+        );
     }
 }
 
@@ -2531,7 +2771,10 @@ fn build_agent(
         Arc::clone(&state.request_options_resolver),
     )
     .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
-    .with_compaction_gate(compaction_gate);
+    .with_compaction_gate(compaction_gate)
+    .with_wrap_failed_tool_results(should_wrap_failed_tool_results(state))
+    .with_failure_loop_threshold(failure_loop_threshold(state))
+    .with_recurse_depth_threshold(recurse_depth_threshold(state));
     // Compose the before-model seam. Order: rlm context-virtualization
     // (replace) first, then the verifier (append), then the budget gate
     // (stop). Each is opt-in; with none installed the loop keeps its Noop
@@ -2566,13 +2809,135 @@ fn build_agent(
     AgentLoop::new(Arc::clone(&state.provider_registry), tool_registry, config)
 }
 
+/// PR 1 of `docs/harness_mitigations_2026-05-01/`. Enable
+/// the failed-tool-result wrapper in `--harness-mode=rlm` by
+/// default. `ANIE_DISABLE_FAIL_REVERIFY=1` turns it off for
+/// smoke-test bisection.
+fn should_wrap_failed_tool_results(state: &ControllerState) -> bool {
+    if !state.harness_mode.installs_rlm_features() {
+        return false;
+    }
+    !env_flag_enabled("ANIE_DISABLE_FAIL_REVERIFY")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// PR 2 of `docs/harness_mitigations_2026-05-01/`. Returns
+/// the failure-loop strike threshold to install. `None`
+/// disables detection. Defaults to `3` in
+/// `--harness-mode=rlm`; `ANIE_FAILURE_LOOP_WARN_AT=<n>`
+/// overrides the threshold; `ANIE_DISABLE_LOOP_DETECTOR=1`
+/// disables entirely.
+fn failure_loop_threshold(state: &ControllerState) -> Option<u32> {
+    if !state.harness_mode.installs_rlm_features() {
+        return None;
+    }
+    if env_flag_enabled("ANIE_DISABLE_LOOP_DETECTOR") {
+        return None;
+    }
+    let parsed = std::env::var("ANIE_FAILURE_LOOP_WARN_AT")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|n| *n > 0);
+    Some(parsed.unwrap_or(anie_agent::DEFAULT_FAILURE_LOOP_THRESHOLD))
+}
+
+/// PR 2 of `docs/rlm_subagents_2026-05-01/`. Sub-agents
+/// inherit `recurse` from the parent only at depths below
+/// this limit. Defaults to
+/// `crate::recurse_factory::DEFAULT_RECURSE_INHERIT_LIMIT`
+/// (3); `ANIE_RECURSE_DEPTH_LIMIT_FOR_INHERITANCE=<n>`
+/// overrides. Soft cap on `recurse` only; doesn't bound
+/// overall recursion depth.
+fn recurse_inherit_limit_from_env() -> u8 {
+    std::env::var("ANIE_RECURSE_DEPTH_LIMIT_FOR_INHERITANCE")
+        .ok()
+        .and_then(|raw| raw.parse::<u8>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(crate::recurse_factory::DEFAULT_RECURSE_INHERIT_LIMIT)
+}
+
+/// PR 1 of `docs/rlm_subagents_2026-05-01/`. Returns the
+/// recurse-depth warn threshold to install. `None` disables
+/// detection. Defaults to `5` in `--harness-mode=rlm`;
+/// `ANIE_RECURSE_DEPTH_WARN_AT=<n>` overrides.
+/// `ANIE_DISABLE_RECURSE_DEPTH_WARN=1` disables entirely.
+fn recurse_depth_threshold(state: &ControllerState) -> Option<u32> {
+    if !state.harness_mode.installs_rlm_features() {
+        return None;
+    }
+    if env_flag_enabled("ANIE_DISABLE_RECURSE_DEPTH_WARN") {
+        return None;
+    }
+    let parsed = std::env::var("ANIE_RECURSE_DEPTH_WARN_AT")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|n| *n > 0);
+    Some(parsed.unwrap_or(anie_agent::DEFAULT_RECURSE_DEPTH_WARN_AT))
+}
+
+/// PR 4 of `docs/skills_2026-05-02/`. Format the
+/// `/skills` slash-command output: catalog of registered
+/// skills with source labels, plus the active-in-this-run
+/// set when non-empty. Disable_model_invocation skills
+/// are still listed (the user may want to load them via
+/// slash command in a follow-up PR) but marked
+/// `[bundled, hidden]` so the user sees they're
+/// model-invisible.
+pub(crate) fn render_skills_listing(
+    registry: &crate::skills::SkillRegistry,
+    active: &crate::skill_tool::ActiveSkills,
+) -> String {
+    if registry.is_empty() {
+        return "No skills are currently registered.".to_string();
+    }
+    let mut out = String::from("Available skills:\n");
+    let max_name_len = registry
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(0);
+    for skill in registry.iter() {
+        let mut tags: Vec<&str> = vec![skill.source.label()];
+        if skill.disable_model_invocation {
+            tags.push("hidden");
+        }
+        let tag_block = format!("[{}]", tags.join(", "));
+        out.push_str(&format!(
+            "  {name:<width$}  {tag}\n    {desc}\n",
+            name = skill.name,
+            width = max_name_len,
+            tag = tag_block,
+            desc = skill.description.replace('\n', " "),
+        ));
+    }
+    let active_set = match active.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if !active_set.is_empty() {
+        let mut names: Vec<String> = active_set.into_iter().collect();
+        names.sort();
+        out.push_str(&format!(
+            "\nActive in this run: {}",
+            names.join(", ")
+        ));
+    }
+    out
+}
+
 /// rlm-mode system-prompt augment. Establishes the policy
 /// before the conversation starts so it competes with —
 /// not just supplements — the cached prompt's "use
 /// web_search/web_read for live-world questions" line.
 /// Combined with the per-turn imperative ledger, this is
 /// what closes the re-fetch loop.
-const RLM_SYSTEM_PROMPT_AUGMENT: &str = "\n\n# Context virtualization (rlm mode)\n\nThis run uses an external archive of prior conversation. Every tool call you issue is recorded there with its arguments. Each turn you receive a `<system-reminder>` ledger listing the URLs, queries, commands, and paths already used.\n\nLedger entry format: each entry is `<value> (id=<call_id>)`. The `<value>` is the URL/query/command/path itself (what you'd compare against the user's question); the `<call_id>` is the runtime tool-call identifier you pass to recurse. Example: `https://example.com/page (id=ollama_tool_call_8_2)` means the value is `https://example.com/page` and the call_id is `ollama_tool_call_8_2`. Never pass the parens or the literal string `(id=...)` as a tool_call_id.\n\nWhen the user asks a follow-up question, FIRST scan the ledger. If the answer would come from a URL, query, command, or path already listed, do NOT re-run the tool. Use `recurse` instead:\n  - `scope.kind=message_grep`, `pattern=<regex>` — search archived messages by keyword. Easiest option; needs no id. Use this first when you're not sure which prior result has the answer.\n  - `scope.kind=tool_result`, `tool_call_id=<id>` — fetch one prior result verbatim. Pass the `<call_id>` from a ledger entry as the tool_call_id (without the parens, without the `id=` prefix).\n  - `scope.kind=summary`, `id=<archive_id>` — fetch the gist (cheapest).\n\nThis applies even to live-world questions (weather, news, prices) when the relevant pages are already in the archive — re-fetching wastes the user's time. Reach for `web_read` / `web_search` only when no archived material would answer the question.";
+const RLM_SYSTEM_PROMPT_AUGMENT: &str = "\n\n# Context virtualization (rlm mode)\n\nThis run uses an external archive of prior conversation. Every tool call you issue is recorded there with its arguments. Each turn you receive a `<system-reminder>` ledger listing the URLs, queries, commands, and paths already used.\n\nLedger entry format: each entry is `<value> (id=<call_id>)`. The `<value>` is the URL/query/command/path itself (what you'd compare against the user's question); the `<call_id>` is the runtime tool-call identifier you pass to recurse. Example: `https://example.com/page (id=ollama_tool_call_8_2)` means the value is `https://example.com/page` and the call_id is `ollama_tool_call_8_2`. Never pass the parens or the literal string `(id=...)` as a tool_call_id.\n\nWhen the user asks a follow-up question, FIRST scan the ledger. If the answer would come from a URL, query, command, or path already listed, do NOT re-run the tool. Use `recurse` instead:\n  - `scope.kind=message_grep`, `pattern=<regex>` — search archived messages by keyword. Easiest option; needs no id. Use this first when you're not sure which prior result has the answer.\n  - `scope.kind=tool_result`, `tool_call_id=<id>` — fetch one prior result verbatim. Pass the `<call_id>` from a ledger entry as the tool_call_id (without the parens, without the `id=` prefix).\n  - `scope.kind=summary`, `id=<archive_id>` — fetch the gist (cheapest).\n\nThis applies even to live-world questions (weather, news, prices) when the relevant pages are already in the archive — re-fetching wastes the user's time. Reach for `web_read` / `web_search` only when no archived material would answer the question.\n\n# Verify before claiming success\n\nThe ledger also lists the bash commands you've run. After any `edit` or `write` to a file you're testing, find the most recent build/test/run command in the ledger and re-execute it before claiming the change works. If the recent failure ledger lists [tool error] entries on a tool call you just made, do NOT skip past them — re-verify the underlying state (re-read the file, re-run the command). The harness will surface a `[loop warning]` `<system-reminder>` if it sees the same tool failing repeatedly with the same arguments — when that fires, change your approach instead of retrying.\n\n# Skills\n\nWhen the system prompt lists `Available skills`, those skills are pre-written guidance for specific situations. If a skill's description matches what you're about to do (writing C++ that uses raw memory, switching topics to look up live data, fixing a bug a previous tool call surfaced), load it FIRST with the `skill` tool — the body may save you from a known-bad failure mode. Loading is cheap; not loading when relevant is the actual cost.";
 
 /// Build the per-run system prompt. In non-rlm modes
 /// returns the cached prompt verbatim. In rlm mode
@@ -2667,12 +3032,23 @@ fn rlm_relevance_budget_tokens(active_ceiling_tokens: u64) -> u64 {
 /// dim mismatch warning we might add later.
 const DEFAULT_EMBEDDING_DIM: usize = 768;
 
-/// Build the optional Plan-08 embedder + worker. Returns
-/// `None` when `ANIE_EMBEDDING_MODEL` is unset (default —
-/// preserves keyword-only behavior) or when the parent's
-/// provider isn't Ollama (the only embedding backend
-/// shipped today). Otherwise returns the embedder Arc +
-/// the worker's mpsc Sender.
+/// Default embedding model used when rlm mode runs against
+/// an Ollama parent and `ANIE_EMBEDDING_MODEL` isn't
+/// explicitly set. Picked because it's the smallest widely-
+/// available embedding model on Ollama and matches the
+/// `DEFAULT_EMBEDDING_DIM` of 768. Operators who want a
+/// different model set the env var; operators who want to
+/// disable embeddings entirely set it to the empty string.
+const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+
+/// Build the optional Plan-08 embedder + worker. In rlm
+/// mode against an Ollama parent the embedder defaults on
+/// (`DEFAULT_EMBEDDING_MODEL`); the env var
+/// `ANIE_EMBEDDING_MODEL` overrides the model, and an
+/// explicit empty string (`ANIE_EMBEDDING_MODEL=`)
+/// disables. Returns `None` when explicitly disabled or
+/// when the parent's provider isn't Ollama (the only
+/// embedding backend shipped today).
 fn build_embedder(
     state: &ControllerState,
     store: Arc<tokio::sync::RwLock<crate::external_context::ExternalContext>>,
@@ -2680,10 +3056,15 @@ fn build_embedder(
     Arc<dyn crate::embedder::Embedder>,
     mpsc::Sender<crate::bg_embedder::EmbedRequest>,
 )> {
-    let model_name = std::env::var("ANIE_EMBEDDING_MODEL").ok()?;
-    if model_name.trim().is_empty() {
-        return None;
-    }
+    // Resolve the embedding model name with three-way
+    // semantics: unset → default; empty → disabled;
+    // anything else → use that. The empty-string-disables
+    // path keeps smoke-test bisection working.
+    let model_name = match std::env::var("ANIE_EMBEDDING_MODEL") {
+        Ok(value) if value.trim().is_empty() => return None,
+        Ok(value) => value,
+        Err(_) => DEFAULT_EMBEDDING_MODEL.to_string(),
+    };
     // Today only Ollama is supported. The parent's
     // current model carries the base_url we point the
     // embedder at — embeddings come from the same
@@ -2693,7 +3074,7 @@ fn build_embedder(
         warn!(
             target: "anie_cli::controller",
             api = ?parent_model.api,
-            "ANIE_EMBEDDING_MODEL set but parent provider is not Ollama; skipping embedder"
+            "rlm embedder skipped — parent provider is not Ollama"
         );
         return None;
     }
@@ -2755,13 +3136,13 @@ fn build_rlm_extras(
         ));
     let summarizer_tx = crate::bg_summarizer::spawn_worker(summarizer, Arc::clone(&store));
 
-    // Plan 08: optionally spawn the background embedder.
-    // Reads `ANIE_EMBEDDING_MODEL` to decide whether to
-    // wire it up. When set + the parent is an Ollama
-    // provider, we spin up an OllamaEmbedder pointed at
-    // the same base_url. Failures during the actual embed
-    // call are handled in-worker (logged, entry stays
-    // unembedded → reranker falls back to keyword).
+    // Plan 08: spawn the background embedder. Defaults on
+    // when the parent is an Ollama provider; the
+    // `ANIE_EMBEDDING_MODEL` env var overrides the model
+    // and an explicit empty string disables. Failures
+    // during the actual embed call are handled in-worker
+    // (logged, entry stays unembedded → reranker falls
+    // back to keyword).
     let embed_handle = build_embedder(state, Arc::clone(&store));
 
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
@@ -2774,6 +3155,8 @@ fn build_rlm_extras(
         thinking: state.config.current_thinking(),
         request_options_resolver: Arc::clone(&state.request_options_resolver),
         ollama_num_ctx_override: state.config.active_ollama_num_ctx_override(),
+        parent_tools: Arc::clone(&state.tool_registry),
+        recurse_inherit_limit: recurse_inherit_limit_from_env(),
     });
     let recurse_tool = Arc::new(anie_tools::RecurseTool::new(
         factory,
@@ -2822,6 +3205,7 @@ fn build_rlm_extras(
 pub fn build_system_prompt(
     cwd: &Path,
     tools: &ToolRegistry,
+    skills: &crate::skills::SkillRegistry,
     config: &AnieConfig,
 ) -> Result<String> {
     let tool_list = tools
@@ -2840,6 +3224,10 @@ pub fn build_system_prompt(
     };
 
     let mut parts = vec![default_base];
+    let skill_catalog = crate::skills::render_catalog(skills);
+    if !skill_catalog.is_empty() {
+        parts.push(skill_catalog);
+    }
     for context_file in collect_context_files(cwd, &config.context)? {
         parts.push(format!(
             "# Project Context\n\n## {}\n\n{}",
@@ -3081,6 +3469,14 @@ fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String
     sessions
         .iter()
         .map(|session| {
+            // When the user has set a display name via
+            // `/name`, surface it ahead of the ID so the
+            // line reads as "name (id)" instead of just
+            // "id". Anonymous sessions stay ID-only.
+            let label = match session.name.as_deref() {
+                Some(name) => format!("{name} ({})", session.id),
+                None => session.id.clone(),
+            };
             format!(
                 "{} {}  {}  {}",
                 if session.id == current_session_id {
@@ -3088,7 +3484,7 @@ fn format_sessions(sessions: &[SessionInfo], current_session_id: &str) -> String
                 } else {
                     ' '
                 },
-                session.id,
+                label,
                 session.cwd,
                 truncate_text(&session.first_message, 60),
             )

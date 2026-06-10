@@ -102,6 +102,38 @@ pub fn create_temp_session() -> (tempfile::TempDir, SessionManager) {
     (dir, session)
 }
 
+/// Reopen a session file, retrying briefly on transient lock
+/// contention. Under `--test-threads=8+` workspace pressure we observed
+/// `try_lock_exclusive` returning `Ok(false)` ~5–15% of the time even
+/// after the prior `SessionManager` had been dropped — explicit drop
+/// alone wasn't enough. This wraps `SessionManager::open_session` with
+/// a short backoff loop so test infrastructure tolerates a Linux
+/// flock-release race that doesn't manifest in production (sessions
+/// are long-lived, not opened-then-reopened in rapid succession).
+pub fn open_session_with_retry(session_path: &Path) -> SessionManager {
+    for attempt in 0..50 {
+        match SessionManager::open_session(session_path) {
+            Ok(session) => return session,
+            Err(error) => {
+                // Only retry lock contention (AlreadyOpen); any other
+                // failure is a real bug and should surface immediately.
+                let is_lock_contention = error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<anie_session::SessionError>(),
+                        Some(anie_session::SessionError::AlreadyOpen(_))
+                    )
+                });
+                if is_lock_contention && attempt < 49 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                panic!("reopen failed: {error}");
+            }
+        }
+    }
+    unreachable!("retry loop returns or panics")
+}
+
 /// Persist a prompt and agent result into a new session, then reopen and
 /// return the deserialized context. This is the standard
 /// "persist → close → reopen → build_context" roundtrip used by many tests.
@@ -125,28 +157,6 @@ pub fn persist_and_reopen(cwd: &Path, prompt: &Message, result: &AgentRunResult)
     // retry the reopen a few times before giving up.
     let reopened = open_session_with_retry(&session_path);
     reopened.build_context()
-}
-
-fn open_session_with_retry(path: &Path) -> SessionManager {
-    for attempt in 0..50 {
-        match SessionManager::open_session(path) {
-            Ok(session) => return session,
-            Err(error) => {
-                let is_lock_contention = error.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<anie_session::SessionError>(),
-                        Some(anie_session::SessionError::AlreadyOpen(_))
-                    )
-                });
-                if is_lock_contention && attempt < 49 {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    continue;
-                }
-                panic!("reopen failed: {error}");
-            }
-        }
-    }
-    unreachable!("retry loop returns or panics")
 }
 
 /// Create a tool registry with all four real tools rooted at the given directory.

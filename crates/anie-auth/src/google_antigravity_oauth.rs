@@ -223,6 +223,9 @@ impl OAuthProvider for GoogleAntigravityOAuthProvider {
             account,
             api_base_url: None,
             project_id: Some(project_id),
+            // Google refresh tokens are long-lived.
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         })
     }
 
@@ -250,6 +253,8 @@ impl OAuthProvider for GoogleAntigravityOAuthProvider {
             account: credential.account.clone(),
             api_base_url: credential.api_base_url.clone(),
             project_id: credential.project_id.clone(),
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         })
     }
 }
@@ -597,6 +602,8 @@ mod tests {
             account: Some("user@example.com".into()),
             api_base_url: None,
             project_id: Some("my-project-123".into()),
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         };
         let refreshed = provider.refresh(&prior).await.expect("refresh");
         assert_eq!(refreshed.access_token, "rotated-access");

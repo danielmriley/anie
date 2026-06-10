@@ -73,7 +73,7 @@ use std::{
     },
 };
 
-use anie_agent::{BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse};
+use anie_agent::{BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, stable_args_hash};
 use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
 use anie_session::estimate_tokens;
 use tokio::sync::{RwLock, mpsc};
@@ -573,9 +573,21 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             _ => None,
         });
 
-        // Step 3: FIFO-evict from the front while over
-        // ceiling. Skip the pinned user message + the
-        // pinned tail (last `keep_last_n` messages).
+        // Step 3: evict to bring total under ceiling.
+        //
+        // Priority order (PR 4 of `docs/harness_mitigations_2026-05-01/`):
+        //   3a. **Supersedable failures first.** A failed
+        //       tool result whose `(tool_name, args_hash)`
+        //       matches a later successful call is just
+        //       noise — the failure adds no information the
+        //       success doesn't already convey. Cursor's
+        //       harness post-mortem calls this "context
+        //       rot": failed tool results that linger past
+        //       their relevance degrade later decisions.
+        //   3b. **Standard FIFO** for the remainder.
+        //
+        // The pinned user message + pinned tail are still
+        // skipped (correctness guarantees from rlm/17).
         let mut running_total: u64 = working
             .iter()
             .map(estimate_tokens)
@@ -583,6 +595,58 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         let working_len = working.len();
         let pinned_tail_start = working_len.saturating_sub(self.keep_last_n);
         let mut to_evict: Vec<usize> = Vec::new();
+        let mut supersedable_evicted: usize = 0;
+
+        // 3a. Supersedable failures (Signal A).
+        let supersedable = find_supersedable_failures(&working);
+        for &idx in &supersedable {
+            if running_total <= self.active_ceiling_tokens {
+                break;
+            }
+            // Don't touch the pinned tail.
+            if idx >= pinned_tail_start {
+                continue;
+            }
+            // Pinned user can't be a tool result anyway, but
+            // be defensive.
+            let is_pinned_user = matches!(working.get(idx), Some(Message::User(u))
+                if pinned_user_ts == Some(u.timestamp));
+            if is_pinned_user {
+                continue;
+            }
+            if let Some(m) = working.get(idx) {
+                running_total = running_total.saturating_sub(estimate_tokens(m));
+                to_evict.push(idx);
+                supersedable_evicted += 1;
+            }
+        }
+
+        // 3a-bis. Stale failures (Signal B, position-based).
+        // Failures that have aged past the still-fresh window
+        // are evicted ahead of standard FIFO order — they're
+        // the most likely-stale class of message in working.
+        let mut stale_evicted: usize = 0;
+        if running_total > self.active_ceiling_tokens {
+            let stale = find_stale_failures(&working, self.keep_last_n);
+            for &idx in &stale {
+                if running_total <= self.active_ceiling_tokens {
+                    break;
+                }
+                if to_evict.contains(&idx) {
+                    continue; // already evicted by Signal A
+                }
+                if idx >= pinned_tail_start {
+                    continue;
+                }
+                if let Some(m) = working.get(idx) {
+                    running_total = running_total.saturating_sub(estimate_tokens(m));
+                    to_evict.push(idx);
+                    stale_evicted += 1;
+                }
+            }
+        }
+
+        // 3b. Standard FIFO eviction for the remainder.
         for (idx, m) in working.iter().enumerate() {
             if running_total <= self.active_ceiling_tokens {
                 break;
@@ -590,6 +654,10 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             // Skip pinned tail.
             if idx >= pinned_tail_start {
                 break;
+            }
+            // Already evicted by 3a.
+            if to_evict.contains(&idx) {
+                continue;
             }
             // Skip pinned user message regardless of position.
             let is_pinned_user = matches!(m, Message::User(u)
@@ -599,6 +667,19 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             }
             running_total = running_total.saturating_sub(estimate_tokens(m));
             to_evict.push(idx);
+        }
+        // After 3a + 3b, indices may not be sorted; sort
+        // ascending so the reverse-drop below removes the
+        // right items.
+        to_evict.sort();
+        to_evict.dedup();
+        if supersedable_evicted > 0 || stale_evicted > 0 {
+            debug!(
+                supersedable_evicted,
+                stale_evicted,
+                fifo_evicted = to_evict.len() - supersedable_evicted - stale_evicted,
+                "rlm policy evicted failures (Signal A/B) + FIFO"
+            );
         }
         let evicted_count = to_evict.len();
         if !to_evict.is_empty() {
@@ -1142,6 +1223,104 @@ impl ContextVirtualizationPolicy {
             timestamp: now_millis(),
         })
     }
+}
+
+/// PR 4 Signal B (simplified) of `docs/harness_mitigations_2026-05-01/`.
+/// Walk `working` and identify failed tool results that
+/// have aged past a "still-fresh" window. A failure is
+/// considered stale when:
+///
+/// - It's a `Message::ToolResult` with `is_error == true`,
+/// - It's NOT in the trailing `keep_last_n` window
+///   (still pinned; would have been skipped anyway),
+/// - At least `min_messages_after = 4` messages follow it
+///   in `working` — heuristic for "≥ 2 turns dwell" without
+///   needing turn-tracking metadata.
+///
+/// Returns indices into `working`, sorted ascending.
+///
+/// **Why simplified vs. the original plan:** the plan
+/// called for embedding-based bottom-quartile relevance
+/// scoring against the current prompt. That requires
+/// embedding all active-context messages on every fire and
+/// passing the embedder + prompt embedding through to the
+/// eviction logic. This iteration ships a position-based
+/// approximation that addresses the core observation
+/// (older failures are usually no longer relevant). True
+/// embedding-based ranking can land as a v2 if smoke shows
+/// position alone isn't sharp enough.
+fn find_stale_failures(working: &[Message], keep_last_n: usize) -> Vec<usize> {
+    const MIN_MESSAGES_AFTER: usize = 4;
+    let working_len = working.len();
+    let pinned_tail_start = working_len.saturating_sub(keep_last_n);
+    let mut stale = Vec::new();
+    for (idx, m) in working.iter().enumerate() {
+        if let Message::ToolResult(tr) = m
+            && tr.is_error
+            && idx < pinned_tail_start
+            && working_len.saturating_sub(idx) > MIN_MESSAGES_AFTER
+        {
+            stale.push(idx);
+        }
+    }
+    stale
+}
+
+/// PR 4 of `docs/harness_mitigations_2026-05-01/`. Walk
+/// `working` and identify failed tool results that have
+/// been "superseded" by a later successful tool call with
+/// the same `(tool_name, args_hash)`. The args come from
+/// the upstream assistant message's `ToolCall.arguments`
+/// (matched by `tool_call_id`); when a tool's arguments are
+/// unrecoverable (e.g., the assistant message was already
+/// evicted), the failed result conservatively stays put.
+///
+/// Returns indices into `working`, sorted ascending.
+fn find_supersedable_failures(working: &[Message]) -> Vec<usize> {
+    use std::collections::{HashMap, HashSet};
+
+    // 1. Map tool_call_id → arguments JSON by walking the
+    //    assistant messages' tool-call blocks. We keep the
+    //    full Value so we can hash it once we know the
+    //    matching tool result.
+    let mut args_by_call_id: HashMap<&str, &serde_json::Value> = HashMap::new();
+    for m in working {
+        if let Message::Assistant(a) = m {
+            for block in &a.content {
+                if let ContentBlock::ToolCall(call) = block {
+                    args_by_call_id.insert(call.id.as_str(), &call.arguments);
+                }
+            }
+        }
+    }
+
+    // 2. Collect the (tool_name, args_hash) pairs of
+    //    successful tool results in `working`. These mark
+    //    "supersession keys" — any failed result with a
+    //    matching key is redundant.
+    let mut success_keys: HashSet<(String, u64)> = HashSet::new();
+    for m in working {
+        if let Message::ToolResult(tr) = m
+            && !tr.is_error
+            && let Some(args) = args_by_call_id.get(tr.tool_call_id.as_str())
+        {
+            success_keys.insert((tr.tool_name.clone(), stable_args_hash(args)));
+        }
+    }
+
+    // 3. Walk `working` again and collect indices of failed
+    //    results whose key is in `success_keys`.
+    let mut supersedable = Vec::new();
+    for (idx, m) in working.iter().enumerate() {
+        if let Message::ToolResult(tr) = m
+            && tr.is_error
+            && let Some(args) = args_by_call_id.get(tr.tool_call_id.as_str())
+            && success_keys.contains(&(tr.tool_name.clone(), stable_args_hash(args)))
+        {
+            supersedable.push(idx);
+        }
+    }
+    supersedable
 }
 
 #[cfg(test)]
@@ -2227,5 +2406,220 @@ mod tests {
             _ => false,
         });
         assert!(has_candidate, "keyword-only path should still page in");
+    }
+
+    // ---- PR 4 of harness_mitigations_2026-05-01: supersedable failure detection ----
+
+    fn failed_tool_result(call_id: &str, tool_name: &str, ts: u64) -> Message {
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            content: vec![ContentBlock::Text { text: "[tool error] failed".into() }],
+            details: serde_json::Value::Null,
+            is_error: true,
+            timestamp: ts,
+        })
+    }
+
+    fn ok_tool_result(call_id: &str, tool_name: &str, ts: u64) -> Message {
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            content: vec![ContentBlock::Text { text: "ok".into() }],
+            details: serde_json::Value::Null,
+            is_error: false,
+            timestamp: ts,
+        })
+    }
+
+    /// Helper: build an Assistant message whose tool-call has
+    /// a specific id (so we can wire it to a matching tool
+    /// result).
+    fn assistant_call_with_id(
+        id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        ts: u64,
+    ) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: id.into(),
+                name: tool_name.into(),
+                arguments,
+            })],
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            provider: "test".into(),
+            model: "test".into(),
+            timestamp: ts,
+            reasoning_details: None,
+        })
+    }
+
+    #[test]
+    fn supersedable_failure_detected_when_args_match_later_success() {
+        let working = vec![
+            assistant_call_with_id("c1", "bash", serde_json::json!({"command": "ls"}), 1),
+            failed_tool_result("c1", "bash", 2),
+            assistant_call_with_id("c2", "bash", serde_json::json!({"command": "ls"}), 3),
+            ok_tool_result("c2", "bash", 4),
+        ];
+        let supersedable = find_supersedable_failures(&working);
+        assert_eq!(supersedable, vec![1], "only the failed result at idx 1 supersedable");
+    }
+
+    #[test]
+    fn no_supersedable_when_failure_args_differ_from_success() {
+        let working = vec![
+            assistant_call_with_id("c1", "bash", serde_json::json!({"command": "ls /a"}), 1),
+            failed_tool_result("c1", "bash", 2),
+            assistant_call_with_id("c2", "bash", serde_json::json!({"command": "ls /b"}), 3),
+            ok_tool_result("c2", "bash", 4),
+        ];
+        let supersedable = find_supersedable_failures(&working);
+        assert!(supersedable.is_empty(), "different args should not supersede");
+    }
+
+    #[test]
+    fn no_supersedable_when_only_failures() {
+        let working = vec![
+            assistant_call_with_id("c1", "bash", serde_json::json!({"command": "ls"}), 1),
+            failed_tool_result("c1", "bash", 2),
+            assistant_call_with_id("c2", "bash", serde_json::json!({"command": "ls"}), 3),
+            failed_tool_result("c2", "bash", 4),
+        ];
+        let supersedable = find_supersedable_failures(&working);
+        assert!(supersedable.is_empty(), "no success → nothing to supersede");
+    }
+
+    #[test]
+    fn supersedable_requires_same_tool_name() {
+        let working = vec![
+            assistant_call_with_id("c1", "bash", serde_json::json!({"command": "ls"}), 1),
+            failed_tool_result("c1", "bash", 2),
+            // Different tool, "same" args (irrelevant — different
+            // tool means different concept).
+            assistant_call_with_id("c2", "edit", serde_json::json!({"command": "ls"}), 3),
+            ok_tool_result("c2", "edit", 4),
+        ];
+        let supersedable = find_supersedable_failures(&working);
+        assert!(
+            supersedable.is_empty(),
+            "different tool_name should not match"
+        );
+    }
+
+    #[test]
+    fn supersedable_args_canonicalized_so_key_order_doesnt_matter() {
+        let working = vec![
+            assistant_call_with_id("c1", "bash", serde_json::json!({"a": 1, "b": 2}), 1),
+            failed_tool_result("c1", "bash", 2),
+            // Same args, different key order.
+            assistant_call_with_id("c2", "bash", serde_json::json!({"b": 2, "a": 1}), 3),
+            ok_tool_result("c2", "bash", 4),
+        ];
+        let supersedable = find_supersedable_failures(&working);
+        assert_eq!(
+            supersedable,
+            vec![1],
+            "stable_args_hash should treat reordered keys as same"
+        );
+    }
+
+    // ---- PR 4 Signal B: stale failure detection ----
+
+    #[test]
+    fn stale_failure_detected_when_far_from_tail() {
+        // Failure at idx 0, plenty of messages after it, NOT
+        // in the pinned tail.
+        let working = vec![
+            failed_tool_result("c1", "bash", 1),  // idx 0 — stale
+            user("dummy", 2),
+            user("dummy", 3),
+            user("dummy", 4),
+            user("dummy", 5),
+            user("latest", 6),                     // pinned tail
+        ];
+        let stale = find_stale_failures(&working, 1);
+        assert_eq!(stale, vec![0]);
+    }
+
+    #[test]
+    fn fresh_failure_not_marked_stale() {
+        // Failure with too few messages after it (still fresh).
+        let working = vec![
+            user("first", 1),
+            user("second", 2),
+            failed_tool_result("c1", "bash", 3),   // only 2 after
+            user("third", 4),
+            user("latest", 5),
+        ];
+        let stale = find_stale_failures(&working, 1);
+        // Failure at idx 2: messages_after = 5 - 2 = 3, < 4 threshold.
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_failure_in_pinned_tail_skipped() {
+        // Failure inside the pinned-tail window — even if old
+        // enough, the tail pin protects it.
+        let working = vec![
+            user("a", 1),
+            user("b", 2),
+            user("c", 3),
+            user("d", 4),
+            user("e", 5),
+            failed_tool_result("c1", "bash", 6),   // last; pinned
+        ];
+        let stale = find_stale_failures(&working, 2);
+        // Pinned tail is the last 2. Idx 5 is in tail.
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn multiple_stale_failures_returned_in_order() {
+        let working = vec![
+            failed_tool_result("c1", "bash", 1),   // idx 0 — stale
+            user("a", 2),
+            failed_tool_result("c2", "edit", 3),   // idx 2 — stale
+            user("b", 4),
+            user("c", 5),
+            user("d", 6),
+            user("e", 7),
+            user("latest", 8),                     // pinned
+        ];
+        let stale = find_stale_failures(&working, 1);
+        assert_eq!(stale, vec![0, 2]);
+    }
+
+    #[test]
+    fn successful_results_never_marked_stale() {
+        let working = vec![
+            ok_tool_result("c1", "bash", 1),       // idx 0 — NOT stale
+            user("a", 2),
+            user("b", 3),
+            user("c", 4),
+            user("d", 5),
+            user("latest", 6),
+        ];
+        let stale = find_stale_failures(&working, 1);
+        assert!(stale.is_empty(), "successes should not be stale-eligible");
+    }
+
+    #[test]
+    fn multiple_supersedable_failures_returned_in_order() {
+        let working = vec![
+            assistant_call_with_id("c1", "bash", serde_json::json!({"command": "ls"}), 1),
+            failed_tool_result("c1", "bash", 2),
+            assistant_call_with_id("c2", "bash", serde_json::json!({"command": "ls"}), 3),
+            failed_tool_result("c2", "bash", 4),
+            // Eventually a success with the same args
+            // supersedes BOTH prior failures.
+            assistant_call_with_id("c3", "bash", serde_json::json!({"command": "ls"}), 5),
+            ok_tool_result("c3", "bash", 6),
+        ];
+        let supersedable = find_supersedable_failures(&working);
+        assert_eq!(supersedable, vec![1, 3]);
     }
 }

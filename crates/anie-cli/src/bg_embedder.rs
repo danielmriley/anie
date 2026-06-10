@@ -12,9 +12,12 @@
 //! reranker (PR 08.3) reads from those cached vectors.
 //!
 //! Lifecycle:
-//! 1. Controller spawns the worker on rlm-mode init when
-//!    `ANIE_EMBEDDING_MODEL` is set, handing it
-//!    `Arc<dyn Embedder>` + `Arc<RwLock<ExternalContext>>`.
+//! 1. Controller spawns the worker on rlm-mode init
+//!    against an Ollama parent (default-on with
+//!    `nomic-embed-text`; `ANIE_EMBEDDING_MODEL=`
+//!    explicitly disables, any other value overrides
+//!    the model), handing it `Arc<dyn Embedder>` +
+//!    `Arc<RwLock<ExternalContext>>`.
 //! 2. Policy enqueues `EmbedRequest { id, text }` after
 //!    archive (only for messages above a size threshold).
 //! 3. Worker pulls, embeds, writes back via

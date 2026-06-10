@@ -143,6 +143,26 @@ pub struct OAuthCredentialData {
     /// preserved across refreshes since project discovery only
     /// happens once.
     pub project_id: Option<String>,
+    /// RFC 3339 UTC timestamp indicating when `refresh_token`
+    /// itself expires. Most OAuth providers issue long-lived
+    /// refresh tokens (months / never), so this field stays
+    /// `None`. GitHub Copilot is the exception: its
+    /// device-flow `ghu_` token has an 8-hour default expiry,
+    /// and unless we proactively refresh *the refresh token*
+    /// using the `extra_refresh_token` (`ghr_`) GitHub returns
+    /// alongside it, the credential becomes unusable after the
+    /// first 8 hours and the user has to re-`/login`. Set when
+    /// the provider returns `expires_in` for the refresh token;
+    /// `None` otherwise.
+    pub refresh_token_expires_at: Option<String>,
+    /// Provider-specific second-tier refresh token used to
+    /// refresh `refresh_token` itself when it expires. For
+    /// GitHub Copilot this is the `ghr_` token returned by
+    /// the device flow (valid for ~6 months) — exchanging it
+    /// at GitHub's `grant_type=refresh_token` endpoint yields
+    /// a fresh `ghu_` (and a new `ghr_` to roll over to).
+    /// `None` for providers whose refresh tokens don't expire.
+    pub extra_refresh_token: Option<String>,
 }
 
 impl OAuthCredentialData {
@@ -158,6 +178,8 @@ impl OAuthCredentialData {
             account: None,
             api_base_url: None,
             project_id: None,
+            refresh_token_expires_at: None,
+            extra_refresh_token: None,
         }
     }
 }

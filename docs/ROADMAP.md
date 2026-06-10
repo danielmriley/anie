@@ -1,7 +1,47 @@
 # Anie Roadmap
 
-Unified, prioritized task list. Items are ordered by impact-to-effort
-ratio — smallest impactful changes first. Check off items as they ship.
+Single source of truth for what's shipped, what's
+in flight, and what's next. Each row links to a plan
+series or doc; series with their own status trackers
+are linked at "see tracker."
+
+Last consolidated: 2026-05-08.
+
+## Active plan series
+
+The major in-flight efforts. Each series owns its own
+README + per-PR plan docs. The status column here is
+high-level; the per-series tracker is authoritative.
+
+| Series | Goal | Status | Tracker |
+|---|---|---|---|
+| **RLM + context virtualization** (`rlm_2026-04-29/`) | Recursive Language Models substrate: recurse tool, indexed external store, eviction policy, ledger injection, embedding-based reranker, background summarization | **All 6 phases (A-F) + Plan 08 embedding reranker landed on `dev_rlm`** | [`rlm_2026-04-29/execution/README.md`](rlm_2026-04-29/execution/README.md) |
+| **Harness mitigations** (`harness_mitigations_2026-05-01/`) | Fix the loudest small-model failure modes from the 2026-05-01 smoke (hallucinated success on tool error, stuck loops, hallucinated improvements) | **PRs 1-4 shipped on `dev_rlm`. PR 4 landed in two parts: Signal A (supersession-based failure eviction, `2fee147`) and Signal B (position-based stale-failure eviction, `81c817e`)** | [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md) |
+| **Sub-agents + decompose + parallel decomposition** (`rlm_subagents_2026-05-01/`) | Address the long-tail-reasoning gap (T2 stalled at 43 min): true sub-agents with full tools, decompose-and-recurse scaffolding, parallel decomposition (revised from voting after design review) | **PRs 1-5.1 shipped: depth observability, tool inheritance, sub-agent resource stats, one-shot pre-loop decompose with visibility + tuned system prompt, parallel-decompose dry-run (parser + round renderer), and concurrent provider-aware sub-agent executor (`c1bb46a`). PR 6 (smoke validation) ✓ — see smoke_protocol_2026-05-01.md** | [`rlm_subagents_2026-05-01/README.md`](rlm_subagents_2026-05-01/README.md) |
+| **Skills system** (`skills_2026-05-02/`) | Anthropic-style skills: markdown files in `.anie/skills/` (and `.agents/skills/`) that the agent loads on demand. The discovery layer for the recurse/decompose capabilities | **PRs 1-4 shipped: registry, skill tool, four bundled skills (cpp-rule-of-five, decompose-multi-constraint-task, use-recurse-for-archive-lookup, verify-after-edit), `/skills` slash command. PR 5 (smoke validation) plan written; smoke run pending** | [`skills_2026-05-02/README.md`](skills_2026-05-02/README.md) |
+| **REPL agent loop** (`repl_agent_loop/`) | Refactor `AgentLoop::run` into an explicit Read → Eval → Print → Loop runtime — the substrate that everything above ultimately rides on | **All 7 PRs shipped on `dev_rlm`: characterization tests, `AgentRunState` extraction, internal REPL driver, tracing spans, public `AgentRunMachine` API, controller pilot, `BeforeModelPolicy` hook (default noop)** | [`repl_agent_loop/execution/README.md`](repl_agent_loop/execution/README.md) |
+| **Provider expansion** (`add_providers/`) | Built-in support for OpenRouter (highest-priority), xAI, Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI Responses API, Amazon Bedrock | **OpenRouter shipped (per memory). Others drafted as plans** | [`add_providers/README.md`](add_providers/README.md) |
+| **Smoke protocol** (`smoke_protocol_2026-05-01.md`) | Canonical 11-turn DLL+weather scenario for validating context-virt and small-model harness changes | **Shipped; baseline captured 2026-05-01; re-run after each major series PR** | [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md) |
+
+## Cross-series coordination
+
+The active series interact:
+
+- **Skills** and **Sub-agents** are complementary —
+  sub-agents give the *capability* to decompose and
+  recurse; skills give the agent the *discovery
+  handles* to use that capability under context
+  pressure.
+- **Harness mitigations** covers the
+  reactive layer (handle failures gracefully); the
+  other series cover the proactive layer (decompose
+  hard problems, surface guidance).
+- **Smoke protocol** is the validation layer all
+  three feed into.
+
+Cross-series PR ordering captured in
+`skills_2026-05-02/README.md` ("Implementation order
+across the two series").
 
 ## Completed
 
@@ -136,21 +176,102 @@ ratio — smallest impactful changes first. Check off items as they ship.
       support, round-trip audit, `ReplayCapabilities` on `Model`,
       cross-provider invariants, error taxonomy, session schema
       migration, multi-turn integration tests
-
-## Next Up — Foundational Architecture
-
-### 0. REPL-shaped agent loop — **top priority**
-**What**: Refactor `AgentLoop::run` into an explicit
-Read → Eval → Print → Loop runtime while preserving current behavior
-first.
-**Why**: Creates stable step boundaries for error recovery, proactive
-compaction, context augmentation, queued user steering, verifier loops,
-recursive task decomposition, and stronger local-small-model behavior.
-This benefits frontier models too.
-**Effort**: Large, staged refactor — first land behavior-characterization
-tests, then extract run state, then introduce internal intents /
-observations / decisions.
-**Details**: [docs/repl_agent_loop_2026-04-27.md](repl_agent_loop_2026-04-27.md)
+- [x] **RLM substrate (Phases A-F + Plan 08)** — recurse tool,
+      indexed external store, ceiling + FIFO eviction with
+      pinned-tail, ledger injection, embedding-based reranker,
+      background summarization. Ships under `--harness-mode=rlm`.
+      See [`rlm_2026-04-29/execution/README.md`](rlm_2026-04-29/execution/README.md).
+- [x] **Harness mitigations PR 1-3 + follow-up** — failed-tool-
+      result wrap, observability-only failure-loop detector,
+      re-test-after-edit rule (in rlm augment only). Caught and
+      fixed the T10 wardrobe-refusal regression via the
+      follow-up. See
+      [`harness_mitigations_2026-05-01/README.md`](harness_mitigations_2026-05-01/README.md).
+- [x] **11-turn smoke protocol baseline** — captured
+      2026-05-01 against qwen3.5:9b. Re-run after the
+      mitigations confirmed PR 1 working (model engages with
+      failures), PR 2 correctly silent (args varied), PR 3
+      regression caught and fixed. See
+      [`smoke_protocol_2026-05-01.md`](smoke_protocol_2026-05-01.md).
+- [x] **Skills system PRs 1-4** — Anthropic-style skills
+      end-to-end: SkillRegistry with six-layer discovery
+      (bundled embedded via include_str! + .claude/.agents/.anie
+      at user + project), `skill` tool wrapping bodies in
+      `<system-reminder source="skill:NAME">`, four bundled
+      skills targeting documented failure modes (rule-of-five,
+      decompose, recurse-for-archive, verify-after-edit), and
+      `/skills` slash command. Catalog appears in the system
+      prompt; agent can autonomously load. See
+      [`skills_2026-05-02/`](skills_2026-05-02/). PR 5 (smoke
+      validation) ✓ in `smoke_protocol_2026-05-01.md`.
+- [x] **Sub-agents PRs 1-5.1** — depth observability,
+      filtered tool inheritance for sub-agents, per-sub-agent
+      resource stats (tokens/wall-clock/cost in
+      `result.details`), one-shot pre-loop decompose
+      (`ANIE_DECOMPOSE=1`) with plan visibility +
+      dependency-marker contract, parallel-decompose
+      dry-run (`ANIE_PARALLEL_DECOMPOSE>=2`) that parses the
+      plan into a topological round structure, and
+      concurrent provider-aware sub-agent executor (PR 5.1,
+      `c1bb46a`). Validated end-to-end with the 2026-05-02
+      comprehensive smoke. See
+      [`rlm_subagents_2026-05-01/`](rlm_subagents_2026-05-01/).
+- [x] **REPL agent loop PRs 1-7** — refactor of
+      `AgentLoop::run` into an explicit
+      Read → Eval → Print → Loop runtime.
+      Characterization tests (`2b3f951`) → `AgentRunState`
+      extraction (`02cc0cd`) → internal REPL driver
+      (`f053013`) → REPL tracing spans (`df07082`) →
+      public `AgentRunMachine` API (`f3e3cf7`) → controller
+      pilot routed through the machine (`9aedb35`) → first
+      `BeforeModelPolicy` policy boundary, default noop
+      (`e55948a`). The substrate that future RLM /
+      sub-agents / skills capabilities extend through
+      structured policy hooks rather than monolithic
+      branches in the agent loop. See
+      [`repl_agent_loop/execution/README.md`](repl_agent_loop/execution/README.md).
+- [x] **TUI typing fast-path** — bypass ratatui for
+      printable keystrokes in idle state (`e8927f1`).
+      Per-keystroke cost dropped from 22 bytes through
+      tokio + render closure + ratatui diff
+      (~250 µs/key) to 1 byte direct stdout write
+      (vim-comparable). Nine-round investigation logged at
+      [`code_review_2026-05-03.md`](code_review_2026-05-03.md);
+      decisive insight came from a standalone reproducer
+      (`crates/anie-tui/examples/typing_repro.rs`) that
+      isolated the latency to anie's pipeline rather than
+      the bytes leaving the process.
+- [x] **Automatic context compaction** —
+      [`midturn_compaction_2026-04-27/`](midturn_compaction_2026-04-27/)
+      Plans 01–06 all Done. Compaction now fires
+      proactively when token usage crosses the
+      context-aware reserve threshold, mid-turn or
+      between turns; `CompactionGate` trait sits on the
+      agent-loop boundary so the controller decides; tool-
+      output caps scale with the live context window;
+      `CompactionPhase` events drive `/state` rendering
+      and the TUI activity-row labels.
+- [x] **Local model context length detection** — three
+      coordinated plans:
+      [`ollama_capability_discovery/`](ollama_capability_discovery/)
+      replaced substring family-name matching with
+      authoritative `/api/show` probing (capability flags
+      + per-model `context_window`),
+      [`ollama_context_length_override/`](ollama_context_length_override/)
+      added the `/context-length` slash command for
+      persistent per-model user override, and
+      [`ollama_default_num_ctx_cap/`](ollama_default_num_ctx_cap/)
+      added a workspace-level cap. The Ollama native
+      `/api/chat` codepath now sends the discovered
+      `num_ctx` per model instead of the old 32K default.
+- [x] **Session management commands** — `/name [<name>]`
+      to set / clear a persistent user-set display name on
+      the current session (`f3652e6`, schema v5
+      `SessionHeader.name` with forward-compat), and
+      `/resume` to switch to the most-recently-modified
+      other session without typing an ID (`e74eb26`).
+      `/session list` + `/session <id>` switch were
+      already in place; `--resume <id>` CLI flag too.
 
 ## Next Up — Small, High-Impact
 
@@ -168,20 +289,30 @@ are budget-evasion, not display nits.
 **Effort**: Medium — a persisted total + seed-on-resume; the per-message
 `usage.cost` already exists, stamped at generation time.
 
-### 1. Automatic context compaction
-**What**: Trigger compaction automatically when approaching the context limit.
-**Why**: Prevents context overflow errors. Currently compaction exists but
-must be triggered manually or by overflow recovery.
-**Effort**: Medium — threshold detection, automatic trigger, TUI indicator.
-**Details**: [docs/notes/local_model_support.md](notes/local_model_support.md)
+### 1. Automatic context compaction — **shipped**
+Landed across the `midturn_compaction_2026-04-27/` plan
+series (Plans 01–06, all Done): context-aware reserve,
+per-turn budget, agent-loop `CompactionGate` trait,
+mid-turn `auto_compact` execution wired into the
+controller's main loop, tool-output caps that scale with
+the live context window, and compaction telemetry
+(`CompactionPhase` events, `/state` rendering, TUI
+activity-row phase labels). See
+[`midturn_compaction_2026-04-27/execution/README.md`](midturn_compaction_2026-04-27/execution/README.md).
 
-### 6. Local model context length detection
-**What**: Query Ollama/vLLM for actual context window size instead of
-defaulting to 32K.
-**Why**: Incorrect context length leads to either wasted capacity or
-overflow errors.
-**Effort**: Medium — API queries, config override, caching.
-**Details**: [docs/notes/local_model_support.md](notes/local_model_support.md)
+### 6. Local model context length detection — **shipped**
+Landed across three coordinated plans:
+[`ollama_capability_discovery/`](ollama_capability_discovery/)
+(authoritative `/api/show`-driven `Model.context_window`
+per model, plus capability flags),
+[`ollama_context_length_override/`](ollama_context_length_override/)
+(`/context-length` slash command for per-model user
+override with persistence), and
+[`ollama_default_num_ctx_cap/`](ollama_default_num_ctx_cap/)
+(workspace-level `num_ctx` cap for constrained hardware).
+The Ollama native `/api/chat` codepath sends the
+discovered `num_ctx` on every request rather than the old
+32K default.
 
 ### 7. Slash command autocomplete menu — **shipped**
 Landed via plans 11 and 12. Typing `/` opens a filterable popup
@@ -191,18 +322,22 @@ complete for `Enumerated` (e.g. `/thinking`) and `Subcommands`
 `ui.slash_command_popup_enabled = false` in `~/.anie/config.toml`.
 File-path `@` completion remains a follow-up.
 
-### 8. Session management commands (`/resume`, `/session`, `/name`)
-**What**: Browse past sessions, show session info, set display names.
-**Why**: Session management currently requires CLI flags or filesystem
-knowledge.
-**Effort**: Medium — session listing UI, metadata display.
-**Status**: Shipped. `/rewind` + `/checkpoint` (Workstream B), the
-interactive `/session` **picker** (Workstream A), and fork/rewind branch
-summaries (Workstream C) all landed via docs/session_ux/ — see Completed.
-Only per-session display names (`/name`) remain, and the deferred
-tree-overlay branch visualization (SESSION-2).
-**Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
-and [docs/session_ux/README.md](session_ux/README.md)
+### 8. Session management commands (`/resume`, `/session`, `/name`) — **shipped**
+- `/session list` and `/session <id>` switching landed
+  earlier (`UiAction::ListSessions`, `SwitchSession`); the
+  interactive `/session` **picker**, `/rewind` + `/checkpoint`,
+  and fork/rewind branch summaries landed via
+  [docs/session_ux/README.md](session_ux/README.md).
+- `/name [<name>]` adds a user-set display name on the
+  current session (schema v5 `SessionHeader.name`,
+  atomic-rewrite persistence, surfaces in `/session list`
+  as `name (id)`). Commit `f3652e6`.
+- `/resume` switches to the most-recently-modified other
+  session — slash-command counterpart to `--resume <id>`
+  without typing the ID; refuses cleanly when no siblings
+  exist or a run is active. Commit `e74eb26`.
+- `--resume <id>` CLI flag was already in place.
+- Deferred: tree-overlay branch visualization (SESSION-2).
 
 ## Longer-Term — Features
 
@@ -212,20 +347,22 @@ and [docs/session_ux/README.md](session_ux/README.md)
 **Effort**: Medium-large — layout restructuring, theme tokens.
 **Details**: [docs/notes/tui_layout_and_visual_design.md](notes/tui_layout_and_visual_design.md)
 
-### 10. Skills system — **shipped (thin loader)**
-Landed via docs/skills_loader/. `SKILL.md` files under `~/.anie/skills/`
-and the project `.anie/skills/` are discovered (project precedence),
-their `name`/`description`/`allowed-tools` frontmatter parsed by a
-hand-rolled subset parser (no YAML dependency), and each registered as a
-`/skill:<name>` command surfaced under the `Skills:` group in `/help`.
-Invoking `/skill:<name>` stages the skill body as a synthetic user turn
-injected ahead of the next prompt (via the session-append seam, not the
-single `BeforeModelPolicy` slot). Malformed files warn and are skipped,
-never panic. Deferred: hard `allowed-tools` enforcement, auto-injection
-into initial context, a `/skills` listing command, and the full
-out-of-process Plan-10 extension host.
+### 10. Skills system — **shipped (merged registry)**
+Two parallel implementations were reconciled in the dev_rlm merge.
+The surviving loader is the `SkillRegistry` from
+[`skills_2026-05-02/`](skills_2026-05-02/): six discovery roots
+(`.anie`/`.agents`/`.claude`, project + user) plus bundled skills
+embedded via `include_str!`, precedence-based shadowing, YAML
+frontmatter (`name`/`description`/`allowed-tools`/
+`disable-model-invocation`), and a system-prompt catalog. On top of
+it sit both activation paths: the model-invoked `skill` tool and
+`/skills` listing (skills_2026-05-02), and per-skill `/skill:<name>`
+commands that stage the body as a synthetic user turn ahead of the
+next prompt (docs/skills_loader/). Malformed files warn and are
+skipped, never panic. Deferred: hard `allowed-tools` enforcement and
+the out-of-process Plan-10 extension host.
 **Details**: [docs/skills_loader/README.md](skills_loader/README.md),
-[docs/notes/skills_system.md](notes/skills_system.md)
+[docs/skills_2026-05-02/README.md](skills_2026-05-02/README.md)
 
 ### 11. `/settings` command
 **What**: Interactive settings viewer/editor in the TUI.
@@ -233,17 +370,13 @@ out-of-process Plan-10 extension host.
 **Effort**: Medium-large — TUI overlay, config mutation, persistence.
 **Details**: [docs/notes/commands_and_slash_menu.md](notes/commands_and_slash_menu.md)
 
-### 12. Provider expansion — **plans drafted**
-**What**: Built-in support for OpenRouter (top priority), xAI,
-Groq, Cerebras, Mistral, Google Gemini, Azure OpenAI, OpenAI
-Responses API, and Amazon Bedrock.
-**Why**: Broader model access without manual config.
-**Effort**: Ranges from S (OpenRouter) to L (Bedrock). Most are
-OpenAI-compat and add as a preset entry + catalog rows.
-**Details**: [docs/add_providers/README.md](add_providers/README.md)
-lists priorities. Per-provider plans live beside it.
-**Skill**: `.claude/skills/adding-providers/SKILL.md` covers the
-mechanical how-to that every plan cross-references.
+### 12. Provider expansion — **plan series active**
+OpenRouter shipped (per memory entries). Other
+providers (xAI, Groq, Cerebras, Mistral, Gemini,
+Azure OpenAI, OpenAI Responses API, Bedrock) drafted
+as plans under
+[`add_providers/`](add_providers/). See the "Active
+plan series" table at the top for high-level status.
 
 ## Long-Term — Architecture
 

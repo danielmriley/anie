@@ -14,6 +14,8 @@ use anyhow::Result;
 use anie_agent::ToolRegistry;
 use anie_config::AnieConfig;
 
+use crate::skills::SkillRegistry;
+
 /// Owns the latest system-prompt text plus the stamp of context
 /// files it was built from. The stamp is a `Vec<(path, mtime)>`
 /// rather than a single max-mtime so deletions of older files are
@@ -25,8 +27,13 @@ pub(crate) struct SystemPromptCache {
 
 impl SystemPromptCache {
     /// Build the cache fresh from the given context.
-    pub(crate) fn build(cwd: &Path, tools: &ToolRegistry, config: &AnieConfig) -> Result<Self> {
-        let system_prompt = crate::controller::build_system_prompt(cwd, tools, config)?;
+    pub(crate) fn build(
+        cwd: &Path,
+        tools: &ToolRegistry,
+        skills: &SkillRegistry,
+        config: &AnieConfig,
+    ) -> Result<Self> {
+        let system_prompt = crate::controller::build_system_prompt(cwd, tools, skills, config)?;
         let context_files_stamp = crate::controller::context_files_stamp(cwd, config);
         Ok(Self {
             system_prompt,
@@ -44,9 +51,10 @@ impl SystemPromptCache {
         &mut self,
         cwd: &Path,
         tools: &ToolRegistry,
+        skills: &SkillRegistry,
         config: &AnieConfig,
     ) -> Result<()> {
-        *self = Self::build(cwd, tools, config)?;
+        *self = Self::build(cwd, tools, skills, config)?;
         Ok(())
     }
 
@@ -56,13 +64,14 @@ impl SystemPromptCache {
         &mut self,
         cwd: &Path,
         tools: &ToolRegistry,
+        skills: &SkillRegistry,
         config: &AnieConfig,
     ) -> bool {
         let current_stamp = crate::controller::context_files_stamp(cwd, config);
         if current_stamp == self.context_files_stamp {
             return false;
         }
-        let Ok(prompt) = crate::controller::build_system_prompt(cwd, tools, config) else {
+        let Ok(prompt) = crate::controller::build_system_prompt(cwd, tools, skills, config) else {
             // Rebuild failed — leave the cache as-is rather than
             // poisoning it with a partial value. The stamp stays
             // unchanged so we'll retry next turn.

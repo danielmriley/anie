@@ -108,18 +108,30 @@ For each turn, log:
 
 Then comparing across runs:
 
-| Signal | Baseline (2026-05-01) | This run | Delta |
+| Signal | Baseline (2026-05-01) | Mitigations smoke (2026-05-01) | Skills + sub-agents (2026-05-02) |
 |---|---|---|---|
-| T3 self-debug succeeded | yes | ? | |
-| T5 introduced infinite recursion | yes | ? | |
-| T7 hallucinated success | yes | ? | |
-| T7 hung > 10 min | yes (killed) | ? | |
-| T10 autonomously fetched weather | no | ? | |
-| T11 web_search → web_read chain | yes | ? | |
-| Cross-domain reranker isolation (T10 paged_in count) | 1 / 52 | ? | |
+| T3 self-debug succeeded | yes | yes | yes |
+| T5 introduced infinite recursion | yes | yes (model still cargo-cults) | improved (cpp-rule-of-five skill loads when prompted; not always autonomous) |
+| T7 hallucinated success | yes | **fixed** (PR 1 wrap) | fixed |
+| T7 hung > 10 min | yes (killed) | mostly fixed | fixed |
+| T10 autonomously fetched weather | no | regressed (PR 3 prompt then refused) → fixed (relocated) | **autonomous + grounded**: 7-step decompose plan → 6 web tool calls → 62°F/43°F/85% rain forecast |
+| T11 web_search → web_read chain | yes | yes | yes (less needed — T10 now produces full answer) |
+| Cross-domain reranker isolation (T10 paged_in count) | 1 / 52 | 1 / 52 | n/a (smoke 4 starts fresh, no archive) |
+| Wall-clock to converge on T2 (DLL build + compile) | 43 min, never converged | 43 min, never converged | 6 min, valgrind clean (cpp-rule-of-five smoke; not full T1-T11 run) |
 
 A "good" run improves at least one of these without
 regressing the others.
+
+### 2026-05-02 comprehensive smoke summary
+
+After landing PRs through the sub-agents series + skills system + decompose, a comprehensive 5-test smoke confirmed:
+
+- **Decompose plan visibility** works end-to-end (`[decompose plan]` block in transcript, model acknowledges).
+- **Parallel-decompose dry-run** correctly renders single-round and multi-round structures (after a system-prompt fix encouraging dependency markers).
+- **Skill autonomous-loading** worked on cpp-rule-of-five (Test 1 of skills smoke); less reliable when competing user-installed skills exist (Test 4 of skills smoke).
+- **Topic switch (wardrobe)** dramatically improved: refusal → autonomous tool use + grounded forecast.
+- **NO_PLAN_NEEDED sentinel** correctly skips the plan on trivial tasks (after system-prompt tightening).
+- **Dependency markers** (`(depends on N)`) now produce real DAGs in the parallel-decompose renderer.
 
 ## Things this protocol catches that a 2-turn smoke
 won't
@@ -193,3 +205,16 @@ question costs an hour to answer.
   large frontier model via OpenRouter, to know what
   "good" looks like and where the harness can
   realistically lift small-model output.
+- **Concurrent execution of independent decompose
+  rounds (PR 5.1).** PR 5 (dry-run) ships the parser
+  + round renderer; PR 5.1 will add the
+  `ControllerSubAgentFactory`-based executor that
+  fans out independent rounds concurrently. Once
+  landed, smoke should measure wall-clock reduction
+  on the dependency-pipeline test.
+- **"Don't relabel your own outputs" guard.** Smoke
+  surfaced a small-model quirk where the prose
+  summary swaps script/output labels even when the
+  scripts themselves are correct. Could be a future
+  skill or a structural reminder injected before the
+  final assistant turn.
