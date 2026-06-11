@@ -2,6 +2,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod agent_loop;
+mod arg_coerce;
 mod failure_loop;
 mod hooks;
 mod recurse;

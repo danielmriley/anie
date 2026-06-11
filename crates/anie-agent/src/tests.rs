@@ -478,6 +478,114 @@ async fn single_tool_call_completes_full_loop() {
     assert!(event_kinds(&events).contains(&"ToolExecEnd"));
 }
 
+fn integer_arg_tool() -> TestTool {
+    TestTool::new(
+        "count",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer" }
+            },
+            "required": ["limit"],
+            "additionalProperties": false
+        }),
+        "count",
+    )
+}
+
+/// Plan 01 PR 1 of `docs/local_model_augmentation/`: a call
+/// whose arguments are mechanically fixable (a stringified
+/// number where the schema wants an integer — a routine
+/// small-model mistake) is coerced and executed instead of
+/// failing validation, and the coercion is surfaced in the
+/// result details for the user.
+#[tokio::test]
+async fn coercion_note_appears_in_tool_result_details() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "42"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+        None,
+        None,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let Message::ToolResult(tool_result) = &result.generated_messages[1] else {
+        panic!("second generated message must be a tool result");
+    };
+    assert!(
+        !tool_result.is_error,
+        "coerced call must execute, got error: {:?}",
+        tool_result.content
+    );
+    let coercions = tool_result
+        .details
+        .get("argument_coercions")
+        .and_then(serde_json::Value::as_array)
+        .expect("details carry the coercion notes");
+    assert_eq!(coercions.len(), 1, "{coercions:?}");
+    assert!(
+        coercions[0]
+            .as_str()
+            .is_some_and(|note| note.contains("limit")),
+        "{coercions:?}"
+    );
+}
+
+/// Regression guard for the coercion seam: arguments that
+/// coercion cannot rescue (lossy "4.5" -> integer) must fail
+/// with the ORIGINAL validation error text — byte-identical
+/// failure behavior to the pre-coercion code path — and must
+/// not carry a coercion note.
+#[tokio::test]
+async fn unrescuable_invalid_arguments_report_the_original_validation_error() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "4.5"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("gave up")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+        None,
+        None,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let Message::ToolResult(tool_result) = &result.generated_messages[1] else {
+        panic!("second generated message must be a tool result");
+    };
+    assert!(tool_result.is_error);
+    let ContentBlock::Text { text } = &tool_result.content[0] else {
+        panic!("error result must carry text");
+    };
+    assert!(
+        text.contains("Tool arguments failed validation"),
+        "original validation error preserved: {text}"
+    );
+    assert!(
+        tool_result.details.get("argument_coercions").is_none(),
+        "failed coercion must not leave notes: {:?}",
+        tool_result.details
+    );
+}
+
 #[tokio::test]
 async fn multiple_sequential_tool_calls_preserve_order() {
     let mut tools = ToolRegistry::new();

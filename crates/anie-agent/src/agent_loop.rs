@@ -1635,7 +1635,7 @@ impl AgentLoop {
 
     async fn execute_single_tool(
         &self,
-        tool_call: ToolCall,
+        mut tool_call: ToolCall,
         context: &[Message],
         event_tx: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
@@ -1663,8 +1663,36 @@ impl AgentLoop {
         // message so behavior is identical to the pre-cache
         // code path.
         let validator_state = self.tool_registry.validator(&tool_call.name);
+        // Validate strictly first; coercion is attempted only on
+        // failure, so already-valid calls pay nothing. Plan 01
+        // PR 1 of `docs/local_model_augmentation/`: small models
+        // routinely emit mechanically fixable argument shapes
+        // (string-encoded objects, stringified numbers); fix
+        // those in code instead of burning a turn. The original
+        // validation error is reported when coercion doesn't
+        // rescue the call, so failure messages are unchanged.
+        let mut coercion_notes: Vec<String> = Vec::new();
         let validation_result = match validator_state {
-            Some(state) => validate_tool_arguments(state, &tool_call.arguments),
+            Some(state) => match validate_tool_arguments(state, &tool_call.arguments) {
+                Ok(()) => Ok(()),
+                Err(original_error) => {
+                    let schema = tool.definition().parameters;
+                    let (coerced, notes) =
+                        crate::arg_coerce::coerce_arguments(&schema, tool_call.arguments.clone());
+                    if !notes.is_empty() && validate_tool_arguments(state, &coerced).is_ok() {
+                        tracing::info!(
+                            tool = %tool_call.name,
+                            coercions = ?notes,
+                            "tool-call arguments coerced to satisfy schema"
+                        );
+                        tool_call.arguments = coerced;
+                        coercion_notes = notes;
+                        Ok(())
+                    } else {
+                        Err(original_error)
+                    }
+                }
+            },
             None => Err("Tool schema compilation failed: validator missing from registry".into()),
         };
         if let Err(message) = validation_result {
@@ -1739,6 +1767,7 @@ impl AgentLoop {
         }
 
         attach_tool_invocation_details(&tool_call, &mut result.details);
+        attach_coercion_notes(&coercion_notes, &mut result.details);
 
         send_event(
             event_tx,
@@ -2297,6 +2326,31 @@ fn apply_tool_result_override(
     }
     if let Some(override_is_error) = override_result.is_error {
         *is_error = override_is_error;
+    }
+}
+
+/// Surface argument coercions in the tool result's details —
+/// same transparency convention as the edit tool's
+/// whitespace-fuzzy counter: the harness may fix things
+/// silently for the model, but never invisibly to the user.
+/// Plan 01 PR 1 of `docs/local_model_augmentation/`.
+fn attach_coercion_notes(notes: &[String], details: &mut serde_json::Value) {
+    if notes.is_empty() {
+        return;
+    }
+    if !details.is_object() {
+        *details = serde_json::json!({});
+    }
+    if let Some(map) = details.as_object_mut() {
+        map.insert(
+            "argument_coercions".to_string(),
+            serde_json::Value::Array(
+                notes
+                    .iter()
+                    .map(|note| serde_json::Value::String(note.clone()))
+                    .collect(),
+            ),
+        );
     }
 }
 
