@@ -2953,11 +2953,18 @@ const RLM_SYSTEM_PROMPT_AUGMENT: &str = "\n\n# Context virtualization (rlm mode)
 
 /// Build the per-run system prompt. In non-rlm modes
 /// returns the cached prompt verbatim. In rlm mode
-/// appends [`RLM_SYSTEM_PROMPT_AUGMENT`].
-fn compose_system_prompt(state: &ControllerState) -> String {
+/// appends [`RLM_SYSTEM_PROMPT_AUGMENT`] and the per-tool
+/// example-call block (Plan 01 PR 3 of
+/// `docs/local_model_augmentation/`). Both appendices are
+/// static for the lifetime of the registry, so the prompt
+/// stays byte-stable across turns (prefix-cache discipline).
+pub(crate) fn compose_system_prompt(state: &ControllerState) -> String {
     let mut prompt = state.prompt_cache.current().to_string();
     if state.harness_mode.installs_rlm_features() {
         prompt.push_str(RLM_SYSTEM_PROMPT_AUGMENT);
+        prompt.push_str(&crate::tool_examples::render_tool_examples(
+            state.tool_registry.definitions_borrowed(),
+        ));
     }
     prompt
 }

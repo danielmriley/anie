@@ -4,6 +4,33 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
+/// Plan 01 PR 3 of `docs/local_model_augmentation/`: the
+/// tool-example block is an rlm-only prompt appendix, and it
+/// is byte-stable across repeated composition (prefix-cache
+/// discipline) — hosted/current-mode prompts never carry it.
+#[tokio::test]
+async fn system_prompt_includes_tool_examples_in_rlm_mode_only() {
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    controller.state.tool_registry = build_tool_registry(Path::new("."), false);
+
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Current;
+    let current = compose_system_prompt(&controller.state);
+    assert!(
+        !current.contains("# Tool-call examples"),
+        "current mode must not carry example lines"
+    );
+
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    let rlm = compose_system_prompt(&controller.state);
+    assert!(rlm.contains("# Tool-call examples"), "{rlm}");
+    assert!(rlm.contains("- bash: "), "{rlm}");
+    assert_eq!(
+        rlm,
+        compose_system_prompt(&controller.state),
+        "example block must be byte-stable across turns"
+    );
+}
+
 use super::*;
 use crate::bootstrap::build_tool_registry;
 use crate::runtime_state::{RuntimeState, load_runtime_state_from};

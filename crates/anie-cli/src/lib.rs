@@ -33,6 +33,7 @@ mod runtime;
 mod runtime_state;
 mod skill_tool;
 mod skills;
+mod tool_examples;
 mod user_error;
 mod verifier;
 
