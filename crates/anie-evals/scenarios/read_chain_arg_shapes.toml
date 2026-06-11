@@ -1,0 +1,11 @@
+name = "read_chain_arg_shapes"
+family = "tool_use"
+description = "Multi-call read chain; exercises offset/limit argument shapes small models get wrong."
+
+prompt = "Read crates/anie-agent/src/arg_coerce.rs and report the exact name and signature of the public function it exports. Then read crates/anie-agent/src/lib.rs and confirm the module is declared there."
+
+[expect]
+contains = ["coerce_arguments"]
+must_call_tool = "read"
+min_tool_calls = 2
+max_tokens = 90000

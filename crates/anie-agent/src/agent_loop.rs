@@ -1702,6 +1702,7 @@ impl AgentLoop {
         // rescue the call, so failure messages are unchanged.
         let mut coercion_notes: Vec<String> = Vec::new();
         let mut repair_rounds_used: u32 = 0;
+        let mut repair_attempted_and_failed = false;
         let validation_result = match validator_state {
             Some(state) => match validate_tool_arguments(state, &tool_call.arguments) {
                 Ok(()) => Ok(()),
@@ -1758,6 +1759,11 @@ impl AgentLoop {
                                 Err(error) => last_error = error,
                             }
                         }
+                        // Plan 01 PR 4: mark the exhausted path in the
+                        // result details so the metrics accumulator can
+                        // count failed-after-repair. Content (what the
+                        // model sees) stays byte-identical.
+                        repair_attempted_and_failed = rescued.is_err();
                         rescued
                     } else {
                         Err(original_error)
@@ -1767,7 +1773,15 @@ impl AgentLoop {
             None => Err("Tool schema compilation failed: validator missing from registry".into()),
         };
         if let Err(message) = validation_result {
-            let result = error_tool_result(message);
+            let mut result = error_tool_result(message);
+            if repair_attempted_and_failed {
+                if let Some(map) = result.details.as_object_mut() {
+                    map.insert(
+                        "argument_repair_failed".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
             return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
         }
 

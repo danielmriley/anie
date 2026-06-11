@@ -1,0 +1,11 @@
+name = "todo_tracked_survey"
+family = "tool_use"
+description = "Structured-arguments stress: todo_write's nested array of objects is a common small-model failure shape."
+
+prompt = "Plan and execute this survey using the todo_write tool to track your steps: count how many .toml scenario files exist under crates/anie-evals/scenarios/ and name one of them. Keep your todo list updated as you go."
+
+[expect]
+contains = ["scenario"]
+must_call_tool = "todo_write"
+min_tool_calls = 2
+max_tokens = 90000

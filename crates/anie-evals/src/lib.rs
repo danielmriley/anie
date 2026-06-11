@@ -63,7 +63,7 @@ pub enum EvalError {
 /// The `RunMetrics` schema version this runner understands. Mirrors
 /// `anie-cli`'s `RUN_METRICS_SCHEMA_VERSION`; a mismatch means the metrics
 /// JSON may have changed field semantics and must not be silently scored.
-pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 1;
+pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 2;
 
 /// A deserialization view of anie-cli's `RunMetrics` JSON. anie-specific
 /// (deviation): this mirrors `anie-cli/src/run_metrics.rs` rather than
@@ -83,6 +83,20 @@ pub struct RunMetricsView {
     pub tokens: TokenView,
     #[serde(default)]
     pub tools: ToolView,
+    /// Plan 01 PR 4 rescue counters (schema v2). Defaulted so
+    /// the view also reads any stray v1-shaped JSON in tests.
+    #[serde(default)]
+    pub tool_repair: ToolRepairView,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct ToolRepairView {
+    #[serde(default)]
+    pub coerced: u32,
+    #[serde(default)]
+    pub repaired: u32,
+    #[serde(default)]
+    pub failed_after_repair: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

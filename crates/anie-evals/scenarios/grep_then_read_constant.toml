@@ -1,0 +1,11 @@
+name = "grep_then_read_constant"
+family = "tool_use"
+description = "Grep-then-read chain ending in a precise fact; weak models stall on grep argument shapes."
+
+prompt = "Find where the constant MAX_TOOL_REPAIR_ROUNDS is defined in this repository, read the surrounding doc comment, and report which CLI retry-policy constant it mirrors."
+
+[expect]
+contains = ["MAX_MODEL_OUTPUT_MALFORMED_RETRIES"]
+must_call_tool = "grep"
+min_tool_calls = 2
+max_tokens = 90000

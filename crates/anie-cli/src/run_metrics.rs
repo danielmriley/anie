@@ -18,7 +18,16 @@ use crate::harness_mode::HarnessMode;
 
 /// Schema version for the metrics artifact. Independent of the session
 /// schema — this is a sidecar file, not a persisted session type.
-pub const RUN_METRICS_SCHEMA_VERSION: u32 = 1;
+///
+/// | Version | Change                                              |
+/// |---------|-----------------------------------------------------|
+/// | 1       | Baseline.                                           |
+/// | 2       | `tool_repair` counters (coerced / repaired /        |
+/// |         | failed_after_repair), sourced from `ToolExecEnd`    |
+/// |         | result details. Plan 01 PR 4 of                     |
+/// |         | `docs/local_model_augmentation/`. Older artifacts   |
+/// |         | load with the counters defaulted to zero.           |
+pub const RUN_METRICS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunMetrics {
@@ -35,6 +44,27 @@ pub struct RunMetrics {
     pub cost: Cost,
     pub tools: ToolMetrics,
     pub compaction: CompactionMetrics,
+    /// Plan 01 of `docs/local_model_augmentation/`: how often
+    /// the harness rescued (or failed to rescue) schema-invalid
+    /// tool calls. `#[serde(default)]` so schema-v1 artifacts
+    /// still deserialize.
+    #[serde(default)]
+    pub tool_repair: ToolRepairMetrics,
+}
+
+/// Counters for the Plan-01 tool-call rescue pipeline, derived
+/// from markers the agent loop leaves in `ToolExecEnd` result
+/// details (`argument_coercions`, `argument_repair_rounds`,
+/// `argument_repair_failed`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ToolRepairMetrics {
+    /// Calls fixed by deterministic schema-guided coercion.
+    pub coerced: u32,
+    /// Calls fixed by the generative repair round.
+    pub repaired: u32,
+    /// Calls where repair was attempted and the call still
+    /// failed validation.
+    pub failed_after_repair: u32,
 }
 
 /// Field names mirror `Usage` exactly. `total_tokens` here is the summed
@@ -85,6 +115,7 @@ pub struct RunMetricsAccumulator {
     cost: Cost,
     tools: ToolMetrics,
     compaction: CompactionMetrics,
+    tool_repair: ToolRepairMetrics,
     /// `call_id -> tool_name`, seeded from `ToolExecStart`, so the
     /// nameless `ToolExecEnd` can attribute per-tool outcomes.
     pending_tools: HashMap<String, String>,
@@ -103,6 +134,7 @@ impl RunMetricsAccumulator {
             cost: Cost::default(),
             tools: ToolMetrics::default(),
             compaction: CompactionMetrics::default(),
+            tool_repair: ToolRepairMetrics::default(),
             pending_tools: HashMap::new(),
         }
     }
@@ -133,7 +165,9 @@ impl RunMetricsAccumulator {
                     .insert(call_id.clone(), tool_name.clone());
             }
             AgentEvent::ToolExecEnd {
-                call_id, is_error, ..
+                call_id,
+                result,
+                is_error,
             } => {
                 // ToolExecEnd carries no tool_name (anie-specific: the
                 // name is only on ToolExecStart), so attribute via the
@@ -148,6 +182,17 @@ impl RunMetricsAccumulator {
                 if *is_error {
                     self.tools.failures += 1;
                     outcome.failures += 1;
+                }
+                // Plan 01 PR 4: the agent loop marks rescued (or
+                // unrescuable) calls in the result details.
+                if result.details.get("argument_coercions").is_some() {
+                    self.tool_repair.coerced += 1;
+                }
+                if result.details.get("argument_repair_rounds").is_some() {
+                    self.tool_repair.repaired += 1;
+                }
+                if result.details.get("argument_repair_failed").is_some() {
+                    self.tool_repair.failed_after_repair += 1;
                 }
             }
             AgentEvent::CompactionEnd { phase, .. } => {
@@ -176,6 +221,7 @@ impl RunMetricsAccumulator {
             cost: self.cost,
             tools: self.tools,
             compaction: self.compaction,
+            tool_repair: self.tool_repair,
         }
     }
 }
@@ -352,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn run_metrics_json_roundtrips_with_schema_version_1() {
+    fn run_metrics_json_roundtrips_with_current_schema_version() {
         let m = fold(&[assistant(Usage {
             input_tokens: 1,
             output_tokens: 2,
@@ -361,7 +407,64 @@ mod tests {
         let json = serde_json::to_string(&m).expect("serialize");
         let back: RunMetrics = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(m, back);
-        assert_eq!(back.schema_version, 1);
+        assert_eq!(back.schema_version, RUN_METRICS_SCHEMA_VERSION);
+    }
+
+    fn tool_end_with_details(call_id: &str, is_error: bool, details: serde_json::Value) -> AgentEvent {
+        AgentEvent::ToolExecEnd {
+            call_id: call_id.into(),
+            result: ToolResult {
+                content: vec![],
+                details,
+            },
+            is_error,
+        }
+    }
+
+    /// Plan 01 PR 4: the accumulator derives rescue counters
+    /// from the detail markers the agent loop attaches —
+    /// coerced, repaired, and failed-after-repair each count
+    /// independently; unmarked calls count nothing.
+    #[test]
+    fn run_metrics_reports_coerced_and_repaired_counts() {
+        let m = fold(&[
+            tool_start("c1", "read"),
+            tool_end_with_details(
+                "c1",
+                false,
+                serde_json::json!({"argument_coercions": ["limit: coerced"]}),
+            ),
+            tool_start("c2", "edit"),
+            tool_end_with_details("c2", false, serde_json::json!({"argument_repair_rounds": 1})),
+            tool_start("c3", "edit"),
+            tool_end_with_details("c3", true, serde_json::json!({"argument_repair_failed": true})),
+            tool_start("c4", "bash"),
+            tool_end("c4", false),
+        ]);
+        assert_eq!(m.tool_repair.coerced, 1);
+        assert_eq!(m.tool_repair.repaired, 1);
+        assert_eq!(m.tool_repair.failed_after_repair, 1);
+        assert_eq!(m.tools.calls, 4, "rescue counters don't replace call counts");
+    }
+
+    /// Forward-compat: a schema-v1 artifact (no `tool_repair`
+    /// field) loads with the counters defaulted, not an error.
+    #[test]
+    fn older_metrics_schema_loads_with_repair_counters_defaulted() {
+        let v1 = serde_json::json!({
+            "schema_version": 1,
+            "harness_mode": "current",
+            "model": "m",
+            "provider": "p",
+            "wall_clock_ms": 5,
+            "turns": 1,
+            "tokens": TokenMetrics::default(),
+            "cost": Cost::default(),
+            "tools": ToolMetrics::default(),
+            "compaction": CompactionMetrics::default(),
+        });
+        let back: RunMetrics = serde_json::from_value(v1).expect("v1 artifact loads");
+        assert_eq!(back.tool_repair, ToolRepairMetrics::default());
     }
 
     #[test]

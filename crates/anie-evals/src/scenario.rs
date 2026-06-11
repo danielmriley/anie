@@ -211,12 +211,13 @@ mod tests {
 
     fn metrics(total_tokens: u64, wall_clock_ms: u64) -> RunMetricsView {
         RunMetricsView {
-            schema_version: 1,
+            schema_version: crate::EXPECTED_RUN_METRICS_SCHEMA_VERSION,
             harness_mode: "current".into(),
             wall_clock_ms,
             turns: 1,
             tokens: TokenView { total_tokens },
             tools: ToolView::default(),
+            tool_repair: crate::ToolRepairView::default(),
         }
     }
 
