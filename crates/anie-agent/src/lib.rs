@@ -12,8 +12,8 @@ mod tool;
 pub use agent_loop::{
     AgentLoop, AgentLoopConfig, AgentRunMachine, AgentRunResult, AgentStepBoundary,
     BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, BudgetLimit, BudgetScope,
-    ChainedBeforeModelPolicy, CompactionGate, CompactionGateOutcome, NoopBeforeModelPolicy,
-    RunStopReason, ToolExecutionMode, send_event,
+    ChainedBeforeModelPolicy, CompactionGate, CompactionGateOutcome, MAX_TOOL_REPAIR_ROUNDS,
+    NoopBeforeModelPolicy, RunStopReason, ToolExecutionMode, send_event,
 };
 pub use failure_loop::{DEFAULT_FAILURE_LOOP_THRESHOLD, stable_args_hash};
 pub use recurse_depth::DEFAULT_RECURSE_DEPTH_WARN_AT;

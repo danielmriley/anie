@@ -586,6 +586,216 @@ async fn unrescuable_invalid_arguments_report_the_original_validation_error() {
     );
 }
 
+/// Agent with the Plan-01-PR-2 repair round enabled. Repair
+/// side requests consume MockProvider scripts in order, so
+/// each test scripts the repair exchange explicitly.
+fn repair_enabled_agent(
+    provider: Box<dyn Provider>,
+    tool_registry: Arc<ToolRegistry>,
+) -> AgentLoop {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(ApiKind::OpenAICompletions, provider);
+    AgentLoop::new(
+        Arc::new(provider_registry),
+        tool_registry,
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_tool_call_repair(true),
+    )
+}
+
+fn first_tool_result(result: &crate::AgentRunResult) -> &anie_protocol::ToolResultMessage {
+    result
+        .generated_messages
+        .iter()
+        .find_map(|message| match message {
+            Message::ToolResult(tool_result) => Some(tool_result),
+            _ => None,
+        })
+        .expect("run must produce a tool result")
+}
+
+/// Plan 01 PR 2: an invalid call (unrescuable by coercion) is
+/// fixed by one focused side request, executes under its
+/// ORIGINAL call id, surfaces the round count in details — and
+/// the repair exchange never lands in the main context or the
+/// main transcript event stream.
+#[tokio::test]
+async fn invalid_call_triggers_one_repair_request_and_succeeds_on_fix() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = repair_enabled_agent(
+        Box::new(MockProvider::new(vec![
+            // Main turn: structurally hopeless arguments.
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "lots"}),
+            )])),
+            // Repair side request: corrected call.
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "repair_1",
+                "count",
+                serde_json::json!({"limit": 7}),
+            )])),
+            // Main turn after the tool result.
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    // Main context: assistant, tool result, assistant — the
+    // repair exchange must not appear.
+    assert_eq!(result.generated_messages.len(), 3);
+    let tool_result = first_tool_result(&result);
+    assert!(!tool_result.is_error, "repaired call must execute");
+    assert_eq!(
+        tool_result.tool_call_id, "call_1",
+        "repair must preserve the original call id"
+    );
+    assert_eq!(
+        tool_result.details.get("argument_repair_rounds"),
+        Some(&serde_json::Value::from(1u32)),
+        "{:?}",
+        tool_result.details
+    );
+    // The repair exchange streams to a drained side channel.
+    // If it leaked into the main event stream, some event
+    // would reference the side request's "repair_1" call id
+    // (the executed call keeps the original "call_1" id).
+    assert!(
+        events
+            .iter()
+            .all(|event| !format!("{event:?}").contains("repair_1")),
+        "side request must not leak events into the main stream"
+    );
+}
+
+/// Plan 01 PR 2: when every repair round returns still-invalid
+/// arguments, the loop falls back to the synthetic-failure
+/// path with the ORIGINAL validation error — byte-identical to
+/// repair-disabled behavior — and leaves no repair note.
+#[tokio::test]
+async fn repair_budget_exhaustion_falls_back_to_synthetic_failure() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = repair_enabled_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "lots"}),
+            )])),
+            // Two repair rounds, both still invalid.
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "repair_1",
+                "count",
+                serde_json::json!({"limit": "more"}),
+            )])),
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "repair_2",
+                "count",
+                serde_json::json!({"limit": "most"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("gave up")),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(tool_result.is_error);
+    let ContentBlock::Text { text } = &tool_result.content[0] else {
+        panic!("error result must carry text");
+    };
+    assert!(
+        text.contains("Tool arguments failed validation"),
+        "original error reported after exhaustion: {text}"
+    );
+    assert!(
+        tool_result.details.get("argument_repair_rounds").is_none(),
+        "failed repair must not leave a note: {:?}",
+        tool_result.details
+    );
+}
+
+/// Plan 01 PR 2: a repair response with no tool call (the
+/// model replied with commentary) gives up quietly after that
+/// round rather than burning the remaining budget.
+#[tokio::test]
+async fn repair_gives_up_quietly_when_model_replies_with_commentary() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = repair_enabled_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "lots"}),
+            )])),
+            // Repair response without a tool call.
+            MockStreamScript::from_message(final_assistant("sorry, I cannot")),
+            MockStreamScript::from_message(final_assistant("done")),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(tool_result.is_error);
+}
+
+/// Plan 01 PR 2: with repair off (the default), an invalid
+/// call fails immediately — no side request is issued. Guarded
+/// by script count: a stray repair request would consume the
+/// final script and change the run's shape.
+#[tokio::test]
+async fn repair_disabled_by_default_reproduces_todays_failure_path() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "lots"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("acknowledged")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+        None,
+        None,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    assert_eq!(result.generated_messages.len(), 3);
+    let tool_result = first_tool_result(&result);
+    assert!(tool_result.is_error);
+    let Message::Assistant(final_message) = &result.generated_messages[2] else {
+        panic!("run must end with the scripted final assistant");
+    };
+    assert_eq!(
+        final_message.content,
+        vec![ContentBlock::Text {
+            text: "acknowledged".into()
+        }],
+        "no script may be consumed by a stray repair request"
+    );
+}
+
 #[tokio::test]
 async fn multiple_sequential_tool_calls_preserve_order() {
     let mut tools = ToolRegistry::new();

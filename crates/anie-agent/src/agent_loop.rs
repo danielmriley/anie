@@ -189,7 +189,7 @@ mod send_event_tests {
 
 use anie_protocol::{
     AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, StreamDelta, ToolCall,
-    ToolResult, ToolResultMessage, Usage, now_millis,
+    ToolDef, ToolResult, ToolResultMessage, Usage, UserMessage, now_millis,
 };
 use anie_provider::{
     LlmContext, Model, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
@@ -520,7 +520,23 @@ pub struct AgentLoopConfig {
     /// Observability-only. PR 1 of
     /// `docs/rlm_subagents_2026-05-01/`.
     recurse_depth_threshold: Option<u32>,
+    /// When true, a tool call whose arguments fail schema
+    /// validation (and that coercion couldn't rescue) gets up
+    /// to [`MAX_TOOL_REPAIR_ROUNDS`] focused side requests
+    /// asking the model to emit a corrected call, instead of
+    /// immediately failing the turn. The side requests never
+    /// touch the main context. Defaults to `false`; the CLI
+    /// enables it in `--harness-mode=rlm`. Plan 01 PR 2 of
+    /// `docs/local_model_augmentation/`.
+    tool_call_repair: bool,
 }
+
+/// Cap on generative repair attempts per invalid tool call.
+/// Mirrors `MAX_MODEL_OUTPUT_MALFORMED_RETRIES` in the CLI
+/// retry policy: after two focused attempts the model is
+/// unlikely to fix the call, and the regular failure path
+/// (schema error back to the model in-context) takes over.
+pub const MAX_TOOL_REPAIR_ROUNDS: u32 = 2;
 
 impl AgentLoopConfig {
     /// Create a config with no steering/follow-up/tool hooks.
@@ -548,7 +564,20 @@ impl AgentLoopConfig {
             wrap_failed_tool_results: false,
             failure_loop_threshold: None,
             recurse_depth_threshold: None,
+            tool_call_repair: false,
         }
+    }
+
+    /// Toggle the bounded tool-call repair round. When enabled,
+    /// schema-invalid tool calls that deterministic coercion
+    /// can't fix get up to [`MAX_TOOL_REPAIR_ROUNDS`] focused
+    /// side requests before falling back to the regular
+    /// failure path. Defaults to off. Plan 01 PR 2 of
+    /// `docs/local_model_augmentation/`.
+    #[must_use]
+    pub fn with_tool_call_repair(mut self, enabled: bool) -> Self {
+        self.tool_call_repair = enabled;
+        self
     }
 
     /// Install a [`FailureLoopDetector`] with the given strike
@@ -1672,13 +1701,16 @@ impl AgentLoop {
         // validation error is reported when coercion doesn't
         // rescue the call, so failure messages are unchanged.
         let mut coercion_notes: Vec<String> = Vec::new();
+        let mut repair_rounds_used: u32 = 0;
         let validation_result = match validator_state {
             Some(state) => match validate_tool_arguments(state, &tool_call.arguments) {
                 Ok(()) => Ok(()),
                 Err(original_error) => {
-                    let schema = tool.definition().parameters;
-                    let (coerced, notes) =
-                        crate::arg_coerce::coerce_arguments(&schema, tool_call.arguments.clone());
+                    let definition = tool.definition();
+                    let (coerced, notes) = crate::arg_coerce::coerce_arguments(
+                        &definition.parameters,
+                        tool_call.arguments.clone(),
+                    );
                     if !notes.is_empty() && validate_tool_arguments(state, &coerced).is_ok() {
                         tracing::info!(
                             tool = %tool_call.name,
@@ -1688,6 +1720,45 @@ impl AgentLoop {
                         tool_call.arguments = coerced;
                         coercion_notes = notes;
                         Ok(())
+                    } else if self.config.tool_call_repair {
+                        // Plan 01 PR 2 of `docs/local_model_augmentation/`:
+                        // bounded generative repair. Each round is a
+                        // focused side request ("here is the schema and
+                        // what failed; emit one corrected call") that
+                        // never touches the main context. The ORIGINAL
+                        // validation error is reported when every round
+                        // fails, so the give-up path is byte-identical
+                        // to repair-disabled behavior.
+                        let mut last_error = original_error.clone();
+                        let mut rescued = Err(original_error);
+                        for round in 1..=MAX_TOOL_REPAIR_ROUNDS {
+                            let Some(corrected) = self
+                                .request_tool_call_repair(
+                                    &definition,
+                                    &tool_call,
+                                    &last_error,
+                                    cancel,
+                                )
+                                .await
+                            else {
+                                break;
+                            };
+                            match validate_tool_arguments(state, &corrected) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        tool = %tool_call.name,
+                                        rounds = round,
+                                        "tool-call arguments repaired via side request"
+                                    );
+                                    tool_call.arguments = corrected;
+                                    repair_rounds_used = round;
+                                    rescued = Ok(());
+                                    break;
+                                }
+                                Err(error) => last_error = error,
+                            }
+                        }
+                        rescued
                     } else {
                         Err(original_error)
                     }
@@ -1768,6 +1839,7 @@ impl AgentLoop {
 
         attach_tool_invocation_details(&tool_call, &mut result.details);
         attach_coercion_notes(&coercion_notes, &mut result.details);
+        attach_repair_note(repair_rounds_used, &mut result.details);
 
         send_event(
             event_tx,
@@ -1780,6 +1852,85 @@ impl AgentLoop {
         .await;
 
         tool_result_message(&tool_call, result, is_error)
+    }
+
+    /// Plan 01 PR 2 of `docs/local_model_augmentation/`. Issue
+    /// one focused side request asking the model to correct an
+    /// invalid tool call. Returns the corrected arguments, or
+    /// `None` when the request could not be made or the model
+    /// did not answer with a call to the same tool (commentary,
+    /// a different tool, provider error — all give up quietly;
+    /// the caller falls back to the regular failure path).
+    ///
+    /// The request is deliberately minimal: a one-message
+    /// context carrying the invalid call and the schema error,
+    /// with ONLY the failing tool advertised, so the model has
+    /// nothing to do but re-emit that call. Stream events go to
+    /// a drained throwaway channel — the repair exchange never
+    /// appears in the transcript or the main context.
+    async fn request_tool_call_repair(
+        &self,
+        definition: &ToolDef,
+        failed_call: &ToolCall,
+        schema_error: &str,
+        cancel: &CancellationToken,
+    ) -> Option<serde_json::Value> {
+        let arguments = serde_json::to_string(&failed_call.arguments).ok()?;
+        let schema = serde_json::to_string(&definition.parameters).ok()?;
+        let prompt = format!(
+            "Your call to the tool `{name}` was invalid.\n\n\
+             Arguments you sent:\n{arguments}\n\n\
+             Validation error:\n{schema_error}\n\n\
+             The tool's parameter schema:\n{schema}\n\n\
+             Call `{name}` again now with corrected, schema-valid \
+             arguments. Emit exactly one tool call and no commentary.",
+            name = failed_call.name,
+        );
+        let messages = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: prompt }],
+            timestamp: now_millis(),
+        })];
+
+        let request = self
+            .config
+            .request_options_resolver
+            .resolve(&self.config.model, &messages)
+            .await
+            .ok()?;
+        let provider = self.provider_registry.get(&self.config.model.api)?;
+        let mut model = self.config.model.clone();
+        if let Some(base_url_override) = request.base_url_override {
+            model.base_url = base_url_override;
+        }
+        let llm_context = LlmContext {
+            system_prompt: "You correct invalid tool calls. Respond with exactly one \
+                            corrected tool call and no other output."
+                .to_string(),
+            messages: provider.convert_messages(&messages),
+            tools: vec![definition.clone()],
+        };
+        let options = self.config.stream_options(request.api_key, request.headers);
+        let stream = provider.stream(&model, llm_context, options).ok()?;
+
+        // Throwaway event channel, actively drained so the side
+        // request can't block on a full buffer and the main
+        // transcript never sees its MessageStart/Delta events.
+        let (side_tx, mut side_rx) = mpsc::channel(64);
+        let drainer = tokio::spawn(async move { while side_rx.recv().await.is_some() {} });
+        let collected = self.collect_stream(stream, &side_tx, cancel).await;
+        drop(side_tx);
+        let _ = drainer.await;
+
+        collected
+            .assistant
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolCall(call) if call.name == failed_call.name => {
+                    Some(call.arguments.clone())
+                }
+                _ => None,
+            })
     }
 
     /// PR 1 + PR 2 of `docs/harness_mitigations_2026-05-01/`.
@@ -2350,6 +2501,25 @@ fn attach_coercion_notes(notes: &[String], details: &mut serde_json::Value) {
                     .map(|note| serde_json::Value::String(note.clone()))
                     .collect(),
             ),
+        );
+    }
+}
+
+/// Surface a successful generative repair in the tool result's
+/// details, like [`attach_coercion_notes`] does for
+/// deterministic coercions. Plan 01 PR 2 of
+/// `docs/local_model_augmentation/`.
+fn attach_repair_note(rounds: u32, details: &mut serde_json::Value) {
+    if rounds == 0 {
+        return;
+    }
+    if !details.is_object() {
+        *details = serde_json::json!({});
+    }
+    if let Some(map) = details.as_object_mut() {
+        map.insert(
+            "argument_repair_rounds".to_string(),
+            serde_json::Value::from(rounds),
         );
     }
 }

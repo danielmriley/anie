@@ -2773,6 +2773,7 @@ fn build_agent(
     .with_ollama_num_ctx_override(state.config.active_ollama_num_ctx_override())
     .with_compaction_gate(compaction_gate)
     .with_wrap_failed_tool_results(should_wrap_failed_tool_results(state))
+    .with_tool_call_repair(should_repair_tool_calls(state))
     .with_failure_loop_threshold(failure_loop_threshold(state))
     .with_recurse_depth_threshold(recurse_depth_threshold(state));
     // Compose the before-model seam. Order: rlm context-virtualization
@@ -2818,6 +2819,17 @@ fn should_wrap_failed_tool_results(state: &ControllerState) -> bool {
         return false;
     }
     !env_flag_enabled("ANIE_DISABLE_FAIL_REVERIFY")
+}
+
+/// Plan 01 PR 2 of `docs/local_model_augmentation/`. Enable
+/// the bounded tool-call repair round in `--harness-mode=rlm`
+/// by default. `ANIE_DISABLE_TOOL_REPAIR=1` turns it off for
+/// smoke-test bisection.
+fn should_repair_tool_calls(state: &ControllerState) -> bool {
+    if !state.harness_mode.installs_rlm_features() {
+        return false;
+    }
+    !env_flag_enabled("ANIE_DISABLE_TOOL_REPAIR")
 }
 
 fn env_flag_enabled(name: &str) -> bool {
