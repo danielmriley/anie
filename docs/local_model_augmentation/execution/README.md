@@ -13,10 +13,25 @@ sequentially, not in parallel.
 
 | PR | Title | Status | Commit |
 |----|-------|--------|--------|
-| PR1 | Schema-guided tool-argument coercion | Not started | — |
-| PR2 | Bounded tool-call repair round | Not started | — |
-| PR3 | Per-tool example calls in prompt catalog | Not started | — |
-| PR4 | Tool-reliability metrics + eval scenarios | Not started | — |
+| PR1 | Schema-guided tool-argument coercion | Done | `6d5e96e` |
+| PR2 | Bounded tool-call repair round | Done | `d8aa8f6` |
+| PR3 | Per-tool example calls in prompt catalog | Done | `d6aaea9` |
+| PR4 | Tool-reliability metrics + eval scenarios | Done | `7894918` |
+
+Plan-01 deviations (rationale in the commits / code comments):
+
+- PR1 validates strictly first and coerces only on failure
+  (zero happy-path overhead), instead of coercing before
+  validation.
+- PR2 implements repair as a side request rather than the
+  ideas-doc `AgentIntent::RepairToolCall` variant.
+- PR3 uses a static example map in `anie-cli/src/tool_examples.rs`
+  instead of a `ToolDef.example` field (~55 construction sites
+  untouched; wire leak structurally impossible). The
+  schema-validation drift guard caught the plan doc's own wrong
+  `edit` example.
+- Pending live verification: the two qwen3:8b smoke items in the
+  plan's exit criteria (coercion + repair against a real model).
 
 ## Plan 02 — Repo map + retrieval
 
