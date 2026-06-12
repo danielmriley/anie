@@ -17,6 +17,9 @@ pub(super) fn build_request_body(
             "num_ctx": num_ctx,
         },
     });
+    if let Some(temperature) = options.temperature {
+        body["options"]["temperature"] = json!(temperature);
+    }
     if model.reasoning_capabilities.is_some() {
         body["think"] = json!(options.thinking != ThinkingLevel::Off);
     }
@@ -290,6 +293,47 @@ mod tests {
 
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn stream_options_temperature_lands_in_ollama_options_object() {
+        let body = build_request_body(
+            &sample_model(32_768),
+            &sample_context(),
+            &StreamOptions {
+                temperature: Some(0.5),
+                ..StreamOptions::default()
+            },
+        );
+
+        // 0.5 is exactly representable in f32, so the f32→f64 widening on the
+        // JSON path is lossless and the equality holds.
+        assert_eq!(body["options"]["temperature"], 0.5);
+        // The temperature rides alongside num_ctx, not at the top level.
+        assert_eq!(body["options"]["num_ctx"], 32_768);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn absent_temperature_omits_the_field_entirely() {
+        let with_temp = build_request_body(
+            &sample_model(32_768),
+            &sample_context(),
+            &StreamOptions {
+                temperature: None,
+                ..StreamOptions::default()
+            },
+        );
+        let default_body = build_request_body(
+            &sample_model(32_768),
+            &sample_context(),
+            &StreamOptions::default(),
+        );
+
+        assert!(with_temp["options"].get("temperature").is_none());
+        // Regression: a None temperature must leave the body byte-identical
+        // to the pre-plumbing request.
+        assert_eq!(with_temp, default_body);
     }
 
     #[test]
