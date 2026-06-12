@@ -266,3 +266,54 @@ PR 4:
   follow-up series.
 - Wiring the verify result into `VerifierPolicy`'s critique
   (let the self-review cite the actual check output).
+
+---
+
+## 9. Amendment (2026-06-12): Signal C — near-duplicate call loops
+
+Field evidence (session `0f9cd627`, qwen3.5:0.8b,
+[field notes](field_notes/2026-06-12_qwen3.5-0.8b_session.md) F4): ten
+consecutive `web_search` calls with escalating near-duplicate queries,
+all "successful", none caught — the failure-loop detector requires
+identical `(tool, args_hash)` AND `is_error`. The small-model loop
+signature is *similar, successful, useless* calls.
+
+### Design
+
+Extend `FailureLoopDetector` (or a sibling `SimilarCallDetector` in
+`failure_loop.rs` — decide at PR time, same module either way):
+
+- Track the last K=5 calls per tool. For string-bearing argument
+  values, compute a token set (lowercased, alphanumeric split — reuse
+  the tokenizer convention from `context_virt`'s keyword overlap).
+- A new call whose token-set Jaccard overlap with any of the last K
+  same-tool calls exceeds 0.6 increments a similarity streak
+  (regardless of is_error); a dissimilar call or different tool resets
+  it.
+- At streak 3: emit the existing-style `SystemMessage` +
+  `tracing::info`, AND inject a harness note into the next tool
+  result: "your last 3 `web_search` calls were near-duplicates; the
+  archive ledger lists what they returned — answer from those results
+  or take a different action. Do NOT search again for the same thing."
+- At streak 5: arm the plan-03 PR10 temperature perturbation (shared
+  machinery — Signal C is a second producer for the same per-run
+  `perturbation` slot).
+- Gate: on in rlm mode, `ANIE_DISABLE_SIMILAR_CALL_DETECTOR=1` off;
+  threshold env-tunable like the existing detector.
+
+### PR
+
+**PR 18 — `local_aug/PR18: near-duplicate call detector (Signal C)`**
+Lands after PR 10 (shares the perturbation slot). Tests:
+`near_duplicate_streak_fires_note_at_three`,
+`successful_but_similar_calls_count_toward_the_streak`,
+`dissimilar_call_resets_the_streak`,
+`streak_of_five_arms_temperature_perturbation`,
+`identical_args_still_route_through_the_existing_failure_detector`.
+
+### Risks
+
+- False positives on legitimately-similar calls (paging through search
+  results). The note is advisory (never blocks); threshold 0.6/streak 3
+  chosen high; eval scenario with legitimate pagination as a negative
+  control.

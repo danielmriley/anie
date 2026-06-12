@@ -56,13 +56,36 @@ phased, evidence-first plans.
 
 | # | Plan | One-line summary |
 |---|------|------------------|
-| 01 | [Tool-call reliability](01_tool_call_reliability.md) | Schema-guided argument coercion, a bounded repair round for invalid calls, per-tool example calls |
+| 01 | [Tool-call reliability](01_tool_call_reliability.md) | Schema-guided argument coercion, a bounded repair round for invalid calls, per-tool example calls. **PRs 1-4 shipped**; amended 2026-06-12 with unknown-tool rescue + unknown-prop stripping (PRs 16-17) |
 | 02 | [Repo map + retrieval](02_repo_map_and_retrieval.md) | Pre-computed, token-capped repo skeleton injected at turn 0; on-demand symbol lookup tool |
-| 03 | [Harness verification + failure recovery](03_harness_verification_and_recovery.md) | Harness-run verify command after edits; failure-loop escalation (temperature perturb); grounded edit-failure recovery |
+| 03 | [Harness verification + failure recovery](03_harness_verification_and_recovery.md) | Harness-run verify command after edits; failure-loop escalation (temperature perturb); grounded edit-failure recovery. Amended 2026-06-12 with near-duplicate call detection (PR 18) |
+| 04 | [Context-budget discipline](04_context_budget_discipline.md) | Prompt-weight tiers for small windows: compact catalogs, skills/context-file budgets, ledger v2 (PRs 13-15) |
+
+Field evidence driving the amendments and plan 04:
+[field_notes/2026-06-12_qwen3.5-0.8b_session.md](field_notes/2026-06-12_qwen3.5-0.8b_session.md)
+— the first real small-model session (qwen3.5:0.8b): 36% tool-error
+rate, a hallucinated tool name as the dominant failure, ledger syntax
+leaking into bash commands, and an 11.3k-token turn-0 prompt against a
+16.4k ceiling.
 
 ## PR ordering and dependencies
 
-Recommended landing order: **01 → 03 → 02**.
+Recommended landing order (revised 2026-06-12, evidence-ranked by the
+field session): **01 amendment (PRs 16-17) → 04 (PRs 13-15) → 03
+(PRs 9-12, 18) → 02 (PRs 5-8)**.
+
+- PRs 16-17 first: they deterministically rescue the failure class
+  that dominated the field session (6 of 8 errors), are small, and
+  build directly on shipped PR1-PR4 machinery.
+- Plan 04 second: prompt weight is the systemic ceiling on every other
+  improvement — nothing else matters if 69% of the window is spent at
+  turn 0.
+- Plan 03 then adds the write-side recovery + Signal C (PR 18 depends
+  on PR 10's perturbation slot).
+- Plan 02 (repo map) is unchanged but moves last: it *adds* prompt
+  weight, so it should land after plan 04's tiering can budget for it.
+
+Original ordering rationale below still applies within plans.
 
 - Plan 01 is the highest measured-lift-per-line change (a
   malformed call costs a full turn on a 9B model today) and

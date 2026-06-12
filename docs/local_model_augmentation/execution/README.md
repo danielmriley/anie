@@ -60,3 +60,22 @@ tokens, tool calls, turns).
 | Date | Feature | Model | Corpus result | Notes |
 |------|---------|-------|---------------|-------|
 | — | — | — | — | — |
+
+## Plan 04 — Context-budget discipline (added 2026-06-12)
+
+| PR | Title | Status | Commit |
+|----|-------|--------|--------|
+| PR13 | PromptTier + compact tool/skills/context budgets | Not started | — |
+| PR14 | Ledger v2 for the Small tier | Not started | — |
+| PR15 | Prompt-weight metrics + eval expectations | Not started | — |
+
+## Amendments (added 2026-06-12, field-evidence driven)
+
+| PR | Plan | Title | Status | Commit |
+|----|------|-------|--------|--------|
+| PR16 | 01 | Unknown-tool rescue (name + schema fingerprint) | Not started | — |
+| PR17 | 01 | Unknown-prop stripping + grounded repair prompts | Not started | — |
+| PR18 | 03 | Near-duplicate call detector (Signal C) | Not started | — |
+
+Revised landing order: PR16-17 → plan 04 → plan 03 (incl. PR18) →
+plan 02. Evidence: field_notes/2026-06-12_qwen3.5-0.8b_session.md.

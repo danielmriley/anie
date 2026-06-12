@@ -240,3 +240,84 @@ PR 4:
   a follow-up).
 - Cross-model repair (route the repair request to a larger
   local model) — local-cascade follow-up series.
+
+---
+
+## 9. Amendment (2026-06-12): field-evidence follow-ups
+
+Session `0f9cd627` (qwen3.5:0.8b — see
+[field notes](field_notes/2026-06-12_qwen3.5-0.8b_session.md)) exposed
+three gaps in the shipped PR1-PR4 pipeline. Two new PRs:
+
+### 9a. Unknown-tool rescue (field notes F1)
+
+The dominant failure (6 of 8 errors) was a call to a **hallucinated
+tool name** (`tool_calls` — the wire-format key). "Tool not found"
+bypasses both coercion and repair today
+(`execute_single_tool`'s missing-tool branch precedes both); each call
+burned a full turn.
+
+Deterministic rescue, tried in order before synthesizing the failure:
+
+1. **Name normalization**: case/underscore/hyphen-insensitive match
+   against registered names (`Bash`, `web-search` → `bash`,
+   `web_search`).
+2. **Schema fingerprinting**: validate the call's arguments against
+   every registered tool's compiled validator (validators are already
+   precompiled and cached; N≈12 `is_valid` calls on a small object is
+   microseconds). If **exactly one** tool validates, remap to it with a
+   `details.tool_name_rescued: {from, to}` note. The field session's
+   bash-shaped calls (`{"command":..., "timeout":...}`) remap uniquely.
+   Zero or multiple matches → today's failure, but with the error text
+   upgraded to include the registered tool list (the SkillTool
+   unknown-name message is the precedent).
+3. Rescued calls flow through normal validation/coercion afterward
+   (the field calls also had a stringified `"timeout": "5"` — existing
+   coercion handles it post-remap).
+
+### 9b. Unknown-property stripping + repair grounding (field notes F3)
+
+- **Coercion gains a rule**: when the schema declares
+  `additionalProperties: false` and validation fails, strip the
+  unknown properties (note each in `details.argument_coercions`) and
+  re-validate. The field session's
+  `{"command": ..., "limit": "15", "path": ...}` bash call would have
+  executed perfectly — instead the generative repair "fixed" it into
+  `bash "find ..."` (exit 127), twice. Deterministic-before-generative
+  is this plan's principle 1; this is its sharpest demonstration.
+- **Repair prompt grounding**: the repair side-request now includes the
+  tool's canonical example call (PR3's `tool_examples` map) so the
+  repairing model imitates a known-good shape instead of inventing
+  one. Plumbing note: the examples map lives in `anie-cli`
+  (`tool_examples.rs`); pass it into `AgentLoopConfig` as an optional
+  `repair_examples: HashMap<String, String>` rather than moving the map.
+- **Repair regression guard**: if a repaired call executes and fails
+  with an *execution* error, the result keeps both the repair note and
+  the original schema error in details so evals can count
+  "repaired-but-worse" outcomes (`RunMetrics.tool_repair.repaired_then_failed`).
+
+### Phased PRs
+
+**PR 16 — `local_aug/PR16: unknown-tool rescue (name + schema fingerprint)`**
+Tests: `case_insensitive_tool_name_is_rescued`,
+`hallucinated_name_with_uniquely_matching_schema_remaps_with_note`,
+`ambiguous_schema_match_fails_with_tool_list_in_error`,
+`rescued_call_still_passes_through_coercion`.
+
+**PR 17 — `local_aug/PR17: unknown-prop stripping + grounded repair prompts`**
+Tests: `additional_properties_violation_strips_unknown_keys_with_notes`,
+`stripping_composes_with_type_coercion_in_one_pass`,
+`repair_prompt_includes_canonical_example_when_available`,
+`repaired_then_failed_marker_lands_in_details`.
+
+### Risks
+
+- Schema fingerprinting could remap a genuinely wrong call to a
+  dangerous tool (e.g. anything → bash if args happen to validate).
+  Mitigation: require the unique match AND at least one *required*
+  property of the target schema present by name; never remap to `bash`
+  unless the original name normalizes to it or `command` is present.
+- Stripping properties can hide intent (the model's `path` extra
+  arguably meant "run in this directory"). The details note keeps it
+  visible; evals (PR15 metrics) will show whether stripped calls
+  succeed at a healthy rate.
