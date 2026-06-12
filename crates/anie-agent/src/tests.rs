@@ -22,9 +22,6 @@ use anie_provider::{
     mock::{MockProvider, MockStreamScript},
 };
 
-use crate::hooks::{
-    AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride,
-};
 use crate::{
     AgentLoop, AgentLoopConfig, CompactionGate, CompactionGateOutcome, Tool, ToolError,
     ToolExecutionContext, ToolExecutionMode, ToolRegistry,
@@ -244,42 +241,6 @@ impl Tool for TestTool {
     }
 }
 
-struct BlockingHook;
-
-#[async_trait]
-impl BeforeToolCallHook for BlockingHook {
-    async fn before_tool_call(
-        &self,
-        _tool_call: &ToolCall,
-        _args: &serde_json::Value,
-        _context: &[Message],
-    ) -> BeforeToolCallResult {
-        BeforeToolCallResult::Block {
-            reason: "blocked by hook".into(),
-        }
-    }
-}
-
-struct OverrideHook;
-
-#[async_trait]
-impl AfterToolCallHook for OverrideHook {
-    async fn after_tool_call(
-        &self,
-        _tool_call: &ToolCall,
-        _result: &ProtocolToolResult,
-        _is_error: bool,
-    ) -> Option<ToolResultOverride> {
-        Some(ToolResultOverride {
-            content: Some(vec![ContentBlock::Text {
-                text: "overridden".into(),
-            }]),
-            details: Some(serde_json::json!({"overridden": true})),
-            is_error: Some(false),
-        })
-    }
-}
-
 struct SlowProvider;
 
 impl Provider for SlowProvider {
@@ -327,8 +288,6 @@ fn agent_with_provider(
     provider: Box<dyn Provider>,
     tool_registry: Arc<ToolRegistry>,
     tool_execution: ToolExecutionMode,
-    before_hook: Option<Arc<dyn BeforeToolCallHook>>,
-    after_hook: Option<Arc<dyn AfterToolCallHook>>,
 ) -> AgentLoop {
     let mut provider_registry = ProviderRegistry::new();
     provider_registry.register(ApiKind::OpenAICompletions, provider);
@@ -344,8 +303,7 @@ fn agent_with_provider(
             Arc::new(StaticResolver {
                 result: Ok(ResolvedRequestOptions::default()),
             }),
-        )
-        .with_hooks(before_hook, after_hook),
+        ),
     )
 }
 
@@ -419,8 +377,6 @@ async fn basic_flow_prompt_to_assistant_without_tools() {
         )])),
         Arc::new(ToolRegistry::new()),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, events) = collect_run(agent, vec![user_prompt("hello")], Vec::new()).await;
@@ -463,8 +419,6 @@ async fn single_tool_call_completes_full_loop() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
@@ -514,8 +468,6 @@ async fn coercion_note_appears_in_tool_result_details() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
@@ -562,8 +514,6 @@ async fn unrescuable_invalid_arguments_report_the_original_validation_error() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
@@ -775,8 +725,6 @@ async fn repair_disabled_by_default_reproduces_todays_failure_path() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
@@ -810,8 +758,6 @@ async fn multiple_sequential_tool_calls_preserve_order() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, _) = collect_run(agent, vec![user_prompt("go")], Vec::new()).await;
@@ -843,8 +789,6 @@ async fn parallel_tool_calls_execute_concurrently() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Parallel,
-        None,
-        None,
     );
 
     let _ = collect_run(agent, vec![user_prompt("parallel")], Vec::new()).await;
@@ -857,8 +801,6 @@ async fn cancellation_during_streaming_returns_aborted_assistant() {
         Box::new(SlowProvider),
         Arc::new(ToolRegistry::new()),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
     let (event_tx, mut event_rx) = mpsc::channel(128);
     let cancel = CancellationToken::new();
@@ -903,8 +845,6 @@ async fn cancellation_during_tool_execution_returns_error_tool_result() {
         )])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -953,8 +893,6 @@ async fn tool_not_found_returns_error_result() {
         ])),
         Arc::new(ToolRegistry::new()),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, _) = collect_run(agent, vec![user_prompt("missing tool")], Vec::new()).await;
@@ -1160,8 +1098,6 @@ async fn tool_argument_validation_failure_skips_execution() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, _) = collect_run(agent, vec![user_prompt("bad args")], Vec::new()).await;
@@ -1175,78 +1111,6 @@ async fn tool_argument_validation_failure_skips_execution() {
         })
         .expect("tool result present");
     assert!(tool_result.is_error);
-}
-
-#[tokio::test]
-async fn before_tool_call_hook_can_block_execution() {
-    let tool = string_arg_tool();
-    let invocations = Arc::clone(&tool.invocations);
-    let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(tool));
-    let agent = agent_with_provider(
-        Box::new(MockProvider::new(vec![
-            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
-                "call_blocked",
-                "echo",
-                serde_json::json!({"value": "blocked"}),
-            )])),
-            MockStreamScript::from_message(final_assistant("done")),
-        ])),
-        Arc::new(tools),
-        ToolExecutionMode::Sequential,
-        Some(Arc::new(BlockingHook)),
-        None,
-    );
-
-    let (result, _) = collect_run(agent, vec![user_prompt("block")], Vec::new()).await;
-    assert_eq!(invocations.load(Ordering::SeqCst), 0);
-    let tool_result = result
-        .generated_messages
-        .iter()
-        .find_map(|message| match message {
-            Message::ToolResult(tool_result) => Some(tool_result),
-            _ => None,
-        })
-        .expect("tool result present");
-    assert!(tool_result.is_error);
-}
-
-#[tokio::test]
-async fn after_tool_call_hook_can_override_result() {
-    let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(string_arg_tool()));
-    let agent = agent_with_provider(
-        Box::new(MockProvider::new(vec![
-            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
-                "call_override",
-                "echo",
-                serde_json::json!({"value": "original"}),
-            )])),
-            MockStreamScript::from_message(final_assistant("done")),
-        ])),
-        Arc::new(tools),
-        ToolExecutionMode::Sequential,
-        None,
-        Some(Arc::new(OverrideHook)),
-    );
-
-    let (result, _) = collect_run(agent, vec![user_prompt("override")], Vec::new()).await;
-    let tool_result = result
-        .generated_messages
-        .iter()
-        .find_map(|message| match message {
-            Message::ToolResult(tool_result) => Some(tool_result),
-            _ => None,
-        })
-        .expect("tool result present");
-
-    assert_eq!(
-        tool_result.content,
-        vec![ContentBlock::Text {
-            text: "overridden".into(),
-        }]
-    );
-    assert!(!tool_result.is_error);
 }
 
 #[tokio::test]
@@ -1269,8 +1133,6 @@ async fn multiple_turns_with_multiple_tool_round_trips_work() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, _) = collect_run(agent, vec![user_prompt("two turns")], Vec::new()).await;
@@ -1297,8 +1159,6 @@ async fn provider_stream_error_is_preserved_and_stops_run() {
         ])])),
         Arc::new(ToolRegistry::new()),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (result, events) = collect_run(agent, vec![user_prompt("error")], Vec::new()).await;
@@ -1342,8 +1202,6 @@ async fn tool_partial_updates_emit_tool_exec_update_events() {
         ])),
         Arc::new(tools),
         ToolExecutionMode::Sequential,
-        None,
-        None,
     );
 
     let (_result, events) = collect_run(agent, vec![user_prompt("updates")], Vec::new()).await;

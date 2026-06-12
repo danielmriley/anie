@@ -197,9 +197,7 @@ use anie_provider::{
 };
 
 use crate::ToolRegistry;
-use crate::hooks::{
-    AfterToolCallHook, BeforeToolCallHook, BeforeToolCallResult, ToolResultOverride,
-};
+use crate::stream_builder::{ActiveDelta, AssistantMessageBuilder, CollectedAssistant};
 use crate::tool::ToolExecutionContext;
 
 /// Agent-loop execution mode for tool calls.
@@ -486,8 +484,6 @@ pub struct AgentLoopConfig {
     ollama_num_ctx_override: Option<u64>,
     get_steering_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
     get_follow_up_messages: Option<Arc<dyn Fn() -> Vec<Message> + Send + Sync>>,
-    before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
-    after_tool_call_hook: Option<Arc<dyn AfterToolCallHook>>,
     /// Optional mid-turn compaction hook. Default `None`. Plan
     /// 8.3 of `docs/midturn_compaction_2026-04-27/`. The
     /// controller installs a real implementation in plan 8.4;
@@ -557,8 +553,6 @@ impl AgentLoopConfig {
             ollama_num_ctx_override: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
-            before_tool_call_hook: None,
-            after_tool_call_hook: None,
             compaction_gate: None,
             before_model_policy: Arc::new(NoopBeforeModelPolicy),
             wrap_failed_tool_results: false,
@@ -687,18 +681,6 @@ impl AgentLoopConfig {
         self
     }
 
-    /// Attach internal tool-execution hooks.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn with_hooks(
-        mut self,
-        before_tool_call_hook: Option<Arc<dyn BeforeToolCallHook>>,
-        after_tool_call_hook: Option<Arc<dyn AfterToolCallHook>>,
-    ) -> Self {
-        self.before_tool_call_hook = before_tool_call_hook;
-        self.after_tool_call_hook = after_tool_call_hook;
-        self
-    }
 }
 
 /// Final agent-run output.
@@ -1095,7 +1077,7 @@ impl AgentLoop {
                 tool_calls,
             } => {
                 let results = self
-                    .execute_tool_calls(&tool_calls, state.context(), event_tx, cancel)
+                    .execute_tool_calls(&tool_calls, event_tx, cancel)
                     .await;
                 AgentObservation::ToolResults { assistant, results }
             }
@@ -1638,7 +1620,6 @@ impl AgentLoop {
     async fn execute_tool_calls(
         &self,
         tool_calls: &[ToolCall],
-        context: &[Message],
         event_tx: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Vec<ToolResultMessage> {
@@ -1647,16 +1628,17 @@ impl AgentLoop {
                 let mut results = Vec::with_capacity(tool_calls.len());
                 for tool_call in tool_calls {
                     results.push(
-                        self.execute_single_tool(tool_call.clone(), context, event_tx, cancel)
+                        self.execute_single_tool(tool_call.clone(), event_tx, cancel)
                             .await,
                     );
                 }
                 results
             }
             ToolExecutionMode::Parallel => {
-                let futures = tool_calls.iter().cloned().map(|tool_call| {
-                    self.execute_single_tool(tool_call, context, event_tx, cancel)
-                });
+                let futures = tool_calls
+                    .iter()
+                    .cloned()
+                    .map(|tool_call| self.execute_single_tool(tool_call, event_tx, cancel));
                 join_all(futures).await
             }
         }
@@ -1665,7 +1647,6 @@ impl AgentLoop {
     async fn execute_single_tool(
         &self,
         mut tool_call: ToolCall,
-        context: &[Message],
         event_tx: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> ToolResultMessage {
@@ -1785,19 +1766,6 @@ impl AgentLoop {
             return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
         }
 
-        if let Some(hook) = &self.config.before_tool_call_hook {
-            match hook
-                .before_tool_call(&tool_call, &tool_call.arguments, context)
-                .await
-            {
-                BeforeToolCallResult::Allow => {}
-                BeforeToolCallResult::Block { reason } => {
-                    let result = error_tool_result(reason);
-                    return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
-                }
-            }
-        }
-
         let (update_tx, mut update_rx) = mpsc::channel(16);
         let update_call_id = tool_call.id.clone();
         let update_event_tx = event_tx.clone();
@@ -1824,17 +1792,10 @@ impl AgentLoop {
             .await;
         let _ = update_forwarder.await;
 
-        let (mut result, mut is_error) = match execution {
+        let (mut result, is_error) = match execution {
             Ok(result) => (result, false),
             Err(error) => (error_tool_result(error.to_string()), true),
         };
-
-        if let Some(hook) = &self.config.after_tool_call_hook {
-            if let Some(override_result) = hook.after_tool_call(&tool_call, &result, is_error).await
-            {
-                apply_tool_result_override(&mut result, &mut is_error, override_result);
-            }
-        }
 
         if is_error && self.config.wrap_failed_tool_results {
             wrap_failed_tool_result(&tool_call.name, &mut result);
@@ -2478,22 +2439,6 @@ fn failure_directive_for(tool_name: &str) -> String {
     )
 }
 
-fn apply_tool_result_override(
-    result: &mut ToolResult,
-    is_error: &mut bool,
-    override_result: ToolResultOverride,
-) {
-    if let Some(content) = override_result.content {
-        result.content = content;
-    }
-    if let Some(details) = override_result.details {
-        result.details = details;
-    }
-    if let Some(override_is_error) = override_result.is_error {
-        *is_error = override_is_error;
-    }
-}
-
 /// Surface argument coercions in the tool result's details —
 /// same transparency convention as the edit tool's
 /// whitespace-fuzzy counter: the harness may fix things
@@ -2556,182 +2501,6 @@ fn attach_tool_invocation_details(tool_call: &ToolCall, details: &mut serde_json
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActiveDelta {
-    Text,
-    Thinking,
-}
-
-struct CollectedAssistant {
-    assistant: AssistantMessage,
-    provider_error: Option<ProviderError>,
-}
-
-struct AssistantMessageBuilder {
-    content: Vec<BuilderContent>,
-    provider: String,
-    model: String,
-}
-
-impl AssistantMessageBuilder {
-    fn new(provider: String, model: String) -> Self {
-        Self {
-            content: Vec::new(),
-            provider,
-            model,
-        }
-    }
-
-    fn placeholder_message(&self) -> AssistantMessage {
-        AssistantMessage {
-            content: Vec::new(),
-            usage: Default::default(),
-            stop_reason: StopReason::Stop,
-            error_message: None,
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            timestamp: now_millis(),
-            reasoning_details: None,
-        }
-    }
-
-    fn push_text(&mut self, text: &str) {
-        match self.content.last_mut() {
-            Some(BuilderContent::Text(existing)) => existing.push_str(text),
-            _ => self.content.push(BuilderContent::Text(text.to_string())),
-        }
-    }
-
-    fn push_thinking(&mut self, thinking: &str) {
-        match self.content.last_mut() {
-            Some(BuilderContent::Thinking(existing)) => existing.push_str(thinking),
-            _ => self
-                .content
-                .push(BuilderContent::Thinking(thinking.to_string())),
-        }
-    }
-
-    fn start_tool_call(&mut self, tool_call: ToolCall) {
-        self.content
-            .push(BuilderContent::ToolCall(ToolCallBuilder::new(tool_call)));
-    }
-
-    fn append_tool_call_delta(&mut self, id: &str, arguments_delta: &str) {
-        if let Some(tool_call) = self.find_tool_call_mut(id) {
-            tool_call.arguments_buffer.push_str(arguments_delta);
-        } else {
-            warn!(
-                tool_call_id = id,
-                "received tool-call delta for unknown tool call"
-            );
-        }
-    }
-
-    fn finish_tool_call(&mut self, id: &str) {
-        if let Some(tool_call) = self.find_tool_call_mut(id) {
-            tool_call.finalize_arguments();
-        }
-    }
-
-    fn finish(self, stop_reason: StopReason, error_message: Option<String>) -> AssistantMessage {
-        let mut content: Vec<ContentBlock> = self
-            .content
-            .into_iter()
-            .map(BuilderContent::into_content_block)
-            .filter(|block| match block {
-                ContentBlock::Text { text } => !text.trim().is_empty(),
-                ContentBlock::Thinking { thinking, .. } => !thinking.trim().is_empty(),
-                _ => true,
-            })
-            .collect();
-        if let Some(message) = &error_message
-            && content.is_empty()
-        {
-            content.push(ContentBlock::Text {
-                text: message.clone(),
-            });
-        }
-        AssistantMessage {
-            content,
-            usage: Default::default(),
-            stop_reason,
-            error_message,
-            provider: self.provider,
-            model: self.model,
-            timestamp: now_millis(),
-            reasoning_details: None,
-        }
-    }
-
-    fn find_tool_call_mut(&mut self, id: &str) -> Option<&mut ToolCallBuilder> {
-        self.content.iter_mut().find_map(|block| match block {
-            BuilderContent::ToolCall(tool_call) if tool_call.id == id => Some(tool_call),
-            _ => None,
-        })
-    }
-}
-
-enum BuilderContent {
-    Text(String),
-    Thinking(String),
-    ToolCall(ToolCallBuilder),
-}
-
-impl BuilderContent {
-    fn into_content_block(self) -> ContentBlock {
-        match self {
-            Self::Text(text) => ContentBlock::Text { text },
-            Self::Thinking(thinking) => ContentBlock::Thinking {
-                thinking,
-                signature: None,
-            },
-            Self::ToolCall(tool_call) => ContentBlock::ToolCall(tool_call.into_tool_call()),
-        }
-    }
-}
-
-struct ToolCallBuilder {
-    id: String,
-    name: String,
-    arguments_value: Option<serde_json::Value>,
-    arguments_buffer: String,
-}
-
-impl ToolCallBuilder {
-    fn new(tool_call: ToolCall) -> Self {
-        Self {
-            id: tool_call.id,
-            name: tool_call.name,
-            arguments_value: Some(tool_call.arguments),
-            arguments_buffer: String::new(),
-        }
-    }
-
-    fn finalize_arguments(&mut self) {
-        if self.arguments_buffer.is_empty() {
-            return;
-        }
-
-        match serde_json::from_str(&self.arguments_buffer) {
-            Ok(arguments) => self.arguments_value = Some(arguments),
-            Err(error) => {
-                self.arguments_value = Some(serde_json::json!({
-                    "_raw": self.arguments_buffer,
-                    "_error": error.to_string(),
-                }));
-            }
-        }
-    }
-
-    fn into_tool_call(mut self) -> ToolCall {
-        self.finalize_arguments();
-        ToolCall {
-            id: self.id,
-            name: self.name,
-            arguments: self.arguments_value.unwrap_or(serde_json::Value::Null),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

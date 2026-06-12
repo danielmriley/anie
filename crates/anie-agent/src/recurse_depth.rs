@@ -13,8 +13,6 @@
 //! payload. This detector reads `details["depth"]` after the
 //! tool finishes and decides whether to fire a warning.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashSet;
 
 /// Default depth at which the warning fires. The controller

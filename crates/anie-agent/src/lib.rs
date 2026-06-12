@@ -4,9 +4,9 @@
 mod agent_loop;
 mod arg_coerce;
 mod failure_loop;
-mod hooks;
 mod recurse;
 mod recurse_depth;
+mod stream_builder;
 mod tool;
 
 pub use agent_loop::{

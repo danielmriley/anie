@@ -21,8 +21,6 @@
 //! acceptable since the goal is "warn loud enough", not
 //! exact-strike accounting.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -52,9 +50,10 @@ pub(crate) struct FailureLoopDetector {
 impl FailureLoopDetector {
     /// Build a new detector. `threshold` is the number of
     /// consecutive failures (with the same tool + args) needed
-    /// to fire a warning. A threshold of `0` disables warning
-    /// emission while still tracking; the controller would
-    /// generally use [`Self::disabled`] instead.
+    /// to fire a warning. To disable the detector entirely the
+    /// controller skips construction altogether: the agent-loop
+    /// config carries `failure_loop_threshold: Option<u32>` and
+    /// only installs a detector when it is `Some(n)`.
     pub(crate) fn new(threshold: u32) -> Self {
         Self {
             threshold,
