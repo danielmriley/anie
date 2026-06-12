@@ -320,6 +320,7 @@ async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     assert!(
         extras.tools.is_empty(),
@@ -342,6 +343,7 @@ async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     assert!(
         extras.tools.is_empty(),
@@ -360,6 +362,7 @@ async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     assert_eq!(
         extras.tools.len(),
@@ -394,6 +397,7 @@ async fn workers_are_not_respawned_on_second_prompt_run() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     let (first_tx, first_store) = {
         let session = controller.rlm_session.as_ref().expect("created on first rlm run");
@@ -406,6 +410,7 @@ async fn workers_are_not_respawned_on_second_prompt_run() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     let session = controller.rlm_session.as_ref().expect("still present");
     assert!(
@@ -448,6 +453,7 @@ async fn session_switch_drops_rlm_state_and_cancels_workers() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     let cancel = controller
         .rlm_session
@@ -491,6 +497,7 @@ async fn summaries_survive_across_runs_within_a_session() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     // Simulate run 1's worker output: archive an entry and
     // attach a summary.
@@ -508,6 +515,7 @@ async fn summaries_survive_across_runs_within_a_session() {
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     let store = Arc::clone(&controller.rlm_session.as_ref().expect("rlm state").external);
     assert_eq!(
@@ -997,6 +1005,124 @@ fn startup_warns_when_prompt_exceeds_half_the_ceiling() {
         prompt_budget_warning(1_000_000, u64::MAX).is_none(),
         "noop ceiling install never warns"
     );
+}
+
+/// rlm2/PR2: with no explicit env override, the rlm ceiling
+/// derives from the allocation budget — effective num_ctx minus
+/// the prompt reserve minus the output reserve — so the working
+/// set genuinely fits in what Ollama will serve.
+#[test]
+fn default_ceiling_derives_from_effective_num_ctx_minus_reserves() {
+    // 16_384 num_ctx − 3_500 prompt reserve − 4_096 default
+    // output reserve = 8_788.
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(None, None, Some(16_384), 3_500),
+        8_788
+    );
+    // ANIE_OUTPUT_RESERVE_TOKENS overrides the output side.
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(None, Some("2048"), Some(16_384), 3_500),
+        16_384 - 3_500 - 2_048
+    );
+    // Unparseable output reserve falls back to the default.
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(None, Some("lots"), Some(16_384), 3_500),
+        8_788
+    );
+}
+
+/// rlm2/PR2: an explicit `ANIE_ACTIVE_CEILING_TOKENS` wins over
+/// the derived default — including the u64::MAX opt-out that
+/// restores the noop fast path.
+#[test]
+fn explicit_ceiling_env_still_wins() {
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(Some("12000"), None, Some(16_384), 3_500),
+        12_000
+    );
+    // The opt-out escape hatch survives the derivation change.
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(
+            Some("18446744073709551615"),
+            None,
+            Some(16_384),
+            3_500
+        ),
+        u64::MAX
+    );
+    // An unparseable explicit value falls through to the
+    // derived default rather than erroring.
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(Some("not-a-number"), None, Some(16_384), 3_500),
+        8_788
+    );
+}
+
+/// rlm2/PR2: a tiny num_ctx minus the reserves can't drive the
+/// ceiling below the 4_096-token floor — we'd rather keep a
+/// usable working set (and let the truncation alarm report the
+/// overflow) than evict the conversation to nothing.
+#[test]
+fn ceiling_floor_holds_for_tiny_num_ctx() {
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(None, None, Some(4_096), 3_500),
+        4_096
+    );
+    // Even when the reserves exceed num_ctx entirely.
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(None, None, Some(2_048), 10_000),
+        4_096
+    );
+}
+
+/// rlm2/PR2: hosted / non-Ollama models have no num_ctx concept
+/// to couple against, so they keep the static 16k default —
+/// behavior unchanged from before the derivation landed.
+#[test]
+fn hosted_models_without_num_ctx_keep_the_static_default_ceiling() {
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(None, None, None, 3_500),
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS
+    );
+    // Explicit env still wins for hosted models too.
+    assert_eq!(
+        resolve_rlm_active_ceiling_tokens(Some("9000"), None, None, 3_500),
+        9_000
+    );
+}
+
+/// rlm2/PR5: with neither env hatch set, the pinned tail is
+/// the 3_072-token default — the old positional default (6
+/// messages) at the 512-token/message conversion, so unset
+/// environments keep their effective behavior.
+#[test]
+fn pin_tail_tokens_default_when_no_env_set() {
+    assert_eq!(resolve_pin_tail_tokens(None, None), 3_072);
+    // Garbage in either hatch falls through to the default.
+    assert_eq!(resolve_pin_tail_tokens(Some("lots"), Some("many")), 3_072);
+    assert_eq!(resolve_pin_tail_tokens(Some(""), Some("")), 3_072);
+}
+
+/// rlm2/PR5: `ANIE_PIN_TAIL_TOKENS` wins outright — over the
+/// default and over the deprecated alias when both are set.
+#[test]
+fn explicit_pin_tail_tokens_env_wins_over_deprecated_alias() {
+    assert_eq!(resolve_pin_tail_tokens(Some("4096"), None), 4_096);
+    assert_eq!(resolve_pin_tail_tokens(Some(" 1024 "), Some("6")), 1_024);
+    assert_eq!(resolve_pin_tail_tokens(Some("0"), Some("6")), 0);
+}
+
+/// rlm2/PR5: the deprecated positional `ANIE_KEEP_LAST_N`
+/// converts onto the token budget at 512 tokens/message —
+/// the old default (6) maps exactly onto the new default
+/// (3_072), so existing setups change nothing.
+#[test]
+fn deprecated_keep_last_n_alias_converts_messages_to_token_budget() {
+    assert_eq!(resolve_pin_tail_tokens(None, Some("6")), 3_072);
+    assert_eq!(resolve_pin_tail_tokens(None, Some("2")), 1_024);
+    assert_eq!(resolve_pin_tail_tokens(None, Some("0")), 0);
+    // Unparseable alias → default, not zero.
+    assert_eq!(resolve_pin_tail_tokens(None, Some("-3")), 3_072);
 }
 
 /// Plan 04 §2d: ledger v2 is a Small-tier behavior with an
@@ -2305,7 +2431,15 @@ async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
         runtime_state,
         provider_registry,
     );
-    let agent = build_agent(&state, None, RlmExtras::empty(), None);
+    let system_prompt = compose_system_prompt(&state);
+    let agent = build_agent(
+        &state,
+        None,
+        RlmExtras::empty(),
+        None,
+        system_prompt,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
+    );
     let (event_tx, _event_rx) = mpsc::channel(16);
 
     let result = agent
@@ -2779,7 +2913,15 @@ async fn context_length_override_applies_to_next_request_without_reload() {
         .handle_action(UiAction::ContextLength(Some("16384".into())))
         .await
         .expect("set context length");
-    let agent = build_agent(&controller.state, None, RlmExtras::empty(), None);
+    let system_prompt = compose_system_prompt(&controller.state);
+    let agent = build_agent(
+        &controller.state,
+        None,
+        RlmExtras::empty(),
+        None,
+        system_prompt,
+        DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
+    );
     let (event_tx, _event_rx) = mpsc::channel(16);
     let result = agent
         .run(

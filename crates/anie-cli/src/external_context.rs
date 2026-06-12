@@ -31,9 +31,125 @@
 //! later — every message anie has ever seen is already
 //! JSONL-persisted under `~/.anie/sessions/`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use anie_protocol::Message;
+use anie_protocol::{ContentBlock, Message};
+
+/// Common English stopwords we drop during tokenization so
+/// they don't dominate keyword overlap. Small fixed set; the
+/// reranker's job is to find topical matches, not common
+/// connective tissue. Kept short on purpose — every word
+/// here is one that appears in nearly every message.
+const STOPWORDS: &[&str] = &[
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "from",
+    "are",
+    "was",
+    "were",
+    "have",
+    "has",
+    "had",
+    "but",
+    "not",
+    "you",
+    "your",
+    "all",
+    "any",
+    "can",
+    "will",
+    "would",
+    "should",
+    "could",
+    "what",
+    "when",
+    "where",
+    "why",
+    "how",
+    "which",
+    "who",
+    "into",
+    "out",
+    "over",
+    "under",
+    "between",
+    "through",
+    "during",
+    "before",
+    "after",
+    "again",
+    "then",
+    "once",
+    "here",
+    "there",
+    "more",
+    "most",
+    "some",
+    "such",
+    "only",
+    "own",
+    "same",
+    "than",
+    "too",
+    "very",
+    "just",
+    "now",
+    "also",
+    "about",
+    "they",
+    "them",
+    "their",
+    "its",
+    "itself",
+    "been",
+    "being",
+    "ourselves",
+];
+
+/// Tokenize text for keyword-overlap scoring: lowercase,
+/// split on non-alphanumeric, drop short tokens, drop
+/// stopwords. Returns a `HashSet` so intersection size
+/// is the score. Lives next to the store (rlm2/PR5)
+/// because [`ExternalContext::push`] caches each archived
+/// message's token set at archive time — the relevance
+/// reranker scores against the cache instead of
+/// re-tokenizing every candidate body on every fire.
+pub(crate) fn tokenize(s: &str) -> HashSet<String> {
+    s.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3 && !STOPWORDS.contains(t))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// First text block in a content vector, if any. Keyword
+/// scoring and the page-in renderer only consider the
+/// textual portion; tool inputs / outputs / images
+/// contribute nothing ("" → zero score).
+pub(crate) fn first_text(blocks: &[ContentBlock]) -> Option<&str> {
+    for b in blocks {
+        if let ContentBlock::Text { text } = b {
+            return Some(text.as_str());
+        }
+    }
+    None
+}
+
+/// Convenience for whole messages: returns the first
+/// text block of the message's content. Custom messages
+/// have no surface text (their payload is opaque JSON).
+pub(crate) fn first_text_of(m: &Message) -> Option<&str> {
+    match m {
+        Message::User(u) => first_text(&u.content),
+        Message::Assistant(a) => first_text(&a.content),
+        Message::ToolResult(t) => first_text(&t.content),
+        Message::Custom(_) => None,
+    }
+}
 
 /// Stable identifier for a message in the [`ExternalContext`].
 /// Position-based (insertion order); IDs do not move when
@@ -91,6 +207,13 @@ pub(crate) struct StoredMessage {
     /// embedder installed), the reranker falls back to
     /// keyword overlap for that candidate.
     pub embedding: Option<Vec<f32>>,
+    /// rlm2/PR5 (perf): the message's keyword token set,
+    /// computed once at archive time. The relevance
+    /// reranker intersects this with the prompt's tokens —
+    /// previously it re-tokenized every candidate body on
+    /// every fire, an O(archive × body length) cost per
+    /// turn that grew with the session.
+    pub tokens: HashSet<String>,
 }
 
 /// Indexed store of messages. Owns its messages; clones
@@ -150,11 +273,15 @@ impl ExternalContext {
                 .push(id);
             self.by_tool_call_id.insert(t.tool_call_id.clone(), id);
         }
+        // rlm2/PR5: tokenize once at archive time so the
+        // reranker scores against the cache every fire.
+        let tokens = first_text_of(&message).map(tokenize).unwrap_or_default();
         self.messages.push(StoredMessage {
             id,
             message,
             summary: None,
             embedding: None,
+            tokens,
         });
         id
     }
@@ -201,7 +328,7 @@ impl ExternalContext {
     /// Returns the slice or `None` if the entry hasn't
     /// been embedded (worker not yet caught up, or no
     /// embedder configured for this run). Production reads
-    /// go through `iter_with_meta`; this accessor exists
+    /// go through `iter_stored`; this accessor exists
     /// for the worker tests.
     #[must_use]
     #[cfg(test)]
@@ -272,23 +399,17 @@ impl ExternalContext {
         self.messages.iter().map(|s| &s.message)
     }
 
-    /// Like `iter` but also exposes each entry's stable id,
-    /// optional summary, and optional embedding. Used by
-    /// the relevance reranker to (1) substitute a summary
-    /// for the full body when the body wouldn't fit under
-    /// the budget, and (2) score by cosine similarity when
-    /// embeddings are available.
-    pub(crate) fn iter_with_meta(
-        &self,
-    ) -> impl Iterator<Item = (MessageId, &Message, Option<&str>, Option<&[f32]>)> {
-        self.messages.iter().map(|s| {
-            (
-                s.id,
-                &s.message,
-                s.summary.as_deref(),
-                s.embedding.as_deref(),
-            )
-        })
+    /// Like `iter` but exposes the full [`StoredMessage`]
+    /// (stable id, optional summary, optional embedding,
+    /// cached token set). Used by the relevance reranker to
+    /// (1) substitute a summary for the full body when the
+    /// body wouldn't fit under the budget, (2) score by
+    /// cosine similarity when embeddings are available, and
+    /// (3) score keyword overlap against the archive-time
+    /// token cache (rlm2/PR5) — all by reference, so
+    /// unselected candidates are never cloned.
+    pub(crate) fn iter_stored(&self) -> impl Iterator<Item = &StoredMessage> {
+        self.messages.iter()
     }
 
     /// Look up the message ID for a `tool_call_id`. None
@@ -484,6 +605,32 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["first", "second", "third"]);
+    }
+
+    /// rlm2/PR5: pushing a message caches its keyword token
+    /// set so the relevance reranker never re-tokenizes
+    /// archived bodies on the turn path. Stopwords are
+    /// already filtered at archive time.
+    #[test]
+    fn push_caches_scoring_token_set_at_archive_time() {
+        let mut store = ExternalContext::new();
+        let id = store.push(user("The Tallahassee weather forecast"));
+        let stored = store.iter_stored().nth(id).expect("present");
+        assert!(stored.tokens.contains("tallahassee"));
+        assert!(stored.tokens.contains("weather"));
+        assert!(stored.tokens.contains("forecast"));
+        assert!(
+            !stored.tokens.contains("the"),
+            "stopwords filtered at archive time"
+        );
+        // Messages with no text block cache an empty set
+        // (score 0) rather than panicking.
+        let tr = store.push(Message::Custom(anie_protocol::CustomMessage {
+            custom_type: "x".into(),
+            content: serde_json::Value::Null,
+            timestamp: now_millis(),
+        }));
+        assert!(store.iter_stored().nth(tr).expect("present").tokens.is_empty());
     }
 
     /// `is_empty` matches `len == 0`.

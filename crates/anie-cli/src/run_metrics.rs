@@ -37,7 +37,12 @@ use crate::harness_mode::HarnessMode;
 /// |         | `prompt.system_prompt_tokens` (plan 04 PR 15), one  |
 /// |         | combined bump. Older artifacts load with both       |
 /// |         | blocks defaulted.                                   |
-pub const RUN_METRICS_SCHEMA_VERSION: u32 = 4;
+/// | 5       | `context` block (rlm2/PR1: eviction + page-in       |
+/// |         | deltas folded off `RlmStatsUpdate`, Ollama prefill  |
+/// |         | totals off `prompt_eval_count`, and the             |
+/// |         | silent-truncation suspicion counter). Older         |
+/// |         | artifacts load with the block defaulted.            |
+pub const RUN_METRICS_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunMetrics {
@@ -70,6 +75,142 @@ pub struct RunMetrics {
     /// artifacts still deserialize.
     #[serde(default)]
     pub prompt: PromptMetrics,
+    /// rlm2/PR1 of `docs/rlm_context_v2/`: context-virtualization
+    /// instrumentation (schema v5). Defaulted so older artifacts
+    /// still deserialize.
+    #[serde(default)]
+    pub context: ContextMetrics,
+}
+
+/// Context-virtualization telemetry (rlm2/PR1). Folds the per-fire
+/// deltas the rlm policy attaches to `AgentEvent::RlmStatsUpdate`
+/// plus Ollama prefill signals off assistant `Usage`:
+///
+/// - `evictions` / `evicted_tokens` / `page_ins` / `page_in_tokens` /
+///   `ledger_tokens_total`: summed over every `RlmStatsUpdate` fire
+///   (one per turn under rlm). Zero on non-rlm runs, which emit no
+///   such event.
+/// - `prefill_tokens_total`: sums Ollama's per-turn
+///   `prompt_eval_count` (mapped onto `Usage::input_tokens`). Counted
+///   only for the `ollama` provider — hosted providers don't carry
+///   prefill semantics, and a turn's input tokens there already live
+///   in `tokens.input_tokens`.
+/// - `truncation_suspected`: increments when a turn's Ollama
+///   `prompt_eval_count` carries the context-shift signature: the
+///   rlm policy's sent estimate (`sent_context_tokens`) exceeded the
+///   effective `num_ctx`, and the prefill count landed near the
+///   window yet under `TRUNCATION_FLOOR_FACTOR` × the estimate —
+///   Ollama re-evaluated a shifted window rather than prefilling
+///   what we sent (the P1 bug class PR2 alarms on). A prefill far
+///   *below* the window is a healthy prefix-cache hit (Ollama's
+///   `prompt_eval_count` counts only newly-evaluated tokens), never
+///   a truncation. Never fires for non-Ollama providers (no
+///   `prompt_eval_count` semantics), never without a measured send,
+///   and never off an errored/aborted reply.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContextMetrics {
+    pub evictions: u64,
+    pub evicted_tokens: u64,
+    pub page_ins: u64,
+    pub page_in_tokens: u64,
+    pub ledger_tokens_total: u64,
+    pub prefill_tokens_total: u64,
+    pub truncation_suspected: u64,
+}
+
+/// The fraction of our sent-context estimate that Ollama's
+/// `prompt_eval_count` must clear to be considered un-truncated.
+/// `estimate_tokens` is a bytes/4 heuristic, so the prefill count
+/// legitimately drifts from it (real tokenizers pack denser on code,
+/// looser on prose); `0.9` is wide enough to absorb that band while
+/// still catching the live bug, where context-shift discards the
+/// whole system prompt + oldest turns and prefill comes in far below
+/// our estimate. PR2 consumes this signal for its alarm.
+const TRUNCATION_FLOOR_FACTOR: f64 = 0.9;
+
+/// The fraction of the effective `num_ctx` a prefill count must
+/// reach before an undershoot is read as a context shift rather
+/// than a prefix-cache hit. Ollama's `prompt_eval_count` counts
+/// only tokens evaluated THIS request: on a healthy append-only
+/// turn the cached prefix covers everything but the new suffix and
+/// the count comes in tiny. A real context shift misaligns the
+/// cached prefix and forces a near-full re-eval of the shifted
+/// window, so prefill lands near `num_ctx`. Requiring at least
+/// half the window separates the two regimes with room for
+/// partial-cache edge cases.
+const TRUNCATION_NEAR_CTX_FACTOR: f64 = 0.5;
+
+/// Provider string that carries `prompt_eval_count` prefill semantics
+/// (`Usage::input_tokens` is Ollama's `prompt_eval_count`). The
+/// truncation detector and prefill total gate on this so hosted
+/// providers are never touched. Shared with the rlm policy's
+/// truncation alarm (rlm2/PR2, `context_virt.rs`).
+pub(crate) const OLLAMA_PROVIDER: &str = "ollama";
+
+/// The PR1 truncation-detector predicate: did Ollama's
+/// `prompt_eval_count` (`prefill_tokens`) come back with the
+/// context-shift signature? Shared between the metrics accumulator
+/// (counts `truncation_suspected`) and the rlm policy's user-facing
+/// alarm (rlm2/PR2) so the two surfaces can never disagree on what
+/// counts as a truncation.
+///
+/// `prompt_eval_count` counts only tokens Ollama evaluated THIS
+/// request — a prefix-cache hit legitimately reports just the new
+/// suffix (or omits the field entirely when the whole prompt was
+/// cached). So a bare undershoot of the sent estimate is NOT a
+/// truncation; the shift signature is all of:
+///
+/// - the sent estimate exceeded the effective `num_ctx` (a shift is
+///   possible at all),
+/// - prefill landed near the window
+///   ([`TRUNCATION_NEAR_CTX_FACTOR`] × `num_ctx` — the shifted
+///   prefix misaligns the cache, forcing a near-full re-eval),
+/// - and prefill still undershot [`TRUNCATION_FLOOR_FACTOR`] × the
+///   sent estimate.
+///
+/// Without a known `num_ctx` (hosted providers, Ollama through a
+/// compat API) the two regimes are indistinguishable, so the
+/// detector stays off. A prefill of 0 (field omitted: fully-cached
+/// prompt, or an errored reply that never reached the model) never
+/// flags.
+pub(crate) fn prefill_indicates_truncation(
+    sent_context_tokens: u64,
+    prefill_tokens: u64,
+    ollama_num_ctx: Option<u64>,
+) -> bool {
+    if sent_context_tokens == 0 || prefill_tokens == 0 {
+        return false;
+    }
+    let Some(num_ctx) = ollama_num_ctx else {
+        return false;
+    };
+    if sent_context_tokens <= num_ctx {
+        return false;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let near_ctx = TRUNCATION_NEAR_CTX_FACTOR * num_ctx as f64;
+    if (prefill_tokens as f64) < near_ctx {
+        // Far below the window: a prefix-cache hit, not a shift.
+        return false;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let floor = TRUNCATION_FLOOR_FACTOR * sent_context_tokens as f64;
+    (prefill_tokens as f64) < floor
+}
+
+/// Did this assistant message come from a completed model turn?
+/// The agent loop synthesizes assistant messages for preflight /
+/// stream failures (`error_assistant_message`) and aborted streams
+/// with the run's real provider string and a fresh timestamp —
+/// those never evaluated the send, so their usage is not a prefill
+/// sample. Shared by the truncation detector here and the rlm
+/// policy's alarm (`context_virt.rs`).
+pub(crate) fn is_completed_reply(reply: &anie_protocol::AssistantMessage) -> bool {
+    reply.error_message.is_none()
+        && !matches!(
+            reply.stop_reason,
+            anie_protocol::StopReason::Error | anie_protocol::StopReason::Aborted
+        )
 }
 
 /// Counters for the plan-03 write-side recovery pipeline, derived
@@ -195,6 +336,19 @@ pub struct RunMetricsAccumulator {
     tool_repair: ToolRepairMetrics,
     recovery: RecoveryMetrics,
     prompt: PromptMetrics,
+    context: ContextMetrics,
+    /// The `sent_context_tokens` from the most recent `RlmStatsUpdate`,
+    /// pending comparison against the NEXT turn's Ollama
+    /// `prompt_eval_count`. `None` until the rlm policy reports a send;
+    /// reset after each comparison so a turn without a fresh
+    /// `RlmStatsUpdate` (non-rlm runs, or the rare fire-less turn)
+    /// can't false-alarm off a stale estimate.
+    pending_sent_context_tokens: Option<u64>,
+    /// The effective `num_ctx` the run requests from Ollama, when
+    /// known (`Some` only for native Ollama chat models). The
+    /// truncation detector needs it to tell a context shift from a
+    /// prefix-cache hit; `None` keeps the detector off.
+    ollama_num_ctx: Option<u64>,
     /// `call_id -> tool_name`, seeded from `ToolExecStart`, so the
     /// nameless `ToolExecEnd` can attribute per-tool outcomes.
     pending_tools: HashMap<String, String>,
@@ -216,8 +370,21 @@ impl RunMetricsAccumulator {
             tool_repair: ToolRepairMetrics::default(),
             recovery: RecoveryMetrics::default(),
             prompt: PromptMetrics::default(),
+            context: ContextMetrics::default(),
+            pending_sent_context_tokens: None,
+            ollama_num_ctx: None,
             pending_tools: HashMap::new(),
         }
+    }
+
+    /// Record the effective Ollama context window (`num_ctx`) the
+    /// run will request — `Some` only for native Ollama chat
+    /// models. Call once at construction time (alongside
+    /// [`Self::set_system_prompt`]); without it the truncation
+    /// detector stays off, because a prefill undershoot can't be
+    /// told apart from a healthy prefix-cache hit.
+    pub fn set_ollama_num_ctx(&mut self, num_ctx: Option<u64>) {
+        self.ollama_num_ctx = num_ctx;
     }
 
     /// Record the composed system prompt's estimated weight (plan 04
@@ -245,6 +412,56 @@ impl RunMetricsAccumulator {
                     .unwrap_or(usage.input_tokens + usage.output_tokens);
                 add_cost(&mut self.cost, &usage.cost);
                 self.turns += 1;
+
+                // rlm2/PR1: prefill telemetry + silent-truncation
+                // detection, Ollama-only. `Usage::input_tokens` is
+                // Ollama's `prompt_eval_count` — the count of context
+                // tokens it actually prefilled this turn.
+                if assistant.provider == OLLAMA_PROVIDER {
+                    self.context.prefill_tokens_total += usage.input_tokens;
+                    // Compare against the context the rlm policy
+                    // reported sending for THIS turn (if any). The
+                    // shift signature (sent above num_ctx, prefill
+                    // near num_ctx yet below the estimate) means
+                    // Ollama context-shifted instead of prefilling
+                    // what we sent. `take()` clears the estimate so
+                    // a later turn without a fresh `RlmStatsUpdate`
+                    // can't re-fire off it. Error/abort-shaped
+                    // replies never evaluated the send, so they are
+                    // not prefill samples.
+                    if let Some(sent) = self.pending_sent_context_tokens.take() {
+                        if is_completed_reply(assistant)
+                            && prefill_indicates_truncation(
+                                sent,
+                                usage.input_tokens,
+                                self.ollama_num_ctx,
+                            )
+                        {
+                            self.context.truncation_suspected += 1;
+                        }
+                    }
+                }
+            }
+            // rlm2/PR1: fold the rlm policy's per-fire deltas into the
+            // context block and stash the sent-context estimate for the
+            // next turn's truncation check.
+            AgentEvent::RlmStatsUpdate {
+                evicted_count,
+                evicted_tokens,
+                paged_in_count,
+                paged_in_tokens,
+                ledger_tokens,
+                sent_context_tokens,
+                ..
+            } => {
+                self.context.evictions += *evicted_count;
+                self.context.evicted_tokens += *evicted_tokens;
+                self.context.page_ins += *paged_in_count;
+                self.context.page_in_tokens += *paged_in_tokens;
+                self.context.ledger_tokens_total += *ledger_tokens;
+                if *sent_context_tokens > 0 {
+                    self.pending_sent_context_tokens = Some(*sent_context_tokens);
+                }
             }
             AgentEvent::ToolExecStart {
                 call_id, tool_name, ..
@@ -344,6 +561,7 @@ impl RunMetricsAccumulator {
             tool_repair: self.tool_repair,
             recovery: self.recovery,
             prompt: self.prompt,
+            context: self.context,
         }
     }
 }
@@ -373,6 +591,44 @@ mod tests {
                 timestamp: 1,
                 reasoning_details: None,
             }),
+        }
+    }
+
+    fn assistant_from(provider: &str, usage: Usage) -> AgentEvent {
+        assistant_stopped(provider, usage, StopReason::Stop)
+    }
+
+    fn assistant_stopped(provider: &str, usage: Usage, stop_reason: StopReason) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            message: Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text { text: "x".into() }],
+                usage,
+                stop_reason,
+                error_message: None,
+                provider: provider.into(),
+                model: "m".into(),
+                timestamp: 1,
+                reasoning_details: None,
+            }),
+        }
+    }
+
+    fn rlm_stats(
+        evicted_count: u64,
+        evicted_tokens: u64,
+        paged_in_count: u64,
+        paged_in_tokens: u64,
+        ledger_tokens: u64,
+        sent_context_tokens: u64,
+    ) -> AgentEvent {
+        AgentEvent::RlmStatsUpdate {
+            archived_messages: 0,
+            evicted_count,
+            evicted_tokens,
+            paged_in_count,
+            paged_in_tokens,
+            ledger_tokens,
+            sent_context_tokens,
         }
     }
 
@@ -410,6 +666,17 @@ mod tests {
 
     fn fold(events: &[AgentEvent]) -> RunMetrics {
         let mut a = acc();
+        for e in events {
+            a.observe(e);
+        }
+        a.finish()
+    }
+
+    /// Like [`fold`], with the effective Ollama window recorded —
+    /// the truncation detector is off without one.
+    fn fold_with_num_ctx(num_ctx: u64, events: &[AgentEvent]) -> RunMetrics {
+        let mut a = acc();
+        a.set_ollama_num_ctx(Some(num_ctx));
         for e in events {
             a.observe(e);
         }
@@ -708,6 +975,246 @@ mod tests {
         a.set_system_prompt(&"x".repeat(400));
         let m = a.finish();
         assert_eq!(m.prompt.system_prompt_tokens, 100);
+    }
+
+    /// rlm2/PR1: the accumulator folds the rlm policy's per-fire
+    /// deltas (off `RlmStatsUpdate`) into the `context` block, and
+    /// sums Ollama's per-turn `prompt_eval_count` (`input_tokens`)
+    /// into `prefill_tokens_total`.
+    #[test]
+    fn rlm_stats_deltas_accumulate_into_context_metrics() {
+        let m = fold_with_num_ctx(16_000, &[
+            rlm_stats(2, 1_500, 1, 600, 80, 9_000),
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 9_000,
+                    output_tokens: 50,
+                    ..Usage::default()
+                },
+            ),
+            rlm_stats(1, 700, 0, 0, 90, 9_500),
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 9_400,
+                    output_tokens: 40,
+                    ..Usage::default()
+                },
+            ),
+        ]);
+        assert_eq!(m.context.evictions, 3);
+        assert_eq!(m.context.evicted_tokens, 2_200);
+        assert_eq!(m.context.page_ins, 1);
+        assert_eq!(m.context.page_in_tokens, 600);
+        assert_eq!(m.context.ledger_tokens_total, 170);
+        // Both turns prefilled close to their estimate — no suspicion.
+        assert_eq!(m.context.prefill_tokens_total, 18_400);
+        assert_eq!(m.context.truncation_suspected, 0);
+    }
+
+    /// rlm2/PR1: a turn carrying the context-shift signature —
+    /// sent estimate above `num_ctx`, prefill near the window yet
+    /// under 0.9× the estimate — is flagged as a suspected silent
+    /// truncation (the P1 context-shift bug). A turn that prefills
+    /// near-estimate is not.
+    #[test]
+    fn truncation_suspected_increments_on_context_shift_signature() {
+        let m = fold_with_num_ctx(12_000, &[
+            // Sent ~16k into a 12k window; Ollama re-evaluated the
+            // shifted window (~8k of it) → context-shift.
+            rlm_stats(0, 0, 0, 0, 100, 16_000),
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 8_000,
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            ),
+            // Sent ~16k, prefilled ~15.5k (within the heuristic band) → fine.
+            rlm_stats(0, 0, 0, 0, 100, 16_000),
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 15_500,
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            ),
+        ]);
+        assert_eq!(m.context.truncation_suspected, 1);
+    }
+
+    /// Regression (rlm2 review): Ollama's `prompt_eval_count`
+    /// counts only newly-evaluated tokens, so on a healthy
+    /// append-only turn the prefix cache covers everything but the
+    /// new suffix and the count comes in tiny. That undershoot is a
+    /// cache HIT, not a truncation — flagging it would invert the
+    /// alarm and fire on every well-behaved multi-turn rlm run.
+    #[test]
+    fn prefix_cache_hit_prefill_is_not_truncation() {
+        let m = fold_with_num_ctx(12_000, &[
+            // Send fits the window: no shift is possible, however
+            // small the prefill.
+            rlm_stats(0, 0, 0, 0, 100, 9_000),
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 300,
+                    ..Usage::default()
+                },
+            ),
+            // Even over the window, a prefill far below it is the
+            // suffix-only cache-hit shape, not a shifted re-eval.
+            rlm_stats(0, 0, 0, 0, 100, 16_000),
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 300,
+                    ..Usage::default()
+                },
+            ),
+            // A fully-cached prompt omits `prompt_eval_count`
+            // entirely (input_tokens = 0).
+            rlm_stats(0, 0, 0, 0, 100, 16_000),
+            assistant_from("ollama", Usage::default()),
+        ]);
+        assert_eq!(m.context.truncation_suspected, 0);
+    }
+
+    /// Without a known `num_ctx` (hosted runs, compat APIs) a
+    /// prefill undershoot can't be told apart from a cache hit, so
+    /// the detector stays off entirely.
+    #[test]
+    fn truncation_detector_is_off_without_a_known_num_ctx() {
+        let m = fold(&[
+            rlm_stats(0, 0, 0, 0, 100, 16_000),
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 8_000,
+                    ..Usage::default()
+                },
+            ),
+        ]);
+        assert_eq!(m.context.truncation_suspected, 0);
+    }
+
+    /// Regression (rlm2 review): the agent loop synthesizes
+    /// assistant messages for stream failures and aborts with the
+    /// real provider string — those never evaluated the send, so
+    /// they must not consume the estimate as a truncation sample.
+    #[test]
+    fn errored_or_aborted_replies_are_not_prefill_samples() {
+        for stop_reason in [StopReason::Error, StopReason::Aborted] {
+            let m = fold_with_num_ctx(12_000, &[
+                rlm_stats(0, 0, 0, 0, 100, 16_000),
+                // Shift-shaped usage on an error-shaped reply.
+                assistant_stopped(
+                    "ollama",
+                    Usage {
+                        input_tokens: 8_000,
+                        ..Usage::default()
+                    },
+                    stop_reason,
+                ),
+            ]);
+            assert_eq!(
+                m.context.truncation_suspected, 0,
+                "{stop_reason:?} replies are not prefill samples"
+            );
+        }
+    }
+
+    /// Unit coverage of the shared predicate: only the full
+    /// context-shift signature flags.
+    #[test]
+    fn prefill_predicate_requires_the_full_shift_signature() {
+        // The shift signature: sent over the window, prefill near it.
+        assert!(prefill_indicates_truncation(16_000, 8_000, Some(12_000)));
+        // Near-estimate prefill: healthy full prefill.
+        assert!(!prefill_indicates_truncation(16_000, 15_500, Some(12_000)));
+        // Prefill far below the window: cache hit.
+        assert!(!prefill_indicates_truncation(16_000, 300, Some(12_000)));
+        // Send fits the window: no shift possible.
+        assert!(!prefill_indicates_truncation(9_000, 300, Some(12_000)));
+        // Omitted prompt_eval_count (fully cached prompt).
+        assert!(!prefill_indicates_truncation(16_000, 0, Some(12_000)));
+        // Unknown window: detector off.
+        assert!(!prefill_indicates_truncation(16_000, 8_000, None));
+    }
+
+    /// rlm2/PR1: the detector must never fire on a hosted provider —
+    /// `prompt_eval_count` semantics don't apply there, so a low
+    /// `input_tokens` relative to our estimate is not a truncation.
+    /// The prefill total stays Ollama-only too.
+    #[test]
+    fn truncation_never_suspected_for_non_ollama_provider() {
+        let m = fold_with_num_ctx(12_000, &[
+            rlm_stats(0, 0, 0, 0, 100, 16_000),
+            // Shift-shaped numbers, hosted provider → never flags.
+            assistant_from(
+                "openai",
+                Usage {
+                    input_tokens: 8_000,
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            ),
+        ]);
+        assert_eq!(m.context.truncation_suspected, 0);
+        assert_eq!(m.context.prefill_tokens_total, 0);
+    }
+
+    /// rlm2/PR1: a `RlmStatsUpdate` with no following assistant turn
+    /// (or a stale estimate) can't leak into a later turn's check —
+    /// the estimate is consumed (`take`) on the first Ollama turn.
+    #[test]
+    fn truncation_estimate_does_not_carry_across_turns() {
+        let m = fold_with_num_ctx(12_000, &[
+            rlm_stats(0, 0, 0, 0, 0, 16_000),
+            // First Ollama turn consumes the estimate (shift signature).
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 8_000,
+                    ..Usage::default()
+                },
+            ),
+            // Second turn has no fresh estimate — must not re-fire.
+            assistant_from(
+                "ollama",
+                Usage {
+                    input_tokens: 8_000,
+                    ..Usage::default()
+                },
+            ),
+        ]);
+        assert_eq!(m.context.truncation_suspected, 1);
+    }
+
+    /// Forward-compat: a schema-v4 artifact (no `context` block)
+    /// loads with the block defaulted, not an error.
+    #[test]
+    fn v4_metrics_artifact_loads_with_context_block_defaulted() {
+        let v4 = serde_json::json!({
+            "schema_version": 4,
+            "harness_mode": "rlm",
+            "model": "m",
+            "provider": "ollama",
+            "wall_clock_ms": 5,
+            "turns": 1,
+            "tokens": TokenMetrics::default(),
+            "cost": Cost::default(),
+            "tools": ToolMetrics::default(),
+            "compaction": CompactionMetrics::default(),
+            "tool_repair": ToolRepairMetrics::default(),
+            "recovery": RecoveryMetrics::default(),
+            "prompt": PromptMetrics::default(),
+        });
+        let back: RunMetrics = serde_json::from_value(v4).expect("v4 artifact loads");
+        assert_eq!(back.context, ContextMetrics::default());
     }
 
     #[test]

@@ -30,6 +30,15 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
         // Plan 04 PR15: record the composed system-prompt weight so
         // the eval matrix can track prompt-budget regressions.
         accumulator.set_system_prompt(&crate::controller::compose_system_prompt(&state));
+        // rlm2 review fix: the truncation detector needs the window
+        // the run will request — without it a prefill undershoot
+        // (a healthy prefix-cache hit) can't be told apart from a
+        // context shift, so the detector stays off. Only native
+        // Ollama chat models carry a `num_ctx`.
+        accumulator.set_ollama_num_ctx(
+            (state.config.current_model().api == anie_provider::ApiKind::OllamaChatApi)
+                .then(|| state.config.effective_ollama_context_window()),
+        );
         accumulator
     });
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel(256);

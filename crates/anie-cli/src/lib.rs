@@ -83,10 +83,14 @@ pub struct Cli {
     /// `rlm` turns on context virtualization end-to-end —
     /// installs the `recurse` tool plus the active-context
     /// ceiling, FIFO eviction, ledger injection, and
-    /// relevance-based paging-in. Defaults: 16k token
-    /// ceiling, last 6 messages pinned, ceiling/4 relevance
-    /// budget. Override via `ANIE_ACTIVE_CEILING_TOKENS`,
-    /// `ANIE_KEEP_LAST_N`, `ANIE_RELEVANCE_BUDGET_TOKENS`.
+    /// relevance-based paging-in. Defaults: ceiling derived
+    /// from the effective Ollama num_ctx minus prompt/output
+    /// reserves (16k static for non-Ollama models), a
+    /// 3072-token pinned tail, ceiling/4 relevance budget.
+    /// Override via `ANIE_ACTIVE_CEILING_TOKENS`,
+    /// `ANIE_OUTPUT_RESERVE_TOKENS`, `ANIE_PIN_TAIL_TOKENS`
+    /// (deprecated positional alias: `ANIE_KEEP_LAST_N`),
+    /// `ANIE_RELEVANCE_BUDGET_TOKENS`.
     /// Plan `docs/rlm_2026-04-29/07_evaluation_harness.md`.
     #[arg(long, value_enum, default_value_t = harness_mode::HarnessMode::default())]
     pub harness_mode: harness_mode::HarnessMode,

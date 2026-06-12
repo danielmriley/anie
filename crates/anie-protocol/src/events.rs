@@ -73,7 +73,25 @@ pub enum AgentEvent {
     /// `archive: N msgs` segment of the status bar without
     /// needing a full `StatusUpdate` (which the controller
     /// only emits at user-action boundaries).
-    RlmStatsUpdate { archived_messages: u64 },
+    RlmStatsUpdate {
+        archived_messages: u64,
+        /// Per-fire deltas (rlm2/PR1 instrumentation). The RunMetrics
+        /// accumulator folds these into its `context` block. This is an
+        /// in-process event (not serde-serialized), so the additive
+        /// fields are plain `u64`s; the serializable RPC/replay mirror
+        /// in `anie-cli` is where `#[serde(default)]` lives.
+        evicted_count: u64,
+        evicted_tokens: u64,
+        paged_in_count: u64,
+        paged_in_tokens: u64,
+        ledger_tokens: u64,
+        /// `estimate_tokens` of the context this fire is about to send
+        /// (survivors + paged-in + ledger). The truncation detector
+        /// (rlm2/PR1, consumed by PR2) compares the next turn's
+        /// Ollama `prompt_eval_count` against this; `0` when the policy
+        /// didn't measure a send.
+        sent_context_tokens: u64,
+    },
     /// Status-bar state changed outside provider-stream events.
     StatusUpdate {
         provider: String,

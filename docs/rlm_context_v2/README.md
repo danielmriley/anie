@@ -58,3 +58,25 @@ live budget-overflow bug.
       default config (the P1 bug class is structurally gone).
 - [ ] rlm retains its wins (repo_map_cold_start, verify_broken_fixture).
 - [ ] No regression on the qwen3.5:0.8b time-scenario field result.
+
+## Status (2026-06-12)
+
+PR1-PR5 implemented (sequential pipeline + integration gate + two
+adversarial reviewers + fix round). Review caught and fixed four
+findings pre-commit: the truncation detector now distinguishes
+context-shift from healthy prefix-cache hits (critical — Ollama's
+prompt_eval_count counts only newly-evaluated tokens); errored
+replies no longer trip the alarm; eviction is tool-call/result
+pair-atomic; policy-injected reminders no longer shadow the real
+user prompt for pinning/reranking/sticky-keying.
+
+Known deferrals: (1) ledger byte-stability is defeated when the
+async summarizer/embedder count lines change between turns — the
+no-op fast path then misses; fix candidate is dropping the count
+lines from the ledger (model-inert telemetry) at the cost of
+re-pinning the Full-tier ledger fixture. (2) repo-map tokens are
+double-reserved in the ceiling derivation (conservative direction).
+(3) page-in body-size gate measures the raw body but charges the
+rendered section (off-by-prefix).
+
+Exit gate: corpus matrix re-run pending below.

@@ -9,29 +9,44 @@
 //! turn, and injects a per-turn ledger telling the model
 //! what's externally available. When the run's active context
 //! exceeds the ceiling, the policy: (1) evicts oldest
-//! messages pinning the last N; (2) archives every snapshot
+//! messages pinning a token-budgeted tail; (2) archives every snapshot
 //! message to the shared [`ExternalContext`] so the recurse
 //! tool can still reach evicted content; (3) scores evicted
 //! content against the current user prompt via keyword
-//! overlap and pages back in the highest-scoring messages
-//! within `relevance_budget_tokens`; (4) builds a structured
-//! ledger; (5) returns
-//! `BeforeModelResponse::ReplaceMessages(working + ledger)`.
+//! overlap and recalls the highest scorers — within
+//! `relevance_budget_tokens` and the per-run budget — into
+//! one consolidated archive-recall message (rlm2/PR4);
+//! (4) builds a structured ledger; (5) returns
+//! `BeforeModelResponse::ReplaceMessages(working + recall +
+//! ledger)`.
 //!
 //! Pinning rules (eviction-resistant):
 //! - The latest `User` message is always preserved
 //!   (rlm/17). Without this, tight ceilings can evict the
 //!   user's directive itself, leading the model to
 //!   confabulate a task from contextual cues.
-//! - The last `keep_last_n` messages by position are
-//!   preserved. Protects turn continuity (current prompt
-//!   + recent assistant/tool work).
+//! - The latest `Assistant` message is always preserved
+//!   (rlm2/PR5) — the model's own most recent reasoning.
+//! - A token-budgeted trailing window is preserved
+//!   (rlm2/PR5): the longest suffix whose estimated total
+//!   fits `pin_tail_tokens` (default 3_072; the deprecated
+//!   positional `ANIE_KEEP_LAST_N` converts at 512
+//!   tokens/message). The trailing message is always
+//!   pinned regardless of size. Protects turn continuity
+//!   (current prompt + recent assistant/tool work) by cost
+//!   rather than by count.
 //!
-//! These two pins compose: a pinned user message can be at
-//! any position; the pinned tail is always the trailing
-//! window. When both pins together exceed the ceiling, the
-//! policy stops evicting and accepts being over budget —
-//! correctness over budget compliance.
+//! These pins compose: the pinned user/assistant messages
+//! can be at any position; the pinned tail is always the
+//! trailing window. When the pins together exceed the
+//! ceiling, the policy stops evicting and accepts being
+//! over budget — correctness over budget compliance.
+//!
+//! Eviction order (rlm2/PR5): supersedable failures, then
+//! stale failures, then the oldest LARGE tool results
+//! (> 1_024 estimated tokens), then standard FIFO — one
+//! stale file dump frees more ceiling than dozens of small
+//! narrative texts.
 //!
 //! The ledger is a `User` message wrapped in
 //! `<system-reminder>` tags — universally compatible with
@@ -44,11 +59,11 @@
 //! 3-char minimum, common stopwords filtered); each evicted
 //! message is tokenized the same way; score is the size of
 //! the token-set intersection. Tie-break by recency. Cheap
-//! enough to run on every fire. When a candidate's full
-//! body wouldn't fit under the budget, the reranker falls
-//! back to the Phase-F summary (if one's been written)
-//! before skipping — fitting more relevant matches into
-//! the same budget at lossy fidelity.
+//! enough to run on every fire. Selection is summaries-first
+//! (rlm2/PR4): a scored candidate contributes its Phase-F
+//! summary when one exists; its full body only when no
+//! summary exists and the body is small. The recurse tool
+//! covers the fidelity gap.
 //!
 //! Identity / dedup: messages are tracked by `timestamp`. The
 //! agent loop generates one message per `now_millis()`
@@ -65,22 +80,59 @@
 //! default builds keep the noop policy. Setting
 //! `ANIE_ACTIVE_CEILING_TOKENS` to a finite value turns on
 //! the full eviction + ledger + relevance pipeline.
+//!
+//! Hysteresis (rlm2/PR3, `docs/rlm_context_v2/03_hysteresis.md`):
+//! eviction is batched — when the running total breaches the
+//! ceiling, the policy evicts down to a low-water mark
+//! (`ceiling × ANIE_EVICT_LOW_WATER_PCT`, default 0.6) in one
+//! pass, so the turns that follow append without evicting.
+//! Append-only turns take a no-op fast path: when nothing was
+//! evicted or paged in and the rebuilt ledger (and rebuilt
+//! archive-recall message, when one exists) would be
+//! byte-identical to what's already in the context, the
+//! policy returns `Continue` — the existing messages stay in
+//! place (the prompt prefix is a pure extension of the
+//! previous turn's, so Ollama's prefix cache holds) and only
+//! the store-side archiving of new messages runs.
+//!
+//! Page-in v2 (rlm2/PR4, `docs/rlm_context_v2/04_page_in_v2.md`):
+//! recalled archive content is summaries-first — the reranker
+//! pages in the Phase-F summary when one exists; full bodies
+//! page in only when no summary exists AND the body is under
+//! [`PAGE_IN_BODY_MAX_TOKENS`] (`ANIE_PAGE_IN_BODIES=1`
+//! restores the old bodies-preferred behavior for A/B). All
+//! recalled content renders inside ONE consolidated
+//! `<system-reminder source="archive-recall">` message placed
+//! immediately before the ledger — never interleaved into the
+//! transcript as fake user turns. Recalled items are sticky:
+//! keyed by the latest user prompt's timestamp, an item stays
+//! in the recall message (and is never re-paged) until the
+//! prompt changes; because recalled content never enters the
+//! working set, it is structurally exempt from FIFO eviction.
+//! Total page-in spend per run is capped by
+//! `ANIE_PAGE_IN_RUN_BUDGET` (default 8192 tokens); the
+//! counter lives in session-scoped [`PageInRunState`] so
+//! continuation runs (same prompt, fresh per-run policy)
+//! share it, and it resets when the prompt timestamp changes.
 
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 use anie_agent::{BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, stable_args_hash};
-use anie_protocol::{AgentEvent, ContentBlock, Message, UserMessage, now_millis};
+use anie_protocol::{AgentEvent, AssistantMessage, ContentBlock, Message, UserMessage, now_millis};
 use anie_session::estimate_tokens;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::external_context::{ExternalContext, MessageKindLabel};
+use crate::external_context::{
+    ExternalContext, MessageId, MessageKindLabel, StoredMessage, first_text, first_text_of,
+    tokenize,
+};
 
 /// Extract a Message's timestamp, regardless of variant.
 fn message_timestamp(m: &Message) -> u64 {
@@ -92,127 +144,41 @@ fn message_timestamp(m: &Message) -> u64 {
     }
 }
 
-/// Common English stopwords we drop during tokenization so
-/// they don't dominate keyword overlap. Small fixed set; the
-/// reranker's job is to find topical matches, not common
-/// connective tissue. Kept short on purpose — every word
-/// here is one that appears in nearly every message.
-const STOPWORDS: &[&str] = &[
-    "the",
-    "and",
-    "for",
-    "with",
-    "this",
-    "that",
-    "from",
-    "are",
-    "was",
-    "were",
-    "have",
-    "has",
-    "had",
-    "but",
-    "not",
-    "you",
-    "your",
-    "all",
-    "any",
-    "can",
-    "will",
-    "would",
-    "should",
-    "could",
-    "what",
-    "when",
-    "where",
-    "why",
-    "how",
-    "which",
-    "who",
-    "into",
-    "out",
-    "over",
-    "under",
-    "between",
-    "through",
-    "during",
-    "before",
-    "after",
-    "again",
-    "then",
-    "once",
-    "here",
-    "there",
-    "more",
-    "most",
-    "some",
-    "such",
-    "only",
-    "own",
-    "same",
-    "than",
-    "too",
-    "very",
-    "just",
-    "now",
-    "also",
-    "about",
-    "they",
-    "them",
-    "their",
-    "its",
-    "itself",
-    "been",
-    "being",
-    "ourselves",
-];
-
-/// Tokenize text for keyword-overlap scoring: lowercase,
-/// split on non-alphanumeric, drop short tokens, drop
-/// stopwords. Returns a `HashSet` so intersection size
-/// is the score.
-fn tokenize(s: &str) -> HashSet<String> {
-    s.to_ascii_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 3 && !STOPWORDS.contains(t))
-        .map(|t| t.to_string())
-        .collect()
+/// rlm2/PR4: is this message the policy's consolidated
+/// archive-recall reminder? Content guard used alongside the
+/// `last_recall_ts` timestamp match when stripping, so a
+/// same-millisecond collision with the ledger (both are
+/// `now_millis()`-stamped in the same fire) can't capture the
+/// wrong message.
+fn is_archive_recall(m: &Message) -> bool {
+    first_text_of(m).is_some_and(|t| t.starts_with(ARCHIVE_RECALL_OPEN))
 }
 
-/// First text block in a content vector, if any. The
-/// reranker only scores the textual portion; tool inputs /
-/// outputs / images get summarized to "" (zero score) for
-/// v1.
-fn first_text(blocks: &[ContentBlock]) -> Option<&str> {
-    for b in blocks {
-        if let ContentBlock::Text { text } = b {
-            return Some(text.as_str());
-        }
-    }
-    None
+/// rlm2 review fix: policy-injected reminders (the repo map, the
+/// ledger, the archive-recall message) ride the `User` variant on
+/// the wire but are NOT the user's directive. The repo-map policy
+/// in particular re-appends its `<system-reminder source="repo-
+/// map">` message with a fresh timestamp AFTER the real prompt, so
+/// any "latest user message" lookup that doesn't skip reminders
+/// targets the repo map instead of the user's question — wrong
+/// eviction pin, wrong reranker keywords, wrong sticky page-in
+/// key. The ledger/recall are stripped before these run; this
+/// guard covers every other reminder-shaped injection.
+fn is_reminder_user(u: &UserMessage) -> bool {
+    first_text(&u.content).is_some_and(|t| t.trim_start().starts_with("<system-reminder"))
 }
 
-/// Convenience for whole messages: returns the first
-/// text block of the message's content. Used by the
-/// archive-time embed enqueue path. Custom messages
-/// have no surface text (their payload is opaque
-/// JSON).
-fn first_text_of(m: &Message) -> Option<&str> {
-    match m {
-        Message::User(u) => first_text(&u.content),
-        Message::Assistant(a) => first_text(&a.content),
-        Message::ToolResult(t) => first_text(&t.content),
-        Message::Custom(_) => None,
-    }
-}
-
-/// Tokenize the most recent `User` message in `working` —
-/// our proxy for "the model's current request." Returns
-/// `None` when no user message has any text content (rare;
-/// e.g., images-only) so the reranker can short-circuit.
+/// Tokenize the most recent real `User` message in `working`
+/// (policy-injected reminders skipped) — our proxy for "the
+/// model's current request." Returns `None` when no user message
+/// has any text content (rare; e.g., images-only) so the reranker
+/// can short-circuit.
 fn current_prompt_tokens(working: &[Message]) -> Option<HashSet<String>> {
     for m in working.iter().rev() {
         if let Message::User(u) = m {
+            if is_reminder_user(u) {
+                continue;
+            }
             if let Some(text) = first_text(&u.content) {
                 let toks = tokenize(text);
                 if !toks.is_empty() {
@@ -224,13 +190,15 @@ fn current_prompt_tokens(working: &[Message]) -> Option<HashSet<String>> {
     None
 }
 
-/// The latest `User` message's first text block + its
-/// timestamp — the input to the prompt-embedding cache.
-/// `None` when no user message carries text (e.g.,
-/// images-only).
+/// The latest real `User` message's first text block + its
+/// timestamp (policy-injected reminders skipped) — the input to
+/// the prompt-embedding cache and the sticky page-in key. `None`
+/// when no user message carries text (e.g., images-only).
 fn latest_user_prompt(working: &[Message]) -> Option<(String, u64)> {
     working.iter().rev().find_map(|m| match m {
-        Message::User(u) => first_text(&u.content).map(|t| (t.to_string(), u.timestamp)),
+        Message::User(u) if !is_reminder_user(u) => {
+            first_text(&u.content).map(|t| (t.to_string(), u.timestamp))
+        }
         _ => None,
     })
 }
@@ -239,9 +207,13 @@ fn latest_user_prompt(working: &[Message]) -> Option<(String, u64)> {
 /// paging back in. Carries the score (cosine similarity
 /// when embeddings are available, keyword-overlap intersection
 /// size cast to f32 otherwise), the archive entry's stable id
-/// (for the summary-fallback annotation), the full message
-/// body, and the optional pre-computed summary.
-struct RelevanceCandidate {
+/// (for the summary-fallback annotation), and BORROWED views
+/// of the message body and optional summary. rlm2/PR5 (perf):
+/// candidates borrow from the store for the whole
+/// score-and-select pass; the only owned data the reranker
+/// produces is the rendered section text of selected items —
+/// unselected bodies are never cloned.
+struct RelevanceCandidate<'a> {
     /// Cosine similarity in [-1, 1] when scored by
     /// embedding; intersection-size as f32 when scored by
     /// keyword overlap. Higher is better for both — we
@@ -249,48 +221,155 @@ struct RelevanceCandidate {
     /// fallback only fires per-candidate (we never mix
     /// scores in the same sort).
     score: f32,
-    id: crate::external_context::MessageId,
-    message: Message,
-    summary: Option<String>,
+    id: MessageId,
+    message: &'a Message,
+    summary: Option<&'a str>,
 }
 
-/// Score a candidate using the best available signal. If
-/// both the prompt and the candidate have embeddings,
-/// returns cosine similarity (range [-1, 1]). Otherwise
-/// falls back to keyword overlap (intersection size cast
-/// to f32, range [0, ∞)). The two scales aren't
-/// commensurate but they only ever appear in the same
-/// sort when the run is mid-warmup (some candidates
-/// embedded, some not) — both are "higher is better" so
-/// the relative ordering remains useful in either
-/// regime.
+/// Score a stored candidate using the best available
+/// signal. If both the prompt and the candidate have
+/// embeddings, returns cosine similarity (range [-1, 1]).
+/// Otherwise falls back to keyword overlap — the size of
+/// the intersection between the prompt's tokens and the
+/// candidate's token set cached at archive time (rlm2/PR5;
+/// previously every fire re-tokenized every candidate
+/// body). The two scales aren't commensurate but they only
+/// ever appear in the same sort when the run is mid-warmup
+/// (some candidates embedded, some not) — both are "higher
+/// is better" so the relative ordering remains useful in
+/// either regime.
 fn score_candidate(
     prompt_embed: Option<&[f32]>,
     prompt_tokens: &HashSet<String>,
-    candidate_embed: Option<&[f32]>,
-    candidate_message: &Message,
+    candidate: &StoredMessage,
 ) -> f32 {
-    if let (Some(p), Some(c)) = (prompt_embed, candidate_embed) {
+    if let (Some(p), Some(c)) = (prompt_embed, candidate.embedding.as_deref()) {
         return crate::embedder::cosine_similarity(p, c);
     }
-    score_message(prompt_tokens, candidate_message) as f32
+    prompt_tokens.intersection(&candidate.tokens).count() as f32
 }
 
-/// Score a candidate message against tokenized prompt
-/// keywords. The score is the size of the intersection of
-/// the prompt's tokens and the message's tokens. Tool
-/// results, assistants, and users all contribute their
-/// first text block; custom messages get score 0.
-fn score_message(prompt_tokens: &HashSet<String>, m: &Message) -> usize {
-    let text = match m {
-        Message::User(u) => first_text(&u.content),
-        Message::Assistant(a) => first_text(&a.content),
-        Message::ToolResult(t) => first_text(&t.content),
-        Message::Custom(_) => None,
+/// rlm2/PR3: default low-water fraction for batch eviction.
+/// Evicting to exactly the ceiling means the very next append
+/// breaches it again — eviction (and the prefix-breaking
+/// ledger rebuild) every turn. Evicting down to 60% of the
+/// ceiling buys ~40% of the ceiling in append-only headroom.
+const DEFAULT_EVICT_LOW_WATER_PCT: f64 = 0.6;
+
+/// rlm2/PR3: parse the low-water fraction from an
+/// `ANIE_EVICT_LOW_WATER_PCT` value. Clamped to [0.3, 0.9]:
+/// below 0.3 a breach throws away most of the context;
+/// above 0.9 the hysteresis band is too thin to matter.
+/// Non-finite or unparseable values fall back to the default
+/// (same convention as `resolve_rlm_active_ceiling_tokens`).
+fn resolve_evict_low_water_pct(env_value: Option<&str>) -> f64 {
+    let Some(raw) = env_value else {
+        return DEFAULT_EVICT_LOW_WATER_PCT;
     };
-    let Some(text) = text else { return 0 };
-    let msg_tokens = tokenize(text);
-    prompt_tokens.intersection(&msg_tokens).count()
+    match raw.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() => v.clamp(0.3, 0.9),
+        _ => DEFAULT_EVICT_LOW_WATER_PCT,
+    }
+}
+
+/// `ANIE_EVICT_LOW_WATER_PCT`, parsed once per process.
+fn env_evict_low_water_pct() -> f64 {
+    static PCT: LazyLock<f64> = LazyLock::new(|| {
+        resolve_evict_low_water_pct(std::env::var("ANIE_EVICT_LOW_WATER_PCT").ok().as_deref())
+    });
+    *PCT
+}
+
+/// rlm2/PR4: default per-run page-in spend cap. The old
+/// per-turn-only budget let the navigation family re-page the
+/// same bodies turn after turn (the 66k-token bill in the
+/// corpus evidence); 8k tokens per run keeps recall useful
+/// while bounding the total tax.
+const DEFAULT_PAGE_IN_RUN_BUDGET_TOKENS: u64 = 8192;
+
+/// rlm2/PR4: a body with no summary pages in only when it's
+/// smaller than this. Anything larger is reachable via the
+/// recurse tool (the ledger says so) — pushing it inline is
+/// exactly the FIFO-displacement churn page-in v2 removes.
+const PAGE_IN_BODY_MAX_TOKENS: u64 = 512;
+
+/// rlm2/PR5: size-aware eviction threshold. Among evictable
+/// messages, tool results estimated above this evict before
+/// standard FIFO — a 4k-token file dump from twenty turns
+/// ago costs more than every small assistant note combined,
+/// while the small texts carry the narrative continuity.
+const LARGE_TOOL_RESULT_EVICT_TOKENS: u64 = 1_024;
+
+/// Opening tag of the consolidated archive-recall message.
+/// The `source` attribute distinguishes it from the ledger's
+/// plain `<system-reminder>` so the two can be stripped and
+/// byte-compared independently.
+const ARCHIVE_RECALL_OPEN: &str = "<system-reminder source=\"archive-recall\">";
+
+/// rlm2/PR4: parse the per-run page-in budget from an
+/// `ANIE_PAGE_IN_RUN_BUDGET` value. Unparseable values fall
+/// back to the default (same convention as
+/// `resolve_evict_low_water_pct`); 0 disables page-in for the
+/// run entirely.
+fn resolve_page_in_run_budget(env_value: Option<&str>) -> u64 {
+    env_value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PAGE_IN_RUN_BUDGET_TOKENS)
+}
+
+/// `ANIE_PAGE_IN_RUN_BUDGET`, parsed once per process.
+fn env_page_in_run_budget() -> u64 {
+    static BUDGET: LazyLock<u64> = LazyLock::new(|| {
+        resolve_page_in_run_budget(std::env::var("ANIE_PAGE_IN_RUN_BUDGET").ok().as_deref())
+    });
+    *BUDGET
+}
+
+/// rlm2/PR4: parse the `ANIE_PAGE_IN_BODIES` A/B escape hatch
+/// — truthy restores the pre-PR4 bodies-preferred page-in
+/// selection (full body when it fits the budget, summary as
+/// the fallback). Same truthy set as the controller's
+/// `env_flag_enabled`.
+fn resolve_page_in_bodies(env_value: Option<&str>) -> bool {
+    matches!(
+        env_value.map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// `ANIE_PAGE_IN_BODIES`, parsed once per process.
+fn env_page_in_bodies() -> bool {
+    static BODIES: LazyLock<bool> = LazyLock::new(|| {
+        resolve_page_in_bodies(std::env::var("ANIE_PAGE_IN_BODIES").ok().as_deref())
+    });
+    *BODIES
+}
+
+/// rlm2/PR4: sticky page-in state, session-scoped (owned by
+/// the controller's `RlmSessionState`, shared with each
+/// per-run policy) but keyed by the latest user prompt's
+/// timestamp — so it resets exactly at run granularity (a
+/// fresh prompt is a fresh run) while surviving the per-run
+/// policy rebuilds of continuation runs, which share the
+/// prompt and therefore the budget and the sticky set.
+#[derive(Default)]
+pub(crate) struct PageInRunState {
+    /// Timestamp of the user prompt the sticky set and spend
+    /// counter belong to. A fire that sees a different latest
+    /// prompt timestamp resets the whole state.
+    prompt_ts: Option<u64>,
+    /// Rendered recall sections in page-in order. Append-only
+    /// for the lifetime of a prompt, so re-rendering the
+    /// consolidated recall message is byte-stable when no new
+    /// item paged in — the no-op fast path depends on this.
+    sticky_sections: Vec<String>,
+    /// Timestamps of archive messages already recalled for
+    /// this prompt. The same item is never paged in twice for
+    /// one prompt.
+    sticky_ts: HashSet<u64>,
+    /// Estimated tokens spent on page-in this run, compared
+    /// against the per-run budget.
+    spent_tokens: u64,
 }
 
 /// Active-context ceiling + FIFO eviction policy.
@@ -306,14 +385,30 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// short-circuits on every call).
     active_ceiling_tokens: u64,
 
-    /// Always keep the last N messages, regardless of
-    /// ceiling. Protects turn continuity — the model needs to
-    /// see what just happened (current user prompt + recent
-    /// tool results + recent assistant reasoning). If the
-    /// pinned tail itself exceeds the ceiling, the loop is
-    /// over budget but the policy stops evicting (we'd rather
-    /// be over ceiling than blind to the current turn).
-    keep_last_n: usize,
+    /// rlm2/PR3: when eviction fires (running total above the
+    /// ceiling), evict down to `ceiling × evict_low_water_pct`
+    /// in one batch rather than stopping at the ceiling, so
+    /// the turns that follow are byte-stable appends. From
+    /// `ANIE_EVICT_LOW_WATER_PCT`, clamped to [0.3, 0.9].
+    evict_low_water_pct: f64,
+
+    /// rlm2/PR5: token budget for the pinned tail — the
+    /// longest trailing window of messages whose estimated
+    /// total fits this budget is exempt from eviction.
+    /// Replaces the positional `keep_last_n` (N messages):
+    /// position is a terrible proxy for cost — 6 small
+    /// assistant notes are ~100 tokens while 6 tool results
+    /// can be 20k. Protects turn continuity; the trailing
+    /// message is always pinned regardless of size, and the
+    /// latest user + latest assistant messages are
+    /// identity-pinned separately. If the pins together
+    /// exceed the ceiling, the loop is over budget but the
+    /// policy stops evicting (we'd rather be over ceiling
+    /// than blind to the current turn). From
+    /// `ANIE_PIN_TAIL_TOKENS` (default 3_072); the
+    /// deprecated `ANIE_KEEP_LAST_N` converts at 512
+    /// tokens/message.
+    pin_tail_tokens: u64,
 
     /// Token budget for relevance-based paging-in (Phase E).
     /// Sits *on top* of `active_ceiling_tokens`: after
@@ -323,6 +418,23 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// paging entirely (FIFO-only behavior, equivalent to
     /// pure Phase C).
     relevance_budget_tokens: u64,
+
+    /// rlm2/PR4: cap on total page-in spend per run. The
+    /// per-fire budget is `min(relevance_budget_tokens,
+    /// run_budget - spent_so_far)`. From
+    /// `ANIE_PAGE_IN_RUN_BUDGET`, default 8192.
+    page_in_run_budget: u64,
+
+    /// rlm2/PR4: `ANIE_PAGE_IN_BODIES` A/B hatch — `true`
+    /// restores the pre-PR4 bodies-preferred selection.
+    /// Default `false` (summaries-first).
+    page_in_bodies: bool,
+
+    /// rlm2/PR4: sticky page-in state. Session-scoped (shared
+    /// with the controller's `RlmSessionState` via
+    /// [`Self::with_page_in_state`]) but keyed by the latest
+    /// user prompt's timestamp, so it self-resets per run.
+    page_in_state: Arc<Mutex<PageInRunState>>,
 
     /// Shared with the recurse tool's
     /// `ControllerContextProvider` so evicted messages are
@@ -346,6 +458,37 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// so successive turns don't accumulate stale ledgers.
     /// `None` until the policy injects its first ledger.
     last_ledger_ts: Mutex<Option<u64>>,
+
+    /// rlm2/PR4: timestamp of the consolidated archive-recall
+    /// message injected on the previous fire, if any. Mirrors
+    /// `last_ledger_ts` — the recall message is stripped from
+    /// `request.context` alongside the ledger so it's never
+    /// archived as conversational content and can be
+    /// byte-compared against the rebuilt render for the no-op
+    /// fast path.
+    last_recall_ts: Mutex<Option<u64>>,
+
+    /// rlm2/PR2: what the previous fire sent, pending comparison
+    /// against the Ollama prefill count that comes back on the
+    /// next assistant message. `None` until the first fire;
+    /// consumed (`take`) at the start of every fire so a turn
+    /// whose model call errored (no fresh assistant reply) can't
+    /// false-alarm off a stale estimate.
+    pending_truncation_check: Mutex<Option<TruncationCheck>>,
+
+    /// rlm2/PR2: latched once the silent-truncation alarm has
+    /// emitted its `SystemMessage`. The policy is per-run, so
+    /// this is the "one-time-per-run" gate; the WARN log still
+    /// fires on every detection.
+    truncation_alarm_sent: AtomicBool,
+
+    /// The effective `num_ctx` the run requests from Ollama, when
+    /// known (`Some` only for native Ollama chat models; set by the
+    /// controller via [`Self::with_ollama_num_ctx`]). The truncation
+    /// detector needs it to tell a context shift (prefill near the
+    /// window, send above it) from a healthy prefix-cache hit
+    /// (prefill = the new suffix only); `None` keeps the alarm off.
+    ollama_num_ctx: Option<u64>,
 
     /// Optional sender for per-fire breadcrumbs to the user.
     /// Set by the controller when building the policy so
@@ -407,6 +550,24 @@ pub(crate) struct ContextVirtualizationPolicy {
     prompt_embed_cache: Arc<Mutex<PromptEmbedCache>>,
 }
 
+/// rlm2/PR2: the baseline the silent-truncation alarm compares the
+/// next Ollama prefill count against.
+#[derive(Debug, Clone, Copy)]
+struct TruncationCheck {
+    /// `estimate_tokens` of the working set the previous fire sent
+    /// (survivors + paged-in + ledger) — the same value emitted as
+    /// `RlmStatsUpdate::sent_context_tokens`.
+    sent_context_tokens: u64,
+    /// Timestamp of the newest assistant message at the time of
+    /// that fire. The comparison only runs when the context's
+    /// newest assistant message has a *different* timestamp — a
+    /// fresh reply to the send we measured. Without this guard, a
+    /// retried turn (model call errored, no new assistant message)
+    /// would compare the new estimate against a stale reply's
+    /// prefill count and could false-alarm.
+    last_assistant_ts: Option<u64>,
+}
+
 /// State of the prompt-embedding cache slot.
 #[derive(Default)]
 enum PromptEmbedCache {
@@ -429,18 +590,26 @@ impl ContextVirtualizationPolicy {
     /// archived.
     pub(crate) fn new(
         active_ceiling_tokens: u64,
-        keep_last_n: usize,
+        pin_tail_tokens: u64,
         relevance_budget_tokens: u64,
         external: Arc<RwLock<ExternalContext>>,
         pushed: Arc<Mutex<HashSet<u64>>>,
     ) -> Self {
         Self {
             active_ceiling_tokens,
-            keep_last_n,
+            evict_low_water_pct: env_evict_low_water_pct(),
+            pin_tail_tokens,
             relevance_budget_tokens,
+            page_in_run_budget: env_page_in_run_budget(),
+            page_in_bodies: env_page_in_bodies(),
+            page_in_state: Arc::new(Mutex::new(PageInRunState::default())),
             external,
             pushed,
             last_ledger_ts: Mutex::new(None),
+            last_recall_ts: Mutex::new(None),
+            pending_truncation_check: Mutex::new(None),
+            truncation_alarm_sent: AtomicBool::new(false),
+            ollama_num_ctx: None,
             event_tx: None,
             external_size: Arc::new(AtomicUsize::new(0)),
             summarizer_tx: None,
@@ -449,6 +618,52 @@ impl ContextVirtualizationPolicy {
             small_tier_ledger: false,
             prompt_embed_cache: Arc::new(Mutex::new(PromptEmbedCache::Empty)),
         }
+    }
+
+    /// Pin the low-water fraction for deterministic tests
+    /// (the constructor reads the process-wide env value,
+    /// which a developer shell might override).
+    #[cfg(test)]
+    fn with_evict_low_water_pct(mut self, pct: f64) -> Self {
+        self.evict_low_water_pct = pct;
+        self
+    }
+
+    /// Record the effective Ollama context window (`num_ctx`) the
+    /// run requests — `Some` only for native Ollama chat models.
+    /// Without it the silent-truncation alarm stays off: a prefill
+    /// undershoot can't be told apart from a prefix-cache hit.
+    pub(crate) fn with_ollama_num_ctx(mut self, num_ctx: Option<u64>) -> Self {
+        self.ollama_num_ctx = num_ctx;
+        self
+    }
+
+    /// rlm2/PR4: share the session-scoped sticky page-in
+    /// state. The controller passes `RlmSessionState`'s
+    /// instance so continuation runs (fresh per-run policy,
+    /// same prompt) keep the sticky set and the per-run spend
+    /// counter; without this call the policy keeps a private
+    /// instance (tests, and any future non-session install).
+    pub(crate) fn with_page_in_state(mut self, state: Arc<Mutex<PageInRunState>>) -> Self {
+        self.page_in_state = state;
+        self
+    }
+
+    /// Pin the per-run page-in budget for deterministic tests
+    /// (the constructor reads the process-wide env value).
+    #[cfg(test)]
+    fn with_page_in_run_budget(mut self, budget: u64) -> Self {
+        self.page_in_run_budget = budget;
+        self
+    }
+
+    /// Pin the bodies-preferred A/B hatch for deterministic
+    /// tests (the constructor reads the process-wide env
+    /// value).
+    #[cfg(test)]
+    fn with_page_in_bodies(mut self, enabled: bool) -> Self {
+        self.page_in_bodies = enabled;
+        self
     }
 
     /// Switch the per-turn ledger to the Small-tier v2 shape
@@ -516,6 +731,234 @@ impl ContextVirtualizationPolicy {
     pub(crate) fn pushed_set_from_snapshot(snapshot: &[Message]) -> HashSet<u64> {
         snapshot.iter().map(message_timestamp).collect()
     }
+
+    /// rlm2/PR2: the silent-truncation alarm. Consumes the
+    /// baseline stashed by the previous fire and compares it
+    /// against the prefill count Ollama reported on the fresh
+    /// assistant reply (`Usage::input_tokens` carries
+    /// `prompt_eval_count` for the `ollama` provider). On a
+    /// detector hit (`run_metrics::prefill_indicates_truncation`,
+    /// the same predicate behind `context.truncation_suspected`:
+    /// send above `num_ctx`, prefill near the window — a prefill
+    /// far below it is a prefix-cache hit, never flagged): WARN on
+    /// every detection, plus a one-time-per-run `SystemMessage`
+    /// with the remediation hint. Hosted providers never match the
+    /// provider gate, so non-Ollama behavior is unchanged; replies
+    /// shaped by an error or abort never evaluated the send and
+    /// are skipped.
+    async fn alarm_on_silent_truncation(&self, context: &[Message]) {
+        let pending = self
+            .pending_truncation_check
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let Some(check) = pending else { return };
+        let Some(reply) = latest_assistant(context) else {
+            return;
+        };
+        // Only a reply that arrived *after* the measured send is
+        // a valid prefill sample for it.
+        if check.last_assistant_ts == Some(reply.timestamp) {
+            return;
+        }
+        if reply.provider != crate::run_metrics::OLLAMA_PROVIDER {
+            return;
+        }
+        // The agent loop synthesizes assistant messages for stream
+        // failures and aborts (provider = the real provider, usage
+        // defaulted) — those never evaluated the send, so their
+        // usage is not a prefill sample.
+        if !crate::run_metrics::is_completed_reply(reply) {
+            return;
+        }
+        let prefilled = reply.usage.input_tokens;
+        if !crate::run_metrics::prefill_indicates_truncation(
+            check.sent_context_tokens,
+            prefilled,
+            self.ollama_num_ctx,
+        ) {
+            return;
+        }
+        warn!(
+            target: "anie_cli::context_virt",
+            sent_context_tokens = check.sent_context_tokens,
+            prompt_eval_count = prefilled,
+            "suspected silent truncation: Ollama evaluated far fewer tokens than were sent \
+             (context-shift drops the OLDEST tokens, i.e. the system prompt)"
+        );
+        if self.truncation_alarm_sent.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(AgentEvent::SystemMessage {
+                    text: format_truncation_alarm(check.sent_context_tokens, prefilled),
+                })
+                .await;
+        }
+    }
+
+    /// rlm2/PR2: stash this fire's sent-context estimate (and the
+    /// newest assistant timestamp it was paired with) as the next
+    /// fire's truncation baseline.
+    fn record_truncation_baseline(&self, sent_context_tokens: u64, context: &[Message]) {
+        *self
+            .pending_truncation_check
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(TruncationCheck {
+            sent_context_tokens,
+            last_assistant_ts: latest_assistant(context).map(|a| a.timestamp),
+        });
+    }
+}
+
+/// Newest assistant message in the context, if any.
+fn latest_assistant(context: &[Message]) -> Option<&AssistantMessage> {
+    context.iter().rev().find_map(|m| match m {
+        Message::Assistant(a) => Some(a),
+        _ => None,
+    })
+}
+
+/// rlm2/PR2: the one-time-per-run remediation hint for a suspected
+/// silent truncation (the P1 bug class from the field notes:
+/// ceiling == num_ctx, so Ollama context-shifted the system prompt
+/// away with no visible signal).
+fn format_truncation_alarm(sent_context_tokens: u64, prefill_tokens: u64) -> String {
+    format!(
+        "Ollama evaluated only {prefill_tokens} tokens of the ~{sent_context_tokens} sent — \
+         the context was silently truncated (Ollama drops the oldest tokens, typically the \
+         system prompt, when the window fills). Lower the active ceiling \
+         (ANIE_ACTIVE_CEILING_TOKENS) or raise /context-length."
+    )
+}
+
+/// rlm2/PR5: first index of the token-budgeted pinned tail.
+/// Walk backward from the newest message accumulating
+/// `estimate_tokens`; the tail is the longest contiguous
+/// suffix whose total fits within `pin_tail_tokens`. The
+/// trailing message is always pinned regardless of size —
+/// evicting the tool result that *just* arrived would blind
+/// the model to its own last action and trigger an immediate
+/// re-call. Returns `working.len()` when nothing is pinned
+/// (empty input only — the always-pin rule covers everything
+/// else).
+fn pinned_tail_start(working: &[Message], pin_tail_tokens: u64) -> usize {
+    let mut remaining = pin_tail_tokens;
+    let mut start = working.len();
+    for (idx, m) in working.iter().enumerate().rev() {
+        let cost = estimate_tokens(m);
+        if idx + 1 == working.len() {
+            start = idx;
+            remaining = remaining.saturating_sub(cost);
+            continue;
+        }
+        if cost > remaining {
+            break;
+        }
+        remaining -= cost;
+        start = idx;
+    }
+    start
+}
+
+/// rlm2 review fix: eviction must be pair-atomic. An assistant
+/// message carrying `ToolCall` blocks and the `ToolResult`
+/// messages answering them form one protocol unit — OpenAI-family
+/// providers reject a context where either side survives without
+/// the other (400: orphaned tool call / tool result). Maps each
+/// index in `working` onto its pairing group: the assistant plus
+/// every result answering one of its call ids. Indices with no
+/// pair partner in `working` are absent (singleton units). Results
+/// always follow their call in the transcript, so one forward pass
+/// sees the owner before its results.
+fn tool_pair_groups(working: &[Message]) -> HashMap<usize, Arc<Vec<usize>>> {
+    let mut call_owner: HashMap<&str, usize> = HashMap::new();
+    let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, m) in working.iter().enumerate() {
+        match m {
+            Message::Assistant(a) => {
+                for block in &a.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        call_owner.insert(call.id.as_str(), idx);
+                    }
+                }
+            }
+            Message::ToolResult(t) => {
+                if let Some(&owner) = call_owner.get(t.tool_call_id.as_str()) {
+                    members
+                        .entry(owner)
+                        .or_insert_with(|| vec![owner])
+                        .push(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut groups: HashMap<usize, Arc<Vec<usize>>> = HashMap::new();
+    for group in members.into_values() {
+        let shared = Arc::new(group);
+        for &idx in shared.iter() {
+            groups.insert(idx, Arc::clone(&shared));
+        }
+    }
+    groups
+}
+
+/// The anchors the eviction passes must not touch: the
+/// token-budgeted tail plus the identity-pinned latest user and
+/// latest assistant messages.
+struct EvictionPins {
+    tail_start: usize,
+    user_ts: Option<u64>,
+    assistant_ts: Option<u64>,
+}
+
+impl EvictionPins {
+    fn is_pinned(&self, idx: usize, working: &[Message]) -> bool {
+        if idx >= self.tail_start {
+            return true;
+        }
+        match working.get(idx) {
+            Some(Message::User(u)) => self.user_ts == Some(u.timestamp),
+            Some(Message::Assistant(a)) => self.assistant_ts == Some(a.timestamp),
+            _ => false,
+        }
+    }
+}
+
+/// Mark `idx` — together with its tool-call pair group, if any —
+/// for eviction, charging every newly-marked member against
+/// `running_total`. Returns the number of messages newly marked;
+/// 0 when the unit is blocked because a member is pinned (evicting
+/// around the pin would orphan one side of a tool_call/tool_result
+/// pair). The pin check covering the whole group also makes a
+/// pinned-tail snap unnecessary: a tool result inside the tail
+/// keeps its (earlier) assistant call alive through the group.
+fn evict_unit(
+    idx: usize,
+    working: &[Message],
+    groups: &HashMap<usize, Arc<Vec<usize>>>,
+    pins: &EvictionPins,
+    to_evict: &mut Vec<usize>,
+    running_total: &mut u64,
+) -> usize {
+    let singleton = [idx];
+    let unit: &[usize] = groups.get(&idx).map_or(&singleton[..], |g| g.as_slice());
+    if unit.iter().any(|&i| pins.is_pinned(i, working)) {
+        return 0;
+    }
+    let mut marked = 0;
+    for &i in unit {
+        if to_evict.contains(&i) {
+            continue;
+        }
+        let Some(m) = working.get(i) else { continue };
+        *running_total = running_total.saturating_sub(estimate_tokens(m));
+        to_evict.push(i);
+        marked += 1;
+    }
+    marked
 }
 
 #[async_trait::async_trait]
@@ -534,23 +977,46 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             return BeforeModelResponse::Continue;
         }
 
-        // Step 1: strip the previous turn's ledger out of
-        // working. If we left it in, archiving would push
-        // stale ledgers into `external` and the model would
-        // see two ledgers (old + new) every turn.
+        // rlm2/PR2: before doing anything else, compare the
+        // previous fire's sent-context estimate against the
+        // prefill count Ollama reported on the reply — the
+        // silent-truncation alarm.
+        self.alarm_on_silent_truncation(request.context).await;
+
+        // Step 1: strip the previous turn's ledger — and the
+        // previous turn's archive-recall message (rlm2/PR4) —
+        // out of working. If we left them in, archiving would
+        // push policy metadata into `external` and the model
+        // would see stale copies alongside the fresh ones.
+        // rlm2/PR3: keep the stripped messages around — if
+        // this turn is a pure append and the rebuilt ledger
+        // (and rebuilt recall render) come out byte-identical,
+        // we return `Continue` and the old messages stay
+        // exactly where they are in the context. The recall
+        // branch carries a content guard so a same-millisecond
+        // timestamp collision with the ledger can't capture
+        // the wrong message.
         let stale_ledger_ts = *self
             .last_ledger_ts
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let mut working: Vec<Message> = match stale_ledger_ts {
-            None => request.context.to_vec(),
-            Some(ts) => request
-                .context
-                .iter()
-                .filter(|m| message_timestamp(m) != ts)
-                .cloned()
-                .collect(),
-        };
+        let stale_recall_ts = *self
+            .last_recall_ts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut in_place_ledger: Option<&Message> = None;
+        let mut in_place_recall: Option<&Message> = None;
+        let mut working: Vec<Message> = Vec::with_capacity(request.context.len());
+        for m in request.context {
+            let ts = message_timestamp(m);
+            if stale_recall_ts == Some(ts) && is_archive_recall(m) {
+                in_place_recall = Some(m);
+            } else if stale_ledger_ts == Some(ts) {
+                in_place_ledger = Some(m);
+            } else {
+                working.push(m.clone());
+            }
+        }
 
         // Step 2: archive any unseen messages to `external`
         // so eviction is reversible via the recurse tool.
@@ -622,8 +1088,23 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         // confabulated a fix narrative for `SummaryOutputStore`
         // — a struct that doesn't exist — because the
         // user's "just say done" directive had been evicted.)
+        // Policy-injected reminders (the repo map, re-appended
+        // with a fresh timestamp after the real prompt) are not
+        // the directive — pinning one would leave the actual
+        // prompt evictable (rlm2 review fix).
         let pinned_user_ts: Option<u64> = working.iter().rev().find_map(|m| match m {
-            Message::User(u) => Some(u.timestamp),
+            Message::User(u) if !is_reminder_user(u) => Some(u.timestamp),
+            _ => None,
+        });
+        // rlm2/PR5: the latest assistant message is pinned
+        // the same way. The token-budgeted tail can be
+        // shorter than "the last user + assistant exchange"
+        // when a giant tool result sits between them; the
+        // identity pins guarantee the minimum the model
+        // needs — its own latest reasoning plus the user's
+        // directive — regardless of size.
+        let pinned_assistant_ts: Option<u64> = working.iter().rev().find_map(|m| match m {
+            Message::Assistant(a) => Some(a.timestamp),
             _ => None,
         });
 
@@ -646,33 +1127,52 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             .iter()
             .map(estimate_tokens)
             .fold(0u64, u64::saturating_add);
-        let working_len = working.len();
-        let pinned_tail_start = working_len.saturating_sub(self.keep_last_n);
+        // rlm2/PR3 hysteresis: evicting to exactly the ceiling
+        // guarantees the next append breaches it again — one
+        // eviction (and one prefix-breaking ledger rebuild) per
+        // turn. When the ceiling is breached, evict down to the
+        // low-water mark in one batch so the following turns
+        // append without evicting. Under the ceiling the target
+        // equals the current total and the loops below are no-ops.
+        let evict_target: u64 = if running_total > self.active_ceiling_tokens {
+            (self.active_ceiling_tokens as f64 * self.evict_low_water_pct) as u64
+        } else {
+            running_total
+        };
+        // rlm2/PR5: the pinned tail is token-budgeted, not
+        // positional — the longest trailing window that fits
+        // `pin_tail_tokens`.
+        let pins = EvictionPins {
+            tail_start: pinned_tail_start(&working, self.pin_tail_tokens),
+            user_ts: pinned_user_ts,
+            assistant_ts: pinned_assistant_ts,
+        };
+        // rlm2 review fix: every pass below evicts whole
+        // tool_call/tool_result groups via `evict_unit` — taking
+        // one side without the other produces a context hosted
+        // providers reject with a 400. A group with any pinned
+        // member is skipped entirely.
+        let eviction_groups = tool_pair_groups(&working);
         let mut to_evict: Vec<usize> = Vec::new();
         let mut supersedable_evicted: usize = 0;
 
         // 3a. Supersedable failures (Signal A).
         let supersedable = find_supersedable_failures(&working);
         for &idx in &supersedable {
-            if running_total <= self.active_ceiling_tokens {
+            if running_total <= evict_target {
                 break;
             }
-            // Don't touch the pinned tail.
-            if idx >= pinned_tail_start {
+            if to_evict.contains(&idx) {
                 continue;
             }
-            // Pinned user can't be a tool result anyway, but
-            // be defensive.
-            let is_pinned_user = matches!(working.get(idx), Some(Message::User(u))
-                if pinned_user_ts == Some(u.timestamp));
-            if is_pinned_user {
-                continue;
-            }
-            if let Some(m) = working.get(idx) {
-                running_total = running_total.saturating_sub(estimate_tokens(m));
-                to_evict.push(idx);
-                supersedable_evicted += 1;
-            }
+            supersedable_evicted += evict_unit(
+                idx,
+                &working,
+                &eviction_groups,
+                &pins,
+                &mut to_evict,
+                &mut running_total,
+            );
         }
 
         // 3a-bis. Stale failures (Signal B, position-based).
@@ -680,62 +1180,111 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         // are evicted ahead of standard FIFO order — they're
         // the most likely-stale class of message in working.
         let mut stale_evicted: usize = 0;
-        if running_total > self.active_ceiling_tokens {
-            let stale = find_stale_failures(&working, self.keep_last_n);
+        if running_total > evict_target {
+            let stale = find_stale_failures(&working, pins.tail_start);
             for &idx in &stale {
-                if running_total <= self.active_ceiling_tokens {
+                if running_total <= evict_target {
                     break;
                 }
                 if to_evict.contains(&idx) {
                     continue; // already evicted by Signal A
                 }
-                if idx >= pinned_tail_start {
-                    continue;
-                }
-                if let Some(m) = working.get(idx) {
-                    running_total = running_total.saturating_sub(estimate_tokens(m));
-                    to_evict.push(idx);
-                    stale_evicted += 1;
-                }
+                stale_evicted += evict_unit(
+                    idx,
+                    &working,
+                    &eviction_groups,
+                    &pins,
+                    &mut to_evict,
+                    &mut running_total,
+                );
             }
         }
 
-        // 3b. Standard FIFO eviction for the remainder.
-        for (idx, m) in working.iter().enumerate() {
-            if running_total <= self.active_ceiling_tokens {
+        // 3a-ter (rlm2/PR5): size-aware pass. Among the
+        // evictable remainder, the oldest LARGE tool results
+        // (> [`LARGE_TOOL_RESULT_EVICT_TOKENS`]) go before
+        // standard FIFO — one stale file dump frees more
+        // ceiling than dozens of small assistant texts, and
+        // the small texts are what carry narrative
+        // continuity at negligible cost.
+        let mut large_evicted: usize = 0;
+        if running_total > evict_target {
+            for (idx, m) in working.iter().enumerate() {
+                if running_total <= evict_target {
+                    break;
+                }
+                if idx >= pins.tail_start {
+                    break;
+                }
+                if to_evict.contains(&idx) {
+                    continue;
+                }
+                if !matches!(m, Message::ToolResult(_)) {
+                    continue;
+                }
+                if estimate_tokens(m) <= LARGE_TOOL_RESULT_EVICT_TOKENS {
+                    continue;
+                }
+                large_evicted += evict_unit(
+                    idx,
+                    &working,
+                    &eviction_groups,
+                    &pins,
+                    &mut to_evict,
+                    &mut running_total,
+                );
+            }
+        }
+
+        // 3b. Standard FIFO eviction for the remainder. The
+        // pinned user/assistant anchors are enforced inside
+        // `evict_unit` (a unit containing one is skipped whole).
+        for idx in 0..working.len() {
+            if running_total <= evict_target {
                 break;
             }
             // Skip pinned tail.
-            if idx >= pinned_tail_start {
+            if idx >= pins.tail_start {
                 break;
             }
-            // Already evicted by 3a.
+            // Already evicted by 3a / 3a-bis / 3a-ter.
             if to_evict.contains(&idx) {
                 continue;
             }
-            // Skip pinned user message regardless of position.
-            let is_pinned_user = matches!(m, Message::User(u)
-                if pinned_user_ts == Some(u.timestamp));
-            if is_pinned_user {
-                continue;
-            }
-            running_total = running_total.saturating_sub(estimate_tokens(m));
-            to_evict.push(idx);
+            evict_unit(
+                idx,
+                &working,
+                &eviction_groups,
+                &pins,
+                &mut to_evict,
+                &mut running_total,
+            );
         }
-        // After 3a + 3b, indices may not be sorted; sort
-        // ascending so the reverse-drop below removes the
-        // right items.
+        // After 3a + 3a-ter + 3b, indices may not be sorted;
+        // sort ascending so the reverse-drop below removes
+        // the right items.
         to_evict.sort();
         to_evict.dedup();
-        if supersedable_evicted > 0 || stale_evicted > 0 {
+        if supersedable_evicted > 0 || stale_evicted > 0 || large_evicted > 0 {
             debug!(
                 supersedable_evicted,
                 stale_evicted,
-                fifo_evicted = to_evict.len() - supersedable_evicted - stale_evicted,
-                "rlm policy evicted failures (Signal A/B) + FIFO"
+                large_evicted,
+                fifo_evicted =
+                    to_evict.len() - supersedable_evicted - stale_evicted - large_evicted,
+                "rlm policy evicted failures (Signal A/B) + large tool results + FIFO"
             );
         }
         let evicted_count = to_evict.len();
+        // rlm2/PR1: sum the estimated weight of what we're about to
+        // drop, before the indices are invalidated by removal, so the
+        // RunMetrics `context` block can attribute eviction by tokens
+        // (the navigation tax is a token problem, not a count problem).
+        let evicted_tokens: u64 = to_evict
+            .iter()
+            .filter_map(|&idx| working.get(idx))
+            .map(estimate_tokens)
+            .fold(0u64, u64::saturating_add);
         if !to_evict.is_empty() {
             // Drop in reverse so earlier indices stay valid.
             for &idx in to_evict.iter().rev() {
@@ -743,23 +1292,121 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             }
         }
 
-        // Step 3.5: relevance-based paging-in. Score every
-        // evicted message against the current prompt's
-        // keywords; page back the highest scorers within
-        // `relevance_budget_tokens`. This budget overlays on
-        // top of the active ceiling so total send is at
-        // most `active_ceiling + relevance_budget`. After
-        // adding, sort working by timestamp so paged-in
-        // messages land at their original chronological
-        // position.
-        let paged_in_count = self.page_in_relevant(&mut working).await;
+        // Step 3.5 (rlm2/PR4): relevance-based recall. Score
+        // every evicted message against the current prompt;
+        // recall the highest scorers — summaries first — into
+        // the consolidated archive-recall render, within
+        // `min(relevance_budget_tokens, run budget remaining)`.
+        // The recall budget overlays on top of the active
+        // ceiling so total send is at most
+        // `active_ceiling + relevance_budget`. Recalled
+        // content never enters `working` itself: it renders
+        // inside ONE `<system-reminder source="archive-recall">`
+        // message appended right before the ledger below, so
+        // the real transcript's chronology stays intact and
+        // recalled items are structurally exempt from FIFO.
+        let (recall_text, paged_in_count, paged_in_tokens) =
+            self.recall_relevant_archive(&working).await;
 
         // Step 4: build the ledger from current external
         // state and append it. The ledger sits at the very
         // end of working, right before the model generates,
         // so it's maximally visible to the model.
-        let ledger = self.build_ledger(working.len(), paged_in_count).await;
+        let ledger = self.build_ledger(&working).await;
         let ledger_ts = message_timestamp(&ledger);
+        let ledger_tokens = estimate_tokens(&ledger);
+
+        // rlm2/PR3: the append-only no-op fast path. When this
+        // turn changed nothing about the working context's
+        // shape — no eviction, no page-in — and the rebuilt
+        // ledger is byte-identical to the one already sitting
+        // in the context, replacing the messages would only
+        // move identical ledger bytes from mid-context to the
+        // end, invalidating Ollama's prefix cache from that
+        // point for zero information gain. Return `Continue`
+        // instead: the context goes out exactly as it arrived
+        // (a pure extension of the previous turn's send), the
+        // old ledger message stays in place, and
+        // `last_ledger_ts` keeps pointing at it so a later
+        // rebuilding turn still strips it. Store-side archiving
+        // of new messages already happened in step 2 above —
+        // the archive grows every turn regardless of which
+        // path returns.
+        let ledger_unchanged = match (
+            in_place_ledger.and_then(first_text_of),
+            first_text_of(&ledger),
+        ) {
+            (Some(old), Some(new)) => old == new,
+            _ => false,
+        };
+        // rlm2/PR4: same byte-compare for the archive-recall
+        // message. A turn whose only change would be
+        // re-rendering an IDENTICAL recall (sticky sections,
+        // no new page-ins) still qualifies as a no-op; a
+        // recall appearing, disappearing (prompt changed,
+        // sticky reset), or changing forces a rebuild.
+        let recall_unchanged = match (in_place_recall.and_then(first_text_of), recall_text.as_deref())
+        {
+            (None, None) => true,
+            (Some(old), Some(new)) => old == new,
+            _ => false,
+        };
+        if evicted_count == 0 && paged_in_count == 0 && ledger_unchanged && recall_unchanged {
+            let sent_context_tokens: u64 = request
+                .context
+                .iter()
+                .map(estimate_tokens)
+                .fold(0u64, u64::saturating_add);
+            self.record_truncation_baseline(sent_context_tokens, request.context);
+            info!(
+                target: "anie_cli::context_virt",
+                archived_total,
+                active_tokens = sent_context_tokens,
+                ceiling = self.active_ceiling_tokens,
+                "rlm policy fire (append-only no-op, ledger left in place)"
+            );
+            if let Some(tx) = &self.event_tx {
+                let _ = tx
+                    .send(AgentEvent::RlmStatsUpdate {
+                        archived_messages: archived_total as u64,
+                        evicted_count: 0,
+                        evicted_tokens: 0,
+                        paged_in_count: 0,
+                        paged_in_tokens: 0,
+                        ledger_tokens,
+                        sent_context_tokens,
+                    })
+                    .await;
+            }
+            return BeforeModelResponse::Continue;
+        }
+
+        // rlm2/PR4: place ALL recalled content as one
+        // consolidated message immediately before the ledger
+        // (which stays strictly last — invariant b). Recorded
+        // in `last_recall_ts` + `pushed` for the same reasons
+        // as the ledger: stripped next fire, never archived.
+        if let Some(text) = recall_text {
+            let recall = Message::User(UserMessage {
+                content: vec![ContentBlock::Text { text }],
+                timestamp: now_millis(),
+            });
+            let recall_ts = message_timestamp(&recall);
+            *self
+                .last_recall_ts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(recall_ts);
+            self.pushed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(recall_ts);
+            working.push(recall);
+        } else {
+            *self
+                .last_recall_ts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
         working.push(ledger);
 
         // Record the ledger timestamp so the next fire
@@ -785,6 +1432,11 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             .iter()
             .map(estimate_tokens)
             .fold(0u64, u64::saturating_add);
+        // rlm2/PR2: stash what we're about to send as the next
+        // fire's truncation-alarm baseline (recorded whether or
+        // not an event sender is attached — the WARN side of the
+        // alarm doesn't need one).
+        self.record_truncation_baseline(active_tokens, request.context);
         info!(
             target: "anie_cli::context_virt",
             archived_total,
@@ -792,7 +1444,7 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             paged_in = paged_in_count,
             active_tokens,
             ceiling = self.active_ceiling_tokens,
-            keep_last_n = self.keep_last_n,
+            pin_tail_tokens = self.pin_tail_tokens,
             "rlm policy fire"
         );
 
@@ -806,6 +1458,16 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             let _ = tx
                 .send(AgentEvent::RlmStatsUpdate {
                     archived_messages: archived_total as u64,
+                    evicted_count: evicted_count as u64,
+                    evicted_tokens,
+                    paged_in_count: paged_in_count as u64,
+                    paged_in_tokens,
+                    ledger_tokens,
+                    // `active_tokens` is `estimate_tokens` of the full
+                    // working set (survivors + paged-in + ledger) we're
+                    // about to send — the truncation detector's
+                    // baseline for the next turn's `prompt_eval_count`.
+                    sent_context_tokens: active_tokens,
                 })
                 .await;
             // Breadcrumb: only on meaningful work
@@ -839,10 +1501,33 @@ const TOOL_CALL_KEYS: &[(&str, &str, &str)] = &[
     ("write", "paths", "path"),
 ];
 
-/// Maximum displayed identity entries per tool. The ledger
-/// has a soft 500-token target; even at 8 URL strings × ~80
-/// chars × 6 tool kinds we stay well under.
+/// Maximum displayed identity entries per tool — the MOST
+/// RECENT 8 (rlm2/PR5; earlier calls collapse into one
+/// overflow line pointing at recurse message_grep). The
+/// ledger has a soft 500-token target; even at 8 URL
+/// strings × ~80 chars × 6 tool kinds we stay well under.
 const TOOL_CALL_DISPLAY_CAP: usize = 8;
+
+/// rlm2/PR5: the single overflow line appended after the
+/// per-tool entries when the per-tool cap elided older
+/// calls. One line total (not per tool) — the count is all
+/// the model needs; the search instruction is the same
+/// either way. `plain` selects the Small-tier no-syntax
+/// phrasing (plan 04 §2d: notation leaks into small-model
+/// tool calls).
+fn format_elided_calls_line(elided: usize, plain: bool) -> String {
+    let plural = if elided == 1 { "" } else { "s" };
+    if plain {
+        format!(
+            "{elided} earlier call{plural} not listed — search them with recurse message_grep."
+        )
+    } else {
+        format!(
+            "- {elided} earlier call{plural} not listed — search them with recurse \
+             scope.kind=message_grep"
+        )
+    }
+}
 
 /// Maximum length of a single ledger entry (URL, query,
 /// command). Anything longer gets truncated with an
@@ -867,7 +1552,27 @@ pub(crate) struct ToolCallEntry {
 /// return a per-tool list of unique tool-call entries
 /// (id + meaningful arg). Used by `build_ledger` to
 /// surface tool-call identity to the model.
-fn collect_tool_call_summary(external: &ExternalContext) -> Vec<(String, Vec<ToolCallEntry>)> {
+///
+/// rlm2/PR5 (ledger diet): entries whose result bodies the
+/// model can already see — timestamps in `visible_body_ts`,
+/// i.e. still in the working set or recalled into the
+/// sticky archive-recall message — are skipped. The ledger
+/// exists to point at content reachable *only* via recurse;
+/// repeating what's on screen is pure token tax. The skip
+/// is deterministic for a given (archive, working, sticky)
+/// state, so PR3's byte-stability holds: an entry reappears
+/// exactly when its body is evicted or the sticky set
+/// resets, both of which already force a ledger rebuild.
+///
+/// Ordering is deterministic and append-only (rlm2/PR3):
+/// tools sort alphabetically; entries within a tool keep the
+/// archive's insertion order (`ids_by_kind` preserves push
+/// order), so unchanged history renders unchanged bytes and
+/// new calls only append to existing lines.
+fn collect_tool_call_summary(
+    external: &ExternalContext,
+    visible_body_ts: &HashSet<u64>,
+) -> Vec<(String, Vec<ToolCallEntry>)> {
     let assistant_ids = external.ids_by_kind(MessageKindLabel::Assistant);
     let mut by_tool: HashMap<String, Vec<ToolCallEntry>> = HashMap::new();
     // Dedup by (tool_name, arg_value) so the same URL
@@ -887,6 +1592,14 @@ fn collect_tool_call_summary(external: &ExternalContext) -> Vec<(String, Vec<Too
             let Some(arg_value) = arg_value else {
                 continue;
             };
+            // rlm2/PR5: result body already visible → skip.
+            let body_ts = external
+                .find_by_tool_call_id(&call.id)
+                .and_then(|rid| external.get_by_id(rid))
+                .map(message_timestamp);
+            if body_ts.is_some_and(|ts| visible_body_ts.contains(&ts)) {
+                continue;
+            }
             let truncated = truncate_for_ledger(&arg_value, TOOL_CALL_ENTRY_MAX_CHARS);
             let dedupe = seen.entry(call.name.clone()).or_default();
             if dedupe.insert(truncated.clone()) {
@@ -933,13 +1646,18 @@ fn truncate_for_ledger(s: &str, max_chars: usize) -> String {
 }
 
 /// Render `(tool_name, entries)` pairs into ledger lines
-/// like `- web_read targets: [id=ollama_tc_8_2] foo,
-/// [id=ollama_tc_8_3] bar`. Each entry surfaces the
+/// like `- web_read targets: foo (id=ollama_tc_8_2),
+/// bar (id=ollama_tc_8_3)`. Each entry surfaces the
 /// `tool_call_id` so `RecurseScope::ToolResult` is
 /// directly usable. Empty input yields no lines so the
 /// ledger stays compact when nothing has been called yet.
+/// rlm2/PR5: each tool shows its MOST RECENT
+/// [`TOOL_CALL_DISPLAY_CAP`] entries; all elided older
+/// calls collapse into one trailing overflow line naming
+/// recurse message_grep.
 fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> Vec<String> {
     let mut lines = Vec::new();
+    let mut elided_total = 0usize;
     for (tool_name, args) in summary {
         if args.is_empty() {
             continue;
@@ -951,6 +1669,7 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> V
             .unwrap_or("args");
         let total = args.len();
         let display = total.min(TOOL_CALL_DISPLAY_CAP);
+        elided_total += total - display;
         // Format: `<value> (id=<tool_call_id>)`. Value
         // first because that's what the model needs to match
         // against the user's question. The `(id=...)` suffix
@@ -959,18 +1678,16 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> V
         // was passing the bracketed string as a tool_call_id.
         let rendered: Vec<String> = args
             .iter()
-            .take(display)
+            .skip(total - display)
             .map(|e| format!("{} (id={})", e.arg_value, e.tool_call_id))
             .collect();
-        let suffix = if total > display {
-            format!(", +{} more", total - display)
-        } else {
-            String::new()
-        };
         lines.push(format!(
-            "- {tool_name} {label}: {}{suffix}",
+            "- {tool_name} {label}: {}",
             rendered.join(", ")
         ));
+    }
+    if elided_total > 0 {
+        lines.push(format_elided_calls_line(elided_total, false));
     }
     lines
 }
@@ -979,26 +1696,27 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> V
 /// Small-tier ledger lines — `web_search: "query one", "query
 /// two"`. Deliberately NO `(id=...)` suffix: the v1 notation
 /// was pattern-matched into bash commands by the field-session
-/// model (notes F2). Same display cap as the v1 renderer.
+/// model (notes F2). Same display cap as the v1 renderer
+/// (rlm2/PR5: most recent entries, one overflow line).
 fn render_plain_tool_call_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> Vec<String> {
     let mut lines = Vec::new();
+    let mut elided_total = 0usize;
     for (tool_name, args) in summary {
         if args.is_empty() {
             continue;
         }
         let total = args.len();
         let display = total.min(TOOL_CALL_DISPLAY_CAP);
+        elided_total += total - display;
         let rendered: Vec<String> = args
             .iter()
-            .take(display)
+            .skip(total - display)
             .map(|e| format!("\"{}\"", e.arg_value))
             .collect();
-        let suffix = if total > display {
-            format!(", +{} more", total - display)
-        } else {
-            String::new()
-        };
-        lines.push(format!("{tool_name}: {}{suffix}", rendered.join(", ")));
+        lines.push(format!("{tool_name}: {}", rendered.join(", ")));
+    }
+    if elided_total > 0 {
+        lines.push(format_elided_calls_line(elided_total, true));
     }
     lines
 }
@@ -1026,6 +1744,51 @@ fn format_breadcrumb(evicted: usize, paged_in: usize, archived_total: usize) -> 
         parts.join("; "),
         if archived_total == 1 { "" } else { "s" }
     )
+}
+
+/// rlm2/PR4: one recall section for an archive entry whose
+/// summary is being paged in. Names the entry id so the model
+/// can fetch the full body via recurse.
+fn render_summary_section(id: crate::external_context::MessageId, summary: &str) -> String {
+    format!("[archive entry {id} — summary; full body via recurse]\n{summary}")
+}
+
+/// rlm2/PR4: one recall section for a small, unsummarized
+/// archive entry whose full body is being paged in.
+fn render_body_section(id: crate::external_context::MessageId, body: &str) -> String {
+    format!("[archive entry {id}]\n{body}")
+}
+
+/// rlm2/PR4: render the consolidated archive-recall message
+/// text from the sticky sections. Deterministic in section
+/// order, so a turn with no new page-ins re-renders the exact
+/// bytes of the previous turn's recall message — the no-op
+/// fast path byte-compares this output.
+fn render_archive_recall(sections: &[String]) -> String {
+    let mut lines = vec![
+        ARCHIVE_RECALL_OPEN.to_string(),
+        "Relevant archived content recalled for the current prompt. Summaries are lossy — \
+         fetch any full body with the recurse tool."
+            .to_string(),
+    ];
+    for section in sections {
+        lines.push(String::new());
+        lines.push(section.clone());
+    }
+    lines.push("</system-reminder>".to_string());
+    lines.join("\n")
+}
+
+/// rlm2/PR4: token cost of one recall section — the same
+/// `estimate_tokens` lens the eviction accounting uses,
+/// applied to the section text as it will actually render.
+fn section_tokens(text: &str) -> u64 {
+    estimate_tokens(&Message::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        timestamp: 0,
+    }))
 }
 
 impl ContextVirtualizationPolicy {
@@ -1094,21 +1857,68 @@ impl ContextVirtualizationPolicy {
         });
     }
 
-    /// Score evicted messages against the current prompt's
-    /// keywords (or cached embedding) and append the
-    /// highest-scoring ones to `working`, up to
-    /// `relevance_budget_tokens`. Returns the number of
-    /// messages paged in (used by the ledger). Re-sorts
-    /// `working` by timestamp at the end so paged-in content
-    /// lands at its original chronological position rather
-    /// than at the back where it was just pushed.
-    async fn page_in_relevant(&self, working: &mut Vec<Message>) -> usize {
+    /// rlm2/PR4: score evicted messages against the current
+    /// prompt's keywords (or cached embedding) and recall the
+    /// highest scorers into the consolidated archive-recall
+    /// render — summaries first; a full body only when no
+    /// summary exists AND the body is under
+    /// [`PAGE_IN_BODY_MAX_TOKENS`] (`ANIE_PAGE_IN_BODIES=1`
+    /// restores the old bodies-preferred selection). The
+    /// per-fire budget is `min(relevance_budget_tokens,
+    /// per-run budget remaining)`.
+    ///
+    /// Returns `(recall_text, newly_paged_count,
+    /// newly_paged_tokens)`. `recall_text` is the FULL render
+    /// — every sticky section recalled so far for the current
+    /// prompt, not just this fire's additions — so an item
+    /// stays visible until the prompt changes. The counters
+    /// cover only this fire's additions: rlm2/PR1's
+    /// `paged_in_tokens` keeps measuring new page-in spend,
+    /// and a fire that merely re-renders identical sticky
+    /// content reports zeros (and can no-op).
+    async fn recall_relevant_archive(&self, working: &[Message]) -> (Option<String>, usize, u64) {
         if self.relevance_budget_tokens == 0 {
-            return 0;
+            return (None, 0, 0);
         }
-        let Some(prompt_tokens) = current_prompt_tokens(working) else {
-            return 0;
+        let prompt_text_ts = latest_user_prompt(working);
+        let Some((_, prompt_ts)) = prompt_text_ts.as_ref() else {
+            return (None, 0, 0);
         };
+        // Sticky reset: the state belongs to one prompt. A
+        // different latest-prompt timestamp means a new run —
+        // clear the sticky set AND the per-run spend counter.
+        {
+            let mut state = self
+                .page_in_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if state.prompt_ts != Some(*prompt_ts) {
+                *state = PageInRunState {
+                    prompt_ts: Some(*prompt_ts),
+                    ..PageInRunState::default()
+                };
+            }
+        }
+        // Snapshot what's already recalled + how much budget
+        // is left, without holding the lock across the store
+        // read below.
+        let (sticky_ts, mut budget) = {
+            let state = self
+                .page_in_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let run_remaining = self.page_in_run_budget.saturating_sub(state.spent_tokens);
+            (
+                state.sticky_ts.clone(),
+                self.relevance_budget_tokens.min(run_remaining),
+            )
+        };
+        let Some(prompt_tokens) = current_prompt_tokens(working) else {
+            return (self.render_sticky_recall(), 0, 0);
+        };
+        if budget == 0 {
+            return (self.render_sticky_recall(), 0, 0);
+        }
 
         // Plan-08: when an embedder is configured and the
         // background task has already embedded the current
@@ -1117,38 +1927,103 @@ impl ContextVirtualizationPolicy {
         // overlap; the embed is kicked off below — after we
         // know the archive actually holds something to
         // rerank — so the turn path never waits on it.
-        let prompt_text_ts = latest_user_prompt(working);
         let prompt_embed = prompt_text_ts
             .as_ref()
             .and_then(|(_, ts)| self.peek_prompt_embedding(*ts));
 
-        // Take a snapshot of evicted candidates outside any
-        // lock so we don't hold the read guard while
-        // scoring. For each candidate also clone its summary
-        // and embedding so the budget loop can fall back to
-        // summary form / keyword overlap as needed.
+        // Score and select while holding the read guard.
+        // rlm2/PR5 (perf): candidates BORROW from the store —
+        // scoring intersects the prompt's tokens with each
+        // entry's token set cached at archive time, and the
+        // budget loop renders owned section text only for
+        // the items it accepts. Unselected bodies are never
+        // cloned (enforced by `RelevanceCandidate<'_>`'s
+        // lifetime). No `.await` runs while the guard is
+        // held, so the future stays Send.
         let working_ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
         let mut candidate_pool = 0usize;
-        let mut candidates: Vec<RelevanceCandidate> = {
+        let accepted: Vec<(u64, String, u64)> = {
             let external = self.external.read().await;
-            external
-                .iter_with_meta()
-                .filter(|(_, m, _, _)| !working_ts.contains(&message_timestamp(m)))
+            let mut candidates: Vec<RelevanceCandidate<'_>> = external
+                .iter_stored()
+                .filter(|s| {
+                    let ts = message_timestamp(&s.message);
+                    !working_ts.contains(&ts) && !sticky_ts.contains(&ts)
+                })
                 .inspect(|_| candidate_pool += 1)
-                .filter_map(|(id, m, summary, embedding)| {
-                    let s = score_candidate(prompt_embed.as_deref(), &prompt_tokens, embedding, m);
-                    if s <= 0.0 {
+                .filter_map(|s| {
+                    let score = score_candidate(prompt_embed.as_deref(), &prompt_tokens, s);
+                    if score <= 0.0 {
                         None
                     } else {
                         Some(RelevanceCandidate {
-                            score: s,
-                            id,
-                            message: m.clone(),
-                            summary: summary.map(str::to_string),
+                            score,
+                            id: s.id,
+                            message: &s.message,
+                            summary: s.summary.as_deref(),
                         })
                     }
                 })
-                .collect()
+                .collect();
+
+            // Sort by score descending; tie-break by recency
+            // (later timestamps preferred). NaN guard: if a
+            // score ever ends up NaN (shouldn't with our
+            // cosine guards), treat it as Equal so the sort
+            // stays total.
+            candidates.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| message_timestamp(b.message).cmp(&message_timestamp(a.message)))
+            });
+
+            // Budget loop: pick the section form for each
+            // candidate, charge its rendered cost against the
+            // per-fire budget, and collect the accepted
+            // sections (the only owned data this pass makes).
+            let mut accepted: Vec<(u64, String, u64)> = Vec::new();
+            for candidate in candidates {
+                let RelevanceCandidate {
+                    id,
+                    message,
+                    summary,
+                    ..
+                } = candidate;
+                let ts = message_timestamp(message);
+                let body_text = first_text_of(message);
+                let section = if self.page_in_bodies {
+                    // A/B hatch: the pre-PR4 preference — full
+                    // body when it fits the budget, summary as
+                    // the fallback.
+                    let body_section = body_text.map(|t| render_body_section(id, t));
+                    match body_section {
+                        Some(s) if section_tokens(&s) <= budget => Some(s),
+                        _ => summary.map(|s| render_summary_section(id, s)),
+                    }
+                } else if let Some(summary_text) = summary {
+                    // Summaries-first: the ledger already tells
+                    // the model `recurse` fetches the full body.
+                    Some(render_summary_section(id, summary_text))
+                } else if estimate_tokens(message) < PAGE_IN_BODY_MAX_TOKENS {
+                    body_text.map(|t| render_body_section(id, t))
+                } else {
+                    // Large unsummarized body: reachable via
+                    // recurse only.
+                    None
+                };
+                let Some(section) = section else { continue };
+                let cost = section_tokens(&section);
+                if cost > budget {
+                    continue;
+                }
+                budget = budget.saturating_sub(cost);
+                accepted.push((ts, section, cost));
+                if budget == 0 {
+                    break;
+                }
+            }
+            accepted
         };
 
         // Prompt-embed cache miss with a live candidate
@@ -1164,69 +2039,65 @@ impl ContextVirtualizationPolicy {
             }
         }
 
-        if candidates.is_empty() {
-            return 0;
-        }
-
-        // Sort by score descending; tie-break by recency
-        // (later timestamps preferred). NaN guard: if a
-        // score ever ends up NaN (shouldn't with our
-        // cosine guards), treat it as Equal so the sort
-        // stays total.
-        candidates.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| message_timestamp(&b.message).cmp(&message_timestamp(&a.message)))
-        });
-
-        let mut budget = self.relevance_budget_tokens;
-        let mut paged = 0;
-        for candidate in candidates {
-            let RelevanceCandidate {
-                id,
-                message,
-                summary,
-                ..
-            } = candidate;
-            // Prefer the full body when it fits. Fall back
-            // to the summary if it doesn't and a summary is
-            // available — this is the Phase F payoff for the
-            // reranker. Skip entirely otherwise.
-            let full_cost = estimate_tokens(&message);
-            if full_cost <= budget {
-                budget = budget.saturating_sub(full_cost);
-                working.push(message);
-                paged += 1;
-            } else if let Some(summary_text) = summary {
-                let summary_message = Message::User(UserMessage {
-                    content: vec![ContentBlock::Text {
-                        text: format!(
-                            "[summary of archive entry {id} — full body paged out]\n\n{summary_text}"
-                        ),
-                    }],
-                    timestamp: message_timestamp(&message),
-                });
-                let summary_cost = estimate_tokens(&summary_message);
-                if summary_cost > budget {
-                    continue;
-                }
-                budget = budget.saturating_sub(summary_cost);
-                working.push(summary_message);
-                paged += 1;
+        // Fold the accepted sections into the sticky state
+        // and render the full recall (old sticky sections +
+        // this fire's additions). Counters cover only the
+        // additions.
+        let mut state = self
+            .page_in_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut paged = 0usize;
+        let mut paged_tokens = 0u64;
+        for (ts, section, cost) in accepted {
+            if !state.sticky_ts.insert(ts) {
+                continue;
             }
-            if budget == 0 {
-                break;
-            }
+            state.sticky_sections.push(section);
+            state.spent_tokens = state.spent_tokens.saturating_add(cost);
+            paged += 1;
+            paged_tokens = paged_tokens.saturating_add(cost);
         }
+        let recall = if state.sticky_sections.is_empty() {
+            None
+        } else {
+            Some(render_archive_recall(&state.sticky_sections))
+        };
+        (recall, paged, paged_tokens)
+    }
 
-        if paged > 0 {
-            // Stable sort by timestamp so paged-in content
-            // lands in chronological order alongside the
-            // surviving FIFO content.
-            working.sort_by_key(message_timestamp);
+    /// rlm2/PR4: render the current sticky sections (no new
+    /// additions). The early-return paths of
+    /// [`Self::recall_relevant_archive`] use this so an
+    /// already-recalled item stays visible even on fires that
+    /// can't score new candidates (budget exhausted, empty
+    /// candidate pool, prompt with no scorable text).
+    fn render_sticky_recall(&self) -> Option<String> {
+        let state = self
+            .page_in_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if state.sticky_sections.is_empty() {
+            None
+        } else {
+            Some(render_archive_recall(&state.sticky_sections))
         }
-        paged
+    }
+
+    /// rlm2/PR5: timestamps of every message body the model
+    /// can already see this turn — the working set plus the
+    /// sticky archive-recall set. Ledger identity entries
+    /// whose result bodies are in this set are skipped
+    /// (diet): the ledger points at content reachable only
+    /// via recurse.
+    fn visible_body_ts(&self, working: &[Message]) -> HashSet<u64> {
+        let mut ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
+        let state = self
+            .page_in_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        ts.extend(state.sticky_ts.iter().copied());
+        ts
     }
 
     /// Plan 04 §2d: the Small-tier ledger. Plain
@@ -1236,16 +2107,18 @@ impl ContextVirtualizationPolicy {
     /// shape is advertised (`message_grep`, the one the
     /// field session showed the model reaching for); the
     /// other scopes stay live on the wire, just unlisted.
-    async fn build_small_tier_ledger_lines(&self, active_len: usize) -> Vec<String> {
+    async fn build_small_tier_ledger_lines(&self, working: &[Message]) -> Vec<String> {
+        let visible_body_ts = self.visible_body_ts(working);
         let external = self.external.read().await;
-        let total = external.len();
+        // rlm2/PR3: count only evicted messages, for the same
+        // byte-stability reason as the v1 header — totals grow
+        // on every append and would defeat the no-op fast path.
+        let evicted = external.len().saturating_sub(working.len());
         let mut lines = vec![
             "<system-reminder>".to_string(),
-            format!(
-                "Archive: {total} older messages are saved outside this conversation ({active_len} active)."
-            ),
+            format!("Archive: {evicted} older messages are saved outside this conversation."),
         ];
-        let summary = collect_tool_call_summary(&external);
+        let summary = collect_tool_call_summary(&external, &visible_body_ts);
         let call_lines = render_plain_tool_call_lines(&summary);
         if !call_lines.is_empty() {
             lines.push("These tool calls were already made — do NOT repeat them:".to_string());
@@ -1263,9 +2136,14 @@ impl ContextVirtualizationPolicy {
     /// the shared `ExternalContext` indexes; tool-result
     /// breakdown is sorted by frequency and capped at 8 names
     /// to keep the ledger bounded (target ≤500 tokens).
-    async fn build_ledger(&self, active_len: usize, paged_in_count: usize) -> Message {
+    /// rlm2/PR4: the ledger no longer reports a per-turn
+    /// paged-in count — recalled content is self-describing
+    /// in the adjacent archive-recall message, and dropping
+    /// the count keeps the ledger bytes stable across the
+    /// turn that follows a page-in (fast-path discipline).
+    async fn build_ledger(&self, working: &[Message]) -> Message {
         if self.small_tier_ledger {
-            let lines = self.build_small_tier_ledger_lines(active_len).await;
+            let lines = self.build_small_tier_ledger_lines(working).await;
             return Message::User(UserMessage {
                 content: vec![ContentBlock::Text {
                     text: lines.join("\n"),
@@ -1273,10 +2151,11 @@ impl ContextVirtualizationPolicy {
                 timestamp: now_millis(),
             });
         }
+        let visible_body_ts = self.visible_body_ts(working);
         let lines = {
             let external = self.external.read().await;
             let total = external.len();
-            let evicted = total.saturating_sub(active_len);
+            let evicted = total.saturating_sub(working.len());
 
             // Imperative header. Earlier versions said "use
             // the recurse tool to access evicted content" —
@@ -1286,11 +2165,18 @@ impl ContextVirtualizationPolicy {
             // form below is explicit: scan the lists, prefer
             // recurse over re-running tools whose targets
             // are already listed.
+            // rlm2/PR3: the header counts only EVICTED
+            // messages. The total/active counts grow with
+            // every appended message, which would change the
+            // ledger bytes every turn and starve the
+            // append-only fast path; the evicted count is
+            // stable across appends (new messages land in
+            // both the archive and the working set) and is
+            // the number the model actually needs — how much
+            // is reachable only via recurse.
             let mut lines = vec![
                 "<system-reminder>".to_string(),
-                format!(
-                    "external context — {total} archived messages ({evicted} evicted, {active_len} active)"
-                ),
+                format!("external context — {evicted} evicted messages in the archive"),
                 String::new(),
                 "Before issuing a new tool call, scan the lists below.".to_string(),
                 "If the URL, query, command, or path you're about to use is already listed,"
@@ -1309,12 +2195,6 @@ impl ContextVirtualizationPolicy {
                 "Re-running a tool whose output is already archived wastes user time.".to_string(),
                 String::new(),
             ];
-
-            if paged_in_count > 0 {
-                lines.push(format!(
-                    "- {paged_in_count} relevant prior messages paged in for this turn"
-                ));
-            }
 
             // Phase F: report how many archive entries the
             // background summarizer has produced. Lets the
@@ -1371,7 +2251,7 @@ impl ContextVirtualizationPolicy {
             // result text was evicted. With it, the model
             // can short-circuit duplicate work directly from
             // the ledger.
-            let summary = collect_tool_call_summary(&external);
+            let summary = collect_tool_call_summary(&external, &visible_body_ts);
             for line in render_tool_call_summary_lines(&summary) {
                 lines.push(line);
             }
@@ -1395,8 +2275,8 @@ impl ContextVirtualizationPolicy {
 /// considered stale when:
 ///
 /// - It's a `Message::ToolResult` with `is_error == true`,
-/// - It's NOT in the trailing `keep_last_n` window
-///   (still pinned; would have been skipped anyway),
+/// - It's NOT in the pinned tail (`idx < pinned_tail_start`;
+///   still pinned; would have been skipped anyway),
 /// - At least `min_messages_after = 4` messages follow it
 ///   in `working` — heuristic for "≥ 2 turns dwell" without
 ///   needing turn-tracking metadata.
@@ -1413,10 +2293,9 @@ impl ContextVirtualizationPolicy {
 /// (older failures are usually no longer relevant). True
 /// embedding-based ranking can land as a v2 if smoke shows
 /// position alone isn't sharp enough.
-fn find_stale_failures(working: &[Message], keep_last_n: usize) -> Vec<usize> {
+fn find_stale_failures(working: &[Message], pinned_tail_start: usize) -> Vec<usize> {
     const MIN_MESSAGES_AFTER: usize = 4;
     let working_len = working.len();
-    let pinned_tail_start = working_len.saturating_sub(keep_last_n);
     let mut stale = Vec::new();
     for (idx, m) in working.iter().enumerate() {
         if let Message::ToolResult(tr) = m
@@ -1618,11 +2497,11 @@ mod tests {
         assert!(is_ledger(&survivors[2]));
     }
 
-    /// Over ceiling: evicts oldest first, pins the last N.
-    /// With 10 messages, ceiling tight enough to require
-    /// eviction, and `keep_last_n = 3`, the result keeps the
-    /// last 3 at minimum and evicts older ones from the
-    /// front.
+    /// Over ceiling: evicts oldest first, pins the trailing
+    /// token-budgeted tail. With 10 one-token messages,
+    /// ceiling tight enough to require eviction, and
+    /// `pin_tail_tokens = 3`, the result keeps the last 3
+    /// at minimum and evicts older ones from the front.
     #[tokio::test]
     async fn over_ceiling_evicts_oldest_keeps_pinned_tail() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
@@ -1632,7 +2511,8 @@ mod tests {
         let context: Vec<Message> = (0..10)
             .map(|i| user(&format!("msg{i}"), i as u64))
             .collect();
-        // Ceiling = 5 tokens; keep_last_n = 3.
+        // Ceiling = 5 tokens; pin_tail_tokens = 3 → pins the
+        // last three 1-token messages.
         let policy = ContextVirtualizationPolicy::new(5, 3, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
 
@@ -1696,6 +2576,67 @@ mod tests {
         );
     }
 
+    /// rlm2 review fix: the repo-map policy appends its
+    /// `<system-reminder source="repo-map">` message AFTER the real
+    /// prompt with a fresh timestamp, making it the newest User
+    /// message at every fire. The latest-user pin must skip it —
+    /// pinning the reminder leaves the actual directive evictable,
+    /// exactly the rlm/17 confabulation regression the pin exists
+    /// to prevent.
+    #[tokio::test]
+    async fn latest_user_pin_skips_policy_reminder_messages() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let reminder =
+            "<system-reminder source=\"repo-map\">\nsrc/lib.rs\n</system-reminder>";
+        let context = vec![
+            user("Just say done.", 1), // the directive — must survive
+            assistant("ok let me read", 2),
+            tool_result("c1", "read", "lots of file content here", 3),
+            assistant("read result", 4),
+            tool_result("c2", "read", "more file content", 5),
+            user(reminder, 6), // policy-injected, newest user message
+        ];
+        let policy = ContextVirtualizationPolicy::new(2, 2, 0, store, shared_pushed(HashSet::new()));
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let has_user_directive = survivors.iter().any(|m| match m {
+            Message::User(u) => match u.content.first() {
+                Some(ContentBlock::Text { text }) => text == "Just say done.",
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(
+            has_user_directive,
+            "the directive, not the repo-map reminder, is the pinned user message: {survivors:?}"
+        );
+    }
+
+    /// rlm2 review fix: prompt identification (the reranker's
+    /// keyword source, the embed/sticky key) reads the latest REAL
+    /// user message, skipping policy-injected reminders.
+    #[test]
+    fn prompt_identification_skips_reminder_user_messages() {
+        let working = vec![
+            user("what is the weather in tallahassee", 1),
+            user(
+                "<system-reminder source=\"repo-map\">\nsrc/repo_map.rs\n</system-reminder>",
+                2,
+            ),
+        ];
+        let (text, ts) = latest_user_prompt(&working).expect("the real prompt is found");
+        assert_eq!(ts, 1, "keyed to the directive, not the reminder");
+        assert!(text.contains("tallahassee"), "{text}");
+        let toks = current_prompt_tokens(&working).expect("tokens");
+        assert!(toks.contains("tallahassee"), "{toks:?}");
+        assert!(
+            !toks.contains("repo"),
+            "repo-map file paths must not drive the reranker: {toks:?}"
+        );
+    }
+
     /// Pinned tail itself exceeds the ceiling: the policy
     /// keeps the tail anyway and stops evicting. We'd rather
     /// be over budget than blind to the current turn.
@@ -1703,10 +2644,10 @@ mod tests {
     async fn pinned_tail_overrides_ceiling() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let context: Vec<Message> = (0..6).map(|i| user(&format!("msg{i}"), i as u64)).collect();
-        // Ceiling = 1 token (impossibly tight); keep_last_n = 5.
-        // The pinned tail (5 messages) will be over the
-        // ceiling but the policy refuses to evict pinned
-        // messages.
+        // Ceiling = 1 token (impossibly tight);
+        // pin_tail_tokens = 5 pins the last five 1-token
+        // messages. The pinned tail will be over the ceiling
+        // but the policy refuses to evict pinned messages.
         let policy = ContextVirtualizationPolicy::new(1, 5, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
 
@@ -1785,7 +2726,7 @@ mod tests {
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
         // Pinned tail (last 2 originals) + ledger at the
-        // end. keep_last_n=2 keeps assistant("ack2") and
+        // end. pin_tail_tokens=2 fits assistant("ack2") and
         // user("third").
         assert!(is_ledger(survivors.last().expect("non-empty")));
         let originals = &survivors[..survivors.len() - 1];
@@ -1797,10 +2738,15 @@ mod tests {
         assert_eq!(store.read().await.len(), context.len());
     }
 
-    /// Ledger does not accumulate across fires: each turn
-    /// strips the previous turn's ledger before injecting a
-    /// fresh one. After two fires the survivors should
-    /// contain exactly one ledger, not two.
+    /// Ledger does not accumulate across fires: a turn that
+    /// changes the ledger content strips the previous turn's
+    /// ledger before injecting the fresh one. After two
+    /// rebuilding fires the survivors contain exactly one
+    /// ledger, not two. (rlm2/PR3: a turn whose rebuilt
+    /// ledger would be byte-identical takes the `Continue`
+    /// fast path instead — `ledger_bytes_stable_across_appending_turns`
+    /// covers that side; here the appended tool result
+    /// changes the tool-result breakdown, forcing a rebuild.)
     #[tokio::test]
     async fn ledger_replaced_each_turn_no_accumulation() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
@@ -1818,15 +2764,21 @@ mod tests {
 
         // Fire 2: feed the post-fire-1 context back in (this
         // is what the loop does — it persists the
-        // ReplaceMessages output as the new state).
-        let r2 = policy.before_model(sample_request(&after_fire_1)).await;
+        // ReplaceMessages output as the new state) plus a new
+        // tool result, which changes the ledger's tool-result
+        // breakdown and forces a rebuild.
+        let mut context_2 = after_fire_1;
+        context_2.push(tool_result("c1", "bash", "ls output", 50));
+        let r2 = policy.before_model(sample_request(&context_2)).await;
         let after_fire_2 = match r2 {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-        // Still exactly one ledger; old one was stripped.
-        assert_eq!(after_fire_2.len(), 4);
+        // Exactly one ledger; the old one was stripped and the
+        // fresh one is strictly last.
+        assert_eq!(after_fire_2.len(), 5);
         assert_eq!(after_fire_2.iter().filter(|m| is_ledger(m)).count(), 1);
+        assert!(is_ledger(after_fire_2.last().expect("non-empty")));
     }
 
     /// Ledger reflects current external state: when external
@@ -1863,7 +2815,9 @@ mod tests {
             ledger_text.contains("do NOT re-run the tool"),
             "ledger should explicitly forbid re-running tools: {ledger_text}",
         );
-        assert!(ledger_text.contains("5 archived messages"));
+        // rlm2/PR3: the header counts evicted messages only
+        // (nothing evicted here — everything is active).
+        assert!(ledger_text.contains("0 evicted messages in the archive"));
         assert!(ledger_text.contains("3 tool results"));
         assert!(ledger_text.contains("bash x2"));
         assert!(ledger_text.contains("read x1"));
@@ -1875,14 +2829,18 @@ mod tests {
     /// bash commands (notes F2) never appears.
     #[tokio::test]
     async fn small_tier_ledger_contains_no_id_notation() {
-        let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let context = vec![
+        // The call's result body lives only in the archive
+        // (rlm2/PR5: entries whose bodies are still in the
+        // working set are skipped as redundant).
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
             user("what's the time?", 1),
             assistant_with_tool_call("web_search", serde_json::json!({"query": "rust testing"}), 2),
             tool_result("call_2", "web_search", "result body", 3),
-        ];
+        ])));
+        let pushed: HashSet<u64> = (1..=3).collect();
+        let context = vec![user("and in Tokyo?", 200)];
         let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()))
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed))
                 .with_small_tier_ledger(true);
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
@@ -1925,19 +2883,23 @@ mod tests {
 
     /// Plan 04 §2d regression guard: with the Small-tier flag
     /// off (Full tier, or `ANIE_LEDGER=v1`), the ledger is
-    /// byte-identical to the pre-plan-04 rendering. The
-    /// expected string IS the v1 fixture — drift fails the
-    /// byte compare.
+    /// byte-identical to this v1 fixture — drift fails the
+    /// byte compare. (Fixture updated by rlm2/PR3: the header
+    /// counts evicted messages only; and by rlm2/PR5: the
+    /// archived exchange lives outside the working set, since
+    /// identity entries whose bodies are in the working set
+    /// are now skipped.)
     #[tokio::test]
     async fn full_tier_ledger_unchanged() {
-        let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let context = vec![
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
             user("u0", 1),
             assistant_with_tool_call("web_search", serde_json::json!({"query": "rust testing"}), 2),
             tool_result("call_2", "web_search", "result body", 3),
-        ];
+        ])));
+        let pushed: HashSet<u64> = (1..=3).collect();
+        let context = vec![user("follow-up question", 200)];
         let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1945,7 +2907,7 @@ mod tests {
         };
         let text = user_text(survivors.last().expect("non-empty")).expect("ledger text");
         let expected = "<system-reminder>\n\
-            external context — 3 archived messages (0 evicted, 3 active)\n\
+            external context — 3 evicted messages in the archive\n\
             \n\
             Before issuing a new tool call, scan the lists below.\n\
             If the URL, query, command, or path you're about to use is already listed,\n\
@@ -2032,17 +2994,21 @@ mod tests {
         assert!(toks.contains("forecast"));
     }
 
-    /// `score_message`: intersection size between prompt
-    /// tokens and message tokens. Stopwords don't count.
+    /// rlm2/PR5: keyword scoring is the intersection size
+    /// between the prompt's tokens and the candidate's token
+    /// set cached at archive time. Stopwords don't count.
     #[test]
-    fn score_message_returns_intersection_size() {
+    fn candidate_score_is_intersection_with_archive_cached_tokens() {
         let prompt_tokens = tokenize("weather forecast Tallahassee");
-        let m = user("the weather in Tallahassee is sunny", 1);
+        let mut store = ExternalContext::new();
+        let scored = store.push(user("the weather in Tallahassee is sunny", 1));
+        let unrelated = store.push(user("hello world friends", 1));
         // "weather" + "tallahassee" overlap; "the" is a
         // stopword.
-        assert_eq!(score_message(&prompt_tokens, &m), 2);
-        let unrelated = user("hello world friends", 1);
-        assert_eq!(score_message(&prompt_tokens, &unrelated), 0);
+        let stored = store.iter_stored().nth(scored).expect("present");
+        assert_eq!(score_candidate(None, &prompt_tokens, stored), 2.0);
+        let stored = store.iter_stored().nth(unrelated).expect("present");
+        assert_eq!(score_candidate(None, &prompt_tokens, stored), 0.0);
     }
 
     /// Phase E: with `relevance_budget_tokens = 0`, the
@@ -2105,8 +3071,8 @@ mod tests {
         };
 
         // Find the Tallahassee message in survivors. With
-        // FIFO+keep_last_n=1 alone it would be evicted; the
-        // reranker should have paged it back in.
+        // FIFO + a 1-token pinned tail alone it would be
+        // evicted; the reranker should have paged it back in.
         let has_tallahassee_match = survivors.iter().any(|m| {
             user_text(m)
                 .map(|t| t.contains("Tallahassee weather patterns"))
@@ -2118,9 +3084,10 @@ mod tests {
         );
     }
 
-    /// Phase E: paging-in respects the budget. Many
-    /// matching candidates, small budget — only the highest
-    /// scorers fit. Sum of paged-in message tokens ≤ budget.
+    /// Phase E: paging-in respects the per-fire budget. Many
+    /// matching candidates, a budget that fits exactly one
+    /// rendered section — only one is recalled, and the spend
+    /// counter stays at or under the budget.
     #[tokio::test]
     async fn paged_in_respects_budget() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
@@ -2129,7 +3096,10 @@ mod tests {
             .collect();
         context.push(user("what's the weather like?", 100));
 
-        let budget = 6_u64;
+        // Each rendered section ("[archive entry N]\n
+        // weather report number N") is ~10 estimated tokens;
+        // a 15-token budget admits one and rejects a second.
+        let budget = 15_u64;
         let policy =
             ContextVirtualizationPolicy::new(2, 1, budget, Arc::clone(&store), shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
@@ -2137,28 +3107,26 @@ mod tests {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-        // Identify paged-in messages: present in survivors
-        // and in the original context's evictable region
-        // (positions 0..10), excluding the pinned tail
-        // (position 10) and the ledger.
-        let pinned_tail_ts = message_timestamp(&context[10]);
-        let paged_in: Vec<&Message> = survivors
+        let recall = survivors
             .iter()
-            .filter(|m| !is_ledger(m) && message_timestamp(m) != pinned_tail_ts)
-            .collect();
-        let paged_tokens: u64 = paged_in
-            .iter()
-            .map(|m| estimate_tokens(m))
-            .fold(0, u64::saturating_add);
-        assert!(
-            paged_tokens <= budget,
-            "paged-in tokens ({paged_tokens}) exceeded budget ({budget}); \
-             {} message(s) were paged in",
-            paged_in.len()
+            .find(|m| is_archive_recall(m))
+            .and_then(|m| user_text(m))
+            .expect("expected at least one paged-in section");
+        assert_eq!(
+            recall.matches("[archive entry").count(),
+            1,
+            "budget admits exactly one section: {recall}"
         );
-        // Sanity: at least one was paged in (otherwise the
-        // test isn't exercising the path).
-        assert!(!paged_in.is_empty(), "expected at least one paged-in");
+        let state = policy
+            .page_in_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(
+            state.spent_tokens <= budget,
+            "spent tokens ({}) exceeded budget ({budget})",
+            state.spent_tokens
+        );
+        assert_eq!(state.sticky_sections.len(), 1);
     }
 
     /// Phase E: paging-in does not duplicate messages that
@@ -2168,9 +3136,9 @@ mod tests {
     async fn paged_in_excludes_active_context() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         // All 5 messages contain "weather" (high score
-        // candidates). With keep_last_n = 5 and ceiling
-        // 10_000, no eviction triggers, so ALL 5 are
-        // already in working.
+        // candidates). With a 10_000-token ceiling, no
+        // eviction triggers, so ALL 5 are already in
+        // working.
         let context: Vec<Message> = (0..5)
             .map(|i| user(&format!("weather weather {i}"), i as u64))
             .chain([user("what's the weather?", 100)])
@@ -2222,37 +3190,50 @@ mod tests {
         }
     }
 
-    /// Phase E: ledger reports the paged-in count when
-    /// non-zero.
+    /// rlm2/PR4: ALL paged content renders inside ONE
+    /// consolidated `<system-reminder source="archive-recall">`
+    /// message placed immediately before the ledger — never
+    /// interleaved into the transcript as fake user turns.
     #[tokio::test]
-    async fn ledger_reports_paged_in_count() {
-        let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let mut context: Vec<Message> = (0..6)
-            .map(|i| user(&format!("weather chat {i}"), i as u64))
-            .collect();
-        context.push(user("weather!", 100));
-
-        let policy =
-            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), shared_pushed(HashSet::new()));
-        let response = policy.before_model(sample_request(&context)).await;
-        let survivors = match response {
+    async fn paged_content_renders_in_one_archive_recall_message() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            user("weather note alpha", 1),
+            user("weather note beta", 2),
+        ])));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64, 2u64])),
+        );
+        let context = vec![user("weather?", 100)];
+        let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-        let ledger_text = survivors
+        let recalls: Vec<&str> = survivors
             .iter()
-            .find_map(|m| {
-                if is_ledger(m) {
-                    user_text(m).map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-            .expect("ledger present");
-        assert!(
-            ledger_text.contains("paged in for this turn"),
-            "expected paged-in count in ledger: {ledger_text}"
-        );
+            .filter(|m| is_archive_recall(m))
+            .filter_map(|m| user_text(m))
+            .collect();
+        assert_eq!(recalls.len(), 1, "exactly one recall message: {survivors:?}");
+        assert!(recalls[0].contains("weather note alpha"), "{}", recalls[0]);
+        assert!(recalls[0].contains("weather note beta"), "{}", recalls[0]);
+        // Placement: immediately before the ledger, which
+        // stays strictly last (invariant b).
+        assert!(is_ledger(survivors.last().expect("non-empty")));
+        assert!(is_archive_recall(&survivors[survivors.len() - 2]));
+        // No fake interleaved turns: archive content appears
+        // nowhere outside the recall message.
+        for (idx, m) in survivors.iter().enumerate() {
+            if idx != survivors.len() - 2 {
+                assert!(
+                    !user_text(m).unwrap_or("").contains("[archive entry"),
+                    "archive content leaked outside the recall message at idx {idx}"
+                );
+            }
+        }
     }
 
     /// Tool-call summary appears in the ledger so the model
@@ -2291,7 +3272,7 @@ mod tests {
             assistant_with_tool_call("read", serde_json::json!({"path": "src/main.rs"}), 6),
         ]);
 
-        let summary = collect_tool_call_summary(&store);
+        let summary = collect_tool_call_summary(&store, &HashSet::new());
         let summary_map: HashMap<String, Vec<ToolCallEntry>> = summary.into_iter().collect();
 
         // Entries surface the tool_call_id (assigned by
@@ -2392,33 +3373,50 @@ mod tests {
         );
     }
 
-    /// Ledger caps each tool's identity list at
-    /// `TOOL_CALL_DISPLAY_CAP` and reports overflow with a
-    /// "+N more" suffix. Keeps the ledger bounded even when
-    /// the agent has fired hundreds of tool calls.
+    /// rlm2/PR5: the ledger caps each tool's identity list
+    /// at the MOST RECENT `TOOL_CALL_DISPLAY_CAP` entries;
+    /// all elided older calls collapse into one trailing
+    /// overflow line that names recurse message_grep. Keeps
+    /// the ledger bounded even when the agent has fired
+    /// hundreds of tool calls, without losing the pointer to
+    /// the elided history.
     #[test]
-    fn render_tool_call_summary_truncates_with_more_suffix() {
+    fn ledger_caps_per_tool_with_overflow_line() {
         let entries: Vec<ToolCallEntry> = (0..12)
             .map(|i| ToolCallEntry {
                 tool_call_id: format!("tc_{i}"),
                 arg_value: format!("https://example.com/page{i}"),
             })
             .collect();
-        let summary = vec![("web_read".to_string(), entries)];
+        let summary = vec![("web_read".to_string(), entries.clone())];
         let lines = render_tool_call_summary_lines(&summary);
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2, "one tool line + one overflow line: {lines:?}");
         let line = &lines[0];
-        assert!(
-            line.contains("+4 more"),
-            "expected +4 more suffix when 12 entries against cap 8: {line}"
-        );
-        // First 8 entries appear with their ids; entry #9
-        // (page8 / tc_8) does not. New format is
-        // `<value> (id=<call_id>)`.
-        assert!(line.contains("page0 (id=tc_0)"));
-        assert!(line.contains("page7 (id=tc_7)"));
-        assert!(!line.contains("page8"));
-        assert!(!line.contains("(id=tc_8)"));
+        // The most recent 8 entries appear with their ids;
+        // the 4 oldest (page0..page3) do not.
+        assert!(line.contains("page4 (id=tc_4)"), "{line}");
+        assert!(line.contains("page11 (id=tc_11)"), "{line}");
+        assert!(!line.contains("(id=tc_3)"), "{line}");
+        assert!(!line.contains("(id=tc_0)"), "{line}");
+        let overflow = &lines[1];
+        assert!(overflow.contains("4 earlier calls"), "{overflow}");
+        assert!(overflow.contains("message_grep"), "{overflow}");
+
+        // The Small-tier renderer applies the same cap with
+        // the no-syntax phrasing (no scope grammar).
+        let plain = render_plain_tool_call_lines(&summary);
+        assert_eq!(plain.len(), 2, "{plain:?}");
+        assert!(plain[0].contains("\"https://example.com/page4\""), "{}", plain[0]);
+        assert!(!plain[0].contains("page3\""), "{}", plain[0]);
+        assert!(plain[1].contains("4 earlier calls"), "{}", plain[1]);
+        assert!(plain[1].contains("recurse message_grep"), "{}", plain[1]);
+        assert!(!plain[1].contains("scope.kind"), "{}", plain[1]);
+
+        // No overflow → no overflow line (byte-stability:
+        // the line appears exactly when calls are elided).
+        let small = vec![("web_read".to_string(), entries[..3].to_vec())];
+        assert_eq!(render_tool_call_summary_lines(&small).len(), 1);
+        assert_eq!(render_plain_tool_call_lines(&small).len(), 1);
     }
 
     /// New test: the rendered ledger lines surface the
@@ -2447,72 +3445,115 @@ mod tests {
         assert!(line.contains("https://weather.com/Tifton (id=ollama_tool_call_8_3)"));
     }
 
-    /// Phase F reranker integration: when an evicted
-    /// candidate's full body is too large for the relevance
-    /// budget but its summary fits, the reranker pages the
-    /// summary in instead of skipping the candidate
-    /// entirely. The summary message gets a clear header
-    /// so the model knows it's looking at a summary rather
-    /// than the original.
+    /// rlm2/PR4: summaries-first — when a candidate has a
+    /// Phase-F summary, the summary is what pages in, even
+    /// when the full body would comfortably fit the budget.
+    /// The section header tells the model recurse fetches
+    /// the full body.
     #[tokio::test]
-    async fn reranker_falls_back_to_summary_when_full_body_too_big() {
-        // Build a large message that exceeds the relevance
-        // budget. Repeat a keyword the prompt will match.
-        let huge_text: String = "relevant_keyword data ".repeat(200);
+    async fn page_in_prefers_summary_over_body() {
         let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
-            &huge_text, 1,
+            "relevant_keyword body content here",
+            1,
         )])));
         store
             .write()
             .await
             .set_summary(0, "concise summary text".to_string());
-
-        // Tight budget — full body won't fit, summary
-        // will. Active context references the keyword so
-        // the reranker scores the candidate.
         let policy = ContextVirtualizationPolicy::new(
             10_000,
             8,
-            150, // budget tight enough that huge body skips, summary fits
+            10_000, // roomy budget — the body WOULD fit; preference decides
             Arc::clone(&store),
-            shared_pushed(HashSet::from([1u64])), // skip re-archive
+            shared_pushed(HashSet::from([1u64])),
         );
         let context = vec![user("looking for relevant_keyword info", 200)];
-        let response = policy.before_model(sample_request(&context)).await;
-        let survivors = match response {
+        let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-
-        // The summary should be paged in, not the huge
-        // body. Find a User message containing the
-        // "[summary of archive entry" header.
-        let has_summary = survivors.iter().any(|m| match m {
-            Message::User(u) => match u.content.first() {
-                Some(ContentBlock::Text { text }) => {
-                    text.starts_with("[summary of archive entry")
-                        && text.contains("concise summary text")
-                }
-                _ => false,
-            },
-            _ => false,
-        });
+        let recall = survivors
+            .iter()
+            .find(|m| is_archive_recall(m))
+            .and_then(|m| user_text(m))
+            .expect("recall message present");
+        assert!(recall.contains("concise summary text"), "{recall}");
         assert!(
-            has_summary,
-            "expected summary fallback in survivors; got {survivors:?}"
+            recall.contains("— summary; full body via recurse"),
+            "summary sections must advertise the recurse path: {recall}"
         );
-        // The huge body should NOT be in survivors —
-        // budget too tight.
-        let has_huge = survivors.iter().any(|m| match m {
-            Message::User(u) => match u.content.first() {
-                Some(ContentBlock::Text { text }) => text.contains(&huge_text),
-                _ => false,
-            },
-            _ => false,
-        });
         assert!(
-            !has_huge,
-            "huge body should not have been paged in alongside the summary"
+            !recall.contains("relevant_keyword body content here"),
+            "the body must not page in when a summary exists: {recall}"
+        );
+    }
+
+    /// rlm2/PR4: the `ANIE_PAGE_IN_BODIES=1` A/B hatch
+    /// restores the pre-PR4 preference — full body first when
+    /// it fits the budget, summary as the fallback.
+    #[tokio::test]
+    async fn page_in_bodies_env_hatch_restores_body_preference() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "relevant_keyword body content here",
+            1,
+        )])));
+        store
+            .write()
+            .await
+            .set_summary(0, "concise summary text".to_string());
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64])),
+        )
+        .with_page_in_bodies(true);
+        let context = vec![user("looking for relevant_keyword info", 200)];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall = survivors
+            .iter()
+            .find(|m| is_archive_recall(m))
+            .and_then(|m| user_text(m))
+            .expect("recall message present");
+        assert!(
+            recall.contains("relevant_keyword body content here"),
+            "bodies hatch pages the full body: {recall}"
+        );
+        assert!(
+            !recall.contains("concise summary text"),
+            "bodies hatch must not also page the summary: {recall}"
+        );
+    }
+
+    /// rlm2/PR4: a large unsummarized body (≥ 512 estimated
+    /// tokens) never pages in, even when both the per-fire
+    /// and per-run budgets would admit it — it stays
+    /// reachable via recurse only.
+    #[tokio::test]
+    async fn large_unsummarized_body_is_not_paged_in() {
+        let huge_text: String = format!("relevant_keyword {}", "filler ".repeat(600));
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            &huge_text, 1,
+        )])));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            100_000, // the old behavior would have paged the body in
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64])),
+        );
+        let context = vec![user("looking for relevant_keyword info", 200)];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        assert!(
+            !survivors.iter().any(is_archive_recall),
+            "large unsummarized body must stay recurse-only: {survivors:?}"
         );
     }
 
@@ -2870,7 +3911,8 @@ mod tests {
             user("dummy", 5),
             user("latest", 6),                     // pinned tail
         ];
-        let stale = find_stale_failures(&working, 1);
+        // Pinned tail = the last message only.
+        let stale = find_stale_failures(&working, 5);
         assert_eq!(stale, vec![0]);
     }
 
@@ -2884,7 +3926,7 @@ mod tests {
             user("third", 4),
             user("latest", 5),
         ];
-        let stale = find_stale_failures(&working, 1);
+        let stale = find_stale_failures(&working, 4);
         // Failure at idx 2: messages_after = 5 - 2 = 3, < 4 threshold.
         assert!(stale.is_empty());
     }
@@ -2901,8 +3943,9 @@ mod tests {
             user("e", 5),
             failed_tool_result("c1", "bash", 6),   // last; pinned
         ];
-        let stale = find_stale_failures(&working, 2);
-        // Pinned tail is the last 2. Idx 5 is in tail.
+        // Pinned tail is the last 2 (start index 4). Idx 5
+        // is in the tail.
+        let stale = find_stale_failures(&working, 4);
         assert!(stale.is_empty());
     }
 
@@ -2918,7 +3961,7 @@ mod tests {
             user("e", 7),
             user("latest", 8),                     // pinned
         ];
-        let stale = find_stale_failures(&working, 1);
+        let stale = find_stale_failures(&working, 7);
         assert_eq!(stale, vec![0, 2]);
     }
 
@@ -2932,7 +3975,7 @@ mod tests {
             user("d", 5),
             user("latest", 6),
         ];
-        let stale = find_stale_failures(&working, 1);
+        let stale = find_stale_failures(&working, 5);
         assert!(stale.is_empty(), "successes should not be stale-eligible");
     }
 
@@ -2950,5 +3993,1315 @@ mod tests {
         ];
         let supersedable = find_supersedable_failures(&working);
         assert_eq!(supersedable, vec![1, 3]);
+    }
+
+    // ----- rlm2/PR2: silent-truncation alarm -----
+
+    /// An assistant reply as the Ollama provider would report
+    /// it: `usage.input_tokens` carries `prompt_eval_count`.
+    fn reply_from(provider: &str, prefill_tokens: u64, ts: u64) -> Message {
+        reply_stopped(provider, prefill_tokens, ts, StopReason::Stop)
+    }
+
+    fn reply_stopped(
+        provider: &str,
+        prefill_tokens: u64,
+        ts: u64,
+        stop_reason: StopReason,
+    ) -> Message {
+        Message::Assistant(AssistantMessage {
+            content: vec![ContentBlock::Text { text: "ok".into() }],
+            usage: Usage {
+                input_tokens: prefill_tokens,
+                ..Usage::default()
+            },
+            stop_reason,
+            error_message: None,
+            provider: provider.into(),
+            model: "test".into(),
+            timestamp: ts,
+            reasoning_details: None,
+        })
+    }
+
+    /// The effective `num_ctx` the alarm-test policies declare.
+    /// The "long prompt" contexts below estimate at ~300 tokens,
+    /// so a send always exceeds this window; a prefill of
+    /// [`SHIFT_PREFILL`] (≥ half the window, far under the sent
+    /// estimate) is the genuine context-shift signature.
+    const ALARM_NUM_CTX: u64 = 100;
+    const SHIFT_PREFILL: u64 = 90;
+
+    /// Policy with a comfortable ceiling (no eviction → no
+    /// breadcrumb SystemMessages to confuse the assertions),
+    /// a declared Ollama window for the shift detector, plus an
+    /// event channel for the alarm.
+    fn alarm_policy() -> (ContextVirtualizationPolicy, mpsc::Receiver<AgentEvent>) {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let (tx, rx) = mpsc::channel(32);
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            4,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_ollama_num_ctx(Some(ALARM_NUM_CTX))
+        .with_event_sender(tx);
+        (policy, rx)
+    }
+
+    fn drain_system_messages(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::SystemMessage { text } = event {
+                texts.push(text);
+            }
+        }
+        texts
+    }
+
+    /// The alarm consumes the PR1 detector: an Ollama reply
+    /// carrying the context-shift signature (send above the
+    /// window, prefill near the window — a forced re-eval of the
+    /// shifted prefix) emits the remediation `SystemMessage` —
+    /// exactly once per run, even when later turns keep
+    /// truncating.
+    #[tokio::test]
+    async fn truncation_alarm_fires_once_per_run() {
+        let (policy, mut rx) = alarm_policy();
+
+        // Fire 1: establishes the sent-context baseline.
+        let mut context = vec![user(&"long prompt ".repeat(100), 1)];
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "no alarm before any reply exists"
+        );
+
+        // Ollama replies having evaluated ~the whole 100-token
+        // window — far under the ~300-token send: context shift.
+        context.push(reply_from(
+            crate::run_metrics::OLLAMA_PROVIDER,
+            SHIFT_PREFILL,
+            2,
+        ));
+        policy.before_model(sample_request(&context)).await;
+        let alarms = drain_system_messages(&mut rx);
+        assert_eq!(alarms.len(), 1, "alarm fires on the truncated turn: {alarms:?}");
+        assert!(alarms[0].contains("silently truncated"), "{}", alarms[0]);
+        assert!(alarms[0].contains("/context-length"), "{}", alarms[0]);
+        assert!(alarms[0].contains("ANIE_ACTIVE_CEILING_TOKENS"), "{}", alarms[0]);
+
+        // A second truncated turn still WARNs (not asserted)
+        // but must NOT re-emit the SystemMessage.
+        context.push(reply_from(
+            crate::run_metrics::OLLAMA_PROVIDER,
+            SHIFT_PREFILL,
+            3,
+        ));
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "the SystemMessage is one-time-per-run"
+        );
+    }
+
+    /// Regression (rlm2 review): Ollama's `prompt_eval_count`
+    /// counts only newly-evaluated tokens, so an append-only turn
+    /// served from the prefix cache legitimately reports a tiny
+    /// prefill (the new suffix) or omits the field entirely
+    /// (`input_tokens` = 0). Neither is a truncation — the old
+    /// bare-undershoot predicate fired on every healthy cached
+    /// turn, exactly when the PR3 fast path was working.
+    #[tokio::test]
+    async fn cached_prefix_prefill_does_not_trip_truncation_alarm() {
+        let (policy, mut rx) = alarm_policy();
+        let mut context = vec![user(&"long prompt ".repeat(100), 1)];
+        policy.before_model(sample_request(&context)).await;
+        drain_system_messages(&mut rx);
+
+        // Suffix-only prefill, far below the declared window.
+        context.push(reply_from(crate::run_metrics::OLLAMA_PROVIDER, 10, 2));
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "a suffix-only prefill is a cache hit, not a truncation"
+        );
+
+        // Fully-cached prompt: Ollama omits prompt_eval_count.
+        context.push(reply_from(crate::run_metrics::OLLAMA_PROVIDER, 0, 3));
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "an omitted prompt_eval_count is a cache hit, not a truncation"
+        );
+    }
+
+    /// Without a declared `num_ctx` (non-native APIs) a prefill
+    /// undershoot can't be told apart from a cache hit — the
+    /// alarm stays off.
+    #[tokio::test]
+    async fn truncation_alarm_off_without_a_known_num_ctx() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let (tx, mut rx) = mpsc::channel(32);
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            4,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_event_sender(tx);
+        let mut context = vec![user(&"long prompt ".repeat(100), 1)];
+        policy.before_model(sample_request(&context)).await;
+        drain_system_messages(&mut rx);
+
+        context.push(reply_from(
+            crate::run_metrics::OLLAMA_PROVIDER,
+            SHIFT_PREFILL,
+            2,
+        ));
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "no num_ctx → no shift detection"
+        );
+    }
+
+    /// Regression (rlm2 review): the agent loop synthesizes
+    /// assistant messages for stream failures and aborts with the
+    /// real provider string, a fresh timestamp, and defaulted (or
+    /// partial) usage. Those never evaluated the send — they must
+    /// not be read as prefill samples, even when their usage would
+    /// otherwise match the shift signature.
+    #[tokio::test]
+    async fn errored_or_aborted_replies_do_not_trip_truncation_alarm() {
+        for stop_reason in [StopReason::Error, StopReason::Aborted] {
+            let (policy, mut rx) = alarm_policy();
+            let mut context = vec![user(&"long prompt ".repeat(100), 1)];
+            policy.before_model(sample_request(&context)).await;
+            drain_system_messages(&mut rx);
+
+            context.push(reply_stopped(
+                crate::run_metrics::OLLAMA_PROVIDER,
+                SHIFT_PREFILL,
+                2,
+                stop_reason,
+            ));
+            policy.before_model(sample_request(&context)).await;
+            assert!(
+                drain_system_messages(&mut rx).is_empty(),
+                "{stop_reason:?} replies are not prefill samples"
+            );
+        }
+    }
+
+    /// A prefill count near the estimate is inside the
+    /// heuristic band — no alarm.
+    #[tokio::test]
+    async fn truncation_alarm_quiet_when_prefill_matches_estimate() {
+        let (policy, mut rx) = alarm_policy();
+        let mut context = vec![user(&"long prompt ".repeat(100), 1)];
+        policy.before_model(sample_request(&context)).await;
+        drain_system_messages(&mut rx);
+
+        // Recover the exact estimate the policy reported, and
+        // reply with a prefill right at it.
+        let sent = 1_000; // comfortably above the real ~300-token estimate
+        context.push(reply_from(crate::run_metrics::OLLAMA_PROVIDER, sent, 2));
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "prefill ≥ estimate is not a truncation"
+        );
+    }
+
+    /// Hosted providers have no `prompt_eval_count` semantics —
+    /// a low `input_tokens` there is not a truncation, so the
+    /// alarm never fires for non-Ollama replies.
+    #[tokio::test]
+    async fn truncation_alarm_never_fires_for_non_ollama_provider() {
+        let (policy, mut rx) = alarm_policy();
+        let mut context = vec![user(&"long prompt ".repeat(100), 1)];
+        policy.before_model(sample_request(&context)).await;
+        drain_system_messages(&mut rx);
+
+        // Shift-shaped numbers, but a hosted provider string.
+        context.push(reply_from("openai", SHIFT_PREFILL, 2));
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "hosted providers are exempt from the alarm"
+        );
+    }
+
+    /// A retried turn (model call errored, so no fresh
+    /// assistant reply landed) must not compare the new
+    /// estimate against a stale reply's prefill count.
+    #[tokio::test]
+    async fn truncation_alarm_requires_a_fresh_assistant_reply() {
+        let (policy, mut rx) = alarm_policy();
+        // The context already ends with an old Ollama reply whose
+        // prefill would match the shift signature against the NEW
+        // send's estimate — only the freshness guard protects it.
+        let mut context = vec![
+            user("hi", 1),
+            reply_from(crate::run_metrics::OLLAMA_PROVIDER, SHIFT_PREFILL, 2),
+        ];
+        context.push(user(&"long prompt ".repeat(100), 3));
+        policy.before_model(sample_request(&context)).await;
+        drain_system_messages(&mut rx);
+
+        // Fire again with NO new assistant message (the retry
+        // case): the stale reply's prefill must not be read as
+        // a truncation of the just-measured send.
+        policy.before_model(sample_request(&context)).await;
+        assert!(
+            drain_system_messages(&mut rx).is_empty(),
+            "stale replies are not prefill samples for the new send"
+        );
+    }
+
+    // ----- rlm2/PR3: batch eviction + append-only turns -----
+
+    /// What the agent loop does with a policy response: keep
+    /// the context on `Continue`, adopt the replacement on
+    /// `ReplaceMessages`. The PR3 tests drive multi-turn
+    /// sequences through this so the byte-compare assertions
+    /// exercise the same state transitions as the real loop.
+    fn apply_response(response: BeforeModelResponse, context: Vec<Message>) -> Vec<Message> {
+        match response {
+            BeforeModelResponse::Continue => context,
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected Continue or ReplaceMessages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_water_pct_unset_uses_default() {
+        assert_eq!(resolve_evict_low_water_pct(None), 0.6);
+    }
+
+    #[test]
+    fn low_water_pct_clamped_into_bounds() {
+        assert_eq!(resolve_evict_low_water_pct(Some("0.1")), 0.3);
+        assert_eq!(resolve_evict_low_water_pct(Some("0.99")), 0.9);
+        assert_eq!(resolve_evict_low_water_pct(Some("0.75")), 0.75);
+    }
+
+    #[test]
+    fn low_water_pct_unparseable_falls_back_to_default() {
+        assert_eq!(resolve_evict_low_water_pct(Some("lots")), 0.6);
+        assert_eq!(resolve_evict_low_water_pct(Some("")), 0.6);
+        // `"NaN".parse::<f64>()` succeeds; the finite guard
+        // (not the parse) has to catch it — clamp on NaN
+        // would propagate NaN into the eviction target.
+        assert_eq!(resolve_evict_low_water_pct(Some("NaN")), 0.6);
+        assert_eq!(resolve_evict_low_water_pct(Some("inf")), 0.6);
+    }
+
+    /// rlm2/PR3: a retried turn — same context as the previous
+    /// fire, nothing new to archive, rebuilt ledger identical —
+    /// returns `Continue` and leaves the in-place ledger alone
+    /// instead of stripping and re-appending identical bytes.
+    #[tokio::test]
+    async fn under_ceiling_turn_with_no_new_archive_returns_continue() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            4,
+            0,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
+        let context = vec![user("hi", 1), assistant("hello", 2)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        assert!(is_ledger(sent_1.last().expect("non-empty")));
+
+        let response = policy.before_model(sample_request(&sent_1)).await;
+        assert_eq!(response, BeforeModelResponse::Continue);
+        // Nothing new arrived, so the archive holds exactly the
+        // two originals (the ledger is never archived).
+        assert_eq!(store.read().await.len(), 2);
+    }
+
+    /// rlm2/PR3 hysteresis: a ceiling breach evicts in one
+    /// batch down to `ceiling × low_water_pct`, not merely to
+    /// the ceiling — otherwise the very next append breaches
+    /// again and every turn pays an eviction + ledger rebuild.
+    #[tokio::test]
+    async fn eviction_batches_down_to_low_water_mark() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let body = "x".repeat(40); // 10 estimated tokens per message
+        let context: Vec<Message> = (0..30).map(|i| user(&body, i as u64)).collect();
+        let ceiling = 200u64;
+        let policy =
+            ContextVirtualizationPolicy::new(ceiling, 2, 0, store, shared_pushed(HashSet::new()))
+                .with_evict_low_water_pct(0.6);
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let surviving_tokens: u64 = survivors
+            .iter()
+            .filter(|m| !is_ledger(m))
+            .map(estimate_tokens)
+            .fold(0, u64::saturating_add);
+        let low_water = (ceiling as f64 * 0.6) as u64;
+        assert!(
+            surviving_tokens <= low_water,
+            "eviction must batch down to the low-water mark ({low_water}), \
+             not stop at the ceiling ({ceiling}); got {surviving_tokens}"
+        );
+        // ... but no further than the low-water mark: the
+        // first message that lands the total at or under the
+        // target is the last one evicted.
+        assert!(
+            surviving_tokens + 10 > low_water,
+            "eviction overshot the low-water mark ({low_water}): {surviving_tokens}"
+        );
+    }
+
+    /// rlm2/PR3, the byte-compare test: two consecutive
+    /// appending turns (plain assistant replies, no new tool
+    /// activity) take the `Continue` fast path, so each turn's
+    /// outgoing context is a pure extension of the previous
+    /// turn's — the pre-ledger prefix AND the ledger bytes are
+    /// unchanged (Ollama's prefix cache holds). The stability
+    /// property must hold for both ledger formats, so the
+    /// scenario runs against the v1 (Full-tier) and v2
+    /// (Small-tier) renderers.
+    #[tokio::test]
+    async fn ledger_bytes_stable_across_appending_turns() {
+        for small_tier in [false, true] {
+            let store = Arc::new(RwLock::new(ExternalContext::new()));
+            let policy = ContextVirtualizationPolicy::new(
+                10_000,
+                4,
+                0,
+                Arc::clone(&store),
+                shared_pushed(HashSet::new()),
+            )
+            .with_small_tier_ledger(small_tier);
+
+            // Turn 1: first fire injects the ledger.
+            let context = vec![user("original question", 1), assistant("working on it", 2)];
+            let sent_1 = apply_response(
+                policy.before_model(sample_request(&context)).await,
+                context,
+            );
+            assert!(is_ledger(sent_1.last().expect("non-empty")));
+            let ledger_text_1 = user_text(sent_1.last().expect("non-empty"))
+                .expect("ledger text")
+                .to_string();
+
+            // Turn 2: the model replied with plain text; the
+            // loop appends it after the ledger.
+            let mut context_2 = sent_1.clone();
+            context_2.push(assistant("a plain text reply", 3));
+            let response_2 = policy.before_model(sample_request(&context_2)).await;
+            assert_eq!(
+                response_2,
+                BeforeModelResponse::Continue,
+                "appending turn must not rebuild (small_tier={small_tier})"
+            );
+            let sent_2 = apply_response(response_2, context_2);
+            // Invariant (c): the new message was archived
+            // store-side even though the fast path returned
+            // Continue.
+            assert_eq!(store.read().await.len(), 3, "small_tier={small_tier}");
+
+            // Turn 3: another plain append.
+            let mut context_3 = sent_2.clone();
+            context_3.push(assistant("another plain reply", 4));
+            let response_3 = policy.before_model(sample_request(&context_3)).await;
+            assert_eq!(
+                response_3,
+                BeforeModelResponse::Continue,
+                "small_tier={small_tier}"
+            );
+            let sent_3 = apply_response(response_3, context_3);
+            assert_eq!(store.read().await.len(), 4, "small_tier={small_tier}");
+
+            // The byte compare: every send extends the previous
+            // send without touching it.
+            assert_eq!(&sent_2[..sent_1.len()], &sent_1[..]);
+            assert_eq!(&sent_3[..sent_2.len()], &sent_2[..]);
+            // Exactly one ledger survives, byte-identical to
+            // the one turn 1 injected.
+            let ledgers: Vec<&Message> = sent_3.iter().filter(|m| is_ledger(m)).collect();
+            assert_eq!(ledgers.len(), 1, "small_tier={small_tier}");
+            assert_eq!(
+                user_text(ledgers[0]).expect("ledger text"),
+                ledger_text_1,
+                "small_tier={small_tier}"
+            );
+        }
+    }
+
+    /// rlm2/PR3 negative control: an appending turn that DOES
+    /// change the ledger content (a new tool call + result
+    /// landed in the archive) rebuilds — the stale ledger is
+    /// stripped and the fresh one is strictly the last
+    /// message, while the pre-ledger prefix is preserved.
+    #[tokio::test]
+    async fn appending_turn_with_new_tool_activity_rebuilds_ledger() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            0,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
+        let context = vec![user("original question", 1), assistant("working on it", 2)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        let ledger_text_1 = user_text(sent_1.last().expect("non-empty"))
+            .expect("ledger text")
+            .to_string();
+
+        let mut context_2 = sent_1.clone();
+        context_2.push(assistant_with_tool_call(
+            "bash",
+            serde_json::json!({"command": "ls"}),
+            3,
+        ));
+        context_2.push(tool_result("call_3", "bash", "file listing", 4));
+        let survivors = match policy.before_model(sample_request(&context_2)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("tool activity must force a rebuild, got {other:?}"),
+        };
+        // [user, assistant, tool-call assistant, tool result, ledger].
+        assert_eq!(survivors.len(), 5);
+        assert!(is_ledger(survivors.last().expect("non-empty")));
+        assert_eq!(survivors.iter().filter(|m| is_ledger(m)).count(), 1);
+        // Pre-ledger prefix preserved.
+        assert_eq!(&survivors[..2], &sent_1[..2]);
+        let new_ledger_text = user_text(survivors.last().expect("non-empty")).expect("text");
+        assert_ne!(new_ledger_text, ledger_text_1);
+        assert!(new_ledger_text.contains("bash"), "{new_ledger_text}");
+    }
+
+    /// rlm2/PR3: when a turn evicts and pages content back in,
+    /// the rebuilt ledger is still strictly the last message
+    /// (paged-in messages re-sort into chronology *before* the
+    /// ledger is appended).
+    #[tokio::test]
+    async fn ledger_remains_last_message_after_page_in() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let mut context: Vec<Message> = vec![
+            user("a long discussion about Tallahassee weather patterns", 1),
+            user("filler about pets", 2),
+            user("filler about food", 3),
+            user("filler about music", 4),
+            user("filler about books", 5),
+        ];
+        context.push(user("what's the weather in Tallahassee tomorrow?", 100));
+        let policy = ContextVirtualizationPolicy::new(
+            5,
+            1,
+            50,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let paged_in = survivors.iter().any(|m| {
+            user_text(m)
+                .map(|t| t.contains("Tallahassee weather patterns"))
+                .unwrap_or(false)
+        });
+        assert!(paged_in, "the test needs a page-in to be meaningful");
+        assert!(is_ledger(survivors.last().expect("non-empty")));
+        assert_eq!(survivors.iter().filter(|m| is_ledger(m)).count(), 1);
+    }
+
+    /// rlm2/PR2 interaction: the silent-truncation alarm and
+    /// the baseline recording both still run on the PR3
+    /// append-only fast path — the alarm at the start of the
+    /// fire, the baseline right before `Continue` returns. The
+    /// reply carries the genuine shift signature (prefill ≈ the
+    /// declared window, far under the send) — a suffix-sized
+    /// prefill on this same path is the healthy cached case and
+    /// must NOT fire (`cached_prefix_prefill_does_not_trip_truncation_alarm`).
+    #[tokio::test]
+    async fn truncation_alarm_still_fires_on_append_only_noop_turn() {
+        let (policy, mut rx) = alarm_policy();
+        let context = vec![user(&"long prompt ".repeat(100), 1)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        drain_system_messages(&mut rx);
+
+        // The Ollama reply re-evaluated ~the whole window — far
+        // under what the previous fire sent — and, being a plain
+        // text append, the turn takes the Continue fast path.
+        let mut context_2 = sent_1;
+        context_2.push(reply_from(
+            crate::run_metrics::OLLAMA_PROVIDER,
+            SHIFT_PREFILL,
+            2,
+        ));
+        let response = policy.before_model(sample_request(&context_2)).await;
+        assert_eq!(response, BeforeModelResponse::Continue);
+        let alarms = drain_system_messages(&mut rx);
+        assert_eq!(alarms.len(), 1, "alarm must fire on the fast path: {alarms:?}");
+        assert!(alarms[0].contains("silently truncated"), "{}", alarms[0]);
+
+        // And the fast path recorded a fresh baseline for the
+        // NEXT turn's comparison (sized to what actually went
+        // out: the unchanged request context).
+        let baseline = policy
+            .pending_truncation_check
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("baseline recorded on the Continue path");
+        let expected: u64 = context_2
+            .iter()
+            .map(estimate_tokens)
+            .fold(0, u64::saturating_add);
+        assert_eq!(baseline.sent_context_tokens, expected);
+    }
+
+    // ----- rlm2/PR4: summaries-first, sticky page-ins -----
+
+    /// The consolidated archive-recall message in `survivors`,
+    /// if any.
+    fn recall_text_of(survivors: &[Message]) -> Option<String> {
+        survivors
+            .iter()
+            .find(|m| is_archive_recall(m))
+            .and_then(|m| user_text(m))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn page_in_run_budget_unset_uses_default() {
+        assert_eq!(resolve_page_in_run_budget(None), 8192);
+    }
+
+    #[test]
+    fn page_in_run_budget_parses_value_and_rejects_garbage() {
+        assert_eq!(resolve_page_in_run_budget(Some("4096")), 4096);
+        assert_eq!(resolve_page_in_run_budget(Some(" 0 ")), 0);
+        assert_eq!(resolve_page_in_run_budget(Some("lots")), 8192);
+        assert_eq!(resolve_page_in_run_budget(Some("")), 8192);
+        assert_eq!(resolve_page_in_run_budget(Some("-1")), 8192);
+    }
+
+    #[test]
+    fn page_in_bodies_flag_recognizes_truthy_values_only() {
+        assert!(!resolve_page_in_bodies(None));
+        assert!(resolve_page_in_bodies(Some("1")));
+        assert!(resolve_page_in_bodies(Some("true")));
+        assert!(resolve_page_in_bodies(Some("yes")));
+        assert!(!resolve_page_in_bodies(Some("0")));
+        assert!(!resolve_page_in_bodies(Some("false")));
+        assert!(!resolve_page_in_bodies(Some("")));
+    }
+
+    /// rlm2/PR4: a recalled item is sticky — it stays in the
+    /// recall message across later turns (including turns
+    /// that FIFO-evict working content) and disappears only
+    /// when the latest user prompt changes.
+    #[tokio::test]
+    async fn sticky_page_in_survives_fifo_until_prompt_changes() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "archived Tallahassee weather discussion",
+            1,
+        )])));
+        let policy = ContextVirtualizationPolicy::new(
+            60,
+            1,
+            1_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64])),
+        )
+        .with_evict_low_water_pct(0.6);
+
+        // Fire 1: the prompt matches the archived candidate.
+        let context = vec![user("what was the Tallahassee weather conclusion?", 100)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        let recall_1 = recall_text_of(&sent_1).expect("recall after fire 1");
+        assert!(recall_1.contains("archived Tallahassee weather discussion"));
+
+        // Fire 2: bulky filler breaches the ceiling, so FIFO
+        // eviction runs. The recalled item never entered the
+        // working set, so eviction can't touch it — the
+        // rebuilt recall still carries it, byte-identical.
+        let mut context_2 = sent_1.clone();
+        for i in 0..6u64 {
+            context_2.push(assistant(&"filler chatter ".repeat(10), 101 + i));
+        }
+        let survivors = match policy.before_model(sample_request(&context_2)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall_2 = recall_text_of(&survivors).expect("recall survives eviction");
+        assert_eq!(recall_2, recall_1, "sticky recall re-renders identically");
+        assert!(is_ledger(survivors.last().expect("non-empty")));
+        assert!(is_archive_recall(&survivors[survivors.len() - 2]));
+
+        // Fire 3: a NEW user prompt (different timestamp,
+        // unrelated topic) resets the sticky set — the recall
+        // message disappears.
+        let mut context_3 = survivors.clone();
+        context_3.push(user("completely unrelated cooking question", 200));
+        let survivors_3 = match policy.before_model(sample_request(&context_3)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("prompt change must rebuild, got {other:?}"),
+        };
+        assert!(
+            recall_text_of(&survivors_3).is_none(),
+            "sticky set resets when the prompt changes: {survivors_3:?}"
+        );
+        assert!(is_ledger(survivors_3.last().expect("non-empty")));
+    }
+
+    /// rlm2/PR4: the same archive item is never paged in
+    /// twice for one prompt — a later rebuilding turn neither
+    /// duplicates the section nor re-charges the run budget.
+    #[tokio::test]
+    async fn same_item_not_paged_twice_for_one_prompt() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "relevant_keyword archived note",
+            1,
+        )])));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64])),
+        );
+        let context = vec![user("looking for relevant_keyword", 100)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        assert!(recall_text_of(&sent_1).is_some());
+        let spent_after_1 = {
+            let state = policy
+                .page_in_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(state.sticky_sections.len(), 1);
+            assert!(state.spent_tokens > 0);
+            state.spent_tokens
+        };
+
+        // New tool activity forces a ledger rebuild (the
+        // recall path runs again), same prompt.
+        let mut context_2 = sent_1.clone();
+        context_2.push(assistant_with_tool_call(
+            "bash",
+            serde_json::json!({"command": "ls"}),
+            101,
+        ));
+        context_2.push(tool_result("call_101", "bash", "listing", 102));
+        let survivors = match policy.before_model(sample_request(&context_2)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall = recall_text_of(&survivors).expect("recall persists");
+        assert_eq!(
+            recall.matches("[archive entry").count(),
+            1,
+            "section must not duplicate: {recall}"
+        );
+        let state = policy
+            .page_in_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert_eq!(state.sticky_sections.len(), 1);
+        assert_eq!(
+            state.spent_tokens, spent_after_1,
+            "re-rendering must not re-charge the run budget"
+        );
+    }
+
+    /// rlm2/PR4: the per-run page-in budget caps total spend
+    /// across the whole run, and resets when a new prompt
+    /// (new run) arrives.
+    #[tokio::test]
+    async fn per_run_page_in_budget_is_enforced() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            user("weather note alpha", 1),
+            user("weather note beta", 2),
+        ])));
+        // Each rendered section is ~9 estimated tokens; a
+        // 12-token run budget admits one, then exhausts —
+        // even though the per-fire relevance budget (10k)
+        // would happily take both.
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64, 2u64])),
+        )
+        .with_page_in_run_budget(12);
+        let context = vec![user("weather?", 100)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        {
+            let state = policy
+                .page_in_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(state.sticky_sections.len(), 1, "run budget admits one section");
+            assert!(state.spent_tokens <= 12);
+        }
+
+        // A rebuilding turn within the same run can't spend
+        // past the cap: the second candidate stays out.
+        let mut context_2 = sent_1.clone();
+        context_2.push(assistant_with_tool_call(
+            "bash",
+            serde_json::json!({"command": "ls"}),
+            101,
+        ));
+        context_2.push(tool_result("call_101", "bash", "listing", 102));
+        let survivors = match policy.before_model(sample_request(&context_2)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        {
+            let state = policy
+                .page_in_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                state.sticky_sections.len(),
+                1,
+                "budget exhausted — no further page-ins this run"
+            );
+        }
+
+        // A NEW prompt is a new run: the budget resets and
+        // the remaining candidate can page in.
+        let mut context_3 = survivors;
+        context_3.push(user("more weather please", 200));
+        let survivors_3 = match policy.before_model(sample_request(&context_3)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall_3 = recall_text_of(&survivors_3).expect("new run pages in again");
+        assert_eq!(recall_3.matches("[archive entry").count(), 1);
+        let state = policy
+            .page_in_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(state.spent_tokens <= 12, "fresh run, fresh budget");
+    }
+
+    /// rlm2/PR4 × PR3: a turn whose only change would be
+    /// re-rendering an IDENTICAL archive-recall message still
+    /// qualifies for the append-only no-op fast path — and
+    /// the new message is archived store-side regardless
+    /// (invariant c).
+    #[tokio::test]
+    async fn turn_after_page_in_with_identical_recall_takes_noop_fast_path() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "relevant_keyword archived note",
+            1,
+        )])));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            4,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64])),
+        );
+        let context = vec![user("looking for relevant_keyword", 100)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        assert!(recall_text_of(&sent_1).is_some());
+        assert!(is_ledger(sent_1.last().expect("non-empty")));
+
+        // Plain text append: nothing evicts, nothing new
+        // pages in, the rebuilt ledger and the re-rendered
+        // recall are byte-identical — Continue, recall and
+        // ledger left in place.
+        let mut context_2 = sent_1.clone();
+        context_2.push(assistant("a plain text reply", 101));
+        let response = policy.before_model(sample_request(&context_2)).await;
+        assert_eq!(response, BeforeModelResponse::Continue);
+        // Invariant (c): the reply was archived even though
+        // the turn no-opped (candidate + prompt + reply).
+        assert_eq!(store.read().await.len(), 3);
+
+        // And the recall/ledger pair is stripped cleanly by a
+        // later rebuilding turn: exactly one of each remains,
+        // ledger strictly last, recall immediately before it.
+        let mut context_3 = context_2.clone();
+        context_3.push(assistant_with_tool_call(
+            "bash",
+            serde_json::json!({"command": "ls"}),
+            102,
+        ));
+        context_3.push(tool_result("call_102", "bash", "listing", 103));
+        let survivors = match policy.before_model(sample_request(&context_3)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        assert_eq!(
+            survivors.iter().filter(|m| is_archive_recall(m)).count(),
+            1
+        );
+        assert_eq!(survivors.iter().filter(|m| is_ledger(m)).count(), 1);
+        assert!(is_ledger(survivors.last().expect("non-empty")));
+        assert!(is_archive_recall(&survivors[survivors.len() - 2]));
+    }
+
+    // ----- rlm2/PR5: ledger diet, token-budget tail, size-aware eviction -----
+
+    /// rlm2/PR5: the pinned tail is a token budget, not a
+    /// message count. 10 messages × 20 tokens with a 45-token
+    /// tail budget pins exactly the last two messages (a
+    /// third would overflow); under the old positional
+    /// reading, "45" would have pinned the whole context and
+    /// disabled eviction entirely.
+    #[tokio::test]
+    async fn pinned_tail_is_token_budgeted_not_positional() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let body = "y".repeat(80); // 20 estimated tokens per message
+        let context: Vec<Message> = (0..10).map(|i| user(&body, i as u64)).collect();
+        // Total ≈ 200; ceiling 100 → low-water target 60.
+        let policy = ContextVirtualizationPolicy::new(
+            100,
+            45,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_evict_low_water_pct(0.6);
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let originals: Vec<&Message> = survivors.iter().filter(|m| !is_ledger(m)).collect();
+        assert!(
+            originals.len() < context.len(),
+            "a 45-token budget must not pin all ten 20-token messages: {survivors:?}"
+        );
+        // FIFO stops at the low-water mark: 7 evicted, the
+        // newest 3 (60 tokens) survive in order.
+        assert_eq!(originals.len(), 3);
+        let ts: Vec<u64> = originals.iter().map(|m| message_timestamp(m)).collect();
+        assert_eq!(ts, vec![7, 8, 9]);
+    }
+
+    /// rlm2/PR5: the latest user AND latest assistant
+    /// messages are identity-pinned regardless of the tail
+    /// budget — with `pin_tail_tokens = 0` and an aggressive
+    /// ceiling, both survive while bulk tool results around
+    /// them evict. The trailing message is also always
+    /// pinned (the model must see what just happened).
+    #[tokio::test]
+    async fn last_user_and_assistant_pinned_even_with_zero_tail_budget() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context = vec![
+            user("the actual directive", 1),
+            assistant(&format!("important conclusion {}", "x".repeat(200)), 2),
+            tool_result("c1", "bash", &"big output ".repeat(100), 3),
+            tool_result("c2", "bash", &"more output ".repeat(100), 4),
+        ];
+        let policy = ContextVirtualizationPolicy::new(
+            5,
+            0,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_evict_low_water_pct(0.6);
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ts: Vec<u64> = survivors
+            .iter()
+            .filter(|m| !is_ledger(m))
+            .map(message_timestamp)
+            .collect();
+        assert!(ts.contains(&1), "latest user pinned: {survivors:?}");
+        assert!(ts.contains(&2), "latest assistant pinned: {survivors:?}");
+        assert!(ts.contains(&4), "trailing message pinned: {survivors:?}");
+        assert!(!ts.contains(&3), "the older tool result evicts: {survivors:?}");
+    }
+
+    /// rlm2/PR5 size-aware eviction: among evictable
+    /// messages, an old LARGE tool result (> 1_024 estimated
+    /// tokens) evicts before older-but-small assistant
+    /// texts. Pure FIFO would have evicted the small
+    /// narrative note first for negligible gain.
+    #[tokio::test]
+    async fn large_old_tool_results_evict_before_small_text() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let big = "z".repeat(5_000); // ~1_250 tokens, over the 1_024 threshold
+        let context = vec![
+            assistant("narrative note alpha", 1), // oldest AND small
+            tool_result("c1", "bash", &big, 2),   // old + large
+            assistant("narrative note beta", 3),
+            user("current question", 4),
+        ];
+        // Total ≈ 1_260; ceiling 600 → target 360: evicting
+        // the large tool result alone reaches it.
+        let policy = ContextVirtualizationPolicy::new(
+            600,
+            30,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_evict_low_water_pct(0.6);
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ts: Vec<u64> = survivors
+            .iter()
+            .filter(|m| !is_ledger(m))
+            .map(message_timestamp)
+            .collect();
+        assert!(
+            !ts.contains(&2),
+            "the large tool result must evict first: {survivors:?}"
+        );
+        assert!(
+            ts.contains(&1),
+            "the older small text survives — FIFO would have dropped it: {survivors:?}"
+        );
+        assert_eq!(ts, vec![1, 3, 4]);
+    }
+
+    // ----- rlm2 review fix: pair-atomic eviction -----
+
+    /// No surviving assistant `ToolCall` may lack its result, and
+    /// no surviving tool result may lack its call — OpenAI-family
+    /// providers reject either orphan with a 400.
+    fn assert_tool_pairs_intact(survivors: &[Message]) {
+        let mut call_ids: Vec<&str> = Vec::new();
+        let mut result_ids: Vec<&str> = Vec::new();
+        for m in survivors {
+            match m {
+                Message::Assistant(a) => {
+                    for block in &a.content {
+                        if let ContentBlock::ToolCall(c) = block {
+                            call_ids.push(c.id.as_str());
+                        }
+                    }
+                }
+                Message::ToolResult(t) => result_ids.push(t.tool_call_id.as_str()),
+                _ => {}
+            }
+        }
+        call_ids.sort_unstable();
+        result_ids.sort_unstable();
+        assert_eq!(
+            call_ids, result_ids,
+            "eviction orphaned a tool_call/tool_result pair: {survivors:?}"
+        );
+    }
+
+    /// The size-aware pass (3a-ter) evicts a LARGE tool result —
+    /// the assistant message whose `ToolCall` produced it must go
+    /// with it, or the survivors carry an orphaned call.
+    #[tokio::test]
+    async fn size_aware_eviction_takes_the_assistant_call_with_its_large_result() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let big = "z".repeat(5_000); // ~1_250 tokens, over the 1_024 threshold
+        let context = vec![
+            user("do the thing", 1),
+            assistant_call_with_id("call_2", "bash", serde_json::json!({"command": "ls"}), 2),
+            tool_result("call_2", "bash", &big, 3),
+            assistant_call_with_id("call_4", "bash", serde_json::json!({"command": "pwd"}), 4),
+            tool_result("call_4", "bash", "pwd output", 5),
+            assistant("narrative", 6),
+            user("now summarize", 7),
+        ];
+        let policy = ContextVirtualizationPolicy::new(
+            600,
+            30,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_evict_low_water_pct(0.6);
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ts: Vec<u64> = survivors
+            .iter()
+            .filter(|m| !is_ledger(m))
+            .map(message_timestamp)
+            .collect();
+        assert!(!ts.contains(&3), "the large result evicts: {survivors:?}");
+        assert!(
+            !ts.contains(&2),
+            "its assistant call must evict with it: {survivors:?}"
+        );
+        assert_tool_pairs_intact(&survivors);
+    }
+
+    /// The latest-assistant anchor pins a message carrying a
+    /// `ToolCall` — its result is part of the same protocol unit,
+    /// so the pin protects the whole pair instead of letting FIFO
+    /// evict the result out from under the call.
+    #[tokio::test]
+    async fn pinned_assistant_anchor_protects_its_tool_results_from_eviction() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let filler = "f".repeat(2_000); // ~500 tokens of evictable bulk
+        // The result is ~100 tokens — big enough that eviction is
+        // still over target after the filler goes, so a per-message
+        // FIFO would reach it (skipping only the pinned assistant)
+        // and orphan the call.
+        let context = vec![
+            user(&filler, 1),
+            assistant_call_with_id("call_2", "bash", serde_json::json!({"command": "ls"}), 2),
+            tool_result("call_2", "bash", &"ls output ".repeat(40), 3),
+            user("current directive", 4),
+        ];
+        // Ceiling far below the filler; pin tail covers only the
+        // trailing directive, so ts 2 + 3 are protected purely by
+        // the latest-assistant anchor extending over its pair.
+        let policy = ContextVirtualizationPolicy::new(
+            50,
+            1,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_evict_low_water_pct(0.6);
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ts: Vec<u64> = survivors
+            .iter()
+            .filter(|m| !is_ledger(m))
+            .map(message_timestamp)
+            .collect();
+        assert!(!ts.contains(&1), "the filler evicts: {survivors:?}");
+        assert!(ts.contains(&2), "latest assistant pinned: {survivors:?}");
+        assert!(
+            ts.contains(&3),
+            "the pinned call's result must survive with it: {survivors:?}"
+        );
+        assert_tool_pairs_intact(&survivors);
+    }
+
+    /// Regression for the orphaned-pair finding: a low-water batch
+    /// eviction sweeping a transcript dense with pairs (where the
+    /// old per-message FIFO routinely broke between a call and its
+    /// result) leaves no orphan on either side.
+    #[tokio::test]
+    async fn low_water_batch_eviction_never_orphans_tool_pairs() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let body = "b".repeat(120); // ~30 tokens per result
+        let mut context = vec![user("kick off the build", 1)];
+        for i in 0..8u64 {
+            let ts = 10 + i * 2;
+            let id = format!("call_{ts}");
+            context.push(assistant_call_with_id(
+                &id,
+                "bash",
+                serde_json::json!({"command": format!("step {i}")}),
+                ts,
+            ));
+            context.push(tool_result(&id, "bash", &body, ts + 1));
+        }
+        context.push(user("how did it go?", 100));
+        let policy = ContextVirtualizationPolicy::new(
+            120,
+            40,
+            0,
+            store,
+            shared_pushed(HashSet::new()),
+        )
+        .with_evict_low_water_pct(0.6);
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        assert!(
+            survivors.len() < context.len(),
+            "the batch eviction must actually fire: {survivors:?}"
+        );
+        assert_tool_pairs_intact(&survivors);
+    }
+
+    /// rlm2/PR5 ledger diet: an identity entry whose result
+    /// body is still in the working set is skipped — the
+    /// model can see the body, so pointing at the archive is
+    /// redundant. An entry whose body was evicted stays
+    /// listed.
+    #[tokio::test]
+    async fn ledger_skips_entries_present_in_working_set() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            assistant_with_tool_call("bash", serde_json::json!({"command": "ls"}), 1),
+            tool_result("call_1", "bash", "ls output", 2),
+            assistant_with_tool_call("bash", serde_json::json!({"command": "pwd"}), 3),
+            tool_result("call_3", "bash", "pwd output", 4),
+        ])));
+        let pushed: HashSet<u64> = (1..=4).collect();
+        // The `ls` result (ts 2) is still in the working set;
+        // the `pwd` result (ts 4) lives only in the archive.
+        let context = vec![
+            user("a question", 100),
+            tool_result("call_1", "bash", "ls output", 2),
+        ];
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let ledger_text = user_text(survivors.last().expect("non-empty")).expect("ledger text");
+        assert!(
+            ledger_text.contains("pwd (id=call_3)"),
+            "evicted body stays listed: {ledger_text}"
+        );
+        assert!(
+            !ledger_text.contains("ls (id=call_1)"),
+            "body in the working set must not be listed: {ledger_text}"
+        );
+    }
+
+    /// rlm2/PR5 ledger diet: an identity entry whose result
+    /// body was recalled into the sticky archive-recall
+    /// message is skipped for the same reason — the body is
+    /// already on screen.
+    #[tokio::test]
+    async fn ledger_skips_entries_recalled_into_sticky_set() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            assistant_with_tool_call(
+                "bash",
+                serde_json::json!({"command": "echo relevant_keyword"}),
+                1,
+            ),
+            tool_result("call_1", "bash", "relevant_keyword output text", 2),
+        ])));
+        let pushed: HashSet<u64> = (1..=2).collect();
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            store,
+            shared_pushed(pushed),
+        );
+        let context = vec![user("looking for relevant_keyword", 100)];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall = recall_text_of(&survivors).expect("the result body pages in");
+        assert!(recall.contains("relevant_keyword output text"), "{recall}");
+        let ledger_text = user_text(survivors.last().expect("non-empty")).expect("ledger text");
+        assert!(
+            !ledger_text.contains("(id=call_1)"),
+            "sticky-recalled body must not be listed in the ledger: {ledger_text}"
+        );
+    }
+
+    /// rlm2/PR5 × PR3: the per-tool cap and overflow line are
+    /// deterministic, so an over-the-cap archive still
+    /// renders byte-identical ledgers across appending turns
+    /// — the no-op fast path keeps working.
+    #[tokio::test]
+    async fn capped_ledger_stays_byte_stable_across_appending_turns() {
+        let archived: Vec<Message> = (0..10)
+            .map(|i| {
+                assistant_with_tool_call(
+                    "bash",
+                    serde_json::json!({ "command": format!("cmd{i}") }),
+                    i as u64 + 1,
+                )
+            })
+            .collect();
+        let pushed: HashSet<u64> = (1..=10).collect();
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(archived)));
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
+
+        let context = vec![user("question", 100), assistant("working on it", 101)];
+        let sent_1 = apply_response(
+            policy.before_model(sample_request(&context)).await,
+            context,
+        );
+        let ledger_text = user_text(sent_1.last().expect("non-empty")).expect("ledger text");
+        assert!(ledger_text.contains("cmd9"), "{ledger_text}");
+        assert!(!ledger_text.contains("cmd1 "), "{ledger_text}");
+        assert!(ledger_text.contains("2 earlier calls"), "{ledger_text}");
+
+        // A plain text append re-renders the capped lines
+        // byte-identically → Continue.
+        let mut context_2 = sent_1;
+        context_2.push(assistant("a plain text reply", 102));
+        let response = policy.before_model(sample_request(&context_2)).await;
+        assert_eq!(response, BeforeModelResponse::Continue);
+    }
+
+    /// rlm2/PR5 (perf): candidate scoring runs against the
+    /// token sets cached at archive time and borrows every
+    /// candidate from the store — `RelevanceCandidate<'_>`'s
+    /// lifetime makes cloning unselected bodies structurally
+    /// impossible; the only owned output is the rendered
+    /// section text of the items that fit the budget. This
+    /// test pins the observable contract: with one matching
+    /// candidate among many large irrelevant bodies, exactly
+    /// one section's worth of text is produced, and the
+    /// archive entries carry their pre-computed token sets.
+    #[tokio::test]
+    async fn candidate_scoring_does_not_clone_unselected_bodies() {
+        let filler = format!("unrelated filler {}", "lorem ipsum dolor ".repeat(50));
+        let mut archived: Vec<Message> = (0..30).map(|i| user(&filler, i as u64 + 1)).collect();
+        archived.push(user("the relevant_keyword note", 50));
+        let pushed: HashSet<u64> = archived.iter().map(message_timestamp).collect();
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(archived)));
+        {
+            let external = store.try_read().expect("uncontended");
+            assert!(
+                external.iter_stored().all(|s| !s.tokens.is_empty()),
+                "every archived body has its token set cached at push time"
+            );
+        }
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(pushed),
+        );
+        let context = vec![user("looking for relevant_keyword", 100)];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall = recall_text_of(&survivors).expect("the matching note pages in");
+        assert_eq!(
+            recall.matches("[archive entry").count(),
+            1,
+            "only the selected candidate renders a section: {recall}"
+        );
+        assert!(recall.contains("the relevant_keyword note"), "{recall}");
     }
 }

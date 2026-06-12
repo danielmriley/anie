@@ -1610,16 +1610,23 @@ impl InteractiveController {
             self.send_system_message(&message).await;
             return Ok(());
         }
+        // Refresh + compose the per-run system prompt up front:
+        // the rlm ceiling derives from the composed prompt's
+        // weight (rlm2/PR2), and the same string is handed to
+        // `build_agent` below — composed once, never recomposed.
+        self.state.refresh_system_prompt_if_needed();
+        let system_prompt = compose_system_prompt(&self.state);
+        let active_ceiling = if self.state.harness_mode.installs_rlm_features() {
+            rlm_active_ceiling_tokens(&self.state, &system_prompt)
+        } else {
+            u64::MAX
+        };
         info!(
             provider = %self.state.config.current_model().provider,
             model = %self.state.config.current_model().id,
             thinking = %format_thinking(self.state.config.current_thinking()),
             harness_mode = self.state.harness_mode.label(),
-            rlm_active_ceiling_tokens = if self.state.harness_mode.installs_rlm_features() {
-                rlm_active_ceiling_tokens()
-            } else {
-                u64::MAX
-            },
+            rlm_active_ceiling_tokens = active_ceiling,
             "starting interactive run"
         );
         // A fresh user prompt supersedes any pending retry from
@@ -1639,7 +1646,6 @@ impl InteractiveController {
         let max_per_turn = self.state.config.anie_config().compaction.max_per_turn;
         self.compactions_remaining_this_turn
             .store(max_per_turn, Ordering::Release);
-        self.state.refresh_system_prompt_if_needed();
         // Inject any skill bodies staged by `/skill:<name>` as synthetic
         // user turns ahead of this prompt. Reuses the session-append
         // seam (does NOT touch the single BeforeModelPolicy slot held by
@@ -1740,12 +1746,15 @@ impl InteractiveController {
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
             Some(self.event_tx.clone()),
+            active_ceiling,
         );
         let agent = build_agent(
             &self.state,
             self.build_compaction_gate(),
             rlm_extras,
             Some(self.event_tx.clone()),
+            system_prompt,
+            active_ceiling,
         );
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -1785,6 +1794,15 @@ impl InteractiveController {
         retry_attempt: u32,
     ) -> Result<()> {
         self.state.refresh_system_prompt_if_needed();
+        // Same compose-once discipline as `start_prompt_run`
+        // (rlm2/PR2): the composed prompt feeds the ceiling
+        // derivation and the agent build.
+        let system_prompt = compose_system_prompt(&self.state);
+        let active_ceiling = if self.state.harness_mode.installs_rlm_features() {
+            rlm_active_ceiling_tokens(&self.state, &system_prompt)
+        } else {
+            u64::MAX
+        };
         let context = self
             .state
             .session_context()
@@ -1802,12 +1820,15 @@ impl InteractiveController {
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
             Some(self.event_tx.clone()),
+            active_ceiling,
         );
         let agent = build_agent(
             &self.state,
             self.build_compaction_gate(),
             rlm_extras,
             Some(self.event_tx.clone()),
+            system_prompt,
+            active_ceiling,
         );
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -2615,6 +2636,8 @@ fn build_agent(
     compaction_gate: Option<Arc<dyn anie_agent::CompactionGate>>,
     rlm_extras: RlmExtras,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    system_prompt: String,
+    rlm_active_ceiling: u64,
 ) -> AgentLoop {
     // Most runs (current / baseline modes) reuse the bootstrap
     // tool registry verbatim — cheap `Arc::clone`. Only `rlm`
@@ -2626,13 +2649,15 @@ fn build_agent(
     } else {
         Arc::new(state.tool_registry.with_added(rlm_extras.tools))
     };
-    // Compose the per-run system prompt. In rlm mode we
-    // append a paragraph establishing the archive policy
+    // The per-run system prompt is composed by the caller
+    // (rlm2/PR2: the same string feeds the ceiling derivation,
+    // so it's built once and passed down). In rlm mode it
+    // carries a paragraph establishing the archive policy
     // upfront, in the system role — without it, the
     // model's trained pattern of "use web tools for
     // live-world questions" drowns out the per-turn
     // ledger's request to prefer recurse.
-    let system_prompt = compose_system_prompt(state);
+    //
     // Plan 04 §2e of `docs/local_model_augmentation/`: a
     // prompt past half the rlm ceiling means the window is
     // mostly spent before the conversation starts. Warn once
@@ -2640,7 +2665,7 @@ fn build_agent(
     // so repeating it every run is pure noise.
     if state.harness_mode.installs_rlm_features()
         && let Some(message) =
-            prompt_budget_warning(estimate_text_tokens(&system_prompt), rlm_active_ceiling_tokens())
+            prompt_budget_warning(estimate_text_tokens(&system_prompt), rlm_active_ceiling)
     {
         static PROMPT_BUDGET_WARNED: std::sync::Once = std::sync::Once::new();
         PROMPT_BUDGET_WARNED.call_once(|| warn!("{message}"));
@@ -3020,39 +3045,161 @@ impl RlmExtras {
     }
 }
 
-/// Default active-context ceiling under `--harness-mode=rlm`.
-/// 16k tokens is Plan 06 Phase C's recommendation for small
-/// models — tight enough that long sessions actually trigger
-/// eviction, loose enough that ordinary multi-turn use never
-/// crosses it. Operators tune via `ANIE_ACTIVE_CEILING_TOKENS`.
+/// Fallback active-context ceiling under `--harness-mode=rlm`
+/// for models with no `num_ctx` concept (hosted / non-Ollama
+/// providers). 16k tokens is Plan 06 Phase C's recommendation
+/// for small models — tight enough that long sessions actually
+/// trigger eviction, loose enough that ordinary multi-turn use
+/// never crosses it.
+///
+/// For Ollama models the default is *derived* instead (rlm2/PR2,
+/// `docs/rlm_context_v2/02_budget_coupling.md`): the field notes
+/// showed ceiling == num_ctx in practice, so requests also
+/// carrying the system prompt + repo map + ledger overflowed the
+/// window and Ollama context-shifted — silently discarding the
+/// OLDEST tokens, i.e. the system prompt. The derived default is
+/// `effective_num_ctx − prompt_reserve − output_reserve`, floored
+/// at [`RLM_CEILING_FLOOR_TOKENS`], so the content budget is
+/// coupled to the allocation budget. Operators tune via
+/// `ANIE_ACTIVE_CEILING_TOKENS` (wins outright) and
+/// `ANIE_OUTPUT_RESERVE_TOKENS`.
 const DEFAULT_RLM_ACTIVE_CEILING_TOKENS: u64 = 16_384;
 
-/// Default pinned tail under `--harness-mode=rlm`. 6 messages
-/// ≈ 3 user-assistant turns; protects current-turn continuity
-/// even if the pinned tail itself exceeds the ceiling.
-const DEFAULT_RLM_KEEP_LAST_N: usize = 6;
+/// Tokens reserved for the model's *output* when deriving the
+/// rlm ceiling from `num_ctx` — Ollama's window covers prefill +
+/// generation, so the working set must leave generation room.
+/// Override via `ANIE_OUTPUT_RESERVE_TOKENS`.
+const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 4_096;
 
-/// Read the per-run active-context ceiling. `--harness-mode=rlm`
+/// Floor for the derived rlm ceiling. A tiny `num_ctx` minus the
+/// reserves could derive a ceiling too small to hold even the
+/// pinned tail; below this the run is misconfigured either way,
+/// so we keep a usable working set and let Ollama shed (the
+/// truncation alarm will say so).
+const RLM_CEILING_FLOOR_TOKENS: u64 = 4_096;
+
+/// Slack reserved for the per-turn ledger when deriving the rlm
+/// ceiling. The ledger is injected *inside* the working set but
+/// its size varies turn-to-turn with archive contents; 1k of
+/// headroom absorbs that variance.
+const RLM_LEDGER_SLACK_TOKENS: u64 = 1_024;
+
+/// rlm2/PR5: default token budget for the pinned tail under
+/// `--harness-mode=rlm`. Protects current-turn continuity by
+/// cost rather than by count (the old positional default of
+/// 6 messages could pin anywhere from ~100 tokens to ~20k
+/// depending on what the tail held). 3_072 equals the old
+/// default at the conversion factor below, so unset
+/// environments keep their effective behavior.
+const DEFAULT_PIN_TAIL_TOKENS: u64 = 3_072;
+
+/// rlm2/PR5: conversion factor for the deprecated positional
+/// `ANIE_KEEP_LAST_N` alias — N messages map onto N × 512
+/// tokens. 512 is chosen so the old default (6 messages) and
+/// the new default (3_072 tokens) are the same fixed point.
+const PIN_TAIL_TOKENS_PER_MESSAGE: u64 = 512;
+
+/// Resolve the per-run active-context ceiling. `--harness-mode=rlm`
 /// installs a finite default so the eviction + ledger +
 /// relevance pipeline runs out of the box (the user's request:
 /// the flag should make the feature *work*, not require a
-/// constellation of env vars). Override via
-/// `ANIE_ACTIVE_CEILING_TOKENS`. Set the env var to a very
+/// constellation of env vars). An explicit
+/// `ANIE_ACTIVE_CEILING_TOKENS` wins outright; set it to a very
 /// large value (e.g. 18446744073709551615) to opt out and
-/// restore the noop fast path.
-fn rlm_active_ceiling_tokens() -> u64 {
-    std::env::var("ANIE_ACTIVE_CEILING_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_RLM_ACTIVE_CEILING_TOKENS)
+/// restore the noop fast path. Otherwise the default derives
+/// from the Ollama allocation budget (rlm2/PR2); hosted models
+/// keep [`DEFAULT_RLM_ACTIVE_CEILING_TOKENS`].
+///
+/// `system_prompt` is the *composed* per-run prompt the caller
+/// already built for `build_agent` — passed in rather than
+/// recomposed here.
+fn rlm_active_ceiling_tokens(state: &ControllerState, system_prompt: &str) -> u64 {
+    // Only Ollama's native chat API has a `num_ctx` allocation
+    // to couple against; other APIs keep the static default.
+    let effective_num_ctx = (state.config.current_model().api == ApiKind::OllamaChatApi)
+        .then(|| state.config.effective_ollama_context_window());
+    resolve_rlm_active_ceiling_tokens(
+        std::env::var("ANIE_ACTIVE_CEILING_TOKENS").ok().as_deref(),
+        std::env::var("ANIE_OUTPUT_RESERVE_TOKENS").ok().as_deref(),
+        effective_num_ctx,
+        rlm_prompt_reserve_tokens(state, system_prompt),
+    )
 }
 
-/// Read the keep-last-N override from `ANIE_KEEP_LAST_N`.
-fn rlm_keep_last_n() -> usize {
-    std::env::var("ANIE_KEEP_LAST_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_RLM_KEEP_LAST_N)
+/// Tokens the prompt side of the request consumes before the
+/// working set gets a single byte: the composed system prompt,
+/// the repo map (injected by `RepoMapPolicy` *inside* the message
+/// list, budgeted separately from the ceiling), and the ledger
+/// slack.
+fn rlm_prompt_reserve_tokens(state: &ControllerState, system_prompt: &str) -> u64 {
+    let repo_map_budget = if crate::repo_map::repo_map_enabled(state.harness_mode) {
+        crate::repo_map::repo_map_token_budget(state.prompt_tier())
+    } else {
+        0
+    };
+    estimate_text_tokens(system_prompt) + repo_map_budget + RLM_LEDGER_SLACK_TOKENS
+}
+
+/// Pure core of [`rlm_active_ceiling_tokens`]. Env values arrive
+/// as parameters so tests stay race-free (repo convention; cf.
+/// [`summarizer_kind`], [`small_tier_ledger_enabled`]).
+///
+/// - `explicit_ceiling_env` (`ANIE_ACTIVE_CEILING_TOKENS`): wins
+///   outright when it parses.
+/// - `effective_num_ctx`: the num_ctx that will actually go on
+///   the wire (`Some` only for Ollama native chat models).
+/// - `output_reserve_env` (`ANIE_OUTPUT_RESERVE_TOKENS`):
+///   generation headroom, default
+///   [`DEFAULT_OUTPUT_RESERVE_TOKENS`].
+fn resolve_rlm_active_ceiling_tokens(
+    explicit_ceiling_env: Option<&str>,
+    output_reserve_env: Option<&str>,
+    effective_num_ctx: Option<u64>,
+    prompt_reserve_tokens: u64,
+) -> u64 {
+    if let Some(explicit) = explicit_ceiling_env.and_then(|s| s.trim().parse().ok()) {
+        return explicit;
+    }
+    let Some(num_ctx) = effective_num_ctx else {
+        return DEFAULT_RLM_ACTIVE_CEILING_TOKENS;
+    };
+    let output_reserve = output_reserve_env
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS);
+    num_ctx
+        .saturating_sub(prompt_reserve_tokens)
+        .saturating_sub(output_reserve)
+        .max(RLM_CEILING_FLOOR_TOKENS)
+}
+
+/// rlm2/PR5: pure core of [`rlm_pin_tail_tokens`]. Env values
+/// arrive as parameters so tests stay race-free (repo
+/// convention; cf. [`resolve_rlm_active_ceiling_tokens`]).
+///
+/// - `pin_tail_env` (`ANIE_PIN_TAIL_TOKENS`): wins outright
+///   when it parses.
+/// - `keep_last_n_env` (`ANIE_KEEP_LAST_N`, deprecated
+///   positional alias): converts onto the token budget at
+///   [`PIN_TAIL_TOKENS_PER_MESSAGE`] tokens per message.
+/// - Neither set / neither parses →
+///   [`DEFAULT_PIN_TAIL_TOKENS`].
+fn resolve_pin_tail_tokens(pin_tail_env: Option<&str>, keep_last_n_env: Option<&str>) -> u64 {
+    if let Some(tokens) = pin_tail_env.and_then(|s| s.trim().parse().ok()) {
+        return tokens;
+    }
+    if let Some(n) = keep_last_n_env.and_then(|s| s.trim().parse::<u64>().ok()) {
+        return n.saturating_mul(PIN_TAIL_TOKENS_PER_MESSAGE);
+    }
+    DEFAULT_PIN_TAIL_TOKENS
+}
+
+/// Read the pinned-tail token budget from `ANIE_PIN_TAIL_TOKENS`
+/// (deprecated alias: `ANIE_KEEP_LAST_N`).
+fn rlm_pin_tail_tokens() -> u64 {
+    resolve_pin_tail_tokens(
+        std::env::var("ANIE_PIN_TAIL_TOKENS").ok().as_deref(),
+        std::env::var("ANIE_KEEP_LAST_N").ok().as_deref(),
+    )
 }
 
 /// Read the relevance-budget override from
@@ -3213,6 +3360,13 @@ pub(crate) struct RlmSessionState {
         Arc<dyn crate::embedder::Embedder>,
         mpsc::Sender<crate::bg_embedder::EmbedRequest>,
     )>,
+    /// rlm2/PR4: sticky page-in state + per-run page-in
+    /// spend, shared with each per-run policy. Keyed inside
+    /// by the latest user prompt's timestamp, so it resets
+    /// at run granularity while continuation runs (same
+    /// prompt, fresh policy) keep the sticky set and the
+    /// budget already spent.
+    page_in: Arc<std::sync::Mutex<crate::context_virt::PageInRunState>>,
     /// Cancellation for the workers; they `select!` on it
     /// alongside their request channels.
     cancel: CancellationToken,
@@ -3248,6 +3402,7 @@ impl RlmSessionState {
             pushed: Arc::new(std::sync::Mutex::new(pushed)),
             summary_tx,
             embed,
+            page_in: Arc::default(),
             cancel,
             workers,
         }
@@ -3295,6 +3450,7 @@ fn build_rlm_extras(
     recursion_budget: Arc<AtomicU32>,
     context_snapshot: Vec<Message>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    active_ceiling: u64,
 ) -> RlmExtras {
     if !state.harness_mode.installs_rlm_features() {
         return RlmExtras::empty();
@@ -3324,12 +3480,13 @@ fn build_rlm_extras(
         RECURSION_MAX_DEPTH,
     ));
     // Phases C + D + E: install the active-ceiling policy.
-    // With the env var unset, ceiling = u64::MAX → policy
-    // returns Continue on every fire (default behavior
-    // preserved). With a finite ceiling, the policy evicts,
-    // archives, pages relevance-scored content back in, and
-    // injects a per-turn ledger. The relevance budget
-    // defaults to ceiling/4.
+    // The ceiling is resolved per-run by the caller (rlm2/PR2:
+    // it derives from the composed system prompt, which the
+    // caller builds for `build_agent` anyway). With a ceiling
+    // of u64::MAX the policy returns Continue on every fire;
+    // with a finite ceiling it evicts, archives, pages
+    // relevance-scored content back in, and injects a per-turn
+    // ledger. The relevance budget defaults to ceiling/4.
     //
     // The policy gets two extras for user visibility:
     // - The shared `rlm_archived_messages` atomic so the
@@ -3337,22 +3494,34 @@ fn build_rlm_extras(
     //   the store.
     // - The mpsc sender so eviction / paging fires emit
     //   `SystemMessage` breadcrumbs into the transcript.
-    let active_ceiling = rlm_active_ceiling_tokens();
     let mut policy = crate::context_virt::ContextVirtualizationPolicy::new(
         active_ceiling,
-        rlm_keep_last_n(),
+        rlm_pin_tail_tokens(),
         rlm_relevance_budget_tokens(active_ceiling),
         store,
         Arc::clone(&session_state.pushed),
     )
     .with_external_size_atomic(Arc::clone(&state.rlm_archived_messages))
     .with_summarizer(session_state.summary_tx.clone())
+    // rlm2/PR4: the sticky page-in state is session-scoped so
+    // continuation runs share the per-run page-in budget with
+    // the prompt run they extend (same prompt timestamp).
+    .with_page_in_state(Arc::clone(&session_state.page_in))
     // Plan 04 §2d: Small tier gets the v2 plain-line ledger
     // (no id notation); `ANIE_LEDGER=v1` restores the old
     // format. Must stay in lockstep with the augment choice
     // in `compose_system_prompt` — both read
     // `use_small_tier_ledger`.
-    .with_small_tier_ledger(use_small_tier_ledger(state));
+    .with_small_tier_ledger(use_small_tier_ledger(state))
+    // rlm2 review fix: the silent-truncation alarm needs the
+    // window the send is judged against — a prefill far below
+    // the sent estimate is a healthy prefix-cache hit unless
+    // the send actually exceeded `num_ctx`. Only native Ollama
+    // chat models carry one; the alarm stays off elsewhere.
+    .with_ollama_num_ctx(
+        (state.config.current_model().api == ApiKind::OllamaChatApi)
+            .then(|| state.config.effective_ollama_context_window()),
+    );
     if let Some(tx) = event_tx {
         policy = policy.with_event_sender(tx);
     }

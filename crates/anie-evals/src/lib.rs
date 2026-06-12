@@ -63,7 +63,7 @@ pub enum EvalError {
 /// The `RunMetrics` schema version this runner understands. Mirrors
 /// `anie-cli`'s `RUN_METRICS_SCHEMA_VERSION`; a mismatch means the metrics
 /// JSON may have changed field semantics and must not be silently scored.
-pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 4;
+pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 5;
 
 /// A deserialization view of anie-cli's `RunMetrics` JSON. anie-specific
 /// (deviation): this mirrors `anie-cli/src/run_metrics.rs` rather than
@@ -96,6 +96,28 @@ pub struct RunMetricsView {
     /// pre-v4 JSON still reads.
     #[serde(default)]
     pub prompt: PromptView,
+    /// rlm2/PR1 context-virtualization telemetry (schema v5).
+    /// Defaulted so pre-v5 JSON still reads.
+    #[serde(default)]
+    pub context: ContextView,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct ContextView {
+    #[serde(default)]
+    pub evictions: u64,
+    #[serde(default)]
+    pub evicted_tokens: u64,
+    #[serde(default)]
+    pub page_ins: u64,
+    #[serde(default)]
+    pub page_in_tokens: u64,
+    #[serde(default)]
+    pub ledger_tokens_total: u64,
+    #[serde(default)]
+    pub prefill_tokens_total: u64,
+    #[serde(default)]
+    pub truncation_suspected: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

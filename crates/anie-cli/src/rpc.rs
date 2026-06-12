@@ -235,9 +235,9 @@ impl From<AgentEvent> for RpcEvent {
             },
             AgentEvent::TranscriptReplace { messages } => Self::TranscriptReplace { messages },
             AgentEvent::SystemMessage { text } => Self::System { text },
-            AgentEvent::RlmStatsUpdate { archived_messages } => {
-                Self::RlmStats { archived_messages }
-            }
+            AgentEvent::RlmStatsUpdate {
+                archived_messages, ..
+            } => Self::RlmStats { archived_messages },
             AgentEvent::StatusUpdate {
                 provider,
                 model_name,

@@ -1170,7 +1170,9 @@ impl App {
             AgentEvent::SystemMessage { text } => {
                 self.output_pane.add_system_message(text);
             }
-            AgentEvent::RlmStatsUpdate { archived_messages } => {
+            AgentEvent::RlmStatsUpdate {
+                archived_messages, ..
+            } => {
                 self.status_bar.rlm_archived_messages = archived_messages;
             }
             AgentEvent::StatusUpdate {

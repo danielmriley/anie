@@ -95,6 +95,13 @@ Full tier keeps today's ledger verbatim.
 
 ### 2e. Tier-aware `keep_last_n` + ceiling sanity floor
 
+(Update 2026-06-12: rlm2/PR5 replaced the positional `keep_last_n`
+knob with the token-budgeted `pin_tail_tokens` — default 3,072
+tokens via `ANIE_PIN_TAIL_TOKENS`; `ANIE_KEEP_LAST_N` survives as a
+deprecated alias converting at 512 tokens/message. Any tier-aware
+tuning would now adjust the token budget, not a message count. See
+`docs/rlm_context_v2/05_diet_and_knobs.md`.)
+
 With an 11k prompt, `DEFAULT_RLM_ACTIVE_CEILING_TOKENS = 16_384` left
 ~5k of working room. After 2a-2d the prompt should drop to ~2-3k for
 Small tier; additionally, log a startup warning when
