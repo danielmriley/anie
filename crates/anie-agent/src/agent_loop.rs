@@ -525,6 +525,13 @@ pub struct AgentLoopConfig {
     /// enables it in `--harness-mode=rlm`. Plan 01 PR 2 of
     /// `docs/local_model_augmentation/`.
     tool_call_repair: bool,
+    /// Per-tool canonical example calls (tool name → rendered
+    /// example arguments) included in the repair side-request
+    /// prompt, so the repairing model imitates a known-good
+    /// shape instead of inventing one. Empty by default; the
+    /// CLI passes its `tool_examples` map when repair is
+    /// enabled. Plan 01 §9b of `docs/local_model_augmentation/`.
+    repair_examples: HashMap<String, String>,
 }
 
 /// Cap on generative repair attempts per invalid tool call.
@@ -533,6 +540,29 @@ pub struct AgentLoopConfig {
 /// unlikely to fix the call, and the regular failure path
 /// (schema error back to the model in-context) takes over.
 pub const MAX_TOOL_REPAIR_ROUNDS: u32 = 2;
+
+/// Temperature bump applied to the next model request while
+/// the loop-escalation perturbation slot is armed. A stuck
+/// model resamples the same wrong tokens at its default
+/// temperature; the bump buys sampling variance. Plan 03 §2b
+/// of `docs/local_model_augmentation/`.
+const LOOP_PERTURB_BUMP: f32 = 0.4;
+
+/// Base for the bump when no explicit request temperature is
+/// configured (`StreamOptions.temperature == None` means
+/// "provider default"). anie-specific assumption: Ollama's
+/// documented default of 0.8 — close enough that the clamped
+/// result is right for any plausible real default.
+const PERTURB_BASE_TEMPERATURE: f32 = 0.8;
+
+/// Ceiling on the perturbed temperature.
+const PERTURB_MAX_TEMPERATURE: f32 = 1.0;
+
+/// Cap on the file lines a grounded edit-failure attachment
+/// may carry. Matches `MAX_CLOSEST_MATCH_LINES` in
+/// `anie-tools/src/text_match.rs` (the producer of the
+/// locator we re-read). Plan 03 §2c.
+const EDIT_GROUNDING_MAX_LINES: usize = 80;
 
 impl AgentLoopConfig {
     /// Create a config with no steering/follow-up/tool hooks.
@@ -559,6 +589,7 @@ impl AgentLoopConfig {
             failure_loop_threshold: None,
             recurse_depth_threshold: None,
             tool_call_repair: false,
+            repair_examples: HashMap::new(),
         }
     }
 
@@ -571,6 +602,16 @@ impl AgentLoopConfig {
     #[must_use]
     pub fn with_tool_call_repair(mut self, enabled: bool) -> Self {
         self.tool_call_repair = enabled;
+        self
+    }
+
+    /// Provide per-tool example calls (tool name → rendered
+    /// example arguments) for grounding repair side-request
+    /// prompts. Tools without an entry keep the example-free
+    /// prompt. Plan 01 §9b of `docs/local_model_augmentation/`.
+    #[must_use]
+    pub fn with_repair_examples(mut self, examples: HashMap<String, String>) -> Self {
+        self.repair_examples = examples;
         self
     }
 
@@ -935,6 +976,19 @@ pub struct AgentLoop {
     /// `config.recurse_depth_threshold` is `None`.
     recurse_depth_detector:
         Option<std::sync::Mutex<crate::recurse_depth::RecurseDepthDetector>>,
+    /// Signal C (plan 03 §9 of `docs/local_model_augmentation/`).
+    /// Rides the failure-loop detector's install gate — the
+    /// controller turns that on in rlm mode — with its own
+    /// `ANIE_DISABLE_SIMILAR_CALL_DETECTOR` kill switch.
+    similar_call_detector: Option<std::sync::Mutex<crate::failure_loop::SimilarCallDetector>>,
+    /// Loop-escalation perturbation slot (plan 03 §2b). Holds
+    /// the temperature bump for the next model request. Armed
+    /// by the failure-loop detector firing or a similar-call
+    /// streak of 5 (two producers, one slot); cleared by any
+    /// successful tool call. Repair side requests deliberately
+    /// ignore it — they need schema-shaped output, not
+    /// variance.
+    perturbation: std::sync::Mutex<Option<f32>>,
 }
 
 impl AgentLoop {
@@ -951,12 +1005,17 @@ impl AgentLoop {
         let recurse_depth_detector = config.recurse_depth_threshold.map(|threshold| {
             std::sync::Mutex::new(crate::recurse_depth::RecurseDepthDetector::new(threshold))
         });
+        let similar_call_detector = (config.failure_loop_threshold.is_some()
+            && !similar_call_detector_disabled())
+        .then(|| std::sync::Mutex::new(crate::failure_loop::SimilarCallDetector::new()));
         Self {
             provider_registry,
             tool_registry,
             config,
             failure_loop_detector,
             recurse_depth_detector,
+            similar_call_detector,
+            perturbation: std::sync::Mutex::new(None),
         }
     }
 
@@ -1190,7 +1249,10 @@ impl AgentLoop {
             messages: provider.convert_messages(&sanitized_context),
             tools: self.tool_registry.definitions(),
         };
-        let options = self.config.stream_options(request.api_key, request.headers);
+        let mut options = self.config.stream_options(request.api_key, request.headers);
+        if let Some(bump) = self.perturbation_bump() {
+            options.temperature = Some(perturbed_temperature(options.temperature, bump));
+        }
 
         let stream = match provider.stream(&model, llm_context, options) {
             Ok(stream) => stream,
@@ -1660,7 +1722,36 @@ impl AgentLoop {
         )
         .await;
 
+        // Plan 01 §9a of `docs/local_model_augmentation/`:
+        // deterministic unknown-tool rescue before synthesizing the
+        // failure. Name normalization first, schema fingerprinting
+        // second; a rescued call flows through the normal
+        // validation/coercion path below under the remapped name.
+        let mut rescue_note: Option<(String, String)> = None;
+        if self.tool_registry.get(&tool_call.name).is_none() {
+            match rescue_unknown_tool(&self.tool_registry, &tool_call) {
+                Some(target) => {
+                    tracing::info!(
+                        from = %tool_call.name,
+                        to = %target,
+                        "unknown tool call rescued to a registered tool"
+                    );
+                    rescue_note = Some((tool_call.name.clone(), target.clone()));
+                    tool_call.name = target;
+                }
+                None => {
+                    let result = error_tool_result(unknown_tool_error(
+                        &tool_call.name,
+                        &self.tool_registry,
+                    ));
+                    return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
+                }
+            }
+        }
         let Some(tool) = self.tool_registry.get(&tool_call.name) else {
+            // Unreachable after a successful rescue (the target name
+            // came from the registry); kept with the legacy wording
+            // for the impossible path.
             let result = error_tool_result(format!("Tool not found: {}", tool_call.name));
             return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
         };
@@ -1755,6 +1846,7 @@ impl AgentLoop {
         };
         if let Err(message) = validation_result {
             let mut result = error_tool_result(message);
+            attach_rescue_note(rescue_note.as_ref(), &mut result.details);
             if repair_attempted_and_failed {
                 if let Some(map) = result.details.as_object_mut() {
                     map.insert(
@@ -1799,9 +1891,24 @@ impl AgentLoop {
 
         if is_error && self.config.wrap_failed_tool_results {
             wrap_failed_tool_result(&tool_call.name, &mut result);
+            // Plan 03 §2c: directive first, grounding second.
+            self.maybe_ground_edit_failure(&tool_call, &mut result).await;
         }
 
-        self.observe_failure_loop(&tool_call, is_error, event_tx).await;
+        if !is_error {
+            // Any successful call clears the loop-escalation
+            // perturbation (plan 03 §2b) and the per-file edit
+            // strikes for the file it just mutated (§2c). Order
+            // matters: clearing happens BEFORE the similar-call
+            // observation below, so a successful 5th near-
+            // duplicate can still arm the slot.
+            self.clear_perturbation();
+            self.clear_file_match_strikes(&tool_call);
+        }
+
+        self.observe_failure_loop(&tool_call, is_error, &mut result, event_tx)
+            .await;
+        self.observe_similar_calls(&tool_call, &mut result, event_tx).await;
 
         // PR 1 of `docs/rlm_subagents_2026-05-01/`. The recurse
         // tool encodes the depth at which it fired in
@@ -1813,8 +1920,21 @@ impl AgentLoop {
         }
 
         attach_tool_invocation_details(&tool_call, &mut result.details);
+        attach_rescue_note(rescue_note.as_ref(), &mut result.details);
         attach_coercion_notes(&coercion_notes, &mut result.details);
         attach_repair_note(repair_rounds_used, &mut result.details);
+        // Plan 01 §9b: a repaired call that then fails at EXECUTION
+        // keeps the repair note and gains an outcome marker so evals
+        // can count repaired-but-worse results.
+        if repair_rounds_used > 0
+            && is_error
+            && let Some(map) = result.details.as_object_mut()
+        {
+            map.insert(
+                "repair_outcome".to_string(),
+                serde_json::Value::String("executed_with_error".to_string()),
+            );
+        }
 
         send_event(
             event_tx,
@@ -1852,11 +1972,20 @@ impl AgentLoop {
     ) -> Option<serde_json::Value> {
         let arguments = serde_json::to_string(&failed_call.arguments).ok()?;
         let schema = serde_json::to_string(&definition.parameters).ok()?;
+        // Plan 01 §9b: ground the repair in the tool's canonical
+        // example when one is configured. With no example the
+        // prompt is byte-identical to before.
+        let example = self
+            .config
+            .repair_examples
+            .get(&failed_call.name)
+            .map(|example| format!("\n\nA known-good example call:\n{example}"))
+            .unwrap_or_default();
         let prompt = format!(
             "Your call to the tool `{name}` was invalid.\n\n\
              Arguments you sent:\n{arguments}\n\n\
              Validation error:\n{schema_error}\n\n\
-             The tool's parameter schema:\n{schema}\n\n\
+             The tool's parameter schema:\n{schema}{example}\n\n\
              Call `{name}` again now with corrected, schema-valid \
              arguments. Emit exactly one tool call and no commentary.",
             name = failed_call.name,
@@ -1924,7 +2053,9 @@ impl AgentLoop {
         if self.config.wrap_failed_tool_results {
             wrap_failed_tool_result(&tool_call.name, &mut result);
         }
-        self.observe_failure_loop(tool_call, true, event_tx).await;
+        self.observe_failure_loop(tool_call, true, &mut result, event_tx)
+            .await;
+        self.observe_similar_calls(tool_call, &mut result, event_tx).await;
         send_event(
             event_tx,
             AgentEvent::ToolExecEnd {
@@ -1942,11 +2073,16 @@ impl AgentLoop {
     /// installed). When a new threshold-crossing is detected,
     /// emit a `tracing::info!` log and a `SystemMessage`
     /// event so the loop is visible in logs and the
-    /// transcript. Observability-only: never aborts the run.
+    /// transcript. Plan 03 §2b escalation: the crossing also
+    /// appends a harness note to the failed result (the
+    /// SystemMessage never reaches the model; the note does)
+    /// and arms the temperature perturbation. Never aborts
+    /// the run.
     async fn observe_failure_loop(
         &self,
         tool_call: &ToolCall,
         is_error: bool,
+        result: &mut ToolResult,
         event_tx: &mpsc::Sender<AgentEvent>,
     ) {
         let Some(detector) = &self.failure_loop_detector else {
@@ -1978,6 +2114,176 @@ impl AgentLoop {
             tool = tool_call.name,
         );
         send_event(event_tx, AgentEvent::SystemMessage { text: message }).await;
+        result.content.push(ContentBlock::Text {
+            text: format!(
+                "[harness note] The last {strikes} attempts called `{tool}` \
+                 with identical arguments and identical failures. Re-read \
+                 the target with `read`, then take a DIFFERENT approach — \
+                 do not repeat the same call.",
+                tool = tool_call.name,
+            ),
+        });
+        self.arm_perturbation("failure_loop");
+    }
+
+    /// Signal C (plan 03 §9 of `docs/local_model_augmentation/`).
+    /// Feed every tool call — success or failure — to the
+    /// similar-call detector. A streak of 3 near-duplicates
+    /// gets a SystemMessage plus a harness note in the result;
+    /// a streak of 5 arms the shared perturbation slot.
+    /// Advisory only: never blocks the call.
+    async fn observe_similar_calls(
+        &self,
+        tool_call: &ToolCall,
+        result: &mut ToolResult,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let Some(detector) = &self.similar_call_detector else {
+            return;
+        };
+        let signal = match detector.lock() {
+            Ok(mut guard) => guard.observe(&tool_call.name, &tool_call.arguments),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .observe(&tool_call.name, &tool_call.arguments),
+        };
+        match signal {
+            Some(crate::failure_loop::SimilarCallSignal::Note { streak }) => {
+                tracing::info!(
+                    target: "anie_agent::similar_calls",
+                    tool = tool_call.name.as_str(),
+                    streak = streak,
+                    "similar_call_streak_detected"
+                );
+                let message = format!(
+                    "[similar-call warning] the last {streak} `{tool}` calls \
+                     were near-duplicates.",
+                    tool = tool_call.name,
+                );
+                send_event(event_tx, AgentEvent::SystemMessage { text: message }).await;
+                result.content.push(ContentBlock::Text {
+                    text: format!(
+                        "[harness note] Your last {streak} `{tool}` calls were \
+                         near-duplicates; their results are already in your \
+                         context. Answer from those results or take a \
+                         different action — do NOT call `{tool}` again for \
+                         the same thing.",
+                        tool = tool_call.name,
+                    ),
+                });
+            }
+            Some(crate::failure_loop::SimilarCallSignal::Perturb { streak }) => {
+                tracing::info!(
+                    target: "anie_agent::similar_calls",
+                    tool = tool_call.name.as_str(),
+                    streak = streak,
+                    "similar_call_streak_escalated"
+                );
+                self.arm_perturbation("similar_calls");
+            }
+            None => {}
+        }
+    }
+
+    /// Arm the loop-escalation perturbation slot (plan 03 §2b).
+    /// `ANIE_LOOP_PERTURB=0` disables the bump — the notes and
+    /// SystemMessages still fire.
+    fn arm_perturbation(&self, source: &str) {
+        if loop_perturb_disabled() {
+            return;
+        }
+        tracing::info!(
+            target: "anie_agent::loop_perturb",
+            source,
+            bump = LOOP_PERTURB_BUMP,
+            "loop_perturbation_armed"
+        );
+        *self.perturbation_slot() = Some(LOOP_PERTURB_BUMP);
+    }
+
+    fn clear_perturbation(&self) {
+        *self.perturbation_slot() = None;
+    }
+
+    fn perturbation_bump(&self) -> Option<f32> {
+        *self.perturbation_slot()
+    }
+
+    fn perturbation_slot(&self) -> std::sync::MutexGuard<'_, Option<f32>> {
+        match self.perturbation.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Plan 03 §2c — grounded edit-failure recovery. When an
+    /// `edit`/`apply_patch` text-match failure carries the
+    /// closest-match locator (`anie-tools` appends
+    /// `; closest match: path:start-end` — see
+    /// `text_match.rs::closest_match_region`) AND this is at
+    /// least the second match failure for that file, append
+    /// the file's current content at the locator so the model
+    /// can fix `oldText` without spending a `read` turn. The
+    /// first failure stays directive-only — don't pay the
+    /// tokens until a repeat proves the model is stuck.
+    async fn maybe_ground_edit_failure(&self, tool_call: &ToolCall, result: &mut ToolResult) {
+        if !matches!(tool_call.name.as_str(), "edit" | "apply_patch") {
+            return;
+        }
+        // Per-file strikes live on the failure-loop detector;
+        // no detector (non-rlm) means no grounding.
+        let Some(detector) = &self.failure_loop_detector else {
+            return;
+        };
+        let Some((path, start, end)) = result.content.iter().find_map(|block| match block {
+            ContentBlock::Text { text } => parse_closest_match_locator(text),
+            _ => None,
+        }) else {
+            return;
+        };
+        let strikes = match detector.lock() {
+            Ok(mut guard) => guard.record_file_match_failure(&path),
+            Err(poisoned) => poisoned.into_inner().record_file_match_failure(&path),
+        };
+        if strikes < 2 {
+            return;
+        }
+        // The locator path is whatever the model passed to the
+        // tool; relative paths resolve against the harness
+        // process cwd, which matches the tool cwd in the CLI.
+        // A failed read silently degrades to directive-only —
+        // never worse than today.
+        let Ok(content) = tokio::fs::read_to_string(&path).await else {
+            return;
+        };
+        let Some(note) = edit_grounding_note(&path, start, end, &content) else {
+            return;
+        };
+        tracing::info!(
+            target: "anie_agent::edit_grounding",
+            path = path.as_str(),
+            strikes = strikes,
+            "edit_failure_grounded"
+        );
+        result.content.push(ContentBlock::Text { text: note });
+    }
+
+    /// Clear the per-file match-failure strikes when a
+    /// mutating tool succeeds on that file (plan 03 §2c).
+    fn clear_file_match_strikes(&self, tool_call: &ToolCall) {
+        if !matches!(tool_call.name.as_str(), "edit" | "apply_patch" | "write") {
+            return;
+        }
+        let Some(detector) = &self.failure_loop_detector else {
+            return;
+        };
+        let Some(path) = tool_call.arguments.get("path").and_then(|p| p.as_str()) else {
+            return;
+        };
+        match detector.lock() {
+            Ok(mut guard) => guard.clear_file_match_failures(path),
+            Err(poisoned) => poisoned.into_inner().clear_file_match_failures(path),
+        }
     }
 
     /// PR 1 of `docs/rlm_subagents_2026-05-01/`. Read the
@@ -2369,6 +2675,119 @@ fn validate_tool_arguments(
     }
 }
 
+/// Plan 01 §9a of `docs/local_model_augmentation/`. Try to remap
+/// a call to an unregistered tool name onto a registered tool,
+/// in two deterministic steps:
+///
+/// 1. **Name normalization** — case/underscore/hyphen-insensitive
+///    match against registered names (`Bash`, `web-search` →
+///    `bash`, `web_search`).
+/// 2. **Schema fingerprinting** — validate the call's arguments
+///    against every registered tool's precompiled validator and
+///    remap iff EXACTLY ONE tool validates. Safety constraints:
+///    the target must have at least one *required* property
+///    present in the args by name, and `bash` is never a
+///    fingerprint target unless the original name normalizes to
+///    it or `command` is present (a genuinely wrong call must not
+///    be remapped onto arbitrary command execution).
+///
+/// Returns the registered name to remap to, or `None` when the
+/// call stays a failure.
+fn rescue_unknown_tool(registry: &ToolRegistry, call: &ToolCall) -> Option<String> {
+    let normalized = normalize_tool_name(&call.name);
+    let name_matches: Vec<&str> = registry
+        .definitions_borrowed()
+        .iter()
+        .filter(|def| normalize_tool_name(&def.name) == normalized)
+        .map(|def| def.name.as_str())
+        .collect();
+    if let [unique] = name_matches.as_slice() {
+        return Some((*unique).to_string());
+    }
+
+    let args = call.arguments.as_object()?;
+    let candidates: Vec<&str> = registry
+        .definitions_borrowed()
+        .iter()
+        .filter(|def| {
+            if def.name == "bash"
+                && normalized != normalize_tool_name("bash")
+                && !args.contains_key("command")
+            {
+                return false;
+            }
+            let required_property_present = def
+                .parameters
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| {
+                    required
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(|property| args.contains_key(property))
+                });
+            if !required_property_present {
+                return false;
+            }
+            // Fingerprint against the COERCED shape, not the raw
+            // arguments: the calls this rescue exists for (field
+            // notes F1) usually also carry small-model artifacts —
+            // stringified numbers, hallucinated extra keys — that
+            // the post-rescue pipeline fixes anyway. Validating raw
+            // args here refuses exactly those calls. The safety
+            // margin is unchanged: the required-property and bash
+            // guards above run first, and uniqueness across all
+            // candidates is still demanded below.
+            matches!(
+                registry.validator(&def.name),
+                Some(crate::tool::ValidatorState::Ready(validator))
+                    if {
+                        let (coerced, _) = crate::arg_coerce::coerce_arguments(
+                            &def.parameters,
+                            call.arguments.clone(),
+                        );
+                        validator.is_valid(&coerced)
+                    }
+            )
+        })
+        .map(|def| def.name.as_str())
+        .collect();
+    if let [unique] = candidates.as_slice() {
+        Some((*unique).to_string())
+    } else {
+        None
+    }
+}
+
+/// Case/underscore/hyphen-insensitive form of a tool name:
+/// `Web-Search` and `web_search` both normalize to `websearch`.
+fn normalize_tool_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Unknown-tool failure text, upgraded (Plan 01 §9a) to list the
+/// registered tool names — the SkillTool unknown-name message is
+/// the precedent. The `Tool not found:` prefix is preserved for
+/// anything keyed on the legacy wording.
+fn unknown_tool_error(name: &str, registry: &ToolRegistry) -> String {
+    let registered: Vec<String> = registry
+        .definitions_borrowed()
+        .iter()
+        .map(|def| format!("- {}", def.name))
+        .collect();
+    if registered.is_empty() {
+        format!("Tool not found: {name}. No tools are currently registered.")
+    } else {
+        format!(
+            "Tool not found: {name}. Registered tools:\n{}",
+            registered.join("\n")
+        )
+    }
+}
+
 fn error_tool_result(message: String) -> ToolResult {
     ToolResult {
         content: vec![ContentBlock::Text {
@@ -2439,6 +2858,84 @@ fn failure_directive_for(tool_name: &str) -> String {
     )
 }
 
+/// Clamped temperature for a perturbed request: base (or the
+/// assumed provider default when none is configured) plus the
+/// bump, capped at [`PERTURB_MAX_TEMPERATURE`]. Plan 03 §2b.
+fn perturbed_temperature(base: Option<f32>, bump: f32) -> f32 {
+    (base.unwrap_or(PERTURB_BASE_TEMPERATURE) + bump).min(PERTURB_MAX_TEMPERATURE)
+}
+
+/// `ANIE_LOOP_PERTURB=0` disables the temperature bump (the
+/// harness notes still fire). Split from the env read so the
+/// parse is unit-testable without mutating process env.
+fn loop_perturb_disabled() -> bool {
+    loop_perturb_value_disables(std::env::var("ANIE_LOOP_PERTURB").ok().as_deref())
+}
+
+fn loop_perturb_value_disables(value: Option<&str>) -> bool {
+    value == Some("0")
+}
+
+/// `ANIE_DISABLE_SIMILAR_CALL_DETECTOR=1` kill switch for
+/// Signal C. Truthy values mirror the controller's
+/// `env_flag_enabled` convention.
+fn similar_call_detector_disabled() -> bool {
+    matches!(
+        std::env::var("ANIE_DISABLE_SIMILAR_CALL_DETECTOR").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// Parse the `closest match: path:start-end` locator that
+/// `anie-tools` appends to edit/apply_patch text-match
+/// failures (`text_match.rs`, wave 1 A3). Returns the path
+/// and the 1-based inclusive line span. `None` on any shape
+/// mismatch — the grounding hook then degrades to
+/// directive-only.
+fn parse_closest_match_locator(text: &str) -> Option<(String, usize, usize)> {
+    const MARKER: &str = "closest match: ";
+    let after = &text[text.rfind(MARKER)? + MARKER.len()..];
+    let locator = after.lines().next()?.trim();
+    let (path, span) = locator.rsplit_once(':')?;
+    let (start, end) = span.split_once('-')?;
+    let start: usize = start.parse().ok()?;
+    let end: usize = end.parse().ok()?;
+    if path.is_empty() || start == 0 || end < start {
+        return None;
+    }
+    Some((path.to_string(), start, end))
+}
+
+/// Render the grounded edit-failure attachment: the file's
+/// current content at the locator, `path:line`-marked, capped
+/// at [`EDIT_GROUNDING_MAX_LINES`]. `None` when the locator
+/// starts past EOF (the file shrank since the tool ran).
+/// Plan 03 §2c.
+fn edit_grounding_note(
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    content: &str,
+) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = start_line.max(1);
+    if start > lines.len() {
+        return None;
+    }
+    let end = end_line
+        .min(start + EDIT_GROUNDING_MAX_LINES - 1)
+        .min(lines.len());
+    let mut note = format!(
+        "[harness note] Current content of {path}:{start}-{end} \
+         (the closest match to your oldText):\n"
+    );
+    for (offset, line) in lines[start - 1..end].iter().enumerate() {
+        note.push_str(&format!("{path}:{}: {line}\n", start + offset));
+    }
+    note.push_str("Adjust oldText to match these exact bytes.");
+    Some(note)
+}
+
 /// Surface argument coercions in the tool result's details —
 /// same transparency convention as the edit tool's
 /// whitespace-fuzzy counter: the harness may fix things
@@ -2460,6 +2957,24 @@ fn attach_coercion_notes(notes: &[String], details: &mut serde_json::Value) {
                     .map(|note| serde_json::Value::String(note.clone()))
                     .collect(),
             ),
+        );
+    }
+}
+
+/// Surface an unknown-tool rescue in the tool result's details,
+/// same transparency convention as [`attach_coercion_notes`].
+/// Plan 01 §9a of `docs/local_model_augmentation/`.
+fn attach_rescue_note(rescue: Option<&(String, String)>, details: &mut serde_json::Value) {
+    let Some((from, to)) = rescue else {
+        return;
+    };
+    if !details.is_object() {
+        *details = serde_json::json!({});
+    }
+    if let Some(map) = details.as_object_mut() {
+        map.insert(
+            "tool_name_rescued".to_string(),
+            serde_json::json!({ "from": from, "to": to }),
         );
     }
 }
@@ -3078,5 +3593,99 @@ mod tests {
             directive.ends_with("---\n"),
             "directive should end with a separator marking the verbatim error"
         );
+    }
+
+    // Plan 03 §2b — loop-escalation temperature perturbation.
+
+    #[test]
+    fn perturbation_is_clamped_at_one_point_zero() {
+        // Explicit base near the ceiling clamps…
+        assert_eq!(super::perturbed_temperature(Some(0.9), 0.4), 1.0);
+        // …and so does the assumed Ollama default (0.8 + 0.4).
+        assert_eq!(super::perturbed_temperature(None, 0.4), 1.0);
+    }
+
+    #[test]
+    fn perturbation_adds_bump_when_below_the_cap() {
+        let perturbed = super::perturbed_temperature(Some(0.2), 0.4);
+        assert!((perturbed - 0.6).abs() < f32::EPSILON, "{perturbed}");
+    }
+
+    #[test]
+    fn loop_perturb_env_disables_only_on_literal_zero() {
+        assert!(super::loop_perturb_value_disables(Some("0")));
+        assert!(!super::loop_perturb_value_disables(None));
+        assert!(!super::loop_perturb_value_disables(Some("1")));
+        assert!(!super::loop_perturb_value_disables(Some("")));
+    }
+
+    // Plan 03 §2c — grounded edit-failure recovery helpers.
+
+    #[test]
+    fn closest_match_locator_parses_path_and_span_from_failure_text() {
+        let text = "edit #0 for src/lib.rs did not match anything; closest match: src/lib.rs:2-14";
+        assert_eq!(
+            super::parse_closest_match_locator(text),
+            Some(("src/lib.rs".to_string(), 2, 14))
+        );
+    }
+
+    #[test]
+    fn closest_match_locator_rejects_absent_or_malformed_suffixes() {
+        assert_eq!(
+            super::parse_closest_match_locator("edit #0 for f did not match anything"),
+            None
+        );
+        assert_eq!(
+            super::parse_closest_match_locator("closest match: src/lib.rs"),
+            None,
+            "missing span"
+        );
+        assert_eq!(
+            super::parse_closest_match_locator("closest match: src/lib.rs:9-2"),
+            None,
+            "inverted span"
+        );
+        assert_eq!(
+            super::parse_closest_match_locator("closest match: src/lib.rs:0-2"),
+            None,
+            "zero start line (lines are 1-based)"
+        );
+    }
+
+    #[test]
+    fn attachment_is_capped_at_eighty_lines_with_line_markers() {
+        let content: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        let note = super::edit_grounding_note("big.txt", 1, 200, &content)
+            .expect("region within file");
+        // Header announces the SHOWN span, not the requested one.
+        assert!(
+            note.starts_with("[harness note] Current content of big.txt:1-80"),
+            "{note}"
+        );
+        let marked_lines = note
+            .lines()
+            .filter(|line| line.starts_with("big.txt:"))
+            .count();
+        assert_eq!(marked_lines, super::EDIT_GROUNDING_MAX_LINES);
+        assert!(note.contains("big.txt:80: line 80"), "{note}");
+        assert!(!note.contains("big.txt:81:"), "cap exceeded: {note}");
+        assert!(note.ends_with("Adjust oldText to match these exact bytes."));
+    }
+
+    #[test]
+    fn grounding_note_skips_locators_past_end_of_file() {
+        // The file shrank between the tool run and the read.
+        assert_eq!(super::edit_grounding_note("f.rs", 10, 12, "one\ntwo\n"), None);
+    }
+
+    #[test]
+    fn grounding_note_clamps_span_end_to_file_length() {
+        let note =
+            super::edit_grounding_note("f.rs", 2, 99, "one\ntwo\nthree\n").expect("region");
+        assert!(note.contains("f.rs:2-3"), "{note}");
+        assert!(note.contains("f.rs:2: two"), "{note}");
+        assert!(note.contains("f.rs:3: three"), "{note}");
+        assert!(!note.contains("f.rs:4:"), "{note}");
     }
 }

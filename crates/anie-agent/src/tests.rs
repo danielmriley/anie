@@ -117,6 +117,7 @@ struct TestTool {
     delay: Duration,
     partial_updates: Vec<String>,
     wait_for_cancel: bool,
+    fail_execution: bool,
     invocations: Arc<AtomicUsize>,
     current_concurrency: Arc<AtomicUsize>,
     max_concurrency: Arc<AtomicUsize>,
@@ -131,6 +132,7 @@ impl TestTool {
             delay: Duration::ZERO,
             partial_updates: Vec::new(),
             wait_for_cancel: false,
+            fail_execution: false,
             invocations: Arc::new(AtomicUsize::new(0)),
             current_concurrency: Arc::new(AtomicUsize::new(0)),
             max_concurrency: Arc::new(AtomicUsize::new(0)),
@@ -149,6 +151,11 @@ impl TestTool {
 
     fn waiting_for_cancel(mut self) -> Self {
         self.wait_for_cancel = true;
+        self
+    }
+
+    fn failing_execution(mut self) -> Self {
+        self.fail_execution = true;
         self
     }
 }
@@ -226,6 +233,12 @@ impl Tool for TestTool {
 
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
+        }
+
+        if self.fail_execution {
+            return Err(ToolError::ExecutionFailed(
+                "simulated execution failure".into(),
+            ));
         }
 
         let value = args
@@ -543,6 +556,14 @@ fn repair_enabled_agent(
     provider: Box<dyn Provider>,
     tool_registry: Arc<ToolRegistry>,
 ) -> AgentLoop {
+    repair_enabled_agent_with_examples(provider, tool_registry, std::collections::HashMap::new())
+}
+
+fn repair_enabled_agent_with_examples(
+    provider: Box<dyn Provider>,
+    tool_registry: Arc<ToolRegistry>,
+    examples: std::collections::HashMap<String, String>,
+) -> AgentLoop {
     let mut provider_registry = ProviderRegistry::new();
     provider_registry.register(ApiKind::OpenAICompletions, provider);
     AgentLoop::new(
@@ -557,7 +578,8 @@ fn repair_enabled_agent(
                 result: Ok(ResolvedRequestOptions::default()),
             }),
         )
-        .with_tool_call_repair(true),
+        .with_tool_call_repair(true)
+        .with_repair_examples(examples),
     )
 }
 
@@ -744,6 +766,634 @@ async fn repair_disabled_by_default_reproduces_todays_failure_path() {
     );
 }
 
+/// Plan 01 §9b: when the failing tool has a configured example
+/// call, the repair side-request prompt carries it so the
+/// repairing model imitates a known-good shape. Observed via a
+/// provider wrapper that records every request context; the
+/// side request is the one advertising exactly one tool.
+#[tokio::test]
+async fn repair_prompt_includes_canonical_example_when_available() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    // A second registered tool, so the main request advertises
+    // two tools and the single-tool context below can only be
+    // the repair side request.
+    tools.register(Arc::new(string_arg_tool()));
+    let contexts: Arc<std::sync::Mutex<Vec<LlmContext>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "lots"}),
+            )])),
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "repair_1",
+                "count",
+                serde_json::json!({"limit": 7}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ]),
+        contexts: Arc::clone(&contexts),
+    };
+    let agent = repair_enabled_agent_with_examples(
+        Box::new(provider),
+        Arc::new(tools),
+        std::collections::HashMap::from([("count".to_string(), r#"{"limit": 7}"#.to_string())]),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+    assert!(!first_tool_result(&result).is_error, "repaired call executes");
+
+    let contexts = contexts.lock().expect("contexts lock");
+    let side_request = contexts
+        .iter()
+        .find(|context| context.tools.len() == 1)
+        .expect("the repair side request advertises only the failing tool");
+    let messages = serde_json::to_value(
+        side_request
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+    )
+    .expect("serialize side-request messages");
+    assert!(
+        value_contains_string(&messages, "A known-good example call:"),
+        "{messages}"
+    );
+    assert!(
+        value_contains_string(&messages, r#"{"limit": 7}"#),
+        "{messages}"
+    );
+}
+
+/// Plan 01 §9b: a repaired call that then fails at EXECUTION
+/// keeps the repair-round note and gains the
+/// `repair_outcome: executed_with_error` marker, so evals can
+/// count repaired-but-worse outcomes (field notes F3: the
+/// repair produced a schema-valid call that exited 127).
+#[tokio::test]
+async fn repaired_then_failed_marker_lands_in_details() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool().failing_execution()));
+    let agent = repair_enabled_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "count",
+                serde_json::json!({"limit": "lots"}),
+            )])),
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "repair_1",
+                "count",
+                serde_json::json!({"limit": 7}),
+            )])),
+            MockStreamScript::from_message(final_assistant("acknowledged")),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(tool_result.is_error, "execution failure stays an error");
+    assert_eq!(
+        tool_result.details.get("argument_repair_rounds"),
+        Some(&serde_json::Value::from(1u32)),
+        "repair note survives the execution failure: {:?}",
+        tool_result.details
+    );
+    assert_eq!(
+        tool_result.details.get("repair_outcome"),
+        Some(&serde_json::Value::String("executed_with_error".into())),
+        "{:?}",
+        tool_result.details
+    );
+}
+
+/// Provider wrapper that records every request's
+/// `StreamOptions`, so tests can observe the loop-escalation
+/// temperature perturbation (plan 03 §2b).
+struct OptionsRecordingProvider {
+    inner: MockProvider,
+    options: Arc<std::sync::Mutex<Vec<StreamOptions>>>,
+}
+
+impl Provider for OptionsRecordingProvider {
+    fn stream(
+        &self,
+        model: &Model,
+        context: LlmContext,
+        options: StreamOptions,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.options
+            .lock()
+            .expect("options lock")
+            .push(options.clone());
+        self.inner.stream(model, context, options)
+    }
+
+    fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage> {
+        self.inner.convert_messages(messages)
+    }
+
+    fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
+        self.inner.convert_tools(tools)
+    }
+}
+
+/// Agent with the failure-loop detector (and therefore the
+/// Signal C similar-call detector) installed and every request's
+/// `StreamOptions` recorded.
+fn detector_agent_recording_options(
+    scripts: Vec<MockStreamScript>,
+    tools: ToolRegistry,
+    threshold: u32,
+) -> (AgentLoop, Arc<std::sync::Mutex<Vec<StreamOptions>>>) {
+    let options = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = OptionsRecordingProvider {
+        inner: MockProvider::new(scripts),
+        options: Arc::clone(&options),
+    };
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(ApiKind::OpenAICompletions, Box::new(provider));
+    let agent = AgentLoop::new(
+        Arc::new(provider_registry),
+        Arc::new(tools),
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_failure_loop_threshold(Some(threshold)),
+    );
+    (agent, options)
+}
+
+fn all_tool_results(result: &crate::AgentRunResult) -> Vec<&anie_protocol::ToolResultMessage> {
+    result
+        .generated_messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult(tool_result) => Some(tool_result),
+            _ => None,
+        })
+        .collect()
+}
+
+fn result_text(tool_result: &anie_protocol::ToolResultMessage) -> String {
+    tool_result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Plan 03 §2b: the third identical failure crosses the
+/// detector threshold, which appends a harness note to the
+/// failed result AND arms the perturbation — the NEXT model
+/// request carries the bumped temperature (0.8 assumed base +
+/// 0.4 bump, clamped to 1.0). Requests before the crossing
+/// stay at the provider default (None).
+#[tokio::test]
+async fn third_identical_failure_bumps_next_request_temperature() {
+    let failing_call = |id: &str| {
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            id,
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )]))
+    };
+    let (agent, options) = detector_agent_recording_options(
+        vec![
+            failing_call("call_a"),
+            failing_call("call_b"),
+            failing_call("call_c"),
+            MockStreamScript::from_message(final_assistant("done")),
+        ],
+        ToolRegistry::new(),
+        3,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("loop")], Vec::new()).await;
+
+    let options = options.lock().expect("options lock");
+    assert_eq!(options.len(), 4);
+    for request in &options[..3] {
+        assert_eq!(
+            request.temperature, None,
+            "requests before the crossing keep the provider default"
+        );
+    }
+    assert_eq!(
+        options[3].temperature,
+        Some(1.0),
+        "request after the third identical failure is perturbed"
+    );
+
+    // The escalation note rides the third failed result — the
+    // SystemMessage event never reaches the model, the note does.
+    let tool_results = all_tool_results(&result);
+    assert_eq!(tool_results.len(), 3);
+    assert!(
+        result_text(tool_results[2])
+            .contains("[harness note] The last 3 attempts called `missing`"),
+        "{:?}",
+        tool_results[2].content
+    );
+    assert!(
+        !result_text(tool_results[1]).contains("[harness note] The last"),
+        "note must only appear at the crossing"
+    );
+}
+
+/// Plan 03 §2b: any successful tool call clears the
+/// perturbation — the request after the success is back to
+/// the provider default.
+#[tokio::test]
+async fn successful_tool_call_resets_perturbation_to_provider_default() {
+    let failing_call = |id: &str| {
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            id,
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )]))
+    };
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(string_arg_tool()));
+    let (agent, options) = detector_agent_recording_options(
+        vec![
+            failing_call("call_a"),
+            failing_call("call_b"),
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_c",
+                "echo",
+                serde_json::json!({"value": "recovered"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("done")),
+        ],
+        tools,
+        2,
+    );
+
+    let (_result, _events) = collect_run(agent, vec![user_prompt("loop")], Vec::new()).await;
+
+    let options = options.lock().expect("options lock");
+    assert_eq!(options.len(), 4);
+    assert_eq!(
+        options[2].temperature,
+        Some(1.0),
+        "armed after the second identical failure"
+    );
+    assert_eq!(
+        options[3].temperature, None,
+        "the successful echo call must clear the perturbation"
+    );
+}
+
+/// Plan 03 §9 (Signal C), field notes F4: near-duplicate calls
+/// that all SUCCEED still build the streak — the third member
+/// of the cluster gets the harness note and the
+/// `[similar-call warning]` SystemMessage.
+#[tokio::test]
+async fn successful_but_similar_calls_count_toward_the_streak() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(string_arg_tool()));
+    let echo_call = |id: &str, value: &str| {
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            id,
+            "echo",
+            serde_json::json!({"value": value}),
+        )]))
+    };
+    let (agent, _options) = detector_agent_recording_options(
+        vec![
+            echo_call("call_a", "what time is it right now"),
+            echo_call("call_b", "what time is it right now today"),
+            echo_call("call_c", "current time right now what is it"),
+            MockStreamScript::from_message(final_assistant("done")),
+        ],
+        tools,
+        3,
+    );
+
+    let (result, events) = collect_run(agent, vec![user_prompt("search loop")], Vec::new()).await;
+
+    let tool_results = all_tool_results(&result);
+    assert_eq!(tool_results.len(), 3);
+    assert!(!tool_results[2].is_error, "all calls succeed");
+    assert!(
+        result_text(tool_results[2])
+            .contains("[harness note] Your last 3 `echo` calls were near-duplicates"),
+        "{:?}",
+        tool_results[2].content
+    );
+    assert!(
+        !result_text(tool_results[1]).contains("near-duplicates"),
+        "streak of 2 stays silent"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SystemMessage { text } if text.contains("[similar-call warning]")
+        )),
+        "transcript warning expected at streak 3"
+    );
+}
+
+/// Plan 03 §9: at streak 5 the similar-call detector arms the
+/// SAME perturbation slot as the failure-loop escalation —
+/// even though every call succeeded (successes clear the slot
+/// BEFORE the similarity observation, so the arming wins).
+#[tokio::test]
+async fn similar_call_streak_of_five_perturbs_next_request_temperature() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(string_arg_tool()));
+    let echo_call = |id: &str| {
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            id,
+            "echo",
+            serde_json::json!({"value": "what time is it right now"}),
+        )]))
+    };
+    let (agent, options) = detector_agent_recording_options(
+        vec![
+            echo_call("call_a"),
+            echo_call("call_b"),
+            echo_call("call_c"),
+            echo_call("call_d"),
+            echo_call("call_e"),
+            MockStreamScript::from_message(final_assistant("done")),
+        ],
+        tools,
+        3,
+    );
+
+    let (_result, _events) =
+        collect_run(agent, vec![user_prompt("search loop")], Vec::new()).await;
+
+    let options = options.lock().expect("options lock");
+    assert_eq!(options.len(), 6);
+    for request in &options[..5] {
+        assert_eq!(
+            request.temperature, None,
+            "successful calls keep clearing the slot below streak 5"
+        );
+    }
+    assert_eq!(
+        options[5].temperature,
+        Some(1.0),
+        "streak of five arms the shared perturbation slot"
+    );
+}
+
+/// Plan 03 §9: Signal C is additive — identical failing args
+/// still route through the existing failure-loop detector and
+/// fire its `[loop warning]`.
+#[tokio::test]
+async fn identical_args_still_route_through_the_existing_failure_detector() {
+    let failing_call = |id: &str| {
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            id,
+            "missing",
+            serde_json::json!({"command": "ls"}),
+        )]))
+    };
+    let (agent, _options) = detector_agent_recording_options(
+        vec![
+            failing_call("call_a"),
+            failing_call("call_b"),
+            failing_call("call_c"),
+            MockStreamScript::from_message(final_assistant("done")),
+        ],
+        ToolRegistry::new(),
+        3,
+    );
+
+    let (_result, events) = collect_run(agent, vec![user_prompt("loop")], Vec::new()).await;
+
+    let loop_warnings = events
+        .iter()
+        .filter(|event| matches!(
+            event,
+            AgentEvent::SystemMessage { text } if text.contains("[loop warning]")
+        ))
+        .count();
+    assert_eq!(loop_warnings, 1, "failure detector unaffected by Signal C");
+}
+
+/// Tool that always fails with the wave-1 A3 text-match error
+/// shape: `… did not match anything; closest match: path:a-b`.
+struct MatchFailingEditTool {
+    message: String,
+}
+
+#[async_trait]
+impl Tool for MatchFailingEditTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "edit".into(),
+            description: "edit stand-in".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _call_id: &str,
+        _args: serde_json::Value,
+        _cancel: CancellationToken,
+        _update_tx: Option<mpsc::Sender<ProtocolToolResult>>,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<ProtocolToolResult, ToolError> {
+        Err(ToolError::ExecutionFailed(self.message.clone()))
+    }
+}
+
+/// Drive two identical failing `edit` calls against a real
+/// temp file and return the file path plus the run result.
+/// Plan 03 §2c fixture: wrap enabled (the grounding gate) +
+/// detector installed (per-file strike storage), threshold
+/// high enough that the failure-loop note stays out of the
+/// way.
+async fn run_two_edit_match_failures() -> (String, crate::AgentRunResult) {
+    let path = std::env::temp_dir()
+        .join(format!("anie_grounding_{}.txt", uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").expect("write fixture");
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(MatchFailingEditTool {
+        message: format!(
+            "edit #0 for {path} did not match anything; closest match: {path}:2-3"
+        ),
+    }));
+    let edit_call = |id: &str| {
+        MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+            id,
+            "edit",
+            serde_json::json!({"path": path, "oldText": "stale", "newText": "fresh"}),
+        )]))
+    };
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(
+        ApiKind::OpenAICompletions,
+        Box::new(MockProvider::new(vec![
+            edit_call("call_a"),
+            edit_call("call_b"),
+            MockStreamScript::from_message(final_assistant("done")),
+        ])),
+    );
+    let agent = AgentLoop::new(
+        Arc::new(provider_registry),
+        Arc::new(tools),
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_wrap_failed_tool_results(true)
+        .with_failure_loop_threshold(Some(10)),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("edit loop")], Vec::new()).await;
+    let _ = std::fs::remove_file(&path);
+    (path, result)
+}
+
+/// Plan 03 §2c: the FIRST match failure stays directive-only —
+/// don't pay the tokens until a repeat proves the model is
+/// stuck.
+#[tokio::test]
+async fn first_failure_does_not_attach_content() {
+    let (_path, result) = run_two_edit_match_failures().await;
+    let tool_results = all_tool_results(&result);
+    assert_eq!(tool_results.len(), 2);
+    let first = result_text(tool_results[0]);
+    assert!(
+        first.contains("The previous tool call FAILED"),
+        "wrap directive expected: {first}"
+    );
+    assert!(
+        !first.contains("Current content of"),
+        "no grounding on the first strike: {first}"
+    );
+}
+
+/// Plan 03 §2c: the second match failure on the same file
+/// attaches the file's current content at the closest-match
+/// locator, with `path:line` markers.
+#[tokio::test]
+async fn second_match_failure_on_same_file_attaches_best_match_region() {
+    let (path, result) = run_two_edit_match_failures().await;
+    let tool_results = all_tool_results(&result);
+    let second = result_text(tool_results[1]);
+    assert!(
+        second.contains(&format!("Current content of {path}:2-3")),
+        "{second}"
+    );
+    assert!(second.contains(&format!("{path}:2: beta")), "{second}");
+    assert!(second.contains(&format!("{path}:3: gamma")), "{second}");
+    assert!(
+        second.contains("Adjust oldText to match these exact bytes."),
+        "{second}"
+    );
+    assert!(
+        !second.contains(&format!("{path}:1: alpha")),
+        "only the locator span is attached: {second}"
+    );
+}
+
+/// Plan 03 §2c: the two mitigations compose — wrap directive
+/// first, original error in the middle, grounding attachment
+/// last.
+#[tokio::test]
+async fn grounding_composes_after_the_wrap_directive() {
+    let (_path, result) = run_two_edit_match_failures().await;
+    let tool_results = all_tool_results(&result);
+    let blocks: Vec<&str> = tool_results[1]
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(blocks.len() >= 3, "{blocks:?}");
+    assert!(
+        blocks[0].starts_with("[harness note] The previous tool call FAILED"),
+        "directive first: {blocks:?}"
+    );
+    assert!(
+        blocks[1].contains("did not match anything"),
+        "original error second: {blocks:?}"
+    );
+    assert!(
+        blocks.last().expect("blocks").contains("Current content of"),
+        "grounding last: {blocks:?}"
+    );
+}
+
+/// Provider wrapper that records every request context, so
+/// tests can inspect the repair side-request prompt.
+struct RecordingProvider {
+    inner: MockProvider,
+    contexts: Arc<std::sync::Mutex<Vec<LlmContext>>>,
+}
+
+impl Provider for RecordingProvider {
+    fn stream(
+        &self,
+        model: &Model,
+        context: LlmContext,
+        options: StreamOptions,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.contexts
+            .lock()
+            .expect("contexts lock")
+            .push(context.clone());
+        self.inner.stream(model, context, options)
+    }
+
+    fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage> {
+        self.inner.convert_messages(messages)
+    }
+
+    fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
+        self.inner.convert_tools(tools)
+    }
+}
+
+/// Recursively search a JSON value for any string containing
+/// `needle` — message serialization shape doesn't matter.
+fn value_contains_string(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains(needle),
+        serde_json::Value::Array(items) => {
+            items.iter().any(|item| value_contains_string(item, needle))
+        }
+        serde_json::Value::Object(map) => {
+            map.values().any(|item| value_contains_string(item, needle))
+        }
+        _ => false,
+    }
+}
+
 #[tokio::test]
 async fn multiple_sequential_tool_calls_preserve_order() {
     let mut tools = ToolRegistry::new();
@@ -906,6 +1556,286 @@ async fn tool_not_found_returns_error_result() {
         .expect("tool result present");
     assert!(tool_result.is_error);
     assert_eq!(tool_result.tool_name, "missing");
+}
+
+/// Plan 01 §9a: a call whose name differs from a registered
+/// tool only by case (or `-` vs `_`) is remapped instead of
+/// failing, with a `tool_name_rescued` note in the details.
+#[tokio::test]
+async fn case_insensitive_tool_name_is_rescued() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "Count",
+                serde_json::json!({"limit": 3}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(!tool_result.is_error, "rescued call must execute: {:?}", tool_result.content);
+    assert_eq!(
+        tool_result.details.get("tool_name_rescued"),
+        Some(&serde_json::json!({"from": "Count", "to": "count"})),
+        "{:?}",
+        tool_result.details
+    );
+}
+
+/// Plan 01 §9a: hyphen/underscore variants normalize to the
+/// same name (`Web-Search` → `web_search`).
+#[tokio::test]
+async fn hyphenated_name_rescues_to_underscored_registered_tool() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TestTool::new(
+        "web_search",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        "search",
+    )));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "Web-Search",
+                serde_json::json!({"query": "what time is it"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(!tool_result.is_error, "{:?}", tool_result.content);
+    assert_eq!(
+        tool_result.details.get("tool_name_rescued"),
+        Some(&serde_json::json!({"from": "Web-Search", "to": "web_search"})),
+        "{:?}",
+        tool_result.details
+    );
+}
+
+/// Plan 01 §9a, field notes F1: a hallucinated tool name
+/// (`tool_calls` — the wire-format key) whose arguments validate
+/// against EXACTLY ONE registered schema is remapped to that
+/// tool with a rescue note, instead of burning a turn.
+#[tokio::test]
+async fn hallucinated_name_with_uniquely_matching_schema_remaps_with_note() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    tools.register(Arc::new(string_arg_tool()));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "tool_calls",
+                serde_json::json!({"limit": 3}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(!tool_result.is_error, "{:?}", tool_result.content);
+    assert_eq!(
+        tool_result.details.get("tool_name_rescued"),
+        Some(&serde_json::json!({"from": "tool_calls", "to": "count"})),
+        "{:?}",
+        tool_result.details
+    );
+}
+
+/// The literal field-notes F1 call shape (session 0f9cd627): a
+/// hallucinated tool name whose arguments ALSO carry a
+/// small-model artifact (stringified integer). The schema
+/// fingerprint must judge the coerced shape — raw-args
+/// validation would refuse exactly the call this rescue was
+/// built for. Regression for the 2026-06-12 review finding.
+#[tokio::test]
+async fn rescue_fingerprint_matches_on_coerced_not_raw_arguments() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    tools.register(Arc::new(string_arg_tool()));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "tool_calls",
+                // "3" (not 3): raw validation against the integer
+                // schema fails; coerced validation passes.
+                serde_json::json!({"limit": "3"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(
+        !tool_result.is_error,
+        "rescue + coercion must compose: {:?}",
+        tool_result.content
+    );
+    assert_eq!(
+        tool_result.details.get("tool_name_rescued"),
+        Some(&serde_json::json!({"from": "tool_calls", "to": "count"})),
+        "{:?}",
+        tool_result.details
+    );
+    assert!(
+        tool_result.details.get("argument_coercions").is_some(),
+        "the stringified integer must be coerced post-rescue: {:?}",
+        tool_result.details
+    );
+}
+
+/// Plan 01 §9a: when the arguments validate against more than
+/// one registered schema the rescue refuses to guess; the
+/// failure text now lists the registered tool names (the
+/// SkillTool unknown-name message is the precedent).
+#[tokio::test]
+async fn ambiguous_schema_match_fails_with_tool_list_in_error() {
+    let echo_schema = serde_json::json!({
+        "type": "object",
+        "properties": { "value": { "type": "string" } },
+        "required": ["value"],
+        "additionalProperties": false
+    });
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TestTool::new("echo", echo_schema.clone(), "echo")));
+    tools.register(Arc::new(TestTool::new("echo_twin", echo_schema, "twin")));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "tool_calls",
+                serde_json::json!({"value": "x"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("gave up")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(tool_result.is_error, "ambiguous match must not remap");
+    let ContentBlock::Text { text } = &tool_result.content[0] else {
+        panic!("error result must carry text");
+    };
+    assert!(text.contains("Tool not found: tool_calls"), "{text}");
+    assert!(text.contains("- echo"), "{text}");
+    assert!(text.contains("- echo_twin"), "{text}");
+    assert!(
+        tool_result.details.get("tool_name_rescued").is_none(),
+        "{:?}",
+        tool_result.details
+    );
+}
+
+/// Plan 01 §9a: a rescued call still goes through the normal
+/// validation/coercion path — the field session's bash-shaped
+/// calls also carried a stringified `"timeout": "5"`.
+#[tokio::test]
+async fn rescued_call_still_passes_through_coercion() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "Count",
+                serde_json::json!({"limit": "42"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("complete")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(!tool_result.is_error, "{:?}", tool_result.content);
+    assert!(
+        tool_result.details.get("tool_name_rescued").is_some(),
+        "{:?}",
+        tool_result.details
+    );
+    assert!(
+        tool_result.details.get("argument_coercions").is_some(),
+        "rescue composes with coercion: {:?}",
+        tool_result.details
+    );
+}
+
+/// Plan 01 §9a safety constraint: schema fingerprinting never
+/// remaps a call TO `bash` unless the original name normalizes
+/// to bash or the args carry `command` — even when bash's schema
+/// is the unique validating match.
+#[tokio::test]
+async fn schema_fingerprint_refuses_bash_without_command_or_bash_name() {
+    // A permissive stand-in bash schema where a command-less
+    // object can validate (the real bash requires `command`,
+    // making this constraint otherwise untestable).
+    let bash_tool = TestTool::new(
+        "bash",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "script": { "type": "string" } },
+            "required": ["script"],
+            "additionalProperties": false
+        }),
+        "bash",
+    );
+    let invocations = Arc::clone(&bash_tool.invocations);
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(bash_tool));
+    let agent = agent_with_provider(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "tool_calls",
+                serde_json::json!({"script": "rm -rf /"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("gave up")),
+        ])),
+        Arc::new(tools),
+        ToolExecutionMode::Sequential,
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
+
+    let tool_result = first_tool_result(&result);
+    assert!(tool_result.is_error, "must not remap to bash");
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "bash must never execute from a refused rescue"
+    );
 }
 
 /// PR 2 of `docs/harness_mitigations_2026-05-01/`. Drives a

@@ -46,7 +46,30 @@ pub fn coerce_arguments(schema: &Value, args: Value) -> (Value, Vec<String>) {
         args
     };
 
-    // 2.–4. Per-property coercions, one level deep.
+    // 2. Unknown-property stripping (Plan 01 §9b): when the
+    //    schema forbids additional properties, drop args not in
+    //    its `properties` map instead of letting the call fail
+    //    validation. The dropped intent stays visible in the
+    //    notes. Runs before per-property coercion so both compose
+    //    in this single pass.
+    if schema.get("additionalProperties") == Some(&Value::Bool(false))
+        && let (Value::Object(map), Some(properties)) = (
+            &mut args,
+            schema.get("properties").and_then(Value::as_object),
+        )
+    {
+        let unknown: Vec<String> = map
+            .keys()
+            .filter(|key| !properties.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in unknown {
+            map.remove(&key);
+            notes.push(format!("{key}: removed property not in the tool schema"));
+        }
+    }
+
+    // 3.–5. Per-property coercions, one level deep.
     if let (Value::Object(map), Some(properties)) = (
         &mut args,
         schema.get("properties").and_then(Value::as_object),
@@ -265,6 +288,61 @@ mod tests {
         let (coerced, notes) = coerce_arguments(&schema, args.clone());
         assert_eq!(coerced, args);
         assert!(notes.is_empty());
+    }
+
+    /// Plan 01 §9b, field notes F3: a bash-shaped call with
+    /// hallucinated extra args (`limit`, `path`) failed
+    /// `additionalProperties: false` validation and the
+    /// generative repair made it worse. Stripping the unknown
+    /// keys rescues the call deterministically, with one note
+    /// per dropped key so the intent stays visible.
+    #[test]
+    fn additional_properties_violation_strips_unknown_keys_with_notes() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "additionalProperties": false
+        });
+        let args = json!({ "command": "find . -name '*.rs'", "limit": "15", "path": "." });
+        let (coerced, notes) = coerce_arguments(&schema, args);
+        assert_eq!(coerced, json!({ "command": "find . -name '*.rs'" }));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().any(|note| note.starts_with("limit:")), "{notes:?}");
+        assert!(notes.iter().any(|note| note.starts_with("path:")), "{notes:?}");
+    }
+
+    #[test]
+    fn stripping_composes_with_type_coercion_in_one_pass() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string" },
+                "timeout": { "type": "integer" },
+            },
+            "additionalProperties": false
+        });
+        let args = json!({ "command": "date", "timeout": "5", "path": "/tmp" });
+        let (coerced, notes) = coerce_arguments(&schema, args);
+        assert_eq!(coerced, json!({ "command": "date", "timeout": 5 }));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().any(|note| note.contains("removed")), "{notes:?}");
+        assert!(notes.iter().any(|note| note.contains("coerced")), "{notes:?}");
+    }
+
+    /// Stripping only fires when the schema explicitly forbids
+    /// additional properties — `true` or absent means the extra
+    /// key may be meaningful to the tool.
+    #[test]
+    fn unknown_keys_survive_when_additional_properties_not_false() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "additionalProperties": true
+        });
+        let args = json!({ "command": "date", "extra": 1 });
+        let (coerced, notes) = coerce_arguments(&schema, args.clone());
+        assert_eq!(coerced, args);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]

@@ -21,8 +21,8 @@
 //! acceptable since the goal is "warn loud enough", not
 //! exact-strike accounting.
 
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
@@ -45,6 +45,14 @@ pub(crate) struct FailureLoopDetector {
     /// about — throttle: warn once per pair per detector
     /// lifetime even if the loop keeps going.
     warned: HashSet<(String, u64)>,
+    /// Per-file text-match failure strikes for `edit`/
+    /// `apply_patch`, keyed by the path the tool reported.
+    /// Unlike `last`, this survives args changes (a retried
+    /// edit with a tweaked `oldText` is a new args hash but
+    /// the same stuck file) and is cleared per-path on a
+    /// successful mutation. Plan 03 §2c of
+    /// `docs/local_model_augmentation/`.
+    file_match_failures: HashMap<String, u32>,
 }
 
 impl FailureLoopDetector {
@@ -59,7 +67,26 @@ impl FailureLoopDetector {
             threshold,
             last: None,
             warned: HashSet::new(),
+            file_match_failures: HashMap::new(),
         }
+    }
+
+    /// Record a text-match failure for `path` and return the
+    /// new per-file strike count (including this one). The
+    /// grounding hook attaches file content only from the
+    /// second strike onward — the first failure stays
+    /// directive-only.
+    pub(crate) fn record_file_match_failure(&mut self, path: &str) -> u32 {
+        let strikes = self.file_match_failures.entry(path.to_string()).or_insert(0);
+        *strikes += 1;
+        *strikes
+    }
+
+    /// Clear `path`'s match-failure strikes after a successful
+    /// mutation of that file — the model got unstuck, so a
+    /// later unrelated match failure starts fresh.
+    pub(crate) fn clear_file_match_failures(&mut self, path: &str) {
+        self.file_match_failures.remove(path);
     }
 
     /// Record a tool result. Returns `Some(strike_count)` when
@@ -96,6 +123,196 @@ impl FailureLoopDetector {
         self.warned.insert(key);
         Some(new_count)
     }
+}
+
+/// Similarity streak length at which the near-duplicate note
+/// fires. Plan 03 §9 (Signal C) of
+/// `docs/local_model_augmentation/`.
+pub(crate) const SIMILAR_CALL_NOTE_STREAK: u32 = 3;
+
+/// Similarity streak length at which the shared temperature
+/// perturbation slot is armed.
+pub(crate) const SIMILAR_CALL_PERTURB_STREAK: u32 = 5;
+
+/// Token-set Jaccard overlap above which two same-tool calls
+/// count as near-duplicates. Chosen high to spare legitimate
+/// paging-through-results sequences; calls that differ only in
+/// numeric leaves (read `offset`/`limit` pagination) are exempt
+/// outright — see [`SimilarCallDetector::observe`].
+const SIMILAR_CALL_JACCARD_THRESHOLD: f64 = 0.6;
+
+/// How many recent calls per tool a new call is compared
+/// against.
+const SIMILAR_CALL_HISTORY: usize = 5;
+
+/// What the similar-call detector asks the agent loop to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SimilarCallSignal {
+    /// Streak hit [`SIMILAR_CALL_NOTE_STREAK`]: emit the
+    /// SystemMessage + harness note in the tool result.
+    Note { streak: u32 },
+    /// Streak hit [`SIMILAR_CALL_PERTURB_STREAK`]: arm the
+    /// plan-03 PR10 temperature perturbation slot.
+    Perturb { streak: u32 },
+}
+
+/// Signal C — near-duplicate call loops. Plan 03 §9 of
+/// `docs/local_model_augmentation/`, field notes F4: the
+/// small-model loop signature is *similar, successful,
+/// useless* calls (ten escalating `web_search` queries, none
+/// erroring), which the failure-loop detector — identical
+/// `(tool, args_hash)` AND `is_error` — can never catch.
+///
+/// Tracks the last [`SIMILAR_CALL_HISTORY`] calls per tool as
+/// token sets over the string-bearing argument values. A call
+/// whose Jaccard overlap with any recent same-tool call
+/// exceeds [`SIMILAR_CALL_JACCARD_THRESHOLD`] extends the
+/// streak REGARDLESS of is_error; a dissimilar call or a
+/// different tool restarts it. The streak counts the cluster
+/// size — the first call of a cluster is streak 1, so streak
+/// 3 means "the last 3 calls were near-duplicates".
+///
+/// Pagination exemption (plan 03 §9 FP risk): chunked reads of
+/// one file — `{"path": …, "offset": 500}` then `offset: 1000`
+/// — tokenize to the path tokens alone, so consecutive chunks
+/// are maximally similar by Jaccard. A pair whose arguments
+/// differ ONLY in numeric leaves is therefore never counted as
+/// similar; exact repeats (identical full args) still are.
+#[derive(Debug)]
+pub(crate) struct SimilarCallDetector {
+    history: HashMap<String, VecDeque<CallShape>>,
+    streak: u32,
+    streak_tool: Option<String>,
+}
+
+/// One recorded call: the similarity token set plus the two
+/// canonical hashes the pagination exemption compares.
+#[derive(Debug)]
+struct CallShape {
+    tokens: HashSet<String>,
+    args_hash: u64,
+    /// [`stable_args_hash`] of the args with numeric leaves
+    /// nulled out. Equal stripped hashes with different full
+    /// hashes means the pair differs only in numeric knobs.
+    numeric_stripped_hash: u64,
+}
+
+impl SimilarCallDetector {
+    pub(crate) fn new() -> Self {
+        Self {
+            history: HashMap::new(),
+            streak: 0,
+            streak_tool: None,
+        }
+    }
+
+    /// Record a tool call (success or failure — Signal C is
+    /// about repetition, not errors). Returns a signal exactly
+    /// when the streak reaches the note or perturb threshold.
+    pub(crate) fn observe(&mut self, tool_name: &str, args: &Value) -> Option<SimilarCallSignal> {
+        let shape = CallShape {
+            tokens: argument_tokens(args),
+            args_hash: stable_args_hash(args),
+            numeric_stripped_hash: stable_args_hash(&strip_numeric_leaves(args)),
+        };
+        let history = self.history.entry(tool_name.to_string()).or_default();
+        let similar = !shape.tokens.is_empty()
+            && history.iter().any(|prev| {
+                if prev.args_hash == shape.args_hash {
+                    // Exact repeat — the strongest loop signal.
+                    return true;
+                }
+                if prev.numeric_stripped_hash == shape.numeric_stripped_hash {
+                    // Differs only in numeric leaves: offset/limit
+                    // pagination, not a rephrase loop.
+                    return false;
+                }
+                jaccard(&prev.tokens, &shape.tokens) > SIMILAR_CALL_JACCARD_THRESHOLD
+            });
+        history.push_back(shape);
+        if history.len() > SIMILAR_CALL_HISTORY {
+            history.pop_front();
+        }
+
+        if similar && self.streak_tool.as_deref() == Some(tool_name) {
+            self.streak += 1;
+        } else {
+            // This call starts (or restarts) a potential cluster.
+            self.streak = 1;
+            self.streak_tool = Some(tool_name.to_string());
+        }
+        match self.streak {
+            SIMILAR_CALL_NOTE_STREAK => Some(SimilarCallSignal::Note { streak: self.streak }),
+            SIMILAR_CALL_PERTURB_STREAK => {
+                Some(SimilarCallSignal::Perturb { streak: self.streak })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Token set over every string value in the arguments,
+/// recursively. Reimplements the tokenizer convention from
+/// `context_virt`'s keyword overlap (lowercase, alphanumeric
+/// split, 3-char minimum) — locally, because `anie-agent`
+/// must not depend on `anie-cli`. Non-string scalars are
+/// ignored: similarity is about the model rephrasing the same
+/// query, not about numeric knobs.
+fn argument_tokens(args: &Value) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    collect_string_tokens(args, &mut tokens);
+    tokens
+}
+
+fn collect_string_tokens(value: &Value, out: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => {
+            for token in text
+                .to_ascii_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+            {
+                if token.len() >= 3 {
+                    out.insert(token.to_string());
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_string_tokens(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                collect_string_tokens(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace every numeric leaf with `null`, preserving shape, so
+/// [`stable_args_hash`] of the result identifies calls that
+/// differ only in numeric knobs (the pagination exemption).
+fn strip_numeric_leaves(value: &Value) -> Value {
+    match value {
+        Value::Number(_) => Value::Null,
+        Value::Array(items) => Value::Array(items.iter().map(strip_numeric_leaves).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), strip_numeric_leaves(item)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    let intersection = a.intersection(b).count();
+    let union = a.len() + b.len() - intersection;
+    if union == 0 {
+        return 0.0;
+    }
+    intersection as f64 / union as f64
 }
 
 /// Stable hash of a JSON `Value`. Object keys are
@@ -243,5 +460,170 @@ mod tests {
         let nested_a = json!({ "outer": { "z": 1, "a": 2 } });
         let nested_b = json!({ "outer": { "a": 2, "z": 1 } });
         assert_eq!(stable_args_hash(&nested_a), stable_args_hash(&nested_b));
+    }
+
+    #[test]
+    fn file_match_failure_strikes_count_per_path_and_clear_independently() {
+        let mut det = FailureLoopDetector::new(3);
+        assert_eq!(det.record_file_match_failure("src/a.rs"), 1);
+        assert_eq!(det.record_file_match_failure("src/b.rs"), 1);
+        assert_eq!(det.record_file_match_failure("src/a.rs"), 2);
+        // Clearing one path leaves the other's strikes intact.
+        det.clear_file_match_failures("src/a.rs");
+        assert_eq!(det.record_file_match_failure("src/a.rs"), 1);
+        assert_eq!(det.record_file_match_failure("src/b.rs"), 2);
+    }
+
+    // Signal C: the field-notes F4 loop — escalating
+    // near-duplicate queries that all "succeed". The third
+    // member of the cluster fires the note.
+    #[test]
+    fn near_duplicate_streak_fires_note_at_three() {
+        let mut det = SimilarCallDetector::new();
+        assert_eq!(
+            det.observe("web_search", &json!({"query": "what time is it right now"})),
+            None
+        );
+        assert_eq!(
+            det.observe("web_search", &json!({"query": "what time is it right now today"})),
+            None
+        );
+        assert_eq!(
+            det.observe("web_search", &json!({"query": "current time right now what is it"})),
+            Some(SimilarCallSignal::Note { streak: 3 })
+        );
+    }
+
+    #[test]
+    fn dissimilar_call_resets_the_streak() {
+        let mut det = SimilarCallDetector::new();
+        det.observe("web_search", &json!({"query": "what time is it right now"}));
+        det.observe("web_search", &json!({"query": "what time is it right now today"}));
+        // A genuinely different query restarts the cluster…
+        assert_eq!(
+            det.observe("web_search", &json!({"query": "rust borrow checker lifetimes"})),
+            None
+        );
+        // …so two more near-duplicates of IT are still below
+        // the note threshold at streak 2.
+        assert_eq!(
+            det.observe("web_search", &json!({"query": "rust borrow checker lifetimes rules"})),
+            None
+        );
+        assert_eq!(
+            det.observe("web_search", &json!({"query": "borrow checker lifetimes rust explained"})),
+            Some(SimilarCallSignal::Note { streak: 3 })
+        );
+    }
+
+    #[test]
+    fn different_tool_call_resets_the_similarity_streak() {
+        let mut det = SimilarCallDetector::new();
+        det.observe("web_search", &json!({"query": "what time is it right now"}));
+        det.observe("web_search", &json!({"query": "what time is it right now today"}));
+        // Interleaved different tool breaks the streak even
+        // though the per-tool history survives.
+        det.observe("read", &json!({"path": "README.md"}));
+        assert_eq!(
+            det.observe("web_search", &json!({"query": "what time is it right now please"})),
+            None,
+            "streak must restart after a different tool"
+        );
+    }
+
+    #[test]
+    fn streak_of_five_arms_temperature_perturbation() {
+        let mut det = SimilarCallDetector::new();
+        let args = json!({"query": "what time is it right now"});
+        assert_eq!(det.observe("web_search", &args), None);
+        assert_eq!(det.observe("web_search", &args), None);
+        assert_eq!(
+            det.observe("web_search", &args),
+            Some(SimilarCallSignal::Note { streak: 3 })
+        );
+        assert_eq!(det.observe("web_search", &args), None);
+        assert_eq!(
+            det.observe("web_search", &args),
+            Some(SimilarCallSignal::Perturb { streak: 5 })
+        );
+        // Past the perturb threshold the detector stays quiet.
+        assert_eq!(det.observe("web_search", &args), None);
+    }
+
+    // Plan 03 §9 FP risk: chunked reads of one file share all
+    // their string tokens (the path), so Jaccard alone would
+    // call them maximally similar and arm the perturbation on a
+    // healthy run. The numeric-leaf exemption must spare the
+    // whole sequence — note AND perturb thresholds.
+    #[test]
+    fn paginated_reads_differing_only_in_offset_never_fire() {
+        let mut det = SimilarCallDetector::new();
+        for chunk in 0..6 {
+            let args = json!({
+                "path": "crates/anie-cli/src/controller.rs",
+                "offset": chunk * 500,
+                "limit": 500,
+            });
+            assert_eq!(det.observe("read", &args), None, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn exact_repeats_with_numeric_args_still_count_as_similar() {
+        // The exemption is for numeric-only DIFFERENCES; an
+        // identical re-read of the same chunk is still a loop.
+        let mut det = SimilarCallDetector::new();
+        let args = json!({"path": "src/lib.rs", "offset": 500, "limit": 500});
+        assert_eq!(det.observe("read", &args), None);
+        assert_eq!(det.observe("read", &args), None);
+        assert_eq!(
+            det.observe("read", &args),
+            Some(SimilarCallSignal::Note { streak: 3 })
+        );
+    }
+
+    #[test]
+    fn rephrased_queries_with_identical_numeric_knobs_still_fire_the_note() {
+        // Numbers present but the string payload changes too —
+        // the rephrase loop must still be caught via Jaccard.
+        let mut det = SimilarCallDetector::new();
+        let query = |q: &str| json!({"query": q, "max_results": 5});
+        assert_eq!(
+            det.observe("web_search", &query("what time is it right now")),
+            None
+        );
+        assert_eq!(
+            det.observe("web_search", &query("what time is it right now today")),
+            None
+        );
+        assert_eq!(
+            det.observe("web_search", &query("what time is it right now please")),
+            Some(SimilarCallSignal::Note { streak: 3 })
+        );
+    }
+
+    #[test]
+    fn token_free_arguments_never_register_as_similar() {
+        // All-numeric args produce an empty token set; identical
+        // empty sets must not count as near-duplicates (the
+        // failure-loop detector owns the identical-args case).
+        let mut det = SimilarCallDetector::new();
+        let args = json!({"limit": 5, "offset": 10});
+        for _ in 0..6 {
+            assert_eq!(det.observe("count", &args), None);
+        }
+    }
+
+    #[test]
+    fn similarity_tokens_are_lowercased_alphanumeric_min_three_chars() {
+        let tokens = argument_tokens(&json!({
+            "query": "Find the TIME-zone of x in db_v2!"
+        }));
+        // "of"/"x"/"in"/"db"/"v2" are under the 3-char minimum.
+        let expected: HashSet<String> = ["find", "the", "time", "zone"]
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        assert_eq!(tokens, expected);
     }
 }
