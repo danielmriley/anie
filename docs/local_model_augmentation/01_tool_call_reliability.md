@@ -191,7 +191,7 @@ PR 4:
 - `run_metrics_v2_reports_coerced_and_repaired_counts`
 - `older_metrics_schema_loads_with_repair_counters_defaulted`
 - corpus: scenarios pass under `--modes current,rlm` with
-  qwen3:8b (manual smoke per
+  gemma4:e4b (manual smoke per
   `.claude/skills/live-provider-smoke`).
 
 ## 6. Risks
@@ -218,7 +218,7 @@ PR 4:
 - [ ] A deliberately malformed call (string-encoded object) is
       executed successfully with zero extra model turns.
 - [ ] A schema-violating call (missing required field) is
-      fixed by one repair round in a live qwen3:8b smoke.
+      fixed by one repair round in a live gemma4:e4b smoke.
 - [ ] `RunMetrics` reports nonzero `coerced`/`repaired` on the
       new scenarios; pass-rate on the tool-heavy scenarios is
       ≥ baseline with repair on vs. off.

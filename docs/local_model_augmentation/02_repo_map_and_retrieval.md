@@ -215,7 +215,7 @@ PR 4:
 ## 7. Exit criteria
 
 - [ ] All four PRs landed; tests + clippy green per PR.
-- [ ] On the navigation corpus with qwen3:8b in rlm mode,
+- [ ] On the navigation corpus with gemma4:e4b in rlm mode,
       map-on shows fewer tool calls and lower total tokens
       than map-off on ≥3 of 5 scenarios, with no pass-rate
       regression.

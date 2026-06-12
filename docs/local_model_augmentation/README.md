@@ -7,10 +7,18 @@ extends the Tier-1 sketches in
 `docs/small_model_capability_ideas_2026-04-29.md` into three
 phased, evidence-first plans.
 
-## Scope decisions (agreed 2026-06-11)
+## Scope decisions (agreed 2026-06-11; test models named 2026-06-12)
 
-- **Target tier**: small models first (Qwen3 8B/14B, Llama-8B
-  class). Mitigations that work here help every tier above.
+- **Target tier**: small models first (7–14B class). Mitigations
+  that work here help every tier above.
+- **Named test models** (sized to the dev machine — 6GB VRAM /
+  13GB RAM): **gemma4:e4b** is the daily test driver (fits fully
+  in VRAM; fast feedback) and the model for plan smoke criteria;
+  **gemma4:12b** is primary-target validation, run per milestone;
+  qwen3.5:0.8b stays as the failure-mode amplifier for harness
+  development. 27B+ is occasional validation on bigger hardware
+  only. The product metric is the **lift curve**: harness-on vs
+  harness-off completion across all sizes.
 - **Pure local**: no paid-API escalation. Cascading between
   local models is deferred (see each plan's Deferred section).
 - **Backend**: Ollama native `/api/chat` only

@@ -218,7 +218,7 @@ PR 4:
 - `older_metrics_schema_loads_with_recovery_defaulted`
 - broken-fixture scenario passes with verify on, fails the
   `contains` check with verify off (negative control), live
-  qwen3:8b smoke.
+  gemma4:e4b smoke.
 
 ## 6. Risks
 
@@ -243,7 +243,7 @@ PR 4:
 
 - [ ] All four PRs landed; tests + clippy green per PR.
 - [ ] Live smoke: break `cargo check` in a fixture, ask
-      qwen3:8b to fix it — the model receives the harness
+      gemma4:e4b to fix it — the model receives the harness
       verify failure, fixes, and the run ends with
       "verify passed" without the user prompting a re-test.
 - [ ] Live smoke: a forced edit-loop (stale oldText) resolves
