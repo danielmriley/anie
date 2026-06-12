@@ -28,7 +28,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 
 use crate::oauth::{
     AuthCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, TokenResponse,
-    compute_expires_at, generate_pkce,
+    compute_expires_at, generate_pkce, post_json,
 };
 
 /// Anthropic's public Claude Code OAuth client ID. Base64-
@@ -170,7 +170,7 @@ impl OAuthProvider for AnthropicOAuthProvider {
             "redirect_uri": flow.redirect_uri,
             "code_verifier": flow.verifier,
         });
-        let response: TokenResponse = post_token_request(&self.client, &self.token_url, &body)
+        let response: TokenResponse = post_json(&self.client, &self.token_url, &body)
             .await
             .context("authorization_code exchange failed")?;
         Ok(OAuthCredentialData::new(
@@ -187,7 +187,7 @@ impl OAuthProvider for AnthropicOAuthProvider {
             "client_id": client_id,
             "refresh_token": credential.refresh_token,
         });
-        let response: TokenResponse = post_token_request(&self.client, &self.token_url, &body)
+        let response: TokenResponse = post_json(&self.client, &self.token_url, &body)
             .await
             .context("refresh_token exchange failed")?;
         Ok(OAuthCredentialData {
@@ -206,37 +206,6 @@ impl OAuthProvider for AnthropicOAuthProvider {
             extra_refresh_token: None,
         })
     }
-}
-
-/// Post a JSON body to `url`, expect a JSON response, parse as
-/// `TokenResponse`. On HTTP error, include the response body in
-/// the error message so provider-side failures (rate limit,
-/// invalid grant, etc.) surface with enough context to debug.
-async fn post_token_request(
-    client: &reqwest::Client,
-    url: &str,
-    body: &serde_json::Value,
-) -> Result<TokenResponse> {
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(body)
-        .send()
-        .await
-        .map_err(|err| anyhow!("token request failed: {err}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| anyhow!("failed to read token response body: {err}"))?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "token endpoint returned HTTP {status} (body: {text})"
-        ));
-    }
-    serde_json::from_str::<TokenResponse>(&text)
-        .map_err(|err| anyhow!("token response did not parse as JSON ({err}); body was: {text}"))
 }
 
 #[cfg(test)]

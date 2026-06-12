@@ -31,11 +31,10 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Deserialize;
 
 use crate::oauth::{
-    AuthCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, compute_expires_at,
-    generate_pkce,
+    AuthCodeFlow, GoogleTokenResponse, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair,
+    compute_expires_at, generate_pkce, post_form,
 };
 
 const CLIENT_ID_B64: &str = "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==";
@@ -259,14 +258,6 @@ impl OAuthProvider for GoogleAntigravityOAuthProvider {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct GoogleTokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    expires_in: u64,
-}
-
 /// Fetch the user's email via Google's userinfo endpoint.
 /// Best-effort — failures surface `Err(_)` and the caller logs
 /// None for account. We don't want email lookup to abort a
@@ -358,39 +349,6 @@ fn extract_cloud_ai_project(body: &serde_json::Value) -> Option<String> {
         }
     }
     None
-}
-
-async fn post_form<S: AsRef<str>>(
-    client: &reqwest::Client,
-    url: &str,
-    form: &[(S, S)],
-) -> Result<GoogleTokenResponse> {
-    let body = serde_urlencoded::to_string(
-        form.iter()
-            .map(|(k, v)| (k.as_ref(), v.as_ref()))
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|err| anyhow!("failed to url-encode token form: {err}"))?;
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| anyhow!("token request failed: {err}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| anyhow!("failed to read token response body: {err}"))?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "token endpoint returned HTTP {status} (body: {text})"
-        ));
-    }
-    serde_json::from_str(&text)
-        .map_err(|err| anyhow!("token response did not parse as JSON ({err}); body was: {text}"))
 }
 
 #[cfg(test)]

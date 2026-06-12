@@ -658,7 +658,6 @@ pub(crate) struct OllamaShowData {
     pub(crate) capabilities: Option<Vec<String>>,
     /// Architectural context length derived from
     /// `model_info["<arch>.context_length"]`.
-    #[allow(dead_code)] // consumed by discover_ollama_tags; local.rs ignores context_length
     pub(crate) context_length: Option<u64>,
 }
 

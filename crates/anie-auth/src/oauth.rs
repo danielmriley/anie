@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -271,6 +272,94 @@ pub(crate) struct TokenResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: u64,
+}
+
+/// Token-exchange / refresh response shape shared by both Google
+/// OAuth providers (Gemini CLI + Antigravity). Google's token
+/// endpoint omits `refresh_token` on a refresh-grant response
+/// (the existing one is reused), so it's optional here unlike
+/// Anthropic's `TokenResponse`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct GoogleTokenResponse {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    pub expires_in: u64,
+}
+
+/// POST a `application/x-www-form-urlencoded` body to a token
+/// endpoint and parse the JSON response into `T`. On HTTP error,
+/// include the response body in the error so provider-side
+/// failures (invalid_grant, rate limit, etc.) surface with
+/// enough context to debug. Shared by every form-encoded token
+/// flow (Codex, Gemini CLI, Antigravity).
+pub(crate) async fn post_form<T, S>(
+    client: &reqwest::Client,
+    url: &str,
+    form: &[(S, S)],
+) -> Result<T>
+where
+    T: DeserializeOwned,
+    S: AsRef<str>,
+{
+    let body = serde_urlencoded::to_string(
+        form.iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|err| anyhow!("failed to url-encode token form: {err}"))?;
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|err| anyhow!("token request failed: {err}"))?;
+    parse_token_response(response).await
+}
+
+/// POST a JSON body to a token endpoint and parse the JSON
+/// response into `T`. Error handling matches `post_form`. Used
+/// by providers whose token endpoint expects JSON (Anthropic).
+pub(crate) async fn post_json<T>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(body)
+        .send()
+        .await
+        .map_err(|err| anyhow!("token request failed: {err}"))?;
+    parse_token_response(response).await
+}
+
+/// Shared body-reading + status-check + JSON-parse tail for the
+/// token-POST helpers. Keeps the user-facing error message text
+/// identical across providers.
+async fn parse_token_response<T>(response: reqwest::Response) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| anyhow!("failed to read token response body: {err}"))?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "token endpoint returned HTTP {status} (body: {text})"
+        ));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| anyhow!("token response did not parse as JSON ({err}); body was: {text}"))
 }
 
 /// Compute an `expires_at` RFC 3339 string from a provider's

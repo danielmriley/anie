@@ -33,7 +33,7 @@ use serde::Deserialize;
 
 use crate::oauth::{
     AuthCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, compute_expires_at,
-    generate_pkce,
+    generate_pkce, post_form,
 };
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -219,39 +219,6 @@ fn extract_account_id(access_token: &str) -> Option<String> {
         .get("chatgpt_account_id")?
         .as_str()
         .map(str::to_string)
-}
-
-async fn post_form<S: AsRef<str>>(
-    client: &reqwest::Client,
-    url: &str,
-    form: &[(S, S)],
-) -> Result<CodexTokenResponse> {
-    let body = serde_urlencoded::to_string(
-        form.iter()
-            .map(|(k, v)| (k.as_ref(), v.as_ref()))
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|err| anyhow!("failed to url-encode token form: {err}"))?;
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| anyhow!("token request failed: {err}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| anyhow!("failed to read token response body: {err}"))?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "token endpoint returned HTTP {status} (body: {text})"
-        ));
-    }
-    serde_json::from_str(&text)
-        .map_err(|err| anyhow!("token response did not parse as JSON ({err}); body was: {text}"))
 }
 
 #[cfg(test)]

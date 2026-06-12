@@ -35,8 +35,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 
 use crate::oauth::{
-    AuthCodeFlow, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair, compute_expires_at,
-    generate_pkce,
+    AuthCodeFlow, GoogleTokenResponse, LoginFlow, OAuthCredentialData, OAuthProvider, PkcePair,
+    compute_expires_at, generate_pkce, post_form,
 };
 
 const CLIENT_ID_B64: &str = "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t";
@@ -456,14 +456,6 @@ impl GeminiCliOAuthProvider {
 }
 
 #[derive(Debug, Deserialize)]
-struct GoogleTokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    expires_in: u64,
-}
-
-#[derive(Debug, Deserialize)]
 struct LoadCodeAssistPayload {
     #[serde(rename = "currentTier", default)]
     current_tier: Option<Tier>,
@@ -583,39 +575,6 @@ async fn fetch_user_email(
         .get("email")
         .and_then(|v| v.as_str())
         .map(str::to_string))
-}
-
-async fn post_form<S: AsRef<str>>(
-    client: &reqwest::Client,
-    url: &str,
-    form: &[(S, S)],
-) -> Result<GoogleTokenResponse> {
-    let body = serde_urlencoded::to_string(
-        form.iter()
-            .map(|(k, v)| (k.as_ref(), v.as_ref()))
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|err| anyhow!("failed to url-encode token form: {err}"))?;
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Accept", "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| anyhow!("token request failed: {err}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| anyhow!("failed to read token response body: {err}"))?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "token endpoint returned HTTP {status} (body: {text})"
-        ));
-    }
-    serde_json::from_str(&text)
-        .map_err(|err| anyhow!("token response did not parse as JSON ({err}); body was: {text}"))
 }
 
 #[cfg(test)]
