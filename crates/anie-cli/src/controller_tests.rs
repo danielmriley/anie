@@ -310,10 +310,11 @@ fn no_tools_flag_builds_empty_registry() {
 async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
     use std::sync::atomic::AtomicU32;
 
-    let (controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    let (mut controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
     // Default mode is `current` — no recurse tool, no policy.
     let extras = build_rlm_extras(
         &controller.state,
+        &mut controller.rlm_session,
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
@@ -326,12 +327,16 @@ async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
         extras.policy.is_none(),
         "current mode should not install a policy",
     );
+    assert!(
+        controller.rlm_session.is_none(),
+        "non-rlm modes should not create session state",
+    );
 
     // Flip to baseline — also no recurse, no policy.
-    let mut controller = controller;
     controller.state.harness_mode = crate::harness_mode::HarnessMode::Baseline;
     let extras = build_rlm_extras(
         &controller.state,
+        &mut controller.rlm_session,
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
@@ -349,6 +354,7 @@ async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
     controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
     let extras = build_rlm_extras(
         &controller.state,
+        &mut controller.rlm_session,
         Arc::new(AtomicU32::new(8)),
         Vec::new(),
         None,
@@ -362,6 +368,238 @@ async fn build_rlm_extras_only_installs_recurse_in_rlm_mode() {
     assert!(
         extras.policy.is_some(),
         "rlm mode should install the virtualization policy"
+    );
+    assert!(
+        controller.rlm_session.is_some(),
+        "first rlm run should create the session state",
+    );
+}
+
+/// RC3 (docs/code_review_2026-06-11.md): the archive store
+/// and the worker pair are session-scoped. A second prompt
+/// run must reuse them — not rebuild the store from a
+/// context clone and spawn fresh workers whose handles get
+/// discarded.
+#[tokio::test]
+async fn workers_are_not_respawned_on_second_prompt_run() {
+    use std::sync::atomic::AtomicU32;
+
+    let (mut controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    let _ = build_rlm_extras(
+        &controller.state,
+        &mut controller.rlm_session,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
+    let (first_tx, first_store) = {
+        let session = controller.rlm_session.as_ref().expect("created on first rlm run");
+        (session.summary_tx.clone(), Arc::clone(&session.external))
+    };
+
+    let _ = build_rlm_extras(
+        &controller.state,
+        &mut controller.rlm_session,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
+    let session = controller.rlm_session.as_ref().expect("still present");
+    assert!(
+        first_tx.same_channel(&session.summary_tx),
+        "summarizer worker must be reused across runs, not respawned"
+    );
+    assert!(
+        Arc::ptr_eq(&first_store, &session.external),
+        "archive store must be session-scoped, not rebuilt per run"
+    );
+}
+
+/// RC3: switching sessions changes the transcript identity,
+/// so the rlm session state must be dropped — cancelling
+/// its workers — rather than leaking them against the old
+/// session's store.
+#[tokio::test]
+async fn session_switch_drops_rlm_state_and_cancels_workers() {
+    use std::sync::atomic::AtomicU32;
+
+    let (mut controller, mut _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    // The helper's tempdir is dropped on return, deleting
+    // the bootstrap session's file. `NewSession` recreates
+    // the sessions dir, so sessions created from here on
+    // persist — make two, so we can switch between them.
+    controller
+        .handle_action(UiAction::NewSession)
+        .await
+        .expect("create session to switch back to");
+    let switch_target = controller.state.session.id().to_string();
+    controller
+        .handle_action(UiAction::NewSession)
+        .await
+        .expect("create the session that holds rlm state");
+
+    let _ = build_rlm_extras(
+        &controller.state,
+        &mut controller.rlm_session,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
+    let cancel = controller
+        .rlm_session
+        .as_ref()
+        .expect("rlm session state")
+        .cancel
+        .clone();
+    assert!(!cancel.is_cancelled());
+
+    controller
+        .handle_action(UiAction::SwitchSession(switch_target.clone()))
+        .await
+        .expect("switch to the other session");
+    let switch_failed = drain_system_messages(&mut _rx)
+        .iter()
+        .any(|m| m.contains("unknown session"));
+    assert!(!switch_failed, "switch to {switch_target} should succeed");
+    assert!(
+        controller.rlm_session.is_none(),
+        "session switch must drop the rlm session state"
+    );
+    assert!(
+        cancel.is_cancelled(),
+        "dropping the rlm session state must cancel its workers"
+    );
+}
+
+/// RC3: summaries written during one run must still be in
+/// the store when the next run of the same session starts —
+/// previously every run rebuilt the store and threw all
+/// prior summaries/embeddings away.
+#[tokio::test]
+async fn summaries_survive_across_runs_within_a_session() {
+    use std::sync::atomic::AtomicU32;
+
+    let (mut controller, _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    let _ = build_rlm_extras(
+        &controller.state,
+        &mut controller.rlm_session,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
+    // Simulate run 1's worker output: archive an entry and
+    // attach a summary.
+    let store = Arc::clone(&controller.rlm_session.as_ref().expect("rlm state").external);
+    let id = store
+        .write()
+        .await
+        .push(user_message("a long tool result body"));
+    store.write().await.set_summary(id, "the gist".into());
+
+    // Run 2 must see the same store with the summary intact.
+    let _ = build_rlm_extras(
+        &controller.state,
+        &mut controller.rlm_session,
+        Arc::new(AtomicU32::new(8)),
+        Vec::new(),
+        None,
+    );
+    let store = Arc::clone(&controller.rlm_session.as_ref().expect("rlm state").external);
+    assert_eq!(
+        store.read().await.get_summary(id),
+        Some("the gist"),
+        "summaries paid for in run 1 must survive into run 2"
+    );
+}
+
+/// RC1 (docs/code_review_2026-06-11.md): with
+/// `ANIE_SUMMARIZER` unset, an Ollama parent must get the
+/// free head-truncation summarizer — the LLM summarizer
+/// would run full chat generations against the same local
+/// instance serving the interactive turn. Hosted parents
+/// keep the LLM summarizer.
+#[test]
+fn ollama_parent_defaults_to_head_truncation_summarizer() {
+    assert_eq!(
+        summarizer_kind(None, ApiKind::OllamaChatApi),
+        SummarizerKind::HeadTruncation
+    );
+    assert_eq!(
+        summarizer_kind(None, ApiKind::OpenAICompletions),
+        SummarizerKind::Llm
+    );
+}
+
+/// `ANIE_SUMMARIZER=llm` opts an Ollama parent back into
+/// LLM summaries; `ANIE_SUMMARIZER=head` forces head-
+/// truncation for hosted parents. Unknown values fall back
+/// to the per-API default.
+#[test]
+fn env_llm_forces_llm_summarizer_for_ollama_parent() {
+    assert_eq!(
+        summarizer_kind(Some("llm"), ApiKind::OllamaChatApi),
+        SummarizerKind::Llm
+    );
+    assert_eq!(
+        summarizer_kind(Some("head"), ApiKind::OpenAICompletions),
+        SummarizerKind::HeadTruncation
+    );
+    assert_eq!(
+        summarizer_kind(Some("bogus"), ApiKind::OllamaChatApi),
+        SummarizerKind::HeadTruncation
+    );
+}
+
+/// RC2 (docs/code_review_2026-06-11.md): with
+/// `ANIE_EMBEDDING_MODEL` unset, no embedder is built for
+/// an Ollama parent — no second model gets loaded into the
+/// user's Ollama.
+#[tokio::test]
+async fn embedder_disabled_by_default_for_ollama_parent() {
+    let (controller, _rx, _tx) = build_dispatch_controller(
+        vec![model_with_api("qwen3:8b", "ollama", ApiKind::OllamaChatApi)],
+        16,
+    );
+    let store = Arc::new(tokio::sync::RwLock::new(
+        crate::external_context::ExternalContext::new(),
+    ));
+    assert!(
+        build_embedder(&controller.state, store, CancellationToken::new(), None).is_none(),
+        "unset env must mean disabled — embeddings are opt-in"
+    );
+}
+
+/// Setting `ANIE_EMBEDDING_MODEL=<name>` opts embeddings in
+/// for an Ollama parent; an empty/whitespace value still
+/// disables.
+#[tokio::test]
+async fn env_model_name_enables_embedder() {
+    let (controller, _rx, _tx) = build_dispatch_controller(
+        vec![model_with_api("qwen3:8b", "ollama", ApiKind::OllamaChatApi)],
+        16,
+    );
+    let store = Arc::new(tokio::sync::RwLock::new(
+        crate::external_context::ExternalContext::new(),
+    ));
+    let built = build_embedder(
+        &controller.state,
+        Arc::clone(&store),
+        CancellationToken::new(),
+        Some("nomic-embed-text"),
+    );
+    assert!(built.is_some(), "a named model must enable the embedder");
+    assert!(
+        build_embedder(
+            &controller.state,
+            store,
+            CancellationToken::new(),
+            Some("   "),
+        )
+        .is_none(),
+        "empty/whitespace value must disable"
     );
 }
 
@@ -3642,42 +3880,6 @@ async fn new_session_resets_the_session_cost_meter() {
 
 // ---- /loop recurring-prompt command ----
 
-#[test]
-fn parse_loop_command_parses_minutes_and_seconds() {
-    use std::time::Duration;
-    assert_eq!(
-        parse_loop_command(Some("3m continue")),
-        Ok(LoopCommand::Start {
-            interval: Duration::from_secs(180),
-            message: "continue".into()
-        })
-    );
-    assert_eq!(
-        parse_loop_command(Some("30s keep going")),
-        Ok(LoopCommand::Start {
-            interval: Duration::from_secs(30),
-            message: "keep going".into()
-        })
-    );
-}
-
-#[test]
-fn parse_loop_command_recognizes_stop_aliases_and_status() {
-    assert_eq!(parse_loop_command(Some("stop")), Ok(LoopCommand::Stop));
-    assert_eq!(parse_loop_command(Some("OFF")), Ok(LoopCommand::Stop));
-    assert_eq!(parse_loop_command(Some("cancel")), Ok(LoopCommand::Stop));
-    assert_eq!(parse_loop_command(None), Ok(LoopCommand::Status));
-    assert_eq!(parse_loop_command(Some("   ")), Ok(LoopCommand::Status));
-}
-
-#[test]
-fn parse_loop_command_rejects_bad_interval_and_empty_message() {
-    assert!(parse_loop_command(Some("5x hello")).is_err(), "bad unit");
-    assert!(parse_loop_command(Some("0m hello")).is_err(), "zero");
-    assert!(parse_loop_command(Some("abc go")).is_err(), "non-numeric");
-    assert!(parse_loop_command(Some("3m")).is_err(), "empty message");
-}
-
 #[tokio::test]
 async fn loop_command_starts_and_replaces_schedule() {
     use std::time::Duration;
@@ -3785,24 +3987,6 @@ async fn loop_fire_caps_iterations_and_self_stops() {
 }
 
 #[tokio::test]
-async fn wait_until_resolves_at_deadline_and_is_inert_when_none() {
-    use tokio::time::{Duration, Instant, timeout};
-    // A due (past) deadline resolves promptly — the loop arm fires.
-    let due = Instant::now();
-    assert!(
-        timeout(Duration::from_secs(1), wait_until(Some(due)))
-            .await
-            .is_ok()
-    );
-    // `None` never resolves — the arm is inert while no loop is armed.
-    assert!(
-        timeout(Duration::from_millis(50), wait_until(None))
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
 async fn loop_fire_does_not_pile_up_duplicate_queued_messages() {
     let (mut controller, _event_rx, _tx) =
         build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
@@ -3839,55 +4023,6 @@ async fn loop_fire_does_not_pile_up_duplicate_queued_messages() {
 
 fn assistant_with_text(text: &str) -> Message {
     Message::Assistant(assistant_message(text))
-}
-
-#[test]
-fn parse_goal_command_handles_start_stop_and_status() {
-    assert_eq!(
-        parse_goal_command(Some("build a REST API")),
-        GoalCommand::Start("build a REST API".into())
-    );
-    assert_eq!(parse_goal_command(Some("stop")), GoalCommand::Stop);
-    assert_eq!(parse_goal_command(Some("CANCEL")), GoalCommand::Stop);
-    assert_eq!(parse_goal_command(None), GoalCommand::Status);
-    assert_eq!(parse_goal_command(Some("   ")), GoalCommand::Status);
-}
-
-#[test]
-fn detect_goal_outcome_finds_markers_and_prefers_complete() {
-    assert_eq!(
-        detect_goal_outcome(&[assistant_with_text("All tests pass.\nGOAL_COMPLETE")]),
-        Some(GoalOutcome::Complete)
-    );
-    assert_eq!(
-        detect_goal_outcome(&[assistant_with_text("Stuck.\nGOAL_BLOCKED: need an API key")]),
-        Some(GoalOutcome::Blocked("need an API key".into()))
-    );
-    // Complete wins if both somehow appear.
-    assert_eq!(
-        detect_goal_outcome(&[
-            assistant_with_text("GOAL_BLOCKED: x"),
-            assistant_with_text("GOAL_COMPLETE"),
-        ]),
-        Some(GoalOutcome::Complete)
-    );
-    assert_eq!(
-        detect_goal_outcome(&[assistant_with_text("still working")]),
-        None
-    );
-}
-
-#[test]
-fn next_goal_step_caps_turns_and_respects_budget() {
-    assert_eq!(next_goal_step(5, false), GoalDecision::Continue);
-    assert!(
-        matches!(next_goal_step(0, false), GoalDecision::Stop(_)),
-        "turn cap"
-    );
-    assert!(
-        matches!(next_goal_step(5, true), GoalDecision::Stop(_)),
-        "budget"
-    );
 }
 
 #[tokio::test]

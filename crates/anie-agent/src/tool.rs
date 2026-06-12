@@ -11,6 +11,7 @@ use anie_protocol::{ToolDef, ToolResult};
 /// time. `Invalid` preserves current semantics: the tool
 /// stays registered so the error is surfaced on first use,
 /// but we don't hide it behind a lazy recompile per call.
+#[derive(Clone)]
 pub enum ValidatorState {
     /// The schema compiled successfully.
     Ready(Arc<Validator>),
@@ -188,6 +189,29 @@ impl ToolRegistry {
         self.rebuild_sorted_definitions();
     }
 
+    /// Clone this registry and register `extras` on top of it.
+    ///
+    /// The existing tools, their precompiled validators, and the
+    /// sorted-definition snapshot are copied directly — no schema
+    /// recompilation for tools that were already registered. Only
+    /// the `extras` pay the `register()` cost (validator compile +
+    /// one sorted-list rebuild). This is the supported way to build
+    /// a per-run registry on top of the shared bootstrap one
+    /// (`ToolRegistry` is intentionally not `Clone`, because a bare
+    /// clone would invite re-validating every tool).
+    #[must_use]
+    pub fn with_added(&self, extras: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
+        let mut registry = Self {
+            tools: self.tools.clone(),
+            sorted_definitions: self.sorted_definitions.clone(),
+            validators: self.validators.clone(),
+        };
+        for tool in extras {
+            registry.register(tool);
+        }
+        registry
+    }
+
     /// Return the precompiled validator state for a registered
     /// tool, or `None` if no tool with that name is registered.
     #[must_use]
@@ -325,6 +349,55 @@ mod tests {
         registry.register(stub("tool"));
         registry.register(stub("tool"));
         assert_eq!(registry.definitions().len(), 1);
+    }
+
+    #[test]
+    fn with_added_carries_over_existing_tools_validators_and_definitions() {
+        // `with_added` must preserve every base tool plus its
+        // precompiled validator, then layer the extras on top —
+        // without re-registering (and thus re-validating) the base
+        // tools. The observable contract is: all names present,
+        // sorted, with intact validator state.
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(StubTool {
+            def: ToolDef {
+                name: "echo".into(),
+                description: "e".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"msg": {"type": "string"}},
+                    "required": ["msg"]
+                }),
+            },
+        }));
+        base.register(stub("zed"));
+
+        let extended = base.with_added([stub("alpha")]);
+
+        let names: Vec<_> = extended
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(names, vec!["alpha", "echo", "zed"]);
+        // The carried-over validator survived the clone intact.
+        match extended.validator("echo") {
+            Some(ValidatorState::Ready(_)) => {}
+            Some(ValidatorState::Invalid(msg)) => panic!("expected Ready, got Invalid({msg})"),
+            None => panic!("expected carried-over Ready validator, got missing"),
+        }
+        // The original is untouched.
+        assert_eq!(base.definitions().len(), 2);
+    }
+
+    #[test]
+    fn with_added_replaces_base_tool_on_name_collision() {
+        // An extra sharing a base name replaces it, matching
+        // `register()` semantics — no duplicate entry.
+        let mut base = ToolRegistry::new();
+        base.register(stub("tool"));
+        let extended = base.with_added([stub("tool")]);
+        assert_eq!(extended.definitions().len(), 1);
     }
 
     /// A tool with a valid schema gets a `Ready` validator

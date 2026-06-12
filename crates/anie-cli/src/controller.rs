@@ -31,6 +31,13 @@ use anie_session::{CompactionConfig, SessionContext, SessionInfo};
 use anie_tui::UiAction;
 
 use crate::compaction_stats::{CompactionStats, CompactionStatsAtomic};
+use crate::goal_command::{
+    GOAL_MAX_TURNS, GoalCommand, GoalDecision, GoalOutcome, GoalState, detect_goal_outcome,
+    goal_continuation_prompt, initial_goal_prompt, next_goal_step, parse_goal_command,
+};
+use crate::loop_command::{
+    LOOP_MAX_ITERATIONS, LoopCommand, LoopState, format_interval, parse_loop_command, wait_until,
+};
 use crate::retry_policy::GiveUpReason;
 use crate::{
     Cli,
@@ -116,220 +123,15 @@ pub(crate) struct InteractiveController {
     /// The goal decision computed from the just-completed run (where
     /// `result` is in scope), applied after the queued-prompt drain.
     pending_goal_decision: Option<GoalDecision>,
-}
-
-/// A scheduled recurring prompt (`/loop <interval> <message>`).
-struct LoopState {
-    interval: Duration,
-    message: String,
-    /// When the next fire is due (a `tokio::time::Instant`).
-    next_fire: Instant,
-    /// Hard safety cap — remaining fires before the loop self-stops. Not
-    /// the normal stopping mechanism (`/loop stop` is); guards a runaway.
-    fires_remaining: u32,
-}
-
-/// Runaway guard: a loop self-stops after this many fires. High enough to
-/// be a pure safety net, not a normal stop (use `/loop stop`).
-const LOOP_MAX_ITERATIONS: u32 = 1000;
-
-/// Parsed `/loop` argument.
-#[derive(Debug, PartialEq, Eq)]
-enum LoopCommand {
-    /// Start (or replace) the loop.
-    Start { interval: Duration, message: String },
-    /// Cancel the active loop.
-    Stop,
-    /// Report the active loop's status.
-    Status,
-}
-
-/// Parse a `/loop` argument. `None`/empty → `Status`; `stop`/`off`/
-/// `cancel` → `Stop`; otherwise `<Nm|Ns> <message>`. Returns a
-/// human-readable error for a malformed interval or empty message.
-fn parse_loop_command(arg: Option<&str>) -> Result<LoopCommand, String> {
-    let arg = arg.map(str::trim).filter(|value| !value.is_empty());
-    let Some(arg) = arg else {
-        return Ok(LoopCommand::Status);
-    };
-    if matches!(arg.to_ascii_lowercase().as_str(), "stop" | "off" | "cancel") {
-        return Ok(LoopCommand::Stop);
-    }
-    let (interval_token, message) = arg
-        .split_once(char::is_whitespace)
-        .map(|(token, rest)| (token, rest.trim()))
-        .unwrap_or((arg, ""));
-    let interval = parse_interval(interval_token)?;
-    if message.is_empty() {
-        return Err(
-            "usage: /loop <interval> <message>  (e.g. /loop 3m continue), or /loop stop".into(),
-        );
-    }
-    Ok(LoopCommand::Start {
-        interval,
-        message: message.to_string(),
-    })
-}
-
-/// Parse an interval token: `<N>m` (minutes) or `<N>s` (seconds), `N` a
-/// positive integer.
-fn parse_interval(token: &str) -> Result<Duration, String> {
-    let invalid =
-        || format!("`{token}` is not a valid interval; use `<N>m` or `<N>s` (e.g. 3m, 30s)");
-    let (number, unit) = token.split_at(token.len().saturating_sub(1));
-    let secs_per_unit = match unit {
-        "m" | "M" => 60,
-        "s" | "S" => 1,
-        _ => return Err(invalid()),
-    };
-    let n: u64 = number.parse().map_err(|_| invalid())?;
-    if n == 0 {
-        return Err("interval must be greater than zero".into());
-    }
-    Ok(Duration::from_secs(n * secs_per_unit))
-}
-
-/// A future that resolves at `deadline`, or never when `None` (so a
-/// `select!` arm guarded by it is inert while no loop is armed).
-async fn wait_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(at) => sleep_until(at).await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
-/// Human-readable interval for status/confirmation messages.
-fn format_interval(interval: Duration) -> String {
-    let secs = interval.as_secs();
-    if secs % 60 == 0 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
-/// An active autonomous goal loop (`/goal`).
-struct GoalState {
-    goal: String,
-    /// Remaining autonomous continuations before the turn cap stops it.
-    turns_remaining: u32,
-}
-
-/// Runaway guard: a goal self-stops after this many continuations. Each
-/// turn is a full agent run, so this is far lower than `/loop`'s cap.
-const GOAL_MAX_TURNS: u32 = 50;
-
-/// Sentinels the model emits to end an autonomous goal loop.
-const GOAL_COMPLETE_MARKER: &str = "GOAL_COMPLETE";
-const GOAL_BLOCKED_MARKER: &str = "GOAL_BLOCKED";
-
-/// Parsed `/goal` argument.
-#[derive(Debug, PartialEq, Eq)]
-enum GoalCommand {
-    Start(String),
-    Stop,
-    Status,
-}
-
-/// What a just-completed goal turn signalled.
-#[derive(Debug, PartialEq, Eq)]
-enum GoalOutcome {
-    Complete,
-    Blocked(String),
-}
-
-/// The deferred decision applied after the run-completion drain.
-#[derive(Debug, PartialEq, Eq)]
-enum GoalDecision {
-    /// Stop the goal with this user-facing message.
-    Stop(String),
-    /// Keep going (subject to the cap / budget at apply time).
-    Continue,
-}
-
-/// Parse a `/goal` argument. `None`/empty → `Status`; `stop`/`off`/
-/// `cancel` → `Stop`; anything else is the goal description.
-fn parse_goal_command(arg: Option<&str>) -> GoalCommand {
-    let arg = arg.map(str::trim).filter(|value| !value.is_empty());
-    let Some(arg) = arg else {
-        return GoalCommand::Status;
-    };
-    if matches!(arg.to_ascii_lowercase().as_str(), "stop" | "off" | "cancel") {
-        return GoalCommand::Stop;
-    }
-    GoalCommand::Start(arg.to_string())
-}
-
-/// Scan a completed run's messages for a goal-completion sentinel.
-/// `Complete` wins over `Blocked` if both somehow appear.
-fn detect_goal_outcome(messages: &[Message]) -> Option<GoalOutcome> {
-    let mut blocked: Option<GoalOutcome> = None;
-    for message in messages {
-        let Message::Assistant(assistant) = message else {
-            continue;
-        };
-        for block in &assistant.content {
-            let ContentBlock::Text { text } = block else {
-                continue;
-            };
-            if text.contains(GOAL_COMPLETE_MARKER) {
-                return Some(GoalOutcome::Complete);
-            }
-            if blocked.is_none()
-                && let Some(idx) = text.find(GOAL_BLOCKED_MARKER)
-            {
-                let reason = text[idx + GOAL_BLOCKED_MARKER.len()..]
-                    .trim_start_matches([':', ' '])
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                blocked = Some(GoalOutcome::Blocked(reason));
-            }
-        }
-    }
-    blocked
-}
-
-/// The continuation decision for a goal that is not yet complete: keep
-/// going, or stop because the cap or budget says so. Pure for testing.
-fn next_goal_step(turns_remaining: u32, budget_blocked: bool) -> GoalDecision {
-    if turns_remaining == 0 {
-        GoalDecision::Stop(format!(
-            "Goal stopped: reached the {GOAL_MAX_TURNS}-turn cap. Run /goal again to keep going."
-        ))
-    } else if budget_blocked {
-        GoalDecision::Stop("Goal stopped: the session budget ceiling was reached.".to_string())
-    } else {
-        GoalDecision::Continue
-    }
-}
-
-/// The framing for the first turn of an autonomous goal.
-fn initial_goal_prompt(goal: &str) -> String {
-    format!(
-        "You are working autonomously toward the goal below until it is fully achieved. \
-         Plan the steps, execute them with your tools, and VERIFY your work (run tests, \
-         re-read files, check outputs). You will be automatically prompted to continue after \
-         each turn — keep going without waiting for me.\n\n\
-         <goal>\n{goal}\n</goal>\n\n\
-         When the goal is fully achieved AND verified, end your message with the exact line:\n\
-         {GOAL_COMPLETE_MARKER}\n\n\
-         If you are genuinely blocked and need my input to proceed, end your message with:\n\
-         {GOAL_BLOCKED_MARKER}: <one-line reason>"
-    )
-}
-
-/// The framing for each autonomous continuation turn.
-fn goal_continuation_prompt(goal: &str) -> String {
-    format!(
-        "Continue working autonomously toward the goal. Review and verify what you've done so \
-         far, then take the next step.\n\n\
-         <goal>\n{goal}\n</goal>\n\n\
-         End with `{GOAL_COMPLETE_MARKER}` when fully done and verified, or \
-         `{GOAL_BLOCKED_MARKER}: <reason>` if you need my input."
-    )
+    /// Session-scoped rlm archive + background workers
+    /// (RC3, docs/code_review_2026-06-11.md). `None` until
+    /// the first rlm-mode run of the current session;
+    /// invalidated (dropped, workers cancelled) wherever
+    /// the transcript identity changes — see
+    /// `invalidate_rlm_session`. Lives on the controller
+    /// rather than `ControllerState` so the per-mode
+    /// bootstrap constructors stay untouched.
+    rlm_session: Option<RlmSessionState>,
 }
 
 /// Default recursion budget per top-level run. Plan 02
@@ -429,7 +231,27 @@ impl InteractiveController {
             loop_state: None,
             goal_state: None,
             pending_goal_decision: None,
+            rlm_session: None,
         }
+    }
+
+    /// Drop the session-scoped rlm state (archive store +
+    /// background workers). Called wherever the transcript
+    /// identity changes — `/new`, `/switch`, `/fork`,
+    /// `/rewind` — the same seams where the cost meter
+    /// resets — and on `/model`, because the summarizer kind
+    /// and model are chosen when the state is built.
+    /// Dropping cancels + aborts the workers; the
+    /// next rlm run lazily rebuilds the store from the new
+    /// session's context.
+    fn invalidate_rlm_session(&mut self) {
+        self.rlm_session = None;
+        // The status bar mirrors archive size through this
+        // atomic; a stale non-zero count would outlive the
+        // store it described.
+        self.state
+            .rlm_archived_messages
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// The next `/loop` fire deadline, or `None` when no loop is armed.
@@ -1163,6 +985,12 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_model(&requested).await?;
+                    // The rlm session state binds worker config (summarizer
+                    // kind/model) chosen at first rlm run; a model switch
+                    // must not leave hosted-parent summaries flowing to the
+                    // old model. Cheap to rebuild: the next rlm run reseeds
+                    // from the session context.
+                    self.invalidate_rlm_session();
                     self.cancel_and_emit_status().await?;
                     self.send_system_message(&format!(
                         "Model set to {}:{}",
@@ -1180,6 +1008,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let persistence_warning = self.state.set_model_resolved(*model).await?;
+                    self.invalidate_rlm_session();
                     self.cancel_and_emit_status().await?;
                     self.send_persistence_warning_if_present(persistence_warning)
                         .await;
@@ -1276,6 +1105,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     let new_session_id = self.state.fork_session().await?;
+                    self.invalidate_rlm_session();
                     self.cancel_pending_retry_for_run_affecting_change().await?;
                     let transcript = self
                         .state
@@ -1306,6 +1136,7 @@ impl InteractiveController {
                         .await;
                 } else {
                     self.state.new_session().await?;
+                    self.invalidate_rlm_session();
                     self.cancel_pending_retry_for_run_affecting_change().await?;
                     let _ = self
                         .event_tx
@@ -1444,6 +1275,7 @@ impl InteractiveController {
                     } else {
                         match self.state.session.rewind_to(&entry_id) {
                             Ok(plan) => {
+                                self.invalidate_rlm_session();
                                 self.cancel_pending_retry_for_run_affecting_change().await?;
                                 let transcript = self
                                     .state
@@ -1583,6 +1415,7 @@ impl InteractiveController {
             return Ok(());
         }
         self.state.switch_session(session_id).await?;
+        self.invalidate_rlm_session();
         self.cancel_pending_retry_for_run_affecting_change().await?;
         let transcript = self
             .state
@@ -1903,6 +1736,7 @@ impl InteractiveController {
         self.state.cost_meter.reset_run();
         let rlm_extras = build_rlm_extras(
             &self.state,
+            &mut self.rlm_session,
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
             Some(self.event_tx.clone()),
@@ -1959,6 +1793,7 @@ impl InteractiveController {
         // post-compaction re-attempt. No reset here.
         let rlm_extras = build_rlm_extras(
             &self.state,
+            &mut self.rlm_session,
             Arc::clone(&self.recursions_remaining_this_run),
             context.clone(),
             Some(self.event_tx.clone()),
@@ -2745,16 +2580,7 @@ fn build_agent(
     let tool_registry = if rlm_extras.tools.is_empty() {
         Arc::clone(&state.tool_registry)
     } else {
-        let mut new_registry = ToolRegistry::new();
-        for def in state.tool_registry.definitions() {
-            if let Some(tool) = state.tool_registry.get(&def.name) {
-                new_registry.register(tool);
-            }
-        }
-        for tool in rlm_extras.tools {
-            new_registry.register(tool);
-        }
-        Arc::new(new_registry)
+        Arc::new(state.tool_registry.with_added(rlm_extras.tools))
     };
     // Compose the per-run system prompt. In rlm mode we
     // append a paragraph establishing the archive policy
@@ -3045,45 +2871,85 @@ fn rlm_relevance_budget_tokens(active_ceiling_tokens: u64) -> u64 {
     active_ceiling_tokens / 4
 }
 
-/// Default embedding dimensionality. nomic-embed-text
-/// returns 768; this is a sanity-check value. Wrong
-/// values don't break anything — they just disable a
-/// dim mismatch warning we might add later.
-const DEFAULT_EMBEDDING_DIM: usize = 768;
+/// Which summarizer implementation `build_summarizer`
+/// installs for the rlm session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummarizerKind {
+    HeadTruncation,
+    Llm,
+}
 
-/// Default embedding model used when rlm mode runs against
-/// an Ollama parent and `ANIE_EMBEDDING_MODEL` isn't
-/// explicitly set. Picked because it's the smallest widely-
-/// available embedding model on Ollama and matches the
-/// `DEFAULT_EMBEDDING_DIM` of 768. Operators who want a
-/// different model set the env var; operators who want to
-/// disable embeddings entirely set it to the empty string.
-const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+/// Resolve the summarizer choice from `ANIE_SUMMARIZER`
+/// (`"llm"` / `"head"`) and the parent model's API kind.
+///
+/// RC1 of `docs/code_review_2026-06-11.md`: the LLM
+/// summarizer issues full streaming chat generations
+/// against the same model serving the interactive turn.
+/// On a local Ollama parent that means two concurrent
+/// generations (or a saturated Ollama queue) on the same
+/// instance — the observed laptop freeze. So with the env
+/// var unset, Ollama parents get the free head-truncation
+/// summarizer (zero LLM calls against the local instance)
+/// while hosted parents keep the LLM summarizer.
+fn summarizer_kind(env_value: Option<&str>, parent_api: ApiKind) -> SummarizerKind {
+    match env_value.map(str::trim) {
+        Some("llm") => SummarizerKind::Llm,
+        Some("head") => SummarizerKind::HeadTruncation,
+        _ => {
+            if parent_api == ApiKind::OllamaChatApi {
+                SummarizerKind::HeadTruncation
+            } else {
+                SummarizerKind::Llm
+            }
+        }
+    }
+}
 
-/// Build the optional Plan-08 embedder + worker. In rlm
-/// mode against an Ollama parent the embedder defaults on
-/// (`DEFAULT_EMBEDDING_MODEL`); the env var
-/// `ANIE_EMBEDDING_MODEL` overrides the model, and an
-/// explicit empty string (`ANIE_EMBEDDING_MODEL=`)
-/// disables. Returns `None` when explicitly disabled or
-/// when the parent's provider isn't Ollama (the only
-/// embedding backend shipped today).
+/// Build the session's summarizer per [`summarizer_kind`].
+fn build_summarizer(state: &ControllerState) -> Arc<dyn crate::bg_summarizer::Summarizer> {
+    match summarizer_kind(
+        std::env::var("ANIE_SUMMARIZER").ok().as_deref(),
+        state.config.current_model().api,
+    ) {
+        SummarizerKind::HeadTruncation => Arc::new(crate::bg_summarizer::HeadTruncationSummarizer),
+        SummarizerKind::Llm => Arc::new(crate::bg_summarizer::LlmSummarizer::new(
+            Arc::clone(&state.provider_registry),
+            state.config.current_model().clone(),
+            Arc::clone(&state.request_options_resolver),
+            state.config.active_ollama_num_ctx_override(),
+        )),
+    }
+}
+
+/// Embedder + worker handles returned by
+/// [`build_embedder`]: the embedder itself (for prompt
+/// embedding), the worker's request channel, and the
+/// worker's `JoinHandle` (owned by `RlmSessionState`).
+type EmbedderHandles = (
+    Arc<dyn crate::embedder::Embedder>,
+    mpsc::Sender<crate::bg_embedder::EmbedRequest>,
+    JoinHandle<()>,
+);
+
+/// Build the optional Plan-08 embedder + worker.
+///
+/// RC2 of `docs/code_review_2026-06-11.md`: embeddings are
+/// opt-in. A default-on embedder forced the user's Ollama
+/// to keep (or swap) a second model resident alongside the
+/// chat model — on a RAM-constrained laptop each swap is
+/// hundreds of MB of IO, paid on the turn path. Unset (or
+/// empty) `ANIE_EMBEDDING_MODEL` therefore means disabled;
+/// setting it to an Ollama embedding model name (e.g.
+/// `nomic-embed-text`) enables. Returns `None` when
+/// disabled or when the parent's provider isn't Ollama
+/// (the only embedding backend shipped today).
 fn build_embedder(
     state: &ControllerState,
     store: Arc<tokio::sync::RwLock<crate::external_context::ExternalContext>>,
-) -> Option<(
-    Arc<dyn crate::embedder::Embedder>,
-    mpsc::Sender<crate::bg_embedder::EmbedRequest>,
-)> {
-    // Resolve the embedding model name with three-way
-    // semantics: unset → default; empty → disabled;
-    // anything else → use that. The empty-string-disables
-    // path keeps smoke-test bisection working.
-    let model_name = match std::env::var("ANIE_EMBEDDING_MODEL") {
-        Ok(value) if value.trim().is_empty() => return None,
-        Ok(value) => value,
-        Err(_) => DEFAULT_EMBEDDING_MODEL.to_string(),
-    };
+    cancel: CancellationToken,
+    env_model: Option<&str>,
+) -> Option<EmbedderHandles> {
+    let model_name = env_model.map(str::trim).filter(|name| !name.is_empty())?;
     // Today only Ollama is supported. The parent's
     // current model carries the base_url we point the
     // embedder at — embeddings come from the same
@@ -3100,11 +2966,101 @@ fn build_embedder(
     let embedder: Arc<dyn crate::embedder::Embedder> =
         Arc::new(crate::embedder::OllamaEmbedder::new(
             parent_model.base_url.clone(),
-            model_name,
-            DEFAULT_EMBEDDING_DIM,
+            model_name.to_string(),
         ));
-    let tx = crate::bg_embedder::spawn_embed_worker(Arc::clone(&embedder), store);
-    Some((embedder, tx))
+    let (tx, handle) =
+        crate::bg_embedder::spawn_embed_worker(Arc::clone(&embedder), store, cancel);
+    Some((embedder, tx, handle))
+}
+
+/// Session-scoped rlm state: the external archive store
+/// plus the background summarizer/embedder workers that
+/// write into it.
+///
+/// RC3 of `docs/code_review_2026-06-11.md`: before this
+/// existed, every prompt run AND continuation rebuilt the
+/// store from a full context clone and spawned a fresh
+/// worker pair whose `JoinHandle`s were discarded — old
+/// workers kept draining up to 64 queued LLM calls into a
+/// dead store after the run ended, and all summaries /
+/// embeddings paid for in prior runs were thrown away.
+///
+/// Created lazily on the first rlm run of a session
+/// (`build_rlm_extras`), seeded from the session context
+/// once, and reused across runs/continuations. The
+/// controller drops it — cancelling and aborting the
+/// workers — wherever the transcript identity changes
+/// (`/new`, `/switch`, `/fork`, `/rewind`): the same seams
+/// where the cost meter resets.
+pub(crate) struct RlmSessionState {
+    /// Shared archive store. Per-run policies write into
+    /// it; the recurse tool reads from it; it outlives both.
+    external: Arc<tokio::sync::RwLock<crate::external_context::ExternalContext>>,
+    /// Timestamps already archived, shared with each
+    /// per-run policy so re-runs don't re-archive (and
+    /// re-enqueue summaries/embeds for) messages the store
+    /// already holds.
+    pushed: Arc<std::sync::Mutex<HashSet<u64>>>,
+    summary_tx: mpsc::Sender<crate::bg_summarizer::SummaryRequest>,
+    embed: Option<(
+        Arc<dyn crate::embedder::Embedder>,
+        mpsc::Sender<crate::bg_embedder::EmbedRequest>,
+    )>,
+    /// Cancellation for the workers; they `select!` on it
+    /// alongside their request channels.
+    cancel: CancellationToken,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl RlmSessionState {
+    fn new(state: &ControllerState, context_snapshot: Vec<Message>) -> Self {
+        let pushed = crate::context_virt::ContextVirtualizationPolicy::pushed_set_from_snapshot(
+            &context_snapshot,
+        );
+        let store = crate::external_context::ExternalContext::from_messages(context_snapshot);
+        let store = Arc::new(tokio::sync::RwLock::new(store));
+        let cancel = CancellationToken::new();
+        let (summary_tx, summary_handle) = crate::bg_summarizer::spawn_worker(
+            build_summarizer(state),
+            Arc::clone(&store),
+            cancel.clone(),
+        );
+        let mut workers = vec![summary_handle];
+        let embed = build_embedder(
+            state,
+            Arc::clone(&store),
+            cancel.clone(),
+            std::env::var("ANIE_EMBEDDING_MODEL").ok().as_deref(),
+        )
+        .map(|(embedder, tx, handle)| {
+            workers.push(handle);
+            (embedder, tx)
+        });
+        Self {
+            external: store,
+            pushed: Arc::new(std::sync::Mutex::new(pushed)),
+            summary_tx,
+            embed,
+            cancel,
+            workers,
+        }
+    }
+}
+
+impl Drop for RlmSessionState {
+    fn drop(&mut self) {
+        // Per-run policies hold sender clones that can
+        // outlive this state (a spawned run task keeps its
+        // agent alive), so sender-drop alone never stops the
+        // workers. Cancel stops them at the next loop
+        // iteration; abort() additionally interrupts an
+        // in-flight summarize/embed call at its next await
+        // point.
+        self.cancel.cancel();
+        for handle in &self.workers {
+            handle.abort();
+        }
+    }
 }
 
 /// Build the per-run extras (recurse tool + virtualization
@@ -3113,16 +3069,22 @@ fn build_embedder(
 /// other mode, so the caller can pass the result to
 /// `build_agent` unconditionally without an extra branch.
 ///
-/// The recurse tool and the policy share the same
-/// `Arc<RwLock<ExternalContext>>` — the policy writes
-/// evicted messages into the store; the recurse tool reads
-/// from it.
+/// The recurse tool and the policy share the session-scoped
+/// `Arc<RwLock<ExternalContext>>` owned by `rlm_session` —
+/// the policy writes evicted messages into the store; the
+/// recurse tool reads from it. RC3: the store and the
+/// background workers are created lazily on the first rlm
+/// run (seeded from the session context ONCE via
+/// `context_snapshot`) and reused by every subsequent run /
+/// continuation — only the policy + recurse tool wrappers
+/// below are per-run.
 ///
 /// Plan: `docs/rlm_2026-04-29/02_recurse_tool.md` and
 /// `docs/rlm_2026-04-29/06_phased_implementation.md`
 /// Phases A + B + C + D + E + F.
 fn build_rlm_extras(
     state: &ControllerState,
+    rlm_session: &mut Option<RlmSessionState>,
     recursion_budget: Arc<AtomicU32>,
     context_snapshot: Vec<Message>,
     event_tx: Option<mpsc::Sender<AgentEvent>>,
@@ -3130,39 +3092,9 @@ fn build_rlm_extras(
     if !state.harness_mode.installs_rlm_features() {
         return RlmExtras::empty();
     }
-    // Phase B: build the indexed external store from the
-    // run-start snapshot. Phases C/D/E/F all share this
-    // single `Arc<RwLock<ExternalContext>>`.
-    let pushed_set = crate::context_virt::ContextVirtualizationPolicy::pushed_set_from_snapshot(
-        &context_snapshot,
-    );
-    let store = crate::external_context::ExternalContext::from_messages(context_snapshot);
-    let store = Arc::new(tokio::sync::RwLock::new(store));
-
-    // Phase F: spawn the background summarizer. Production
-    // uses the LLM-driven `LlmSummarizer` which issues a
-    // single one-off Provider stream against the run's
-    // current model. On any failure (timeout, provider
-    // error, empty output) it falls back to head-
-    // truncation, so archive entries always end up with
-    // *some* summary.
-    let summarizer: Arc<dyn crate::bg_summarizer::Summarizer> =
-        Arc::new(crate::bg_summarizer::LlmSummarizer::new(
-            Arc::clone(&state.provider_registry),
-            state.config.current_model().clone(),
-            Arc::clone(&state.request_options_resolver),
-            state.config.active_ollama_num_ctx_override(),
-        ));
-    let summarizer_tx = crate::bg_summarizer::spawn_worker(summarizer, Arc::clone(&store));
-
-    // Plan 08: spawn the background embedder. Defaults on
-    // when the parent is an Ollama provider; the
-    // `ANIE_EMBEDDING_MODEL` env var overrides the model
-    // and an explicit empty string disables. Failures
-    // during the actual embed call are handled in-worker
-    // (logged, entry stays unembedded → reranker falls
-    // back to keyword).
-    let embed_handle = build_embedder(state, Arc::clone(&store));
+    let session_state =
+        rlm_session.get_or_insert_with(|| RlmSessionState::new(state, context_snapshot));
+    let store = Arc::clone(&session_state.external);
 
     let provider = Arc::new(crate::recurse_provider::ControllerContextProvider::new(
         Arc::clone(&store),
@@ -3204,15 +3136,15 @@ fn build_rlm_extras(
         rlm_keep_last_n(),
         rlm_relevance_budget_tokens(active_ceiling),
         store,
-        pushed_set,
+        Arc::clone(&session_state.pushed),
     )
     .with_external_size_atomic(Arc::clone(&state.rlm_archived_messages))
-    .with_summarizer(summarizer_tx);
+    .with_summarizer(session_state.summary_tx.clone());
     if let Some(tx) = event_tx {
         policy = policy.with_event_sender(tx);
     }
-    if let Some((embedder, embed_tx)) = embed_handle {
-        policy = policy.with_embedder(embedder, embed_tx);
+    if let Some((embedder, embed_tx)) = &session_state.embed {
+        policy = policy.with_embedder(Arc::clone(embedder), embed_tx.clone());
     }
     RlmExtras {
         tools: vec![recurse_tool],

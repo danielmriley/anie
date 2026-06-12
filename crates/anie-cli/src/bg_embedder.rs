@@ -12,18 +12,21 @@
 //! reranker (PR 08.3) reads from those cached vectors.
 //!
 //! Lifecycle:
-//! 1. Controller spawns the worker on rlm-mode init
-//!    against an Ollama parent (default-on with
-//!    `nomic-embed-text`; `ANIE_EMBEDDING_MODEL=`
-//!    explicitly disables, any other value overrides
-//!    the model), handing it `Arc<dyn Embedder>` +
-//!    `Arc<RwLock<ExternalContext>>`.
+//! 1. Controller spawns the worker once per rlm session
+//!    (`RlmSessionState`) when `ANIE_EMBEDDING_MODEL`
+//!    names an Ollama embedding model. Embeddings are
+//!    opt-in — RC2 of `docs/code_review_2026-06-11.md`:
+//!    a default-on embedder forced the user's Ollama to
+//!    keep a second model resident alongside the chat
+//!    model. The worker gets `Arc<dyn Embedder>` +
+//!    `Arc<RwLock<ExternalContext>>` + a
+//!    `CancellationToken`.
 //! 2. Policy enqueues `EmbedRequest { id, text }` after
 //!    archive (only for messages above a size threshold).
 //! 3. Worker pulls, embeds, writes back via
 //!    `set_embedding`.
-//! 4. Worker exits when the sender drops (controller
-//!    teardown).
+//! 4. Worker exits when the cancellation token fires
+//!    (session-state drop) or every sender is dropped.
 //!
 //! Bounded mpsc (capacity 64). When the worker falls
 //! behind, the policy's `try_send` returns Full and the
@@ -34,6 +37,7 @@
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::embedder::Embedder;
 use crate::external_context::{ExternalContext, MessageId};
@@ -42,18 +46,15 @@ use crate::external_context::{ExternalContext, MessageId};
 /// embedding. Mirrors `bg_summarizer::SUMMARIZE_MIN_TOKENS`
 /// — short messages don't carry enough signal to score
 /// reliably. Keyword overlap handles them adequately.
-#[allow(dead_code)] // wired up in PR 08.3 (policy enqueue).
 pub(crate) const EMBED_MIN_TOKENS: u64 = 200;
 
 /// Bounded queue capacity — same as bg_summarizer. Keeps
 /// memory pressure predictable; full-channel drops are a
 /// graceful degradation rather than a failure.
-#[allow(dead_code)] // wired up in PR 08.3 (policy + controller).
 const EMBED_CHANNEL_CAPACITY: usize = 64;
 
 /// Request sent to the background embed worker.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired up in PR 08.3 (policy enqueue).
 pub(crate) struct EmbedRequest {
     /// `ExternalContext` ID to attach the embedding to.
     pub id: MessageId,
@@ -64,21 +65,32 @@ pub(crate) struct EmbedRequest {
 }
 
 /// Spawn the background worker. Returns the sender end of
-/// the request channel; the caller stashes it on the policy
-/// so eviction/archive can enqueue. The receiver moves
-/// into the spawned task and drops on teardown.
+/// the request channel plus the worker's `JoinHandle`; the
+/// caller (the rlm session state) stashes the sender on the
+/// per-run policy so eviction/archive can enqueue, and
+/// keeps the handle so it can abort the worker on teardown.
 ///
-/// Worker exits when the sender is closed (every Sender
-/// clone dropped). On controller teardown, dropping the
-/// sender drains the queue and the worker exits cleanly.
-#[allow(dead_code)] // wired up in PR 08.3 (controller spawn).
+/// Worker exits when `cancel` fires or the sender is closed
+/// (every Sender clone dropped). RC3 of
+/// `docs/code_review_2026-06-11.md`: per-run policies hold
+/// sender clones that can outlive the session state, so the
+/// token — not sender-drop — is the authoritative teardown
+/// signal.
 pub(crate) fn spawn_embed_worker(
     embedder: Arc<dyn Embedder>,
     external: Arc<RwLock<ExternalContext>>,
-) -> mpsc::Sender<EmbedRequest> {
+    cancel: CancellationToken,
+) -> (mpsc::Sender<EmbedRequest>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<EmbedRequest>(EMBED_CHANNEL_CAPACITY);
-    tokio::spawn(async move {
-        while let Some(EmbedRequest { id, text }) = rx.recv().await {
+    let handle = tokio::spawn(async move {
+        loop {
+            let EmbedRequest { id, text } = tokio::select! {
+                () = cancel.cancelled() => break,
+                request = rx.recv() => match request {
+                    Some(request) => request,
+                    None => break,
+                },
+            };
             match embedder.embed(&text).await {
                 Ok(vec) => {
                     let mut store = external.write().await;
@@ -95,7 +107,7 @@ pub(crate) fn spawn_embed_worker(
             }
         }
     });
-    tx
+    (tx, handle)
 }
 
 #[cfg(test)]
@@ -133,9 +145,6 @@ mod tests {
                 .get(text)
                 .cloned()
                 .ok_or_else(|| format!("no mapping for {text:?}"))
-        }
-        fn dim(&self) -> usize {
-            3
         }
     }
 
@@ -198,7 +207,8 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(mappings));
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let id = store.write().await.push(user_msg("hello world"));
-        let tx = spawn_embed_worker(Arc::clone(&embedder), Arc::clone(&store));
+        let (tx, _handle) =
+            spawn_embed_worker(Arc::clone(&embedder), Arc::clone(&store), CancellationToken::new());
 
         tx.send(EmbedRequest {
             id,
@@ -230,7 +240,8 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(HashMap::new()));
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let id = store.write().await.push(user_msg("anything"));
-        let tx = spawn_embed_worker(Arc::clone(&embedder), Arc::clone(&store));
+        let (tx, _handle) =
+            spawn_embed_worker(Arc::clone(&embedder), Arc::clone(&store), CancellationToken::new());
 
         tx.send(EmbedRequest {
             id,
@@ -243,5 +254,23 @@ mod tests {
         // embedding.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         assert_eq!(store.read().await.get_embedding(id), None);
+    }
+
+    /// RC3 regression (docs/code_review_2026-06-11.md):
+    /// the token — not sender-drop — is the authoritative
+    /// teardown signal. Cancelling must stop the worker
+    /// even while a sender clone is still held.
+    #[tokio::test]
+    async fn cancelled_embed_worker_exits_while_sender_still_held() {
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(HashMap::new()));
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let cancel = CancellationToken::new();
+        let (tx, handle) = spawn_embed_worker(embedder, store, cancel.clone());
+        cancel.cancel();
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .expect("worker must exit on cancellation, not wait for sender drop")
+            .expect("worker task joins cleanly");
+        drop(tx);
     }
 }

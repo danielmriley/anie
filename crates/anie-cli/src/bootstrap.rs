@@ -112,19 +112,11 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
     let tool_registry = if skill_registry.is_empty() {
         tool_registry
     } else {
-        // ToolRegistry isn't Clone; rebuild via the same
-        // pattern build_agent uses for rlm extras.
-        let mut new_registry = anie_agent::ToolRegistry::new();
-        for def in tool_registry.definitions() {
-            if let Some(tool) = tool_registry.get(&def.name) {
-                new_registry.register(tool);
-            }
-        }
-        new_registry.register(Arc::new(crate::skill_tool::SkillTool::new(
+        let skill_tool: Arc<dyn anie_agent::Tool> = Arc::new(crate::skill_tool::SkillTool::new(
             Arc::clone(&skill_registry),
             Arc::clone(&active_skills),
-        )));
-        Arc::new(new_registry)
+        ));
+        Arc::new(tool_registry.with_added([skill_tool]))
     };
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =

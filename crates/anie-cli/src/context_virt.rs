@@ -53,9 +53,10 @@
 //! Identity / dedup: messages are tracked by `timestamp`. The
 //! agent loop generates one message per `now_millis()`
 //! sample; collisions in practice are vanishingly rare. The
-//! pushed-set is pre-populated at construction with the
-//! run-start snapshot so we don't double-push messages that
-//! were already in the store.
+//! pushed-set is session-scoped and shared with the
+//! controller's `RlmSessionState` (seeded once from the
+//! session-start snapshot), so successive runs against the
+//! same store never re-push messages it already holds.
 //!
 //! Default behavior: with `active_ceiling_tokens = u64::MAX`
 //! the policy is effectively a noop — it returns `Continue`
@@ -223,6 +224,17 @@ fn current_prompt_tokens(working: &[Message]) -> Option<HashSet<String>> {
     None
 }
 
+/// The latest `User` message's first text block + its
+/// timestamp — the input to the prompt-embedding cache.
+/// `None` when no user message carries text (e.g.,
+/// images-only).
+fn latest_user_prompt(working: &[Message]) -> Option<(String, u64)> {
+    working.iter().rev().find_map(|m| match m {
+        Message::User(u) => first_text(&u.content).map(|t| (t.to_string(), u.timestamp)),
+        _ => None,
+    })
+}
+
 /// One candidate the relevance reranker is considering for
 /// paging back in. Carries the score (cosine similarity
 /// when embeddings are available, keyword-overlap intersection
@@ -319,10 +331,14 @@ pub(crate) struct ContextVirtualizationPolicy {
     external: Arc<RwLock<ExternalContext>>,
 
     /// Timestamps of messages already pushed to `external`,
-    /// for dedup. Pre-populated at construction time from the
-    /// run-start snapshot so we never re-push the messages
-    /// that were already in the store.
-    pushed: Mutex<HashSet<u64>>,
+    /// for dedup. Shared with the controller's rlm session
+    /// state (RC3, docs/code_review_2026-06-11.md): the
+    /// store outlives any single run, so the dedup set must
+    /// too — otherwise every new run's policy would re-
+    /// archive (and re-enqueue summaries/embeds for) the
+    /// messages the store already holds. Seeded once from
+    /// the session-start snapshot.
+    pushed: Arc<Mutex<HashSet<u64>>>,
 
     /// Timestamp of the ledger message injected on the
     /// previous fire, if any. Used to strip the stale ledger
@@ -367,41 +383,58 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// reranker reads them next turn.
     embed_tx: Option<mpsc::Sender<crate::bg_embedder::EmbedRequest>>,
 
-    /// Per-fire cache for the prompt embedding. Keyed by
-    /// the latest User message's timestamp; reused when
-    /// the same prompt drives multiple fires within a
-    /// turn (which happens whenever the loop spins more
-    /// than one ModelTurn step). Avoids re-embedding the
-    /// same prompt on every fire.
-    cached_prompt_embed: tokio::sync::Mutex<Option<(u64, Vec<f32>)>>,
+    /// Cross-fire cache for the current prompt's embedding,
+    /// keyed by the latest User message's timestamp. Filled
+    /// by a background task (`spawn_prompt_embed_if_missing`)
+    /// — never inline on the before_model path (RC2,
+    /// docs/code_review_2026-06-11.md: the inline await here
+    /// stalled the start of every model turn whenever Ollama
+    /// was busy serving the live generation). Arc-shared so
+    /// the spawned task can write the vector back after the
+    /// fire has already returned.
+    prompt_embed_cache: Arc<Mutex<PromptEmbedCache>>,
+}
+
+/// State of the prompt-embedding cache slot.
+#[derive(Default)]
+enum PromptEmbedCache {
+    /// Nothing cached (or the last attempt failed).
+    #[default]
+    Empty,
+    /// A background task is embedding the prompt with this
+    /// timestamp; don't spawn a duplicate.
+    InFlight(u64),
+    /// Embedding ready for the prompt with this timestamp.
+    Ready(u64, Vec<f32>),
 }
 
 impl ContextVirtualizationPolicy {
     /// Build a policy bound to the given external store. The
-    /// caller passes the set of timestamps already present in
-    /// the store so we don't double-push them on the first
-    /// fire — typically built by walking the run-start
-    /// snapshot before the store is wrapped in the `RwLock`.
+    /// caller passes the shared set of timestamps already
+    /// present in the store so we don't double-push them —
+    /// session-scoped alongside the store itself (RC3), so a
+    /// later run's policy sees everything earlier runs
+    /// archived.
     pub(crate) fn new(
         active_ceiling_tokens: u64,
         keep_last_n: usize,
         relevance_budget_tokens: u64,
         external: Arc<RwLock<ExternalContext>>,
-        pushed: HashSet<u64>,
+        pushed: Arc<Mutex<HashSet<u64>>>,
     ) -> Self {
         Self {
             active_ceiling_tokens,
             keep_last_n,
             relevance_budget_tokens,
             external,
-            pushed: Mutex::new(pushed),
+            pushed,
             last_ledger_ts: Mutex::new(None),
             event_tx: None,
             external_size: Arc::new(AtomicUsize::new(0)),
             summarizer_tx: None,
             embedder: None,
             embed_tx: None,
-            cached_prompt_embed: tokio::sync::Mutex::new(None),
+            prompt_embed_cache: Arc::new(Mutex::new(PromptEmbedCache::Empty)),
         }
     }
 
@@ -947,53 +980,79 @@ fn format_breadcrumb(evicted: usize, paged_in: usize, archived_total: usize) -> 
 }
 
 impl ContextVirtualizationPolicy {
-    /// Score evicted messages against the current prompt's
-    /// keywords and append the highest-scoring ones to
-    /// `working`, up to `relevance_budget_tokens`. Returns
-    /// the number of messages paged in (used by the ledger).
-    /// Re-sorts `working` by timestamp at the end so paged-
-    /// in content lands at its original chronological
-    /// position rather than at the back where it was just
-    /// pushed.
-    /// Embed the latest user prompt in `working`, caching
-    /// per-turn keyed by the prompt's timestamp. Returns
-    /// `None` when no embedder is configured, when the
-    /// prompt has no text, or when the embed call fails
-    /// (logged at warn-level by the caller's fallback
-    /// path).
-    async fn cached_or_compute_prompt_embedding(&self, working: &[Message]) -> Option<Vec<f32>> {
-        let embedder = self.embedder.as_ref()?;
-        // Find the latest user message + its timestamp.
-        let (text, ts) = working.iter().rev().find_map(|m| match m {
-            Message::User(u) => first_text(&u.content).map(|t| (t.to_string(), u.timestamp)),
+    /// Non-blocking read of the prompt-embedding cache.
+    /// Returns the vector only when the background task has
+    /// finished embedding the prompt with this timestamp.
+    fn peek_prompt_embedding(&self, ts: u64) -> Option<Vec<f32>> {
+        let slot = self
+            .prompt_embed_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match &*slot {
+            PromptEmbedCache::Ready(cached_ts, vec) if *cached_ts == ts => Some(vec.clone()),
             _ => None,
-        })?;
-        // Cache hit: same timestamp as last fire.
-        {
-            let cache = self.cached_prompt_embed.lock().await;
-            if let Some((cached_ts, vec)) = cache.as_ref() {
-                if *cached_ts == ts {
-                    return Some(vec.clone());
-                }
-            }
-        }
-        // Miss: embed and store.
-        match embedder.embed(&text).await {
-            Ok(vec) => {
-                *self.cached_prompt_embed.lock().await = Some((ts, vec.clone()));
-                Some(vec)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "anie_cli::context_virt",
-                    %error,
-                    "prompt embed failed; reranker falling back to keyword overlap"
-                );
-                None
-            }
         }
     }
 
+    /// Kick off a background task that embeds the current
+    /// prompt and writes the vector into the shared cache
+    /// slot. No-op when no embedder is configured or when
+    /// the slot already holds (or is computing) this
+    /// prompt's embedding. Never awaited by the caller —
+    /// the current fire reranks by keyword overlap and the
+    /// next fire picks the cached vector up (RC2,
+    /// docs/code_review_2026-06-11.md: awaiting the embed
+    /// inline blocked the start of every model turn behind
+    /// the same Ollama instance serving the live
+    /// generation).
+    fn spawn_prompt_embed_if_missing(&self, text: String, ts: u64) {
+        let Some(embedder) = self.embedder.as_ref().map(Arc::clone) else {
+            return;
+        };
+        {
+            let mut slot = self
+                .prompt_embed_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match &*slot {
+                PromptEmbedCache::InFlight(t) | PromptEmbedCache::Ready(t, _) if *t == ts => {
+                    return;
+                }
+                _ => {}
+            }
+            *slot = PromptEmbedCache::InFlight(ts);
+        }
+        let cache = Arc::clone(&self.prompt_embed_cache);
+        tokio::spawn(async move {
+            let result = embedder.embed(&text).await;
+            let mut slot = cache.lock().unwrap_or_else(|p| p.into_inner());
+            // Only write back if a newer prompt hasn't
+            // claimed the slot in the meantime.
+            if !matches!(&*slot, PromptEmbedCache::InFlight(t) if *t == ts) {
+                return;
+            }
+            match result {
+                Ok(vec) => *slot = PromptEmbedCache::Ready(ts, vec),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "anie_cli::context_virt",
+                        %error,
+                        "background prompt embed failed; reranker stays on keyword overlap"
+                    );
+                    *slot = PromptEmbedCache::Empty;
+                }
+            }
+        });
+    }
+
+    /// Score evicted messages against the current prompt's
+    /// keywords (or cached embedding) and append the
+    /// highest-scoring ones to `working`, up to
+    /// `relevance_budget_tokens`. Returns the number of
+    /// messages paged in (used by the ledger). Re-sorts
+    /// `working` by timestamp at the end so paged-in content
+    /// lands at its original chronological position rather
+    /// than at the back where it was just pushed.
     async fn page_in_relevant(&self, working: &mut Vec<Message>) -> usize {
         if self.relevance_budget_tokens == 0 {
             return 0;
@@ -1002,14 +1061,17 @@ impl ContextVirtualizationPolicy {
             return 0;
         };
 
-        // Plan-08: if an embedder is configured, embed the
-        // prompt once per turn (cached by latest-user-msg
-        // timestamp) and use cosine similarity for
-        // scoring when a candidate has a cached
-        // embedding. Falls back to keyword overlap per-
-        // candidate when either side is missing
-        // embeddings.
-        let prompt_embed = self.cached_or_compute_prompt_embedding(working).await;
+        // Plan-08: when an embedder is configured and the
+        // background task has already embedded the current
+        // prompt, score candidates by cosine similarity.
+        // On a cache miss this fire falls back to keyword
+        // overlap; the embed is kicked off below — after we
+        // know the archive actually holds something to
+        // rerank — so the turn path never waits on it.
+        let prompt_text_ts = latest_user_prompt(working);
+        let prompt_embed = prompt_text_ts
+            .as_ref()
+            .and_then(|(_, ts)| self.peek_prompt_embedding(*ts));
 
         // Take a snapshot of evicted candidates outside any
         // lock so we don't hold the read guard while
@@ -1017,11 +1079,13 @@ impl ContextVirtualizationPolicy {
         // and embedding so the budget loop can fall back to
         // summary form / keyword overlap as needed.
         let working_ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
+        let mut candidate_pool = 0usize;
         let mut candidates: Vec<RelevanceCandidate> = {
             let external = self.external.read().await;
             external
                 .iter_with_meta()
                 .filter(|(_, m, _, _)| !working_ts.contains(&message_timestamp(m)))
+                .inspect(|_| candidate_pool += 1)
                 .filter_map(|(id, m, summary, embedding)| {
                     let s = score_candidate(prompt_embed.as_deref(), &prompt_tokens, embedding, m);
                     if s <= 0.0 {
@@ -1037,6 +1101,19 @@ impl ContextVirtualizationPolicy {
                 })
                 .collect()
         };
+
+        // Prompt-embed cache miss with a live candidate
+        // pool: compute the embedding off the turn path so
+        // the NEXT fire can rerank semantically. Skipped
+        // entirely when the archive holds nothing to rerank
+        // (RC2: the embed used to fire before the empty-
+        // candidates check, paying an HTTP call for turns
+        // with no archive at all).
+        if candidate_pool > 0 && prompt_embed.is_none() {
+            if let Some((text, ts)) = prompt_text_ts {
+                self.spawn_prompt_embed_if_missing(text, ts);
+            }
+        }
 
         if candidates.is_empty() {
             return 0;
@@ -1412,6 +1489,12 @@ mod tests {
         }
     }
 
+    /// Wrap a pushed-timestamps set in the session-shared
+    /// shape the policy constructor takes.
+    fn shared_pushed(set: HashSet<u64>) -> Arc<Mutex<HashSet<u64>>> {
+        Arc::new(Mutex::new(set))
+    }
+
     /// With `u64::MAX` ceiling the policy never evicts —
     /// `Continue` on every call. This is the default-install
     /// behavior the controller falls through to when the
@@ -1419,7 +1502,7 @@ mod tests {
     #[tokio::test]
     async fn ceiling_unlimited_returns_continue() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let policy = ContextVirtualizationPolicy::new(u64::MAX, 4, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(u64::MAX, 4, 0, store, shared_pushed(HashSet::new()));
         let context: Vec<Message> = (0..20).map(|i| user("hello", i as u64)).collect();
         let response = policy.before_model(sample_request(&context)).await;
         assert_eq!(response, BeforeModelResponse::Continue);
@@ -1434,7 +1517,7 @@ mod tests {
     async fn under_ceiling_keeps_all_messages_and_appends_ledger() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         // 10_000-token ceiling, content is tiny.
-        let policy = ContextVirtualizationPolicy::new(10_000, 4, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(10_000, 4, 0, store, shared_pushed(HashSet::new()));
         let context = vec![user("hi", 1), assistant("hello", 2)];
         let response = policy.before_model(sample_request(&context)).await;
 
@@ -1463,7 +1546,7 @@ mod tests {
             .map(|i| user(&format!("msg{i}"), i as u64))
             .collect();
         // Ceiling = 5 tokens; keep_last_n = 3.
-        let policy = ContextVirtualizationPolicy::new(5, 3, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 3, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -1504,7 +1587,7 @@ mod tests {
         ];
         // Tiny ceiling forces eviction; KEEP_LAST_N=2 means
         // only the last 2 messages would normally pin.
-        let policy = ContextVirtualizationPolicy::new(2, 2, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(2, 2, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1537,7 +1620,7 @@ mod tests {
         // The pinned tail (5 messages) will be over the
         // ceiling but the policy refuses to evict pinned
         // messages.
-        let policy = ContextVirtualizationPolicy::new(1, 5, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(1, 5, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -1561,7 +1644,7 @@ mod tests {
         let context: Vec<Message> = (0..8)
             .map(|i| user(&format!("msg{i}"), 100 + i as u64))
             .collect();
-        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), shared_pushed(HashSet::new()));
         let _ = policy.before_model(sample_request(&context)).await;
         let external = store.read().await;
         // Every original message landed in external (or was
@@ -1584,7 +1667,7 @@ mod tests {
         // Pre-populated dedup set matching the snapshot
         // currently in the store.
         let pushed = ContextVirtualizationPolicy::pushed_set_from_snapshot(&context);
-        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&external), pushed);
+        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&external), shared_pushed(pushed));
         let _ = policy.before_model(sample_request(&context)).await;
         let external = external.read().await;
         // Length unchanged: 5 from pre-population, 0
@@ -1607,7 +1690,7 @@ mod tests {
             assistant("ack2", 6),
             user("third", 7),
         ];
-        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -1635,7 +1718,7 @@ mod tests {
     async fn ledger_replaced_each_turn_no_accumulation() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
 
         // Fire 1: ledger appended.
         let r1 = policy.before_model(sample_request(&context)).await;
@@ -1672,7 +1755,7 @@ mod tests {
             tool_result("c3", "read", "file", 4),
             assistant("ack", 5),
         ];
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1708,7 +1791,7 @@ mod tests {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
         let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), HashSet::new());
+            ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), shared_pushed(HashSet::new()));
         let _ = policy.before_model(sample_request(&context)).await;
         // External: 3 originals, 0 ledgers.
         assert_eq!(store.read().await.len(), 3);
@@ -1792,7 +1875,7 @@ mod tests {
             .chain([user("weather forecast for Tallahassee tomorrow", 100)])
             .collect();
         // Budget = 0; ceiling = 5 forces eviction.
-        let policy = ContextVirtualizationPolicy::new(5, 1, 0, store, HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 1, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1832,7 +1915,7 @@ mod tests {
 
         // Tight ceiling forces eviction of message 1; budget
         // big enough to page it back.
-        let policy = ContextVirtualizationPolicy::new(5, 1, 50, Arc::clone(&store), HashSet::new());
+        let policy = ContextVirtualizationPolicy::new(5, 1, 50, Arc::clone(&store), shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1866,7 +1949,7 @@ mod tests {
 
         let budget = 6_u64;
         let policy =
-            ContextVirtualizationPolicy::new(2, 1, budget, Arc::clone(&store), HashSet::new());
+            ContextVirtualizationPolicy::new(2, 1, budget, Arc::clone(&store), shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1911,7 +1994,7 @@ mod tests {
             .chain([user("what's the weather?", 100)])
             .collect();
         let policy =
-            ContextVirtualizationPolicy::new(10_000, 6, 1_000, Arc::clone(&store), HashSet::new());
+            ContextVirtualizationPolicy::new(10_000, 6, 1_000, Arc::clone(&store), shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1942,7 +2025,7 @@ mod tests {
         context.push(user("weather question", 100));
 
         let policy =
-            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), HashSet::new());
+            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -1968,7 +2051,7 @@ mod tests {
         context.push(user("weather!", 100));
 
         let policy =
-            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), HashSet::new());
+            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -2091,7 +2174,7 @@ mod tests {
         // Use under-ceiling pipeline; ledger is built either
         // way. Pre-populate `pushed` so we don't re-archive.
         let pushed: HashSet<u64> = (100..=103).collect();
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), pushed);
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), shared_pushed(pushed));
         let context = vec![user("follow-up about codex", 200)];
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
@@ -2210,7 +2293,7 @@ mod tests {
             8,
             150, // budget tight enough that huge body skips, summary fits
             Arc::clone(&store),
-            HashSet::from([1u64]), // skip re-archive
+            shared_pushed(HashSet::from([1u64])), // skip re-archive
         );
         let context = vec![user("looking for relevant_keyword info", 200)];
         let response = policy.before_model(sample_request(&context)).await;
@@ -2279,38 +2362,105 @@ mod tests {
             async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
                 Ok(vec![1.0, 0.0, 0.0])
             }
-            fn dim(&self) -> usize {
-                3
-            }
         }
         let embedder: Arc<dyn crate::embedder::Embedder> = Arc::new(StubEmbedder);
         let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
 
         let pushed = HashSet::from([1u64]);
         let policy =
-            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), pushed)
+            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), shared_pushed(pushed))
                 .with_embedder(embedder, tx);
 
         // Active context's prompt has no keyword overlap
         // with the candidate. With keyword scoring this
         // would page in nothing; with embedding cosine=1
-        // it should page in.
+        // it should page in. RC2: the prompt embedding is
+        // computed by a background task — the first fire
+        // falls back to keyword overlap (finding nothing)
+        // and kicks the embed off; a later fire picks the
+        // cached vector up and pages the candidate in by
+        // cosine.
         let context = vec![user("totally different abc query", 100)];
+        let mut paged_in = false;
+        for _ in 0..100 {
+            let response = policy.before_model(sample_request(&context)).await;
+            let survivors = match response {
+                BeforeModelResponse::ReplaceMessages(s) => s,
+                other => panic!("expected ReplaceMessages, got {other:?}"),
+            };
+            if survivors.iter().any(|m| match m {
+                Message::User(u) => match u.content.first() {
+                    Some(ContentBlock::Text { text }) => text.contains("zero keyword overlap"),
+                    _ => false,
+                },
+                _ => false,
+            }) {
+                paged_in = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            paged_in,
+            "embedding cosine=1 candidate should be paged in once the background prompt embed lands"
+        );
+    }
+
+    /// RC2 regression (docs/code_review_2026-06-11.md): a
+    /// cache-miss prompt embed must never be awaited on the
+    /// before_model path. With an embedder that takes 30s,
+    /// the fire must return promptly — reranking by keyword
+    /// overlap for the current fire — while the embed runs
+    /// in the background.
+    #[tokio::test]
+    async fn prompt_embed_cache_miss_does_not_block_before_model() {
+        use crate::bg_embedder::EmbedRequest;
+
+        struct SlowEmbedder;
+        #[async_trait::async_trait]
+        impl crate::embedder::Embedder for SlowEmbedder {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(vec![1.0, 0.0, 0.0])
+            }
+        }
+
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "relevant_keyword content here",
+            1,
+        )])));
+        let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            2,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64])),
+        )
+        .with_embedder(Arc::new(SlowEmbedder), tx);
+
+        let context = vec![user("looking for relevant_keyword", 100)];
+        let started = std::time::Instant::now();
         let response = policy.before_model(sample_request(&context)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "before_model must not await the prompt embed inline"
+        );
+        // Keyword fallback still reranks on this fire.
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
         let has_candidate = survivors.iter().any(|m| match m {
             Message::User(u) => match u.content.first() {
-                Some(ContentBlock::Text { text }) => text.contains("zero keyword overlap"),
+                Some(ContentBlock::Text { text }) => text.contains("relevant_keyword content here"),
                 _ => false,
             },
             _ => false,
         });
         assert!(
             has_candidate,
-            "embedding cosine=1 candidate should have been paged in: {survivors:?}"
+            "keyword overlap must still page in while the embed is pending: {survivors:?}"
         );
     }
 
@@ -2338,16 +2488,13 @@ mod tests {
                 // Orthogonal to candidate 1's embedding.
                 Ok(vec![0.0, 1.0, 0.0])
             }
-            fn dim(&self) -> usize {
-                3
-            }
         }
         let embedder: Arc<dyn crate::embedder::Embedder> = Arc::new(OrthogonalEmbedder);
         let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
 
         let pushed = HashSet::from([1u64, 2u64]);
         let policy =
-            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), pushed)
+            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), shared_pushed(pushed))
                 .with_embedder(embedder, tx);
 
         let context = vec![user("looking for quux", 100)];
@@ -2390,7 +2537,7 @@ mod tests {
             2,
             10_000,
             Arc::clone(&store),
-            HashSet::from([1u64]),
+            shared_pushed(HashSet::from([1u64])),
         );
         let context = vec![user("looking for relevant_keyword", 100)];
         let response = policy.before_model(sample_request(&context)).await;

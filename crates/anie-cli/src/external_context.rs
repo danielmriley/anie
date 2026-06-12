@@ -75,7 +75,6 @@ pub(crate) struct StoredMessage {
     /// Stable identifier; equals the message's position at
     /// insertion time. Phase C may decouple position from id
     /// when eviction starts moving messages around.
-    #[allow(dead_code)]
     pub id: MessageId,
     pub message: Message,
     /// Optional Phase-F summary, written by the background
@@ -174,10 +173,7 @@ impl ExternalContext {
     /// Borrow the optional summary attached to `id`. Used by
     /// the recurse tool when the caller asks for the
     /// summarized form rather than the full body.
-    /// `#[allow(dead_code)]` — Phase F's recurse-side
-    /// integration lands in a follow-up commit.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn get_summary(&self, id: MessageId) -> Option<&str> {
         self.messages.get(id).and_then(|s| s.summary.as_deref())
     }
@@ -195,7 +191,6 @@ impl ExternalContext {
     /// message. Idempotent — replaces the previous vector
     /// if any. Used by the Plan-08 background embedder
     /// worker. No-op when `id` is out of bounds.
-    #[allow(dead_code)] // wired up in PR 08.2 (worker) / 08.3 (reranker).
     pub(crate) fn set_embedding(&mut self, id: MessageId, embedding: Vec<f32>) {
         if let Some(stored) = self.messages.get_mut(id) {
             stored.embedding = Some(embedding);
@@ -205,9 +200,11 @@ impl ExternalContext {
     /// Borrow the optional embedding attached to `id`.
     /// Returns the slice or `None` if the entry hasn't
     /// been embedded (worker not yet caught up, or no
-    /// embedder configured for this run).
+    /// embedder configured for this run). Production reads
+    /// go through `iter_with_meta`; this accessor exists
+    /// for the worker tests.
     #[must_use]
-    #[allow(dead_code)] // wired up in PR 08.3 (reranker).
+    #[cfg(test)]
     pub(crate) fn get_embedding(&self, id: MessageId) -> Option<&[f32]> {
         self.messages.get(id).and_then(|s| s.embedding.as_deref())
     }
@@ -217,7 +214,6 @@ impl ExternalContext {
     /// non-zero so the operator can confirm the embedder
     /// is keeping up.
     #[must_use]
-    #[allow(dead_code)] // wired up in PR 08.3 (ledger).
     pub(crate) fn embedding_count(&self) -> usize {
         self.messages
             .iter()
@@ -225,11 +221,10 @@ impl ExternalContext {
             .count()
     }
 
-    /// Number of stored messages. `#[allow(dead_code)]` —
-    /// Phase C will read this to decide when the active
-    /// context approaches the configured ceiling.
+    /// Number of stored messages. The virtualization
+    /// policy reads this after every archive pass to keep
+    /// the status bar's archive count current.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.messages.len()
     }

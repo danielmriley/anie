@@ -16,29 +16,35 @@
 //! budget.
 //!
 //! Two `Summarizer` implementations:
-//! - [`LlmSummarizer`] — production default. Issues one
-//!   non-tool streaming call against the run's configured
-//!   provider/model with a short system prompt asking for
-//!   a 3-5 sentence summary. On any failure (timeout,
-//!   provider error, empty output) it falls back to head-
-//!   truncation so the entry still gets *some* summary.
-//! - [`HeadTruncationSummarizer`] — deterministic baseline:
+//! - [`LlmSummarizer`] — default for hosted (non-Ollama)
+//!   parents. Issues one non-tool streaming call against
+//!   the run's configured provider/model with a short
+//!   system prompt asking for a 3-5 sentence summary. On
+//!   any failure (timeout, provider error, empty output)
+//!   it falls back to head-truncation so the entry still
+//!   gets *some* summary.
+//! - [`HeadTruncationSummarizer`] — deterministic, free:
 //!   keep the first `SUMMARY_MAX_CHARS` characters of the
-//!   first text block. Used as the fallback path inside
-//!   `LlmSummarizer` and as a stand-alone option in tests.
+//!   first text block. The default for local Ollama
+//!   parents (RC1 of `docs/code_review_2026-06-11.md`:
+//!   LLM summaries against the same Ollama instance run
+//!   concurrently with the live turn) and the fallback
+//!   path inside `LlmSummarizer`. `ANIE_SUMMARIZER`
+//!   overrides the choice either way.
 //!
 //! Lifecycle:
-//! 1. Controller spawns the worker on rlm-mode init,
-//!    handing it `Arc<RwLock<ExternalContext>>` plus an
-//!    `Arc<dyn Summarizer>`.
+//! 1. Controller spawns the worker once per rlm session
+//!    (`RlmSessionState`), handing it
+//!    `Arc<RwLock<ExternalContext>>` plus an
+//!    `Arc<dyn Summarizer>` and a `CancellationToken`.
 //! 2. Policy enqueues `SummaryRequest { id, message }`
 //!    after archive (only for messages above a configurable
 //!    size threshold — small messages aren't worth
 //!    summarizing).
 //! 3. Worker pulls from the channel, calls the summarizer,
 //!    writes the result with `set_summary`.
-//! 4. Worker exits when the sender is dropped (controller
-//!    teardown).
+//! 4. Worker exits when the cancellation token fires
+//!    (session-state drop) or every sender is dropped.
 
 use std::{sync::Arc, time::Duration};
 
@@ -50,6 +56,7 @@ use anie_provider::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::external_context::{ExternalContext, MessageId};
 
@@ -376,25 +383,37 @@ fn first_text(m: &Message) -> Option<&str> {
 }
 
 /// Spawn the background worker. Returns the sender end of
-/// the request channel; the caller stashes it on the policy
-/// so eviction can enqueue. The receiver is moved into the
-/// spawned task and dropped on teardown.
+/// the request channel plus the worker's `JoinHandle`; the
+/// caller (the rlm session state) stashes the sender on the
+/// per-run policy so eviction can enqueue, and keeps the
+/// handle so it can abort the worker on teardown.
 ///
-/// The worker runs until the sender is closed (every
-/// `Sender` clone dropped). When the controller tears down
-/// the run, dropping the sender drains the channel and the
-/// worker exits cleanly.
+/// The worker runs until `cancel` fires or the sender is
+/// closed (every `Sender` clone dropped). RC3 of
+/// `docs/code_review_2026-06-11.md`: sender-drop alone is
+/// not a sufficient teardown signal — per-run policies
+/// holding sender clones can outlive the session state, and
+/// an orphaned worker would keep draining up to 64 queued
+/// summarize calls into a dead store.
 pub(crate) fn spawn_worker(
     summarizer: Arc<dyn Summarizer>,
     external: Arc<RwLock<ExternalContext>>,
-) -> mpsc::Sender<SummaryRequest> {
+    cancel: CancellationToken,
+) -> (mpsc::Sender<SummaryRequest>, tokio::task::JoinHandle<()>) {
     // Bounded channel: high-water mark of 64 pending
     // summarize requests. If the worker falls behind, the
     // policy's `try_send` skips the enqueue rather than
     // blocking the model turn.
     let (tx, mut rx) = mpsc::channel::<SummaryRequest>(64);
-    tokio::spawn(async move {
-        while let Some(SummaryRequest { id, message }) = rx.recv().await {
+    let handle = tokio::spawn(async move {
+        loop {
+            let SummaryRequest { id, message } = tokio::select! {
+                () = cancel.cancelled() => break,
+                request = rx.recv() => match request {
+                    Some(request) => request,
+                    None => break,
+                },
+            };
             match summarizer.summarize(&message).await {
                 Ok(summary) => {
                     let mut store = external.write().await;
@@ -410,7 +429,7 @@ pub(crate) fn spawn_worker(
             }
         }
     });
-    tx
+    (tx, handle)
 }
 
 #[cfg(test)]
@@ -702,7 +721,7 @@ mod tests {
         // Pre-populate the store with one tool result.
         let id = store.write().await.push(tool_result_message("body"));
         let summarizer: Arc<dyn Summarizer> = Arc::new(HeadTruncationSummarizer);
-        let tx = spawn_worker(summarizer, Arc::clone(&store));
+        let (tx, _handle) = spawn_worker(summarizer, Arc::clone(&store), CancellationToken::new());
         tx.send(SummaryRequest {
             id,
             message: tool_result_message("body"),
@@ -727,5 +746,28 @@ mod tests {
             .map(str::to_string)
             .expect("summary written");
         assert_eq!(summary, "body");
+    }
+
+    /// RC3 regression (docs/code_review_2026-06-11.md):
+    /// per-run policies hold sender clones that can outlive
+    /// the session state, so sender-drop alone can't stop
+    /// the worker. Cancelling the token must make the
+    /// worker exit even while a sender is still held.
+    #[tokio::test]
+    async fn cancelled_worker_exits_while_sender_still_held() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let cancel = CancellationToken::new();
+        let (tx, handle) = spawn_worker(
+            Arc::new(HeadTruncationSummarizer),
+            Arc::clone(&store),
+            cancel.clone(),
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("worker must exit on cancellation, not wait for sender drop")
+            .expect("worker task joins cleanly");
+        // The sender was alive the whole time.
+        drop(tx);
     }
 }

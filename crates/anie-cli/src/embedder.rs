@@ -14,8 +14,7 @@
 //!   reranker tests so they don't need a real Ollama.
 //!
 //! The trait surface is intentionally minimal: one async
-//! `embed(text) -> Result<Vec<f32>, String>` plus a
-//! synchronous `dim()` for sanity checks. Future
+//! `embed(text) -> Result<Vec<f32>, String>`. Future
 //! providers (Cohere, OpenAI, BAAI) plug into the same
 //! trait without touching callers.
 //!
@@ -25,7 +24,7 @@
 //! on. There's no value in distinguishing HTTP-level vs
 //! parse-level failures at the trait boundary.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Duration};
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -67,6 +66,20 @@ const FAIL_LOG_BODY_PREVIEW_CHARS: usize = 400;
 /// signal beats none).
 const OLLAMA_INPUT_CHAR_CAP: usize = 3000;
 
+/// Total per-request budget for an embed call. RC2 of
+/// `docs/code_review_2026-06-11.md`: the client used to be
+/// built with no timeout at all, so a busy or wedged Ollama
+/// stalled the caller indefinitely. Embeds are best-effort
+/// (every caller treats failure as "fall back to keyword
+/// overlap"), so a bounded failure is strictly better than
+/// an unbounded wait.
+const EMBED_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TCP connect budget for an embed call. Separate from the
+/// total budget so an unreachable host fails fast rather
+/// than consuming the whole request timeout.
+const EMBED_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Truncate a string to `max_chars` graphemes-ish (chars,
 /// good enough for log diagnostics) and append an ellipsis
 /// when clipped.
@@ -82,7 +95,6 @@ fn preview(s: &str, max_chars: usize) -> String {
 /// Strategy for embedding text into a fixed-dimension
 /// vector. Implementations are typically HTTP-backed
 /// (Ollama, OpenAI) or local (fastembed, ONNX).
-#[allow(dead_code)] // wired up in PR 08.2 (cache) and 08.3 (reranker).
 #[async_trait]
 pub(crate) trait Embedder: Send + Sync {
     /// Embed a single text. Returns the embedding vector
@@ -90,17 +102,11 @@ pub(crate) trait Embedder: Send + Sync {
     /// fallback signal — it drops to keyword overlap for
     /// that candidate rather than failing the model turn.
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String>;
-
-    /// Embedding dimensionality. Used as a sanity check —
-    /// callers should error if a returned vector doesn't
-    /// match this length.
-    fn dim(&self) -> usize;
 }
 
 /// Cosine similarity between two equal-length vectors.
 /// Returns 0.0 if either vector is the zero vector
 /// (avoids NaN). Range: [-1.0, 1.0].
-#[allow(dead_code)] // wired up in PR 08.3 (reranker).
 pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -129,26 +135,47 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Construct with `OllamaEmbedder::new(base_url, model)`.
 /// The `model` field is the Ollama model name (e.g.
 /// `nomic-embed-text`); it must already be pulled.
-#[allow(dead_code)] // wired up in PR 08.3 (controller spawn).
 pub(crate) struct OllamaEmbedder {
     client: reqwest::Client,
     base_url: String,
     model: String,
-    dim: usize,
 }
 
 impl OllamaEmbedder {
-    /// Build a new embedder. `dim` is the vector size the
-    /// model returns; for `nomic-embed-text` this is 768.
-    /// Wrong values just hurt the sanity-check, they don't
-    /// change behavior.
-    #[allow(dead_code)] // wired up in PR 08.3 (controller spawn).
-    pub(crate) fn new(base_url: String, model: String, dim: usize) -> Self {
+    /// Build a new embedder.
+    pub(crate) fn new(base_url: String, model: String) -> Self {
+        Self::with_timeouts(base_url, model, EMBED_HTTP_TIMEOUT, EMBED_CONNECT_TIMEOUT)
+    }
+
+    /// Like [`OllamaEmbedder::new`] but with explicit
+    /// timeouts. Split out so tests can use sub-second
+    /// bounds against unroutable hosts.
+    fn with_timeouts(
+        base_url: String,
+        model: String,
+        timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .build()
+            // Only fails when the TLS backend can't
+            // initialize. Embeds are best-effort, so fall
+            // back to the default (timeout-less) client
+            // rather than failing construction.
+            .unwrap_or_else(|error| {
+                warn!(
+                    target: "anie_cli::embedder",
+                    %error,
+                    "failed to build embed http client with timeouts; using default client"
+                );
+                reqwest::Client::new()
+            });
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url,
             model,
-            dim,
         }
     }
 }
@@ -244,10 +271,6 @@ impl Embedder for OllamaEmbedder {
         }
         Ok(vec)
     }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
 }
 
 #[cfg(test)]
@@ -259,7 +282,6 @@ mod tests {
     /// vectors keyed off input text. Used by reranker
     /// tests in PR 08.3.
     pub(crate) struct FixedEmbedder {
-        pub dim: usize,
         pub mappings: std::collections::HashMap<String, Vec<f32>>,
     }
 
@@ -270,9 +292,6 @@ mod tests {
                 .get(text)
                 .cloned()
                 .ok_or_else(|| format!("FixedEmbedder: no mapping for {text:?}"))
-        }
-        fn dim(&self) -> usize {
-            self.dim
         }
     }
 
@@ -320,11 +339,10 @@ mod tests {
         let mut mappings = std::collections::HashMap::new();
         mappings.insert("hello".to_string(), vec![1.0, 0.0, 0.0]);
         mappings.insert("world".to_string(), vec![0.0, 1.0, 0.0]);
-        let e = FixedEmbedder { dim: 3, mappings };
+        let e = FixedEmbedder { mappings };
         assert_eq!(e.embed("hello").await.unwrap(), vec![1.0, 0.0, 0.0]);
         assert_eq!(e.embed("world").await.unwrap(), vec![0.0, 1.0, 0.0]);
         assert!(e.embed("missing").await.is_err());
-        assert_eq!(e.dim(), 3);
     }
 
     #[tokio::test]
@@ -340,7 +358,7 @@ mod tests {
                     }));
             })
             .await;
-        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into(), 4);
+        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into());
         let vec = embedder.embed("hello").await.expect("ok");
         assert_eq!(vec.len(), 4);
         assert!((vec[0] - 0.1).abs() < 1e-6);
@@ -357,7 +375,7 @@ mod tests {
                 then.status(500).body("oops");
             })
             .await;
-        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into(), 768);
+        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into());
         let err = embedder.embed("hello").await.expect_err("should error");
         assert!(
             err.contains("500"),
@@ -404,7 +422,7 @@ mod tests {
                     .json_body(serde_json::json!({"embeddings": [[0.1, 0.2, 0.3]]}));
             })
             .await;
-        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into(), 3);
+        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into());
         let vec = embedder
             .embed(&huge)
             .await
@@ -431,7 +449,7 @@ mod tests {
                     .body(r#"{"error":"input length exceeds maximum context length"}"#);
             })
             .await;
-        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into(), 768);
+        let embedder = OllamaEmbedder::new(server.base_url(), "nomic-embed-text".into());
         let err = embedder.embed("hello").await.expect_err("should error");
         assert!(err.contains("400"), "should include status: {err}");
         assert!(
@@ -441,8 +459,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embed_against_unroutable_host_fails_bounded_instead_of_hanging() {
+        // RC2 regression (docs/code_review_2026-06-11.md):
+        // the client used to be built with no timeout, so a
+        // wedged Ollama stalled the caller indefinitely —
+        // and the prompt embed sat on the model-turn start
+        // path. 10.255.255.1 is in private space with no
+        // route from CI/dev machines; the connect must hit
+        // the configured timeout, not hang.
+        let embedder = OllamaEmbedder::with_timeouts(
+            "http://10.255.255.1:11434".into(),
+            "nomic-embed-text".into(),
+            Duration::from_millis(400),
+            Duration::from_millis(250),
+        );
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), embedder.embed("hello")).await;
+        let inner = result.expect("embed must fail within the configured timeout, not hang");
+        assert!(inner.is_err(), "unroutable host should surface an error");
+    }
+
+    #[tokio::test]
     async fn ollama_embedder_rejects_empty_input() {
-        let embedder = OllamaEmbedder::new("http://localhost:1".into(), "x".into(), 1);
+        let embedder = OllamaEmbedder::new("http://localhost:1".into(), "x".into());
         let err = embedder.embed("   ").await.expect_err("should error");
         assert!(err.contains("empty"));
     }
@@ -458,7 +497,7 @@ mod tests {
                     .json_body(serde_json::json!({"unexpected": "shape"}));
             })
             .await;
-        let embedder = OllamaEmbedder::new(server.base_url(), "x".into(), 1);
+        let embedder = OllamaEmbedder::new(server.base_url(), "x".into());
         let err = embedder.embed("hi").await.expect_err("should error");
         assert!(err.contains("missing `embeddings`"));
     }
