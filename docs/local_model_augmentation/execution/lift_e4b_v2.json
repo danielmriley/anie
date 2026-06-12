@@ -1,0 +1,1927 @@
+{
+  "schema_version": 1,
+  "run_id": "run-1781305696",
+  "harness_commit": "8322d31",
+  "scenarios": [
+    {
+      "name": "find_compaction_stats",
+      "scenario_sha256": "ba4ddcae805f1593596189fe4cb096363d7aee03eb8c27852e653ace99bb9110",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"CompactionStatsAtomic\", \"compaction_stats.rs\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "32299 tokens > cap 24000"
+            },
+            {
+              "check": "max_wall_clock_ms",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 30499,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 30499,
+              "output_tokens": 1800,
+              "total_tokens": 32299
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 3,
+                  "failures": 0
+                },
+                "web_search": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 5,
+              "failures": 0
+            },
+            "turns": 6,
+            "wall_clock_ms": 106594
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"CompactionStatsAtomic\", \"compaction_stats.rs\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_wall_clock_ms",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 216,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 18125,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18125,
+              "output_tokens": 652,
+              "total_tokens": 18777
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "repo_map": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 34444
+          }
+        }
+      ]
+    },
+    {
+      "name": "find_provider_trait",
+      "scenario_sha256": "7101ba32749e025afcd6bd56f854537b9d895326aa4d61cd111f9d50413e6ba1",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "69871 tokens > cap 24000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 65237,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 65237,
+              "output_tokens": 4634,
+              "total_tokens": 69871
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_read": {
+                  "calls": 5,
+                  "failures": 0
+                },
+                "web_search": {
+                  "calls": 4,
+                  "failures": 0
+                }
+              },
+              "calls": 9,
+              "failures": 0
+            },
+            "turns": 10,
+            "wall_clock_ms": 253504
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "31817 tokens > cap 24000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 270,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 29482,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 29482,
+              "output_tokens": 2335,
+              "total_tokens": 31817
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_read": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "web_search": {
+                  "calls": 3,
+                  "failures": 0
+                }
+              },
+              "calls": 4,
+              "failures": 0
+            },
+            "turns": 5,
+            "wall_clock_ms": 127181
+          }
+        }
+      ]
+    },
+    {
+      "name": "grep_apply_patch",
+      "scenario_sha256": "ddada69189d9e70b8741cc63ffff6b83e417453c4c8701984dcf4fca6058296e",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 4571,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 4571,
+              "output_tokens": 462,
+              "total_tokens": 5033
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {},
+              "calls": 0,
+              "failures": 0
+            },
+            "turns": 1,
+            "wall_clock_ms": 24493
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 54,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 4489,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 4489,
+              "output_tokens": 231,
+              "total_tokens": 4720
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {},
+              "calls": 0,
+              "failures": 0
+            },
+            "turns": 1,
+            "wall_clock_ms": 14079
+          }
+        }
+      ]
+    },
+    {
+      "name": "grep_then_read_constant",
+      "scenario_sha256": "8ae7b2dcf11d1208c7324db783dd23513df5e6b80556b5b928ed914ccf2068bc",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"MAX_MODEL_OUTPUT_MALFORMED_RETRIES\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 1 times, need >= 2"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 4587,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 4587,
+              "output_tokens": 725,
+              "total_tokens": 5312
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "grep": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 1,
+              "failures": 0
+            },
+            "turns": 2,
+            "wall_clock_ms": 37166
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"MAX_MODEL_OUTPUT_MALFORMED_RETRIES\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 1 times, need >= 2"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 324,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 27506,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 27506,
+              "output_tokens": 2166,
+              "total_tokens": 29672
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "find": {
+                  "calls": 2,
+                  "failures": 0
+                },
+                "grep": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "repo_map": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 5,
+              "failures": 0
+            },
+            "turns": 6,
+            "wall_clock_ms": 103768
+          }
+        }
+      ]
+    },
+    {
+      "name": "locate_budget_policy",
+      "scenario_sha256": "16f6edb51430b22b708ee2bc28fc0e6db58189004031c356af2aec3076f5af67",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"BudgetPolicy\", \"StopRun\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 10380,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 10380,
+              "output_tokens": 723,
+              "total_tokens": 11103
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_search": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 1,
+              "failures": 0
+            },
+            "turns": 2,
+            "wall_clock_ms": 40263
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"BudgetPolicy\", \"StopRun\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 162,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 16490,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 16490,
+              "output_tokens": 1295,
+              "total_tokens": 17785
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_search": {
+                  "calls": 2,
+                  "failures": 0
+                }
+              },
+              "calls": 2,
+              "failures": 0
+            },
+            "turns": 3,
+            "wall_clock_ms": 69761
+          }
+        }
+      ]
+    },
+    {
+      "name": "paged_read_negative_control",
+      "scenario_sha256": "d84fd2440aae21e6c4d060fb9b302b668944ade8bcab829d63ca108ce9380ad9",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"stable_args_hash\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `read` called 1 times, need >= 3"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 18866,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18866,
+              "output_tokens": 1504,
+              "total_tokens": 20370
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 2,
+                  "failures": 1
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 3,
+              "failures": 2
+            },
+            "turns": 4,
+            "wall_clock_ms": 73651
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"stable_args_hash\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `read` called 1 times, need >= 3"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 270,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 23883,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 23883,
+              "output_tokens": 1094,
+              "total_tokens": 24977
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 3,
+                  "failures": 2
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 4,
+              "failures": 3
+            },
+            "turns": 5,
+            "wall_clock_ms": 55295
+          }
+        }
+      ]
+    },
+    {
+      "name": "read_chain_arg_shapes",
+      "scenario_sha256": "e77780aa3f4a833fb070b9b5374cf75832b6330fc0b65a35d197e79df9f5d7a6",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"coerce_arguments\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 13985,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 13985,
+              "output_tokens": 767,
+              "total_tokens": 14752
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "read": {
+                  "calls": 2,
+                  "failures": 2
+                }
+              },
+              "calls": 2,
+              "failures": 2
+            },
+            "turns": 3,
+            "wall_clock_ms": 39201
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"coerce_arguments\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 222,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 14029,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 14029,
+              "output_tokens": 858,
+              "total_tokens": 14887
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "read": {
+                  "calls": 2,
+                  "failures": 2
+                }
+              },
+              "calls": 2,
+              "failures": 2
+            },
+            "turns": 3,
+            "wall_clock_ms": 43430
+          }
+        }
+      ]
+    },
+    {
+      "name": "read_readme_highlights",
+      "scenario_sha256": "e37af77c7d4ebc82e1d9b974bdb701f2b4c8d1d968e861a72dd17cc7682f483d",
+      "results": [
+        {
+          "mode": "current",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 9183,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 9183,
+              "output_tokens": 255,
+              "total_tokens": 9438
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 1,
+              "failures": 1
+            },
+            "turns": 2,
+            "wall_clock_ms": 15700
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 162,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 13736,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 13736,
+              "output_tokens": 476,
+              "total_tokens": 14212
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 1,
+                  "failures": 1
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 2,
+              "failures": 2
+            },
+            "turns": 3,
+            "wall_clock_ms": 26031
+          }
+        }
+      ]
+    },
+    {
+      "name": "repo_map_cold_start",
+      "scenario_sha256": "a4bfc90c2b117f6386d48aadb31d82a7cc2c13d4923ea96fb257cf037a93082d",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "19038 tokens > cap 16000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 18560,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18560,
+              "output_tokens": 478,
+              "total_tokens": 19038
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 2,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 27087
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 108,
+              "page_in_tokens": 130,
+              "page_ins": 1,
+              "prefill_tokens_total": 9500,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 9500,
+              "output_tokens": 588,
+              "total_tokens": 10088
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "read": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 1,
+              "failures": 0
+            },
+            "turns": 2,
+            "wall_clock_ms": 30943
+          }
+        }
+      ]
+    },
+    {
+      "name": "todo_tracked_survey",
+      "scenario_sha256": "6378e57d3fd0aeb63ddb9e2088af73c00add85f1ef8ee07f25a25cff998dbb68",
+      "results": [
+        {
+          "mode": "current",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 28968,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 28968,
+              "output_tokens": 1464,
+              "total_tokens": 30432
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 1,
+                  "failures": 1
+                },
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "todo_write": {
+                  "calls": 3,
+                  "failures": 0
+                }
+              },
+              "calls": 5,
+              "failures": 1
+            },
+            "turns": 6,
+            "wall_clock_ms": 72939
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 378,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 33747,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 33747,
+              "output_tokens": 1185,
+              "total_tokens": 34932
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 1,
+                  "failures": 1
+                },
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "todo_write": {
+                  "calls": 4,
+                  "failures": 0
+                }
+              },
+              "calls": 6,
+              "failures": 1
+            },
+            "turns": 7,
+            "wall_clock_ms": 60423
+          }
+        }
+      ]
+    },
+    {
+      "name": "verify_broken_fixture",
+      "scenario_sha256": "78a2dffa5d3b2ede1552ff278d86ddfc8233111a18aa4dd55af65a8ed1958233",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"verify passed\"]"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "24241 tokens > cap 24000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 0,
+              "page_in_tokens": 0,
+              "page_ins": 0,
+              "prefill_tokens_total": 23384,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 23384,
+              "output_tokens": 857,
+              "total_tokens": 24241
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "edit": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 4,
+              "failures": 0
+            },
+            "turns": 5,
+            "wall_clock_ms": 44756
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "context": {
+              "evicted_tokens": 0,
+              "evictions": 0,
+              "ledger_tokens_total": 256,
+              "page_in_tokens": 227,
+              "page_ins": 3,
+              "prefill_tokens_total": 19261,
+              "truncation_suspected": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 1
+            },
+            "schema_version": 5,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 19261,
+              "output_tokens": 1174,
+              "total_tokens": 20435
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "edit": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 2,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 63637
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -51,13 +51,19 @@ live budget-overflow bug.
 
 ## Exit criteria (series)
 
-- [ ] Corpus matrix re-run (gemma4:e4b, both modes): rlm total tokens
-      ≤ 1.2× current on the navigation family; `find_compaction_stats`
-      rlm wall clock < 120s.
-- [ ] `context.truncation_suspected == 0` across the corpus with
-      default config (the P1 bug class is structurally gone).
-- [ ] rlm retains its wins (repo_map_cold_start, verify_broken_fixture).
-- [ ] No regression on the qwen3.5:0.8b time-scenario field result.
+- [x] Corpus matrix re-run (gemma4:e4b, both modes): rlm/current
+      token ratio **0.92** (gate ≤ 1.2; was 1.40 pre-series);
+      `find_compaction_stats` rlm **66k/247s → 18k/34s** — telemetry
+      shows zero evictions, zero page-ins, 216 ledger tokens total:
+      the thrash loop is gone, not merely cheaper.
+- [x] `context.truncation_suspected == 0` across all 22 corpus runs.
+- [x] Wins retained (repo_map_cold_start, verify_broken_fixture,
+      todo_tracked_survey) AND read_readme_highlights flipped to PASS:
+      rlm 3/11 → 4/11, current 2/11. Soft spot for the record:
+      grep_then_read_constant got worse under rlm (19k/49s →
+      29k/103s) at n=1 — watch it in the next matrix.
+- [x] qwen3.5:0.8b time-scenario: 2 turns, 1 call, 0 failures,
+      0 truncation, prompt 1,398 tokens — no regression.
 
 ## Status (2026-06-12)
 
@@ -79,4 +85,4 @@ double-reserved in the ceiling derivation (conservative direction).
 (3) page-in body-size gate measures the raw body but charges the
 rendered section (off-by-prefix).
 
-Exit gate: corpus matrix re-run pending below.
+Exit gate: PASSED 2026-06-12 (see checked criteria above; reports in docs/local_model_augmentation/execution/lift_e4b_v2.{json,md}).
