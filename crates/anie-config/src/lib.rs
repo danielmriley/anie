@@ -59,6 +59,14 @@ pub struct AnieConfig {
     /// See `docs/cost_budget/`.
     #[serde(default)]
     pub budget: BudgetConfig,
+    /// Optional harness-run verification command. `command` is
+    /// `None` by default (opt-in; zero behavior change when
+    /// unset). Consumed by `anie-cli`'s `VerifyPolicy`, which runs
+    /// the command after edit-bearing turns and injects a capped
+    /// result reminder. See
+    /// `docs/local_model_augmentation/03_harness_verification_and_recovery.md`.
+    #[serde(default)]
+    pub verify: VerifyConfig,
     /// True if a loaded config file (`~/.anie/config.toml` or
     /// a project-local `.anie/config.toml`) explicitly set the
     /// `[model]` section. Lets callers distinguish "the user
@@ -154,6 +162,52 @@ pub struct BudgetConfig {
     /// tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_tokens: Option<u64>,
+}
+
+/// Harness-run verification command. Opt-in: with no `command`
+/// configured the harness runs nothing and behavior is
+/// byte-identical to a config without this section. When set, a
+/// later wave runs `command` after successful edits and feeds a
+/// capped head of its output back to the model. See
+/// `docs/local_model_augmentation/03_harness_verification_and_recovery.md`
+/// §2a. anie-specific (not in pi): pi has no harness-run verify.
+///
+/// Security note: `command` runs with the same trust level as
+/// the model-invoked `bash` tool — unsandboxed by default,
+/// inheriting `[tools.sandbox]` when configured.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerifyConfig {
+    /// Command to run after successful edits (e.g.
+    /// `cargo check --workspace`). `None` (the default) means
+    /// the feature is off — no command runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Wall-clock timeout in seconds before the verify process
+    /// group is killed.
+    #[serde(default = "default_verify_timeout_s")]
+    pub timeout_s: u64,
+    /// Hard cap on lines of verify output fed back to the model
+    /// (first-N — compile errors front-load).
+    #[serde(default = "default_verify_max_output_lines")]
+    pub max_output_lines: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            timeout_s: default_verify_timeout_s(),
+            max_output_lines: default_verify_max_output_lines(),
+        }
+    }
+}
+
+fn default_verify_timeout_s() -> u64 {
+    120
+}
+
+fn default_verify_max_output_lines() -> u64 {
+    40
 }
 
 fn default_mcp_enabled() -> bool {
@@ -1201,6 +1255,21 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.budget.max_session_tokens = budget.max_session_tokens;
         }
     }
+
+    // Verify settings overlay field-by-field so a project config
+    // can set the command without resetting timeout / cap, or vice
+    // versa, against a global layer.
+    if let Some(verify) = partial.verify {
+        if verify.command.is_some() {
+            config.verify.command = verify.command;
+        }
+        if let Some(timeout_s) = verify.timeout_s {
+            config.verify.timeout_s = timeout_s;
+        }
+        if let Some(max_output_lines) = verify.max_output_lines {
+            config.verify.max_output_lines = max_output_lines;
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -1235,6 +1304,20 @@ struct PartialAnieConfig {
     mcp: Option<McpConfig>,
     #[serde(default)]
     budget: Option<BudgetConfig>,
+    #[serde(default)]
+    verify: Option<PartialVerifyConfig>,
+}
+
+/// Optional `[verify]` overrides loaded from `config.toml`. Each
+/// field is `Option<...>` so omitted keys preserve the
+/// `VerifyConfig::default()` values rather than zero-init.
+/// Mirrors the partial-config pattern used for `[compaction]`,
+/// `[ui]`, etc.
+#[derive(Debug, Default, Deserialize)]
+struct PartialVerifyConfig {
+    command: Option<String>,
+    timeout_s: Option<u64>,
+    max_output_lines: Option<u64>,
 }
 
 /// Optional `[ui]` overrides loaded from `config.toml`. Each
@@ -2432,5 +2515,46 @@ mod tests {
             .expect("everything server from template");
         assert_eq!(server.command, "npx");
         assert_eq!(server.startup_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn verify_section_defaults_apply_when_omitted() {
+        // A `[verify]` block with only the command set must take
+        // the timeout / output-cap defaults (120 s, 40 lines)
+        // rather than zero-initializing them.
+        let config = load_body("[verify]\ncommand = \"cargo check --workspace\"\n");
+        assert_eq!(
+            config.verify.command.as_deref(),
+            Some("cargo check --workspace")
+        );
+        assert_eq!(config.verify.timeout_s, 120);
+        assert_eq!(config.verify.max_output_lines, 40);
+    }
+
+    #[test]
+    fn verify_section_roundtrips() {
+        let config = load_body(
+            r#"
+            [verify]
+            command = "make test"
+            timeout_s = 300
+            max_output_lines = 80
+            "#,
+        );
+        assert_eq!(config.verify.command.as_deref(), Some("make test"));
+        assert_eq!(config.verify.timeout_s, 300);
+        assert_eq!(config.verify.max_output_lines, 80);
+    }
+
+    #[test]
+    fn config_without_verify_section_still_loads() {
+        // Forward-compat: a config written before `[verify]`
+        // existed must load cleanly, command defaulting to None
+        // (feature off) so behavior is byte-identical to today.
+        let config = load_body("[model]\nprovider = \"openai\"\nid = \"gpt-4o\"\n");
+        assert_eq!(config.verify, VerifyConfig::default());
+        assert!(config.verify.command.is_none());
+        assert_eq!(config.verify.timeout_s, 120);
+        assert_eq!(config.verify.max_output_lines, 40);
     }
 }
