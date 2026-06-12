@@ -113,6 +113,7 @@ tokens, tool calls, turns).
 |------|---------|-------|---------------|-------|
 | 2026-06-12 | Full campaign (PR13-19) | gemma4:e4b | time-scenario: prompt 11.3k→1,398 tok, wall 127s→26s | field_notes/2026-06-12_gemma4_baseline.md |
 | 2026-06-12 | Full campaign (PR13-19) | qwen3.5:0.8b | time-scenario: failures 36%→17%, hallucinated tools 6→0, answered correctly via bash `date` | same |
+| 2026-06-12 | Corpus matrix (11 scenarios) | gemma4:e4b | current 2/11, rlm 3/11; rlm wins exactly its target scenarios (repo_map_cold_start 19k→4k tok, verify_broken_fixture) but spends MORE tokens on multi-turn navigation (276k vs 197k total) | lift_e4b.{json,md} in this dir; n=1 per cell — see analysis notes below |
 
 ## Plan 04 — Context-budget discipline (added 2026-06-12)
 
@@ -156,3 +157,26 @@ plan 02) was executed as one working tree: PR10/11/13/14/16/17/18
 and the plan-02 PRs above landed together; "—" in the Commit column
 means uncommitted at last tracker update. Evidence:
 field_notes/2026-06-12_qwen3.5-0.8b_session.md.
+
+### Corpus-run analysis notes (2026-06-12, n=1 per cell — directional only)
+
+1. **Targeted features win their scenarios**: repo_map_cold_start
+   (map answers in 4k tokens vs 19k of exploration) and
+   verify_broken_fixture (the harness-run verify loop closes the task;
+   note `current` can never pass it by construction — verify is
+   rlm-gated).
+2. **rlm costs more on multi-turn navigation** at the 16,384 ceiling:
+   per-turn map+ledger weight and eviction/paging churn outweigh the
+   Small-tier prompt savings once runs go long (find_compaction_stats:
+   66k tokens / 12 calls under rlm vs 11k / 1 call under current —
+   both failed). Experiment to run: e4b with a 32,768 override
+   (PromptTier boundary is inclusive, so Small tier persists) to see
+   if eviction churn is the driver.
+3. **Instrument debt**: `must_call_tool = "grep"` encodes strategy,
+   not outcome — find_provider_trait produced the CORRECT answer in
+   both modes and failed only on tool choice + cap. gemma4:e4b is
+   grep-averse (0 grep calls in 5 scenarios) but often still right.
+   Scenario checks should assert outcomes (contains) and budgets, not
+   methods, except where the method IS the behavior under test.
+   External outcome-graded benchmarks (SWE-bench et al.) don't have
+   this trap.

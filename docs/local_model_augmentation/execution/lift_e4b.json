@@ -1,0 +1,1747 @@
+{
+  "schema_version": 1,
+  "run_id": "run-1781294493",
+  "harness_commit": "c04b86b",
+  "scenarios": [
+    {
+      "name": "find_compaction_stats",
+      "scenario_sha256": "ba4ddcae805f1593596189fe4cb096363d7aee03eb8c27852e653ace99bb9110",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"CompactionStatsAtomic\", \"compaction_stats.rs\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_wall_clock_ms",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 10284,
+              "output_tokens": 761,
+              "total_tokens": 11045
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_search": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 1,
+              "failures": 0
+            },
+            "turns": 2,
+            "wall_clock_ms": 55286
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"CompactionStatsAtomic\", \"compaction_stats.rs\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "66233 tokens > cap 24000"
+            },
+            {
+              "check": "max_wall_clock_ms",
+              "outcome": "fail",
+              "reason": "247300ms > cap 240000ms"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 60865,
+              "output_tokens": 5368,
+              "total_tokens": 66233
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "grep": {
+                  "calls": 3,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 3,
+                  "failures": 0
+                },
+                "repo_map": {
+                  "calls": 4,
+                  "failures": 0
+                }
+              },
+              "calls": 12,
+              "failures": 0
+            },
+            "turns": 13,
+            "wall_clock_ms": 247300
+          }
+        }
+      ]
+    },
+    {
+      "name": "find_provider_trait",
+      "scenario_sha256": "7101ba32749e025afcd6bd56f854537b9d895326aa4d61cd111f9d50413e6ba1",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "37707 tokens > cap 24000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 35436,
+              "output_tokens": 2271,
+              "total_tokens": 37707
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_read": {
+                  "calls": 2,
+                  "failures": 0
+                },
+                "web_search": {
+                  "calls": 3,
+                  "failures": 0
+                }
+              },
+              "calls": 5,
+              "failures": 0
+            },
+            "turns": 6,
+            "wall_clock_ms": 122529
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "58218 tokens > cap 24000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 54440,
+              "output_tokens": 3778,
+              "total_tokens": 58218
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls -a": {
+                  "calls": 1,
+                  "failures": 1
+                },
+                "web_read": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "web_search": {
+                  "calls": 4,
+                  "failures": 0
+                }
+              },
+              "calls": 8,
+              "failures": 1
+            },
+            "turns": 9,
+            "wall_clock_ms": 196014
+          }
+        }
+      ]
+    },
+    {
+      "name": "grep_apply_patch",
+      "scenario_sha256": "ddada69189d9e70b8741cc63ffff6b83e417453c4c8701984dcf4fca6058296e",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 4571,
+              "output_tokens": 317,
+              "total_tokens": 4888
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {},
+              "calls": 0,
+              "failures": 0
+            },
+            "turns": 1,
+            "wall_clock_ms": 17743
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 4492,
+              "output_tokens": 249,
+              "total_tokens": 4741
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {},
+              "calls": 0,
+              "failures": 0
+            },
+            "turns": 1,
+            "wall_clock_ms": 14509
+          }
+        }
+      ]
+    },
+    {
+      "name": "grep_then_read_constant",
+      "scenario_sha256": "8ae7b2dcf11d1208c7324db783dd23513df5e6b80556b5b928ed914ccf2068bc",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"MAX_MODEL_OUTPUT_MALFORMED_RETRIES\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 1 times, need >= 2"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18515,
+              "output_tokens": 1827,
+              "total_tokens": 20342
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "grep": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 86118
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"MAX_MODEL_OUTPUT_MALFORMED_RETRIES\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 1 times, need >= 2"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18248,
+              "output_tokens": 987,
+              "total_tokens": 19235
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "grep": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 49092
+          }
+        }
+      ]
+    },
+    {
+      "name": "locate_budget_policy",
+      "scenario_sha256": "16f6edb51430b22b708ee2bc28fc0e6db58189004031c356af2aec3076f5af67",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"BudgetPolicy\", \"StopRun\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 10304,
+              "output_tokens": 623,
+              "total_tokens": 10927
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_search": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 1,
+              "failures": 0
+            },
+            "turns": 2,
+            "wall_clock_ms": 35765
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"BudgetPolicy\", \"StopRun\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `grep` called 0 times, need >= 1"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 16914,
+              "output_tokens": 776,
+              "total_tokens": 17690
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "web_search": {
+                  "calls": 2,
+                  "failures": 0
+                }
+              },
+              "calls": 2,
+              "failures": 0
+            },
+            "turns": 3,
+            "wall_clock_ms": 45111
+          }
+        }
+      ]
+    },
+    {
+      "name": "paged_read_negative_control",
+      "scenario_sha256": "d84fd2440aae21e6c4d060fb9b302b668944ade8bcab829d63ca108ce9380ad9",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"stable_args_hash\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `read` called 1 times, need >= 3"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 14040,
+              "output_tokens": 667,
+              "total_tokens": 14707
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 2,
+              "failures": 1
+            },
+            "turns": 3,
+            "wall_clock_ms": 34679
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"stable_args_hash\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `read` called 2 times, need >= 3"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 33962,
+              "output_tokens": 2642,
+              "total_tokens": 36604
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 4,
+                  "failures": 2
+                },
+                "read": {
+                  "calls": 2,
+                  "failures": 2
+                }
+              },
+              "calls": 6,
+              "failures": 4
+            },
+            "turns": 7,
+            "wall_clock_ms": 124904
+          }
+        }
+      ]
+    },
+    {
+      "name": "read_chain_arg_shapes",
+      "scenario_sha256": "e77780aa3f4a833fb070b9b5374cf75832b6330fc0b65a35d197e79df9f5d7a6",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"coerce_arguments\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `read` called 1 times, need >= 2"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18708,
+              "output_tokens": 1270,
+              "total_tokens": 19978
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 1
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 3,
+              "failures": 2
+            },
+            "turns": 4,
+            "wall_clock_ms": 61332
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"coerce_arguments\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "fail",
+              "reason": "tool `read` called 1 times, need >= 2"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18744,
+              "output_tokens": 1057,
+              "total_tokens": 19801
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 2,
+                  "failures": 1
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 3,
+              "failures": 2
+            },
+            "turns": 4,
+            "wall_clock_ms": 61202
+          }
+        }
+      ]
+    },
+    {
+      "name": "read_readme_highlights",
+      "scenario_sha256": "e37af77c7d4ebc82e1d9b974bdb701f2b4c8d1d968e861a72dd17cc7682f483d",
+      "results": [
+        {
+          "mode": "current",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 13817,
+              "output_tokens": 471,
+              "total_tokens": 14288
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 2,
+              "failures": 1
+            },
+            "turns": 3,
+            "wall_clock_ms": 26623
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"MCP\"]"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 9093,
+              "output_tokens": 239,
+              "total_tokens": 9332
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "read": {
+                  "calls": 1,
+                  "failures": 1
+                }
+              },
+              "calls": 1,
+              "failures": 1
+            },
+            "turns": 2,
+            "wall_clock_ms": 14693
+          }
+        }
+      ]
+    },
+    {
+      "name": "repo_map_cold_start",
+      "scenario_sha256": "a4bfc90c2b117f6386d48aadb31d82a7cc2c13d4923ea96fb257cf037a93082d",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "19075 tokens > cap 16000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18596,
+              "output_tokens": 479,
+              "total_tokens": 19075
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "ls": {
+                  "calls": 2,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 27429
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 4675,
+              "output_tokens": 305,
+              "total_tokens": 4980
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {},
+              "calls": 0,
+              "failures": 0
+            },
+            "turns": 1,
+            "wall_clock_ms": 18065
+          }
+        }
+      ]
+    },
+    {
+      "name": "todo_tracked_survey",
+      "scenario_sha256": "6378e57d3fd0aeb63ddb9e2088af73c00add85f1ef8ee07f25a25cff998dbb68",
+      "results": [
+        {
+          "mode": "current",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 19014,
+              "output_tokens": 923,
+              "total_tokens": 19937
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "todo_write": {
+                  "calls": 2,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 46783
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "must_call_tool",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 18660,
+              "output_tokens": 947,
+              "total_tokens": 19607
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "find": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "todo_write": {
+                  "calls": 2,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 50089
+          }
+        }
+      ]
+    },
+    {
+      "name": "verify_broken_fixture",
+      "scenario_sha256": "78a2dffa5d3b2ede1552ff278d86ddfc8233111a18aa4dd55af65a8ed1958233",
+      "results": [
+        {
+          "mode": "current",
+          "pass": false,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "fail",
+              "reason": "final text missing: [\"verify passed\"]"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "fail",
+              "reason": "24223 tokens > cap 24000"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "current",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 2398
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 0
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 23511,
+              "output_tokens": 712,
+              "total_tokens": 24223
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "bash": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "edit": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "ls": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 1,
+                  "failures": 0
+                }
+              },
+              "calls": 4,
+              "failures": 0
+            },
+            "turns": 5,
+            "wall_clock_ms": 43960
+          }
+        },
+        {
+          "mode": "rlm",
+          "pass": true,
+          "checks": [
+            {
+              "check": "contains",
+              "outcome": "pass"
+            },
+            {
+              "check": "max_tokens",
+              "outcome": "pass"
+            }
+          ],
+          "metrics": {
+            "compaction": {
+              "mid_turn": 0,
+              "pre_prompt": 0,
+              "reactive_overflow": 0,
+              "total": 0
+            },
+            "cost": {
+              "cache_read": 0.0,
+              "cache_write": 0.0,
+              "input": 0.0,
+              "output": 0.0,
+              "total": 0.0
+            },
+            "harness_mode": "rlm",
+            "model": "gemma4:e4b",
+            "prompt": {
+              "system_prompt_tokens": 1393
+            },
+            "provider": "ollama",
+            "recovery": {
+              "grounded_edit_failures": 0,
+              "loop_perturbations": 0,
+              "verify_failures": 0,
+              "verify_runs": 1
+            },
+            "schema_version": 4,
+            "tokens": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 19018,
+              "output_tokens": 1033,
+              "total_tokens": 20051
+            },
+            "tool_repair": {
+              "coerced": 0,
+              "failed_after_repair": 0,
+              "repaired": 0,
+              "repaired_then_failed": 0
+            },
+            "tools": {
+              "by_tool": {
+                "edit": {
+                  "calls": 1,
+                  "failures": 0
+                },
+                "read": {
+                  "calls": 2,
+                  "failures": 0
+                }
+              },
+              "calls": 3,
+              "failures": 0
+            },
+            "turns": 4,
+            "wall_clock_ms": 59895
+          }
+        }
+      ]
+    }
+  ]
+}
