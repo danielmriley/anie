@@ -15,7 +15,10 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
         anyhow::bail!("No prompt provided. Usage: anie 'your prompt here'");
     }
 
-    let state = prepare_controller_state(&cli).await?;
+    let mut state = prepare_controller_state(&cli).await?;
+    // Re-tier the prompt before metrics capture: bootstrap builds the
+    // Full-tier prompt; the Small tier (plan 04) applies on refresh.
+    state.refresh_system_prompt_if_needed();
     // Capture metrics identity before `state` moves into the controller;
     // the accumulator is only built when `--metrics-out` is set.
     let mut metrics = cli.metrics_out.as_ref().map(|_| {

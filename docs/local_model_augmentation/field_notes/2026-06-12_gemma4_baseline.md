@@ -67,3 +67,28 @@ precedence.
   hallucinated-tool class; ledger v2 to kill the F2 syntax leak).
 - Eval corpus `--modes current,rlm` on gemma4:e4b (first lift-curve
   matrix row).
+
+---
+
+## Post-campaign results (same prompt, commits through PR19)
+
+| Metric | e4b before | e4b after | 0.8b before (field session) | 0.8b after |
+|--------|-----------|-----------|------------------------------|------------|
+| system prompt tokens | ~11.3k | **1,398** (Small tier) | ~11.3k | **1,398** |
+| turns | 3 | 2 | 23 | 13 |
+| tool calls / failures | 2 / 0 | 1 / 0 | 22 / 8 (36%) | 12 / 2 (17%) |
+| hallucinated-tool calls | 0 | 0 | 6 | **0** |
+| approach | web search | web search | 10-search loop + fake tool | **ran `date` via bash, answered** |
+| wall clock | 127s | 26s | — | 61s |
+
+The 0.8B model — which previously hallucinated a tool six times,
+looped through ten web searches, and never answered — now goes
+bash-first, runs `date`, and answers the question. No rescue or
+repair was even needed: the Small-tier prompt/ledger (plan 04)
+removed the confusion at the source, with PR16-18 as the safety net.
+Plan-04 exit criterion (turn-0 prompt < 4k) beaten at 1,398 tokens.
+
+PR19 landed during measurement after the advertised-131k crash
+resurfaced — root cause of the resurfacing was itself a bug worth
+having found: `cargo test` was clobbering the developer's real
+`~/.anie/state.json` (fixed; state now survives the full suite).

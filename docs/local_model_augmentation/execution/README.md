@@ -111,7 +111,8 @@ tokens, tool calls, turns).
 
 | Date | Feature | Model | Corpus result | Notes |
 |------|---------|-------|---------------|-------|
-| — | — | — | — | — |
+| 2026-06-12 | Full campaign (PR13-19) | gemma4:e4b | time-scenario: prompt 11.3k→1,398 tok, wall 127s→26s | field_notes/2026-06-12_gemma4_baseline.md |
+| 2026-06-12 | Full campaign (PR13-19) | qwen3.5:0.8b | time-scenario: failures 36%→17%, hallucinated tools 6→0, answered correctly via bash `date` | same |
 
 ## Plan 04 — Context-budget discipline (added 2026-06-12)
 

@@ -2571,8 +2571,11 @@ impl ControllerState {
     /// any of their mtimes, or the prompt tier changed. Runs
     /// at the top of every prompt/continuation run, so a
     /// `/context-length` change re-tiers the prompt before
-    /// the next model call.
-    fn refresh_system_prompt_if_needed(&mut self) {
+    /// the next model call. Also called once by print mode
+    /// before metrics capture, so `prompt.system_prompt_tokens`
+    /// measures the tiered prompt the run actually sends, not
+    /// bootstrap's Full-tier build.
+    pub(crate) fn refresh_system_prompt_if_needed(&mut self) {
         let cwd = self.session.cwd().to_path_buf();
         let tier = self.prompt_tier();
         self.prompt_cache.refresh_if_stale(
