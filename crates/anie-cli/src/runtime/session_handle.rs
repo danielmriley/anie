@@ -39,6 +39,11 @@ pub(crate) struct SessionHandle {
     session: SessionManager,
     sessions_dir: PathBuf,
     cwd: PathBuf,
+    /// Lazily-opened checkpoint store for the current session, kept
+    /// open across captures so each user turn doesn't re-read and
+    /// re-parse the manifest from disk. Dropped (and re-opened on next
+    /// use) whenever the active session changes.
+    checkpoint_store: Option<WorkspaceCheckpointStore>,
 }
 
 impl SessionHandle {
@@ -52,6 +57,7 @@ impl SessionHandle {
             session,
             sessions_dir,
             cwd,
+            checkpoint_store: None,
         }
     }
 
@@ -134,6 +140,7 @@ impl SessionHandle {
     /// reconciliation.
     pub(crate) fn start_new(&mut self) -> Result<()> {
         self.session = SessionManager::new_session(&self.sessions_dir, &self.cwd)?;
+        self.checkpoint_store = None;
         Ok(())
     }
 
@@ -145,6 +152,7 @@ impl SessionHandle {
         let session = SessionManager::open_session(&path)
             .with_context(|| format!("failed to open session {session_id}"))?;
         self.session = session;
+        self.checkpoint_store = None;
         Ok(())
     }
 
@@ -161,6 +169,7 @@ impl SessionHandle {
         }
         let child_id = child.id().to_string();
         self.session = child;
+        self.checkpoint_store = None;
         Ok(child_id)
     }
 
@@ -235,11 +244,18 @@ impl SessionHandle {
             .join(format!("{}.checkpoints", self.session.id()))
     }
 
-    /// Open (or create) the working-tree checkpoint store for the
+    /// The (lazily-opened) working-tree checkpoint store for the
     /// current session, with tracked paths resolved against `cwd`.
-    fn open_checkpoint_store(&self) -> Result<WorkspaceCheckpointStore> {
-        WorkspaceCheckpointStore::open(self.checkpoint_dir(), &self.cwd)
-            .context("failed to open checkpoint store")
+    /// Held open across captures; invalidated on session switch.
+    fn checkpoint_store(&mut self) -> Result<&mut WorkspaceCheckpointStore> {
+        if self.checkpoint_store.is_none() {
+            let store = WorkspaceCheckpointStore::open(self.checkpoint_dir(), &self.cwd)
+                .context("failed to open checkpoint store")?;
+            self.checkpoint_store = Some(store);
+        }
+        self.checkpoint_store
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("checkpoint store just initialized"))
     }
 
     /// Snapshot the working tree at a session entry, over the set of
@@ -252,8 +268,7 @@ impl SessionHandle {
         label: Option<String>,
     ) -> Result<()> {
         let tracked = self.session.tracked_modified_files();
-        let mut store = self.open_checkpoint_store()?;
-        store
+        self.checkpoint_store()?
             .capture(entry_id, &tracked, label)
             .context("failed to capture checkpoint")
     }
@@ -265,7 +280,7 @@ impl SessionHandle {
     /// a drift refusal leaves the conversation untouched. Returns the
     /// [`RestorePlan`] describing what changed on disk.
     pub(crate) fn rewind_to(&mut self, entry_id: &str) -> Result<RestorePlan> {
-        let mut store = self.open_checkpoint_store()?;
+        let store = self.checkpoint_store()?;
         // Restore (and drift-check) before mutating session state, so a
         // refusal is a clean no-op.
         let plan = store.restore(entry_id)?;
@@ -304,20 +319,23 @@ impl SessionHandle {
 
     /// The recorded rewind anchors, oldest first, each annotated with
     /// the first line of its user turn for display.
-    pub(crate) fn rewind_points(&self) -> Result<Vec<RewindPoint>> {
-        let store = self.open_checkpoint_store()?;
-        let points = store
+    pub(crate) fn rewind_points(&mut self) -> Result<Vec<RewindPoint>> {
+        let anchors: Vec<(String, Option<String>)> = self
+            .checkpoint_store()?
             .entries()
             .iter()
             // Internal post-restore drift baselines are not user anchors.
             .filter(|entry| !entry.baseline_only)
-            .map(|entry| RewindPoint {
-                entry_id: entry.entry_id.clone(),
-                label: entry.label.clone(),
-                summary: self.entry_summary(&entry.entry_id),
-            })
+            .map(|entry| (entry.entry_id.clone(), entry.label.clone()))
             .collect();
-        Ok(points)
+        Ok(anchors
+            .into_iter()
+            .map(|(entry_id, label)| RewindPoint {
+                summary: self.entry_summary(&entry_id),
+                entry_id,
+                label,
+            })
+            .collect())
     }
 
     /// First line of the user message stored at `entry_id`, or empty
@@ -404,7 +422,7 @@ mod tests {
 
         h.capture_checkpoint("turn1", None).unwrap();
 
-        let store = h.open_checkpoint_store().unwrap();
+        let store = h.checkpoint_store().unwrap();
         let files = &store.entries()[0].files;
         // write/edit paths are tracked; the read-only path is not.
         assert!(files.contains_key("a.rs"));
@@ -502,6 +520,68 @@ mod tests {
         assert_eq!(*reason, BranchSummaryReason::Rewind);
         // `later.rs` was edited after the rewind point, so it is discarded.
         assert!(details.modified_files.contains(&"later.rs".to_string()));
+    }
+
+    #[test]
+    fn checkpoint_store_is_held_open_across_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), b"v1").unwrap();
+
+        let mut h = handle(dir.path());
+        h.inner_mut().append_message(&user("t1")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("write", "a.rs")]))
+            .unwrap();
+        h.capture_checkpoint("t1", None).unwrap();
+
+        // Deleting the on-disk manifest between captures proves the
+        // second capture works from the held-open store rather than
+        // re-opening and re-parsing the manifest: the t1 entry survives.
+        let manifest = h.checkpoint_dir().join("manifest.json");
+        std::fs::remove_file(&manifest).unwrap();
+        h.capture_checkpoint("t2", None).unwrap();
+        let ids: Vec<_> = h
+            .checkpoint_store()
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.entry_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
+    }
+
+    #[test]
+    fn checkpoint_store_is_invalidated_on_session_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), b"v1").unwrap();
+
+        let mut h = handle(dir.path());
+        h.inner_mut().append_message(&user("t1")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("write", "a.rs")]))
+            .unwrap();
+        h.capture_checkpoint("t1", None).unwrap();
+        let old_dir = h.checkpoint_dir();
+
+        // A new session must not keep writing into the old session's
+        // sidecar store.
+        h.start_new().unwrap();
+        h.inner_mut().append_message(&user("t2")).unwrap();
+        h.inner_mut()
+            .append_message(&assistant_tool_calls(&[("write", "a.rs")]))
+            .unwrap();
+        h.capture_checkpoint("t2", None).unwrap();
+
+        let new_dir = h.checkpoint_dir();
+        assert_ne!(old_dir, new_dir);
+        let entries: Vec<_> = h
+            .checkpoint_store()
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.entry_id.clone())
+            .collect();
+        assert_eq!(entries, vec!["t2".to_string()]);
     }
 
     #[test]

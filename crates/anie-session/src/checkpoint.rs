@@ -37,6 +37,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,29 @@ pub enum FileState {
     Absent,
 }
 
+/// A capture only records [`FileMeta`] for a path when the file's
+/// mtime is at least this much older than the capture itself. A write
+/// landing in the same coarse-clock tick as the capture's read can
+/// leave the mtime (and possibly the length) unchanged — git's "racy
+/// clean" problem — so fresh files are simply re-read at the next
+/// capture instead of being trusted for the skip. 2s covers FAT's
+/// timestamp granularity, the coarsest in common use.
+const RACY_MTIME_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cheap change-detection metadata for a captured file, recorded at
+/// capture time. When a later capture observes the same `(mtime, len)`
+/// pair for a path, the prior hash is reused without re-reading the
+/// file. Either field differing falls back to the full read + hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMeta {
+    /// Filesystem modification time observed just before the content
+    /// was read (stat-before-read, so a write racing the capture can
+    /// only force an extra re-read, never a stale skip).
+    pub mtime: SystemTime,
+    /// File length in bytes at the same stat.
+    pub len: u64,
+}
+
 /// One capture point: the state of every tracked path at an entry id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
@@ -90,6 +114,12 @@ pub struct ManifestEntry {
     /// State of each tracked path, keyed by the path string the caller
     /// passed (relative to the workspace root, or absolute).
     pub files: BTreeMap<String, FileState>,
+    /// `(mtime, len)` observed per path at capture time, used to skip
+    /// re-hashing unchanged files on the next capture. Absent on
+    /// manifests written by older binaries (and on drift baselines),
+    /// which simply means the next capture re-reads.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<String, FileMeta>,
     /// Internal drift baseline recorded right after a restore — not a
     /// user-selectable rewind anchor. It keeps `latest_state` in sync
     /// with the tree a restore just wrote, so an immediate second rewind
@@ -169,12 +199,45 @@ impl WorkspaceCheckpointStore {
         tracked_paths: &[String],
         label: Option<String>,
     ) -> Result<(), CheckpointError> {
+        let now = SystemTime::now();
         let mut files = BTreeMap::new();
+        let mut meta = BTreeMap::new();
         for path in tracked_paths {
-            let state = match fs::read(self.resolve(path)) {
+            let resolved = self.resolve(path);
+            // Stat before reading: if the prior capture of this path
+            // recorded the same (mtime, len), the content is unchanged
+            // and the prior hash is reused without touching the bytes.
+            let current_meta = fs::metadata(&resolved)
+                .ok()
+                .filter(fs::Metadata::is_file)
+                .and_then(|md| {
+                    md.modified().ok().map(|mtime| FileMeta {
+                        mtime,
+                        len: md.len(),
+                    })
+                });
+            if let Some(current) = current_meta
+                && let Some((FileState::Blob(hash), Some(prev))) = self.latest_capture_record(path)
+                && *prev == current
+            {
+                let hash = hash.clone();
+                files.insert(path.clone(), FileState::Blob(hash));
+                meta.insert(path.clone(), current);
+                continue;
+            }
+            let state = match fs::read(&resolved) {
                 Ok(bytes) => {
                     let hash = hex_digest(&bytes);
                     self.write_blob(&hash, &bytes)?;
+                    // Only trust meta for files quiescent well before
+                    // this capture; see RACY_MTIME_WINDOW.
+                    if let Some(current) = current_meta
+                        && now
+                            .duration_since(current.mtime)
+                            .is_ok_and(|age| age >= RACY_MTIME_WINDOW)
+                    {
+                        meta.insert(path.clone(), current);
+                    }
                     FileState::Blob(hash)
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => FileState::Absent,
@@ -186,6 +249,7 @@ impl WorkspaceCheckpointStore {
             entry_id: entry_id.to_string(),
             label,
             files,
+            meta,
             baseline_only: false,
         };
         match self
@@ -226,6 +290,10 @@ impl WorkspaceCheckpointStore {
             entry_id: id,
             label: None,
             files,
+            // No meta: the restore rewrote the files, so the target
+            // entry's recorded mtimes are stale. The next capture
+            // simply re-reads once.
+            meta: BTreeMap::new(),
             baseline_only: true,
         });
         // The new baseline shadows older ones (per path); drop any that are
@@ -342,6 +410,18 @@ impl WorkspaceCheckpointStore {
             .find_map(|entry| entry.files.get(path).cloned())
     }
 
+    /// The newest entry mentioning `path`, as its recorded state plus
+    /// the `(mtime, len)` meta from that *same* entry (never a mix of
+    /// a newer state with an older entry's meta, which could alias a
+    /// stale hash onto changed content).
+    fn latest_capture_record(&self, path: &str) -> Option<(&FileState, Option<&FileMeta>)> {
+        self.manifest
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.files.get(path).map(|s| (s, entry.meta.get(path))))
+    }
+
     /// The current on-disk state of `path` as a [`FileState`].
     fn current_state(&self, path: &str) -> Result<FileState, CheckpointError> {
         match fs::read(self.resolve(path)) {
@@ -384,7 +464,9 @@ impl WorkspaceCheckpointStore {
     }
 
     fn persist_manifest(&self) -> Result<(), CheckpointError> {
-        let bytes = serde_json::to_vec_pretty(&self.manifest)
+        // Compact JSON: the manifest is rewritten on every user-turn
+        // capture, so the pretty form just multiplies write bytes.
+        let bytes = serde_json::to_vec(&self.manifest)
             .map_err(|e| CheckpointError::Io(std::io::Error::new(ErrorKind::InvalidData, e)))?;
         let path = self.root.join("manifest.json");
         let tmp = path.with_extension("json.tmp");
@@ -430,6 +512,162 @@ mod tests {
             .unwrap();
         // Two paths, identical content -> a single content-addressed blob.
         assert_eq!(blob_count(dir.path()), 1);
+    }
+
+    /// Push `path`'s mtime an hour into the past so the capture treats
+    /// it as quiescent (outside `RACY_MTIME_WINDOW`) and records meta.
+    /// Returns the mtime set.
+    fn age_mtime(path: &Path) -> SystemTime {
+        let old = SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        old
+    }
+
+    #[test]
+    fn unchanged_file_is_not_rehashed_on_next_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        let tracked = vec!["a.txt".to_string()];
+
+        fs::write(&file, b"AAAA").unwrap();
+        let original_mtime = age_mtime(&file);
+        let mut s = store(dir.path());
+        s.capture("t1", &tracked, None).unwrap();
+        let FileState::Blob(t1_hash) = s.entries()[0].files["a.txt"].clone() else {
+            panic!("t1 should capture a blob");
+        };
+
+        // Rewrite the content with the same length, then restore the
+        // original mtime: the (mtime, len) pair matches t1's record, so
+        // the next capture must reuse t1's hash WITHOUT reading the file
+        // — observable as the old hash carried forward despite the bytes
+        // on disk now hashing differently.
+        fs::write(&file, b"BBBB").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        s.capture("t2", &tracked, None).unwrap();
+        assert_eq!(s.entries()[1].files["a.txt"], FileState::Blob(t1_hash));
+        assert_eq!(blob_count(dir.path()), 1, "no new blob written on skip");
+
+        // A length change defeats the skip: the file is re-read and the
+        // new content is hashed and stored.
+        fs::write(&file, b"BBBBB").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        s.capture("t3", &tracked, None).unwrap();
+        assert_ne!(s.entries()[2].files["a.txt"], s.entries()[0].files["a.txt"]);
+        assert_eq!(blob_count(dir.path()), 2);
+    }
+
+    #[test]
+    fn capture_skip_survives_a_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        let tracked = vec!["a.txt".to_string()];
+
+        fs::write(&file, b"AAAA").unwrap();
+        let original_mtime = age_mtime(&file);
+        {
+            let mut s = store(dir.path());
+            s.capture("t1", &tracked, None).unwrap();
+        }
+
+        // The meta map round-trips through manifest.json, so a reopened
+        // store still skips the re-read.
+        fs::write(&file, b"BBBB").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        let mut s = store(dir.path());
+        s.capture("t2", &tracked, None).unwrap();
+        assert_eq!(s.entries()[1].files["a.txt"], s.entries()[0].files["a.txt"]);
+        assert_eq!(blob_count(dir.path()), 1);
+    }
+
+    #[test]
+    fn freshly_written_file_is_never_trusted_for_the_mtime_skip() {
+        // Regression guard for the "racy clean" hazard: a write landing
+        // in the same coarse-clock tick as a capture's read can leave
+        // (mtime, len) unchanged. Captures therefore record no meta for
+        // files modified within RACY_MTIME_WINDOW of the capture, so the
+        // next capture re-reads them.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        let tracked = vec!["a.txt".to_string()];
+
+        fs::write(&file, b"AAAA").unwrap();
+        let mut s = store(dir.path());
+        // Captured immediately after the write: not quiescent.
+        s.capture("t1", &tracked, None).unwrap();
+        assert!(
+            s.entries()[0].meta.is_empty(),
+            "fresh mtime must not be recorded as skip meta"
+        );
+
+        // Same-length rewrite with the mtime pinned back: the next
+        // capture must still pick up the new bytes.
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        fs::write(&file, b"BBBB").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        s.capture("t2", &tracked, None).unwrap();
+        assert_eq!(
+            s.entries()[1].files["a.txt"],
+            FileState::Blob(hex_digest(b"BBBB"))
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_without_meta_loads_and_recaptures_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join(".checkpoints");
+        fs::create_dir_all(cp.join("blobs")).unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, b"v1").unwrap();
+        age_mtime(&file);
+        // A pretty-printed, meta-less manifest as written by an older
+        // binary; it must load, and the meta-less entry simply means the
+        // next capture re-reads (no skip).
+        let manifest = serde_json::json!({
+            "entries": [
+                {"entry_id":"t1","files":{"a.txt":{"kind":"blob","hash":"stale"}}}
+            ]
+        });
+        fs::write(
+            cp.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut s = WorkspaceCheckpointStore::open(&cp, dir.path()).unwrap();
+        assert!(s.entries()[0].meta.is_empty());
+        s.capture("t2", &["a.txt".to_string()], None).unwrap();
+        // No meta on t1 -> full read + hash, not a reuse of "stale".
+        assert_eq!(
+            s.entries()[1].files["a.txt"],
+            FileState::Blob(hex_digest(b"v1"))
+        );
+        assert_eq!(s.entries()[1].meta.len(), 1);
     }
 
     #[test]

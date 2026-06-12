@@ -68,7 +68,7 @@ use anie_provider::ThinkingLevel;
 
 mod checkpoint;
 pub use checkpoint::{
-    CheckpointError, FileState, ManifestEntry, RestorePlan, WorkspaceCheckpointStore,
+    CheckpointError, FileMeta, FileState, ManifestEntry, RestorePlan, WorkspaceCheckpointStore,
 };
 
 /// Current session-file schema version. Bump every time a change is
@@ -1203,52 +1203,9 @@ impl SessionManager {
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
             }
-
-            let Ok(content) = fs::read_to_string(&path) else {
-                warn!(path = %path.display(), "skipping unreadable session file");
-                continue;
-            };
-            let mut lines = content.lines();
-            let Some(header_line) = lines.next() else {
-                continue;
-            };
-            let Ok(header) = serde_json::from_str::<SessionHeader>(header_line) else {
-                continue;
-            };
-
-            let mut message_count = 0u32;
-            let mut first_message = String::new();
-            for line in lines {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Ok(entry) = serde_json::from_str::<SessionEntry>(trimmed) else {
-                    continue;
-                };
-                if let SessionEntry::Message { message, .. } = entry {
-                    message_count = message_count.saturating_add(1);
-                    if first_message.is_empty()
-                        && let Message::User(user) = message
-                    {
-                        first_message = join_text_content(&user.content);
-                    }
-                }
+            if let Some(info) = read_session_listing(path) {
+                sessions.push(info);
             }
-
-            let modified = fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            sessions.push(SessionInfo {
-                path,
-                id: header.id,
-                cwd: header.cwd,
-                created: header.timestamp,
-                modified,
-                message_count,
-                first_message,
-                name: header.name,
-            });
         }
 
         sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
@@ -1827,6 +1784,102 @@ fn content_tokens(blocks: &[ContentBlock]) -> u64 {
             }
         })
         .sum()
+}
+
+/// Minimal listing view of a session line: the entry type tag and, for
+/// message entries, the role. Counting messages and spotting the first
+/// user turn doesn't need the full `SessionEntry` body — for large
+/// sessions the body parse dominates listing cost.
+#[derive(Deserialize)]
+struct ListingEntryTag {
+    #[serde(rename = "type")]
+    entry_type: String,
+    #[serde(default)]
+    message: Option<ListingMessageTag>,
+}
+
+#[derive(Deserialize)]
+struct ListingMessageTag {
+    role: String,
+}
+
+/// Full view of just the first user message line, parsed once per file.
+/// The `role` tag key inside `message` is ignored as an unknown field.
+#[derive(Deserialize)]
+struct ListingUserLine {
+    message: UserMessage,
+}
+
+/// Best-effort [`SessionInfo`] for one session file, streamed line by
+/// line. Every line gets only the cheap [`ListingEntryTag`] parse; the
+/// single line holding the first user message is parsed a second time
+/// in full to extract its text. `None` skips the file from the listing
+/// (unreadable, empty, or an unparseable header).
+fn read_session_listing(path: PathBuf) -> Option<SessionInfo> {
+    use std::io::BufRead as _;
+
+    let Ok(file) = File::open(&path) else {
+        warn!(path = %path.display(), "skipping unreadable session file");
+        return None;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+
+    if reader.read_line(&mut line).is_err() {
+        warn!(path = %path.display(), "skipping unreadable session file");
+        return None;
+    }
+    let header: SessionHeader = serde_json::from_str(line.trim()).ok()?;
+
+    let mut message_count = 0u32;
+    let mut first_message = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                // Mid-file read error (e.g. invalid UTF-8): skip the file,
+                // matching the previous whole-file-read behavior.
+                warn!(path = %path.display(), "skipping unreadable session file");
+                return None;
+            }
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(tag) = serde_json::from_str::<ListingEntryTag>(trimmed) else {
+            continue;
+        };
+        if tag.entry_type != "message" {
+            continue;
+        }
+        let Some(message) = tag.message else {
+            continue;
+        };
+        message_count = message_count.saturating_add(1);
+        if first_message.is_empty()
+            && message.role == "user"
+            && let Ok(user_line) = serde_json::from_str::<ListingUserLine>(trimmed)
+        {
+            first_message = join_text_content(&user_line.message.content);
+        }
+    }
+
+    let modified = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    Some(SessionInfo {
+        path,
+        id: header.id,
+        cwd: header.cwd,
+        created: header.timestamp,
+        modified,
+        message_count,
+        first_message,
+        name: header.name,
+    })
 }
 
 fn join_text_content(blocks: &[ContentBlock]) -> String {
@@ -2553,6 +2606,38 @@ mod tests {
         assert!(line.contains("\"reason\":\"rewind\""));
         let back: SessionEntry = serde_json::from_str(&line).expect("deserialize");
         assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn listing_large_session_does_not_full_parse_every_entry() {
+        // Behavioral proxy for the tag-only listing parse: after the
+        // first user message, a "message" line whose body is valid JSON
+        // but NOT a deserializable `Message` (content is a number, no
+        // timestamp) must still be counted and must not break listing,
+        // because only `{type, message.role}` is parsed for it.
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("tagonly.jsonl");
+        let lines = [
+            format!(
+                r#"{{"type":"session","version":{CURRENT_SESSION_SCHEMA_VERSION},"id":"tagonly","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp"}}"#
+            ),
+            r#"{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":1}}"#.to_string(),
+            r#"{"type":"message","id":"e2","parentId":"e1","timestamp":"t","message":{"role":"assistant","content":12345}}"#.to_string(),
+        ];
+        fs::write(&path, lines.join("\n")).expect("write session file");
+        assert!(
+            serde_json::from_str::<SessionEntry>(
+                lines[2].as_str()
+            )
+            .is_err(),
+            "the malformed line must not be a fully parseable entry, \
+             or this test proves nothing"
+        );
+
+        let sessions = SessionManager::list_sessions(tempdir.path()).expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].first_message, "hello");
+        assert_eq!(sessions[0].message_count, 2);
     }
 
     #[test]
