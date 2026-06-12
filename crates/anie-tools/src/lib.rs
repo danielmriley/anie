@@ -10,6 +10,7 @@ mod grep;
 mod ls;
 mod read;
 mod recurse;
+pub mod repo_map;
 mod shared;
 mod text_match;
 mod todo;

@@ -38,6 +38,37 @@ pub(crate) struct ApplyOutcome {
     pub(crate) kinds: Vec<MatchKind>,
 }
 
+/// Maximum number of file lines surfaced in a [`ClosestMatch`] region.
+/// Plan 03 §2c caps grounded edit-failure attachments so a stuck model
+/// gets enough context to fix its `oldText` without bloating the failed
+/// result with the whole file.
+pub(crate) const MAX_CLOSEST_MATCH_LINES: usize = 80;
+
+/// The file region most similar to a failed-edit `old_text`, located with
+/// the same whitespace-insensitive comparison the fuzzy matcher uses.
+///
+/// Plan 03 §2c groundwork: when an edit's `old_text` matches nothing, the
+/// failure carries this so a later agent-loop wave can show the model the
+/// bytes it should have targeted. `start_line`/`end_line` are 1-based and
+/// inclusive; `region` is the excerpt with `path:line` markers, capped at
+/// [`MAX_CLOSEST_MATCH_LINES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClosestMatch {
+    pub(crate) path: String,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+    pub(crate) region: String,
+}
+
+impl ClosestMatch {
+    /// `path:start-end` — the short locator embedded in the failure
+    /// message so existing error text stays a prefix and only gains a
+    /// suffix.
+    pub(crate) fn locator(&self) -> String {
+        format!("{}:{}-{}", self.path, self.start_line, self.end_line)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MatchedEdit {
     edit_index: usize,
@@ -97,9 +128,15 @@ pub(crate) fn apply_edits(
             &edit.old_text,
         );
         if fuzzy_matches.is_empty() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "edit #{index} for {path} did not match anything",
-            )));
+            let mut message = format!("edit #{index} for {path} did not match anything");
+            // Append the closest region locator so the model (or a later
+            // grounding wave) knows where to look. The existing message
+            // stays a prefix — only a suffix is added — so current tests
+            // that match on "did not match anything" keep passing.
+            if let Some(closest) = closest_match_region(content, &edit.old_text, path) {
+                message.push_str(&format!("; closest match: {}", closest.locator()));
+            }
+            return Err(ToolError::ExecutionFailed(message));
         }
         if fuzzy_matches.len() > 1 {
             return Err(ToolError::ExecutionFailed(format!(
@@ -153,6 +190,87 @@ pub(crate) fn render_diff(original: &str, updated: &str) -> String {
         }
     }
     rendered.trim_end().to_string()
+}
+
+/// Find the file region in `content` most similar to `needle`, scoring a
+/// sliding window of lines by per-line, whitespace-insensitive token
+/// overlap (so a region that differs by only a few tokens beats an
+/// unrelated one). Returns `None` only when `content` is empty. The
+/// returned region is capped at [`MAX_CLOSEST_MATCH_LINES`] and carries
+/// `path:line` markers.
+pub(crate) fn closest_match_region(
+    content: &str,
+    needle: &str,
+    path: &str,
+) -> Option<ClosestMatch> {
+    let content_lines: Vec<&str> = content.lines().collect();
+    if content_lines.is_empty() {
+        return None;
+    }
+    let needle_lines: Vec<&str> = needle.lines().collect();
+
+    // Window the file in chunks the size of the needle and score each
+    // window by per-line token overlap (not strict equality) so a region
+    // that differs only by a few tokens scores higher than an unrelated
+    // one — this is what makes the result the *closest* match rather than
+    // just the first. A zero-line needle (or one that's all blank) still
+    // resolves to a single-line window so the model gets a concrete
+    // anchor.
+    let window = needle_lines.len().clamp(1, content_lines.len());
+    let needle_tokens: Vec<Vec<String>> = needle_lines.iter().map(|l| line_tokens(l)).collect();
+
+    let mut best_start = 0usize;
+    let mut best_score = -1.0f64;
+    for start in 0..=(content_lines.len() - window) {
+        let mut score = 0.0f64;
+        for offset in 0..window {
+            if let Some(needle_line) = needle_tokens.get(offset)
+                && !needle_line.is_empty()
+            {
+                score += line_overlap(&line_tokens(content_lines[start + offset]), needle_line);
+            }
+        }
+        // Earliest window wins ties so the locator is stable.
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+        }
+    }
+
+    // Cap the surfaced excerpt; the scoring window may be larger than the
+    // attachment budget for a big multi-line oldText. `end_line` tracks
+    // the shown range so the locator and the region agree.
+    let region_end =
+        (best_start + window.min(MAX_CLOSEST_MATCH_LINES)).min(content_lines.len());
+    let mut region = String::new();
+    for (offset, line) in content_lines[best_start..region_end].iter().enumerate() {
+        region.push_str(&format!("{}:{}: {}\n", path, best_start + offset + 1, line));
+    }
+
+    Some(ClosestMatch {
+        path: path.to_string(),
+        start_line: best_start + 1,
+        end_line: region_end,
+        region: region.trim_end_matches('\n').to_string(),
+    })
+}
+
+/// Whitespace-split tokens of a single line — the unit the closest-match
+/// scorer compares, so two lines that differ only in spacing or a few
+/// tokens still register as related.
+fn line_tokens(line: &str) -> Vec<String> {
+    line.split_whitespace().map(str::to_string).collect()
+}
+
+/// Fraction of `needle`'s tokens present in `file` (order-insensitive),
+/// in `0.0..=1.0`. An empty `needle` scores 0 so blank needle lines don't
+/// inflate a window.
+fn line_overlap(file: &[String], needle: &[String]) -> f64 {
+    if needle.is_empty() {
+        return 0.0;
+    }
+    let matched = needle.iter().filter(|tok| file.contains(tok)).count();
+    matched as f64 / needle.len() as f64
 }
 
 fn find_all_occurrences(content: &str, needle: &str) -> Vec<(usize, usize)> {
@@ -265,5 +383,67 @@ mod tests {
         let err =
             apply_edits("abcdef", &[edit("abc", "X"), edit("bcd", "Y")], "f").expect_err("overlap");
         assert!(matches!(err, ToolError::ExecutionFailed(m) if m.contains("overlaps")));
+    }
+
+    #[test]
+    fn failed_match_error_carries_closest_region_with_line_markers() {
+        let content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+        // oldText resembles the `beta` line but isn't present verbatim or
+        // fuzzily; the failure should point at the closest region.
+        let err = apply_edits(content, &[edit("fn beta() { return; }", "x")], "src/lib.rs")
+            .expect_err("no match");
+        let ToolError::ExecutionFailed(message) = err else {
+            panic!("expected ExecutionFailed");
+        };
+        // Existing wording stays a prefix; only a locator suffix is added.
+        assert!(message.starts_with("edit #0 for src/lib.rs did not match anything"));
+        assert!(
+            message.contains("closest match: src/lib.rs:2-2"),
+            "message was: {message}"
+        );
+
+        let closest = closest_match_region(content, "fn beta() { return; }", "src/lib.rs")
+            .expect("closest region");
+        assert_eq!(closest.start_line, 2);
+        assert_eq!(closest.end_line, 2);
+        assert_eq!(closest.region, "src/lib.rs:2: fn beta() {}");
+    }
+
+    #[test]
+    fn region_payload_caps_at_eighty_lines() {
+        // A 200-line file with a 120-line needle: the scoring window is
+        // huge, but the surfaced region must never exceed the cap.
+        let content: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        let needle: String = (1..=120).map(|n| format!("line {n} changed\n")).collect();
+
+        let closest =
+            closest_match_region(&content, &needle, "big.txt").expect("closest region");
+        let region_lines = closest.region.lines().count();
+        assert_eq!(region_lines, MAX_CLOSEST_MATCH_LINES);
+        // end_line - start_line + 1 must agree with the shown line count.
+        assert_eq!(
+            closest.end_line - closest.start_line + 1,
+            MAX_CLOSEST_MATCH_LINES
+        );
+        for (offset, line) in closest.region.lines().enumerate() {
+            assert!(
+                line.starts_with(&format!("big.txt:{}: ", closest.start_line + offset)),
+                "line marker malformed: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_match_success_path_unchanged() {
+        // A successful edit must not invoke closest-match machinery or
+        // alter its output in any way.
+        let outcome = apply_edits(
+            "alpha\nbeta\ngamma",
+            &[edit("beta", "BETA")],
+            "f",
+        )
+        .expect("ok");
+        assert_eq!(outcome.updated, "alpha\nBETA\ngamma");
+        assert_eq!(outcome.kinds, vec![MatchKind::Exact]);
     }
 }

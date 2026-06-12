@@ -613,6 +613,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_hunk_no_match_surfaces_closest_region_locator() {
+        // apply_patch routes Update hunks through `text_match::apply_edits`,
+        // so a hunk whose context matches nothing inherits the plan-03 §2c
+        // closest-match locator without any apply_patch-side change.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let abs = dir.path().join("a.rs");
+        std::fs::write(&abs, "fn one() {}\nfn two() {}\nfn three() {}\n").expect("seed");
+
+        let resolved = vec![(
+            FileOp::Update {
+                path: "a.rs".into(),
+                hunks: vec![Edit {
+                    old_text: "fn two() { unreachable!() }".into(),
+                    new_text: "fn two() { todo!() }".into(),
+                }],
+            },
+            abs.clone(),
+        )];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let e = apply_under_lock(resolved, &cancel, false)
+            .await
+            .expect_err("no match");
+        let ToolError::ExecutionFailed(message) = &e else {
+            panic!("expected ExecutionFailed, got {e:?}");
+        };
+        assert!(message.contains("did not match anything"), "{message}");
+        assert!(message.contains("closest match: a.rs:2-2"), "{message}");
+    }
+
+    #[tokio::test]
     async fn duplicate_target_path_across_sections_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let abs = dir.path().join("a.rs");
