@@ -1338,9 +1338,17 @@ fn build_dispatch_controller_with_runtime_state_path(
         ThinkingLevel::Medium,
         None,
     );
-    if let Some(path) = runtime_state_path {
-        config_state.set_runtime_state_path_for_test(path);
-    }
+    // ALWAYS divert persistence into the tempdir: a test that
+    // triggers persist_runtime_state (SetModel, SetThinking, session
+    // switches, ...) without an explicit path was writing the
+    // developer's REAL ~/.anie/state.json — observed clobbering the
+    // selected model and the num_ctx overrides on every full test
+    // run (2026-06-12). The tempdir is dropped on return, so default
+    // writes land in a deleted dir and fail into the warn-logged
+    // best-effort path, which these tests don't assert on.
+    let runtime_state_path =
+        runtime_state_path.unwrap_or_else(|| tempdir.path().join("state.json"));
+    config_state.set_runtime_state_path_for_test(runtime_state_path);
 
     let state = ControllerState {
         config: config_state,

@@ -50,8 +50,20 @@ impl ConfigState {
             current_model,
             current_thinking,
             cli_api_key,
+            // In test builds, persistence diverts to a scratch file
+            // BY DEFAULT. Any test that drives an action which
+            // persists (SetModel, SetThinking, session switches)
+            // through a ConfigState left at the real default was
+            // overwriting the developer's actual ~/.anie/state.json
+            // on every `cargo test` run — observed clobbering the
+            // selected model and the num_ctx overrides (2026-06-12).
+            // Tests that assert on persistence set their own
+            // explicit path via set_runtime_state_path_for_test.
             #[cfg(test)]
-            runtime_state_path_override: None,
+            runtime_state_path_override: Some(std::env::temp_dir().join(format!(
+                "anie-test-runtime-state-{}.json",
+                std::process::id()
+            ))),
         }
     }
 
@@ -87,6 +99,12 @@ impl ConfigState {
             .ollama_num_ctx_overrides
             .get(&ollama_num_ctx_key(&self.current_model))
             .copied()
+            .or_else(|| {
+                default_num_ctx_clamp(
+                    self.current_model.context_window,
+                    std::env::var("ANIE_DEFAULT_NUM_CTX").ok().as_deref(),
+                )
+            })
     }
 
     pub(crate) fn effective_ollama_context_window(&self) -> u64 {
@@ -234,6 +252,33 @@ impl ConfigState {
 
 fn ollama_num_ctx_key(model: &Model) -> String {
     format!("{}:{}", model.provider, model.id)
+}
+
+/// Default `num_ctx` ceiling for Ollama models whose advertised
+/// context window exceeds what consumer hardware can serve. PR19 of
+/// `docs/local_model_augmentation/` (field notes,
+/// 2026-06-12_gemma4_baseline.md): forwarding a discovered 131k
+/// window as `num_ctx` kills llama-server outright on a 6GB-VRAM
+/// machine (`GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)`),
+/// and even where it survives, the KV-cache allocation is gigabytes
+/// the rlm ceiling (16,384 by default) has already made unnecessary.
+///
+/// An explicit `/context-length` override always wins (checked
+/// before this in `active_ollama_num_ctx_override`). Tune or
+/// effectively disable via `ANIE_DEFAULT_NUM_CTX` (set it at or
+/// above the model's window to pass the full window through). The
+/// clamp feeds `effective_ollama_context_window`, so plan 04's
+/// `PromptTier` sees the serveable window, not the advertised one —
+/// a freshly-pulled long-context model lands in the Small tier on
+/// small hardware instead of masquerading as a 131k-window giant.
+const DEFAULT_NUM_CTX_CAP: u64 = 32_768;
+
+fn default_num_ctx_clamp(context_window: u64, env_cap: Option<&str>) -> Option<u64> {
+    let cap = env_cap
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(DEFAULT_NUM_CTX_CAP);
+    (context_window > cap).then_some(cap)
 }
 
 #[cfg(test)]
@@ -395,6 +440,75 @@ mod tests {
         );
 
         assert_eq!(state.active_ollama_num_ctx_override(), None);
+    }
+
+    /// PR19 (field notes 2026-06-12_gemma4_baseline.md): a freshly
+    /// pulled long-context model must not forward its advertised
+    /// window as num_ctx — a discovered 131k window killed
+    /// llama-server outright on a 6GB-VRAM machine.
+    #[test]
+    fn discovered_context_window_above_cap_is_clamped_by_default() {
+        let mut model = model_with_api("gemma4:e4b", "ollama", ApiKind::OllamaChatApi);
+        model.context_window = 131_072;
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model,
+            ThinkingLevel::Off,
+            None,
+        );
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(32_768));
+        // The clamp feeds the effective window, so PromptTier sees
+        // the serveable size, not the advertised one.
+        assert_eq!(state.effective_ollama_context_window(), 32_768);
+    }
+
+    #[test]
+    fn explicit_context_length_override_beats_the_default_clamp() {
+        let mut runtime_state = RuntimeState::default();
+        runtime_state
+            .ollama_num_ctx_overrides
+            .insert("ollama:gemma4:e4b".into(), 65_536);
+        let mut model = model_with_api("gemma4:e4b", "ollama", ApiKind::OllamaChatApi);
+        model.context_window = 131_072;
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            runtime_state,
+            model,
+            ThinkingLevel::Off,
+            None,
+        );
+        assert_eq!(state.active_ollama_num_ctx_override(), Some(65_536));
+    }
+
+    #[test]
+    fn windows_at_or_below_cap_pass_through_unclamped() {
+        assert_eq!(default_num_ctx_clamp(32_768, None), None);
+        assert_eq!(default_num_ctx_clamp(8_192, None), None);
+        assert_eq!(default_num_ctx_clamp(32_769, None), Some(32_768));
+    }
+
+    #[test]
+    fn non_ollama_models_are_never_clamped() {
+        let mut model = model_with_api("gpt-4o", "openai", ApiKind::OpenAICompletions);
+        model.context_window = 131_072;
+        let state = ConfigState::new(
+            AnieConfig::default(),
+            RuntimeState::default(),
+            model,
+            ThinkingLevel::Off,
+            None,
+        );
+        assert_eq!(state.active_ollama_num_ctx_override(), None);
+    }
+
+    #[test]
+    fn env_cap_tunes_or_disables_the_default_clamp() {
+        assert_eq!(default_num_ctx_clamp(131_072, Some("65536")), Some(65_536));
+        // A cap at/above the window passes the full window through.
+        assert_eq!(default_num_ctx_clamp(131_072, Some("200000")), None);
+        // Garbage falls back to the built-in cap rather than erroring.
+        assert_eq!(default_num_ctx_clamp(131_072, Some("garbage")), Some(32_768));
     }
 
     #[test]
