@@ -24,8 +24,8 @@ use anie_config::{
 };
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
 use anie_providers_builtin::{
-    ModelDiscoveryRequest, builtin_models, discover_models, is_ollama_native_discovery_target,
-    ollama_native_base_url,
+    ModelDiscoveryRequest, builtin_models, discover_models, discovery_model_api,
+    discovery_model_base_url,
 };
 
 use crate::{ModelPickerAction, ModelPickerPane, Spinner};
@@ -1246,22 +1246,6 @@ fn default_provider_env(provider_name: &str) -> Option<&'static str> {
         "openai" => Some("OPENAI_API_KEY"),
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         _ => None,
-    }
-}
-
-fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
-    if is_ollama_native_discovery_target(provider_name, base_url) {
-        ApiKind::OllamaChatApi
-    } else {
-        api
-    }
-}
-
-fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
-    if api == ApiKind::OllamaChatApi {
-        ollama_native_base_url(base_url)
-    } else {
-        base_url.to_string()
     }
 }
 

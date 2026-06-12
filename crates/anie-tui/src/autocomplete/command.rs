@@ -5,11 +5,7 @@
 //! This is the only provider anie ships today. Extension-, skill-,
 //! and prompt-sourced commands feed through the same provider
 //! because they all end up in the catalog that the CLI hands to
-//! `App::new`. Dynamic argument sources (e.g. live model lists)
-//! can be registered via `CommandCompletionProvider::new` — see
-//! the `ArgumentSource` trait below.
-
-use std::collections::HashMap;
+//! `App::new`.
 
 use super::{
     AutocompleteProvider, Context, Suggestion, SuggestionKind, SuggestionSet, parse_context,
@@ -17,21 +13,6 @@ use super::{
 use crate::commands::{ArgumentSpec, SlashCommandInfo};
 
 const CONTEXT_LENGTH_STATIC_VALUES: &[&str] = &["reset"];
-
-/// Runtime-supplied argument completions for a command whose
-/// values can't be baked into the static `ArgumentSpec`.
-///
-/// Example future use: a `/model <id>` source that enumerates
-/// the live model catalog. Plan 12 ships without any dynamic
-/// sources — `/model` still routes through the full picker when
-/// the user presses Enter — but the seam exists so plan 10's
-/// extension system can register per-command completers without
-/// touching the popup code.
-pub(crate) trait ArgumentSource: Send + Sync {
-    /// Completions for `prefix`. Return an empty vec to signal
-    /// "no suggestions for this prefix."
-    fn completions(&self, prefix: &str) -> Vec<Suggestion>;
-}
 
 /// Per-command metadata with cached lowercase forms so
 /// prefix filtering in the hot keystroke path doesn't
@@ -83,37 +64,20 @@ impl CachedCommand {
 }
 
 /// Completes command names from a `SlashCommandInfo` catalog and
-/// argument values from either the static `ArgumentSpec` or a
-/// registered `ArgumentSource`.
+/// argument values from the static `ArgumentSpec`.
 pub(crate) struct CommandCompletionProvider {
     commands: Vec<CachedCommand>,
-    argument_sources: HashMap<String, Box<dyn ArgumentSource>>,
 }
 
 impl CommandCompletionProvider {
-    /// Build a provider from a catalog with no dynamic argument
-    /// sources. Sufficient for plan 12 phase B/C/D shipping.
-    /// The provider precomputes lowercase command names and
-    /// enumerated argument values once at construction time.
+    /// Build a provider from a catalog. The provider precomputes
+    /// lowercase command names and enumerated argument values once
+    /// at construction time.
     #[must_use]
     pub(crate) fn new(commands: Vec<SlashCommandInfo>) -> Self {
         Self {
             commands: commands.into_iter().map(CachedCommand::from_info).collect(),
-            argument_sources: HashMap::new(),
         }
-    }
-
-    /// Register a dynamic argument source keyed by command name
-    /// (without the leading slash). Takes precedence over the
-    /// static `ArgumentSpec` when both exist.
-    #[allow(dead_code)]
-    pub(crate) fn with_argument_source(
-        mut self,
-        name: impl Into<String>,
-        source: Box<dyn ArgumentSource>,
-    ) -> Self {
-        self.argument_sources.insert(name.into(), source);
-        self
     }
 
     fn command_name_suggestions(&self, prefix: &str) -> Vec<Suggestion> {
@@ -131,9 +95,6 @@ impl CommandCompletionProvider {
     }
 
     fn argument_suggestions(&self, name: &str, prefix: &str) -> Vec<Suggestion> {
-        if let Some(source) = self.argument_sources.get(name) {
-            return source.completions(prefix);
-        }
         let Some(cmd) = self.commands.iter().find(|cmd| cmd.info.name == name) else {
             return Vec::new();
         };
@@ -351,34 +312,6 @@ mod tests {
             .expect("description present");
         assert!(desc.contains("[off|minimal|low|medium|high]"), "{desc}");
         assert!(desc.contains("Set reasoning effort"), "{desc}");
-    }
-
-    struct StaticSource(Vec<&'static str>);
-
-    impl ArgumentSource for StaticSource {
-        fn completions(&self, prefix: &str) -> Vec<Suggestion> {
-            self.0
-                .iter()
-                .filter(|value| value.starts_with(prefix))
-                .map(|value| Suggestion {
-                    value: (*value).to_string(),
-                    label: (*value).to_string(),
-                    description: None,
-                })
-                .collect()
-        }
-    }
-
-    #[test]
-    fn dynamic_argument_source_takes_precedence_over_static_spec() {
-        let provider = CommandCompletionProvider::new(catalog()).with_argument_source(
-            "thinking",
-            Box::new(StaticSource(vec!["override-one", "override-two"])),
-        );
-        let line = "/thinking o";
-        let set = provider.suggestions(line, line.len()).expect("set");
-        let values: Vec<_> = set.items.iter().map(|s| s.value.as_str()).collect();
-        assert_eq!(values, vec!["override-one", "override-two"]);
     }
 
     #[test]

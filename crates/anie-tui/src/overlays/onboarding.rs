@@ -16,7 +16,7 @@ use anie_config::{ConfigMutator, global_config_path};
 use anie_provider::{ApiKind, CostPerMillion, Model, ModelCompat, ModelInfo};
 use anie_providers_builtin::{
     LocalServer, ModelDiscoveryRequest, builtin_models, detect_local_servers, discover_models,
-    is_ollama_native_discovery_target, ollama_native_base_url,
+    discovery_model_api, discovery_model_base_url,
 };
 
 use crate::{
@@ -2122,22 +2122,6 @@ fn normalize_openai_base_url(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/v1")
-    }
-}
-
-fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
-    if is_ollama_native_discovery_target(provider_name, base_url) {
-        ApiKind::OllamaChatApi
-    } else {
-        api
-    }
-}
-
-fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
-    if api == ApiKind::OllamaChatApi {
-        ollama_native_base_url(base_url)
-    } else {
-        base_url.to_string()
     }
 }
 

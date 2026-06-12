@@ -26,8 +26,7 @@ use anie_protocol::{
 };
 use anie_provider::{ApiKind, Model, ModelInfo};
 use anie_providers_builtin::{
-    ModelDiscoveryCache, ModelDiscoveryRequest, is_ollama_native_discovery_target,
-    ollama_native_base_url,
+    ModelDiscoveryCache, ModelDiscoveryRequest, discovery_model_api, discovery_model_base_url,
 };
 
 // Measured before Set A Plan 09 PR A: interactive mode uses
@@ -395,12 +394,17 @@ pub struct StatusBarState {
     render_misses: std::cell::Cell<u64>,
 }
 
-/// Snapshot of the inputs that produced a cached status-bar
-/// render plus the cached outputs. Two structs compare equal
-/// iff their snapshots match — the `text` / `height` are
-/// pure functions of the snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StatusRenderCache {
+/// Every input that affects the rendered status-bar text /
+/// height, captured as one value so staleness is a single
+/// `PartialEq` comparison. Built exclusively by
+/// [`StatusBarState::render_snapshot`] — a new status-bar field
+/// only needs to be added there (and here), where the previous
+/// hand-written per-field comparison silently omitted
+/// `todo_done` / `todo_total` / `session_cost` and let the bar
+/// paint stale values.
+// No `Eq`: `session_cost` is an f64.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct StatusRenderSnapshot {
     provider_name: String,
     model_name: String,
     thinking: String,
@@ -410,8 +414,20 @@ struct StatusRenderCache {
     cwd: String,
     harness_mode: String,
     rlm_archived_messages: u64,
+    todo_done: u64,
+    todo_total: u64,
+    session_cost: f64,
     transcript_scrolled: bool,
     width: u16,
+}
+
+/// Cached status-bar render: the snapshot that produced it plus
+/// the outputs. `text` / `height` are pure functions of
+/// `snapshot`. `PartialEq` only because the containing
+/// `StatusBarState` derives it.
+#[derive(Debug, Clone, PartialEq)]
+struct StatusRenderCache {
+    snapshot: StatusRenderSnapshot,
     text: String,
     height: u16,
 }
@@ -467,44 +483,18 @@ impl StatusBarState {
     /// `Paragraph::wrap` sizing pass fires when no input has
     /// changed. PR 1 of `docs/code_review_2026-05-03.md`.
     fn cached_render(&mut self, transcript_scrolled: bool, width: u16) -> (&str, u16) {
-        // Disjoint-field borrow: `self.cached_render` is read
-        // through the inline match; the field comparisons use
-        // independent `&self.<field>` borrows, which the
-        // borrow checker treats as non-overlapping under
-        // Rust 2021 disjoint-borrow rules.
-        let stale = match &self.cached_render {
-            Some(c) => {
-                c.width != width
-                    || c.transcript_scrolled != transcript_scrolled
-                    || c.provider_name != self.provider_name
-                    || c.model_name != self.model_name
-                    || c.thinking != self.thinking
-                    || c.last_known_input_tokens != self.last_known_input_tokens
-                    || c.estimated_context_tokens != self.estimated_context_tokens
-                    || c.context_window != self.context_window
-                    || c.cwd != self.cwd
-                    || c.harness_mode != self.harness_mode
-                    || c.rlm_archived_messages != self.rlm_archived_messages
-            }
-            None => true,
-        };
+        let snapshot = self.render_snapshot(transcript_scrolled, width);
+        let stale = self
+            .cached_render
+            .as_ref()
+            .is_none_or(|c| c.snapshot != snapshot);
         if stale {
             let text = build_status_text(self, transcript_scrolled);
             let height = measure_status_height(&text, width);
             #[cfg(test)]
             self.render_misses.set(self.render_misses.get() + 1);
             self.cached_render = Some(StatusRenderCache {
-                provider_name: self.provider_name.clone(),
-                model_name: self.model_name.clone(),
-                thinking: self.thinking.clone(),
-                last_known_input_tokens: self.last_known_input_tokens,
-                estimated_context_tokens: self.estimated_context_tokens,
-                context_window: self.context_window,
-                cwd: self.cwd.clone(),
-                harness_mode: self.harness_mode.clone(),
-                rlm_archived_messages: self.rlm_archived_messages,
-                transcript_scrolled,
-                width,
+                snapshot,
                 text,
                 height,
             });
@@ -515,21 +505,34 @@ impl StatusBarState {
         // happy without panic-shaped paths (clippy
         // `expect_used` lint).
         let cached = self.cached_render.get_or_insert_with(|| StatusRenderCache {
-            provider_name: String::new(),
-            model_name: String::new(),
-            thinking: String::new(),
-            last_known_input_tokens: None,
-            estimated_context_tokens: 0,
-            context_window: 0,
-            cwd: String::new(),
-            harness_mode: String::new(),
-            rlm_archived_messages: 0,
-            transcript_scrolled,
-            width,
+            snapshot: StatusRenderSnapshot::default(),
             text: String::new(),
             height: 1,
         });
         (&cached.text, cached.height)
+    }
+
+    /// Capture every input that feeds [`build_status_text`] /
+    /// [`measure_status_height`]. The one place a field rendered
+    /// in the status bar must be recorded so the cache repaints
+    /// when it changes.
+    fn render_snapshot(&self, transcript_scrolled: bool, width: u16) -> StatusRenderSnapshot {
+        StatusRenderSnapshot {
+            provider_name: self.provider_name.clone(),
+            model_name: self.model_name.clone(),
+            thinking: self.thinking.clone(),
+            last_known_input_tokens: self.last_known_input_tokens,
+            estimated_context_tokens: self.estimated_context_tokens,
+            context_window: self.context_window,
+            cwd: self.cwd.clone(),
+            harness_mode: self.harness_mode.clone(),
+            rlm_archived_messages: self.rlm_archived_messages,
+            todo_done: self.todo_done,
+            todo_total: self.todo_total,
+            session_cost: self.session_cost,
+            transcript_scrolled,
+            width,
+        }
     }
 }
 
@@ -2346,17 +2349,51 @@ impl App {
     }
 }
 
-/// Run the TUI event loop.
-/// Cap redraws at ~120 fps. Per-keystroke paint cost measured
-/// at ~420 µs in `tui_render::keystroke_during_stream_600`, so
-/// the cap exists to bound CPU during streaming bursts, not to
-/// throttle individual keystrokes. An 8 ms cap puts worst-case
-/// keystroke→paint latency at ~7.6 ms (avg ~4 ms), comfortably
-/// below the ~15 ms perceptual threshold even for fast typists,
-/// while still capping render rate during a burst of upstream
-/// agent events. Earlier values (33 ms, then 16 ms) left
-/// detectable input lag.
+/// Frame budget for *input-driven* paints (typing, scroll,
+/// paste). Per-keystroke paint cost measured at ~420 µs in
+/// `tui_render::keystroke_during_stream_600`; an 8 ms cap puts
+/// worst-case keystroke→paint latency at ~7.6 ms (avg ~4 ms),
+/// comfortably below the ~15 ms perceptual threshold even for
+/// fast typists. Earlier values (33 ms, then 16 ms) left
+/// detectable input lag — which is why the budget is two-tier
+/// rather than a single larger constant: background-driven
+/// frames coalesce under [`STREAM_FRAME_BUDGET`] instead.
 const FRAME_BUDGET: Duration = Duration::from_millis(8);
+
+/// Coalescing budget for frames whose pending dirt comes only
+/// from background sources — streaming text deltas, spinner
+/// ticks, agent events. ~30 fps is visually indistinguishable
+/// for token streaming, but it caps every per-frame streaming
+/// cost (markdown re-parse, flat-cache rebuild, syntect) at a
+/// quarter of what the 8 ms budget allowed — CPU that a local
+/// Ollama model needs for generating the tokens being rendered.
+/// Input-driven frames (typing, scroll, paste) keep
+/// [`FRAME_BUDGET`] so interaction latency is unchanged. RC4 of
+/// `docs/code_review_2026-06-11.md`.
+const STREAM_FRAME_BUDGET: Duration = Duration::from_millis(33);
+
+/// Frame budget for the next paint given how the pending dirt
+/// arose: tight for input-driven dirt, coalescing for
+/// stream/tick-driven dirt.
+pub(crate) const fn frame_budget_for(input_driven: bool) -> Duration {
+    if input_driven {
+        FRAME_BUDGET
+    } else {
+        STREAM_FRAME_BUDGET
+    }
+}
+
+/// Whether the render gate opens for the next paint. Split out
+/// of `run_tui` (and parameterized on the elapsed time) so tests
+/// can exercise the two-tier budget decision directly — the
+/// loop's time source isn't injectable.
+pub(crate) fn frame_budget_ready(
+    input_urgent: bool,
+    input_driven: bool,
+    since_last_render: Duration,
+) -> bool {
+    input_urgent || since_last_render >= frame_budget_for(input_driven)
+}
 
 /// Idle poll interval when nothing is dirty. Matches the previous
 /// behavior so background worker polling cadence is unchanged.
@@ -2390,8 +2427,17 @@ pub async fn run_tui(terminal: &mut Terminal<TerminalBackend>, app: &mut App) ->
     // immediately. Streaming / tick paths still respect the
     // budget for coalescing.
     let mut input_urgent = false;
+    // Whether any of the pending dirt came from a terminal event
+    // (keystroke, scroll, paste, resize). Selects the tight
+    // [`FRAME_BUDGET`] over [`STREAM_FRAME_BUDGET`] so streaming
+    // coalesces at ~30 fps while interaction stays at the 8 ms
+    // cadence. Cleared on every successful paint. Dirt that is
+    // never input-driven (agent events, ticks) still always
+    // paints — at worst STREAM_FRAME_BUDGET late — so the final
+    // frame after a stream ends is never dropped.
+    let mut input_driven_dirty = false;
     let mut last_render_at = Instant::now()
-        .checked_sub(FRAME_BUDGET)
+        .checked_sub(STREAM_FRAME_BUDGET)
         .unwrap_or_else(Instant::now);
     // When set, the most recent terminal `Resize`. The render
     // gate waits `RESIZE_DEBOUNCE` from this instant before
@@ -2426,7 +2472,8 @@ pub async fn run_tui(terminal: &mut Terminal<TerminalBackend>, app: &mut App) ->
             Some(t) => t.elapsed() >= RESIZE_DEBOUNCE,
             None => true,
         };
-        let budget_ready = input_urgent || last_render_at.elapsed() >= FRAME_BUDGET;
+        let budget_ready =
+            frame_budget_ready(input_urgent, input_driven_dirty, last_render_at.elapsed());
         if dirty.any() && budget_ready && resize_ready {
             let frame = crate::render_debug::RenderFrame::begin();
             let render_mode = if input_urgent {
@@ -2461,6 +2508,7 @@ pub async fn run_tui(terminal: &mut Terminal<TerminalBackend>, app: &mut App) ->
             }
             dirty.clear_after_render();
             input_urgent = false;
+            input_driven_dirty = false;
             last_render_at = Instant::now();
             last_resize_at = None;
         }
@@ -2470,7 +2518,8 @@ pub async fn run_tui(terminal: &mut Terminal<TerminalBackend>, app: &mut App) ->
         // When resize-debouncing, wait at least until the
         // debounce elapses so the select loop doesn't spin.
         let timeout = if dirty.any() {
-            let budget_remaining = FRAME_BUDGET.saturating_sub(last_render_at.elapsed());
+            let budget_remaining =
+                frame_budget_for(input_driven_dirty).saturating_sub(last_render_at.elapsed());
             if let Some(t) = last_resize_at {
                 let debounce_remaining = RESIZE_DEBOUNCE.saturating_sub(t.elapsed());
                 budget_remaining.max(debounce_remaining)
@@ -2545,6 +2594,9 @@ pub async fn run_tui(terminal: &mut Terminal<TerminalBackend>, app: &mut App) ->
                     // typing fast-path bytes without an
                     // intervening full repaint.
                     dirty.full = true;
+                    // Input-driven: the reconcile paint keeps the
+                    // 8 ms cadence rather than the streaming one.
+                    input_driven_dirty = true;
                     if trace_dirty {
                         tracing::info!(
                             target: "anie_tui::dirty_source",
@@ -2575,11 +2627,17 @@ pub async fn run_tui(terminal: &mut Terminal<TerminalBackend>, app: &mut App) ->
                 if saw_resize {
                     last_resize_at = Some(Instant::now());
                 }
+                if render_dirty.any() {
+                    // Any terminal-event dirt (scroll, resize,
+                    // mouse) selects the tight input budget for
+                    // the next paint.
+                    input_driven_dirty = true;
+                }
                 if render_dirty.composer {
                     // Typed input needs immediate paint; bypass
-                    // FRAME_BUDGET for exactly one frame so the
-                    // keystroke lands on screen without waiting
-                    // out the 33 ms coalescing budget.
+                    // the frame budget for exactly one frame so
+                    // the keystroke lands on screen without
+                    // waiting out the coalescing window.
                     input_urgent = true;
                     if trace_typing && key_arrival_at.is_none() {
                         key_arrival_at = Some(Instant::now());
@@ -2717,22 +2775,6 @@ fn default_provider_context(provider_name: &str) -> Option<ModelPickerContext> {
             base_url: "https://api.openai.com/v1".to_string(),
         }),
         _ => None,
-    }
-}
-
-fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
-    if is_ollama_native_discovery_target(provider_name, base_url) {
-        ApiKind::OllamaChatApi
-    } else {
-        api
-    }
-}
-
-fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
-    if api == ApiKind::OllamaChatApi {
-        ollama_native_base_url(base_url)
-    } else {
-        base_url.to_string()
     }
 }
 
@@ -3454,6 +3496,41 @@ mod tests {
             baseline + 3,
             "transcript_scrolled flip must invalidate"
         );
+    }
+
+    /// Regression for the stale-paint bug found in
+    /// `docs/code_review_2026-06-11.md`: the hand-written
+    /// staleness comparison omitted `todo_done` / `todo_total` /
+    /// `session_cost`, so the bar kept painting stale plan
+    /// progress and cost. The snapshot comparison must cover
+    /// every field that feeds the rendered text.
+    #[test]
+    fn status_bar_repaints_when_todo_or_cost_changes() {
+        let mut state = StatusBarState {
+            provider_name: "ollama".into(),
+            model_name: "qwen3:4b".into(),
+            todo_done: 1,
+            todo_total: 3,
+            ..StatusBarState::default()
+        };
+        let (text, _) = state.cached_render(false, 120);
+        assert!(text.contains("todo: 1/3"), "{text}");
+        let baseline = state.render_misses.get();
+
+        state.todo_done = 2;
+        let (text, _) = state.cached_render(false, 120);
+        assert!(text.contains("todo: 2/3"), "stale todo painted: {text}");
+        assert_eq!(state.render_misses.get(), baseline + 1);
+
+        state.todo_total = 4;
+        let (text, _) = state.cached_render(false, 120);
+        assert!(text.contains("todo: 2/4"), "stale todo painted: {text}");
+        assert_eq!(state.render_misses.get(), baseline + 2);
+
+        state.session_cost = 0.0042;
+        let (text, _) = state.cached_render(false, 120);
+        assert!(text.contains("$0.0042"), "stale cost painted: {text}");
+        assert_eq!(state.render_misses.get(), baseline + 3);
     }
 
     /// PR 7 of `docs/code_review_2026-05-03.md` (F-11).

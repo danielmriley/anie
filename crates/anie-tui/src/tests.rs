@@ -3328,3 +3328,49 @@ fn try_fast_typing_refuses_when_state_is_not_eligible() {
     );
     assert_eq!(app.input_pane_contents(), "");
 }
+
+/// RC4 of `docs/code_review_2026-06-11.md`: the render gate is
+/// two-tier. Dirt that arose from terminal input (typing,
+/// scroll) paints on the tight 8 ms budget — and urgent input
+/// bypasses the budget entirely — while dirt from streaming
+/// deltas / spinner ticks coalesces under the ~33 ms stream
+/// budget so a token burst can't drive 125 full renders/sec on
+/// the same CPU the local model is generating with. The loop's
+/// time source isn't injectable, so this exercises the decision
+/// function the loop delegates to.
+#[test]
+fn streaming_frames_are_throttled_to_stream_budget_while_typing_stays_fast() {
+    use std::time::Duration;
+
+    use crate::app::{frame_budget_for, frame_budget_ready};
+
+    // The two tiers themselves: input keeps the historic 8 ms
+    // cadence, streaming coalesces ~4x slower.
+    assert_eq!(frame_budget_for(true), Duration::from_millis(8));
+    assert_eq!(frame_budget_for(false), Duration::from_millis(33));
+
+    // 10 ms since the last paint: an input-driven frame paints,
+    // a stream-only frame keeps coalescing.
+    let elapsed = Duration::from_millis(10);
+    assert!(
+        frame_budget_ready(false, true, elapsed),
+        "input-driven dirt must paint after the 8 ms budget"
+    );
+    assert!(
+        !frame_budget_ready(false, false, elapsed),
+        "stream-only dirt must keep coalescing under the stream budget"
+    );
+
+    // Urgent input (a keystroke) bypasses both budgets.
+    assert!(
+        frame_budget_ready(true, false, Duration::ZERO),
+        "urgent input must paint immediately"
+    );
+
+    // Once the stream budget elapses the frame always paints —
+    // the final post-stream frame is delayed, never dropped.
+    assert!(
+        frame_budget_ready(false, false, Duration::from_millis(33)),
+        "stream dirt must paint once the stream budget elapses"
+    );
+}

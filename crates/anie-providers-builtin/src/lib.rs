@@ -46,6 +46,29 @@ pub fn ollama_native_base_url(base_url: &str) -> String {
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
 
+/// Resolve the effective `ApiKind` for a discovered model, preferring
+/// Ollama's native chat API when the target looks like an Ollama
+/// endpoint.
+#[must_use]
+pub fn discovery_model_api(provider_name: &str, api: ApiKind, base_url: &str) -> ApiKind {
+    if is_ollama_native_discovery_target(provider_name, base_url) {
+        ApiKind::OllamaChatApi
+    } else {
+        api
+    }
+}
+
+/// Resolve the effective base URL for a discovered model, normalising
+/// Ollama OpenAI-compatible URLs to their native root.
+#[must_use]
+pub fn discovery_model_base_url(api: ApiKind, base_url: &str) -> String {
+    if api == ApiKind::OllamaChatApi {
+        ollama_native_base_url(base_url)
+    } else {
+        base_url.to_string()
+    }
+}
+
 /// Register the currently implemented built-in providers.
 pub fn register_builtin_providers(registry: &mut ProviderRegistry) {
     registry.register(

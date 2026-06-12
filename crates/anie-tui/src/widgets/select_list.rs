@@ -1,11 +1,9 @@
 //! Reusable scrollable-filtered list primitive.
 //!
-//! Used by the inline slash-command autocomplete popup (plan 12)
-//! and designed so the existing `ModelPickerPane` and future
-//! session/extension pickers can migrate onto it. This widget
-//! owns **only** state: selection index, scroll offset, filtered
-//! view. Rendering stays with the caller so each overlay keeps
-//! its own visual style.
+//! Used by the inline slash-command autocomplete popup (plan 12).
+//! This widget owns **only** state: selection index, scroll
+//! offset, filtered view. Rendering stays with the caller so
+//! each overlay keeps its own visual style.
 //!
 //! Pi's equivalent is `packages/tui/src/components/select-list.ts`
 //! (see docs/arch/pi_summary.md). The anie port keeps the same
@@ -15,7 +13,7 @@
 /// Scrollable list of `T` with a filterable view.
 ///
 /// State layout:
-/// - `items` — the immutable backing store set by `new`/`set_items`.
+/// - `items` — the immutable backing store set by `new`.
 /// - `filtered` — indices into `items` currently visible.
 /// - `selected` — index into `filtered`.
 /// - `scroll` — first visible row (in `filtered` space).
@@ -45,39 +43,6 @@ impl<T> SelectList<T> {
             scroll: 0,
             max_visible: max_visible.max(1),
         }
-    }
-
-    /// Replace the backing items and reset filter + selection.
-    #[allow(dead_code)]
-    pub(crate) fn set_items(&mut self, items: Vec<T>) {
-        self.filtered = (0..items.len()).collect();
-        self.items = items;
-        self.selected = 0;
-        self.scroll = 0;
-    }
-
-    /// Apply a predicate to narrow the visible set.
-    ///
-    /// Called whenever the filter text changes. Resets the
-    /// selection to the first match so repeated filter changes
-    /// don't leave the highlight stuck on a now-invisible row.
-    ///
-    /// The autocomplete popup currently rebuilds its
-    /// `SelectList` each time the provider yields a new set —
-    /// this method is the in-place alternative used by the
-    /// model picker migration (tracked as a follow-up in plan
-    /// 12's "Out of scope").
-    #[allow(dead_code)]
-    pub(crate) fn apply_filter<F: Fn(&T) -> bool>(&mut self, predicate: F) {
-        self.filtered = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| predicate(item))
-            .map(|(index, _)| index)
-            .collect();
-        self.selected = 0;
-        self.scroll = 0;
     }
 
     /// Move selection by `delta` rows, wrapping at both ends.
@@ -123,26 +88,6 @@ impl<T> SelectList<T> {
         self.filtered
             .get(self.selected)
             .and_then(|index| self.items.get(*index))
-    }
-
-    /// Number of rows currently visible after filtering.
-    #[allow(dead_code)]
-    pub(crate) fn visible_len(&self) -> usize {
-        self.filtered.len()
-    }
-
-    /// Maximum viewport height.
-    #[allow(dead_code)]
-    pub(crate) fn max_visible(&self) -> usize {
-        self.max_visible
-    }
-
-    /// Set a new viewport height; re-clamps scroll so the
-    /// selection stays visible.
-    #[allow(dead_code)]
-    pub(crate) fn set_max_visible(&mut self, max_visible: usize) {
-        self.max_visible = max_visible.max(1);
-        self.scroll_to_selected();
     }
 
     /// Actual row count to render: `min(max_visible,
@@ -204,14 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_narrows_visible_set() {
-        let mut list = SelectList::new(words(), 10);
-        list.apply_filter(|word| word.starts_with('b'));
-        let visible: Vec<&str> = list.visible().map(|(_, w, _)| w.as_str()).collect();
-        assert_eq!(visible, vec!["banana", "blueberry"]);
-    }
-
-    #[test]
     fn move_selection_wraps_at_bounds() {
         let mut list = SelectList::new(words(), 10);
         assert_eq!(list.selected().map(String::as_str), Some("apple"));
@@ -253,23 +190,6 @@ mod tests {
     }
 
     #[test]
-    fn set_items_resets_selection_to_first_row() {
-        let mut list = SelectList::new(words(), 10);
-        list.move_selection(3); // blueberry
-        list.set_items(vec!["one".to_string(), "two".into(), "three".into()]);
-        assert_eq!(list.selected().map(String::as_str), Some("one"));
-        assert_eq!(list.visible_len(), 3);
-    }
-
-    #[test]
-    fn apply_filter_resets_selection_to_first_match() {
-        let mut list = SelectList::new(words(), 10);
-        list.move_selection(4); // cherry
-        list.apply_filter(|w| w.contains('p'));
-        assert_eq!(list.selected().map(String::as_str), Some("apple"));
-    }
-
-    #[test]
     fn height_hint_clamps_to_max_visible() {
         let list = SelectList::new(words(), 3);
         assert_eq!(list.height_hint(), 3);
@@ -277,8 +197,7 @@ mod tests {
         let list = SelectList::new(words(), 99);
         assert_eq!(list.height_hint(), 5, "clamps to the filtered set size");
 
-        let mut list = SelectList::new(words(), 10);
-        list.apply_filter(|w| w.starts_with('z'));
+        let list = SelectList::<String>::new(Vec::new(), 10);
         assert_eq!(list.height_hint(), 0);
     }
 
@@ -309,9 +228,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_filtered_view_returns_no_selection() {
-        let mut list = SelectList::new(words(), 10);
-        list.apply_filter(|_| false);
+    fn empty_view_returns_no_selection() {
+        let list = SelectList::<String>::new(Vec::new(), 10);
         assert!(list.selected().is_none());
         assert_eq!(list.visible().count(), 0);
     }

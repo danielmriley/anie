@@ -158,6 +158,19 @@ impl LineCache {
 struct StreamingAssistantRender {
     text: String,
     cache: Option<StreamingRenderCache>,
+    /// Single-slot cache for the wrapped *thinking* body, the
+    /// same shape as `cache` above. The thinking header line
+    /// carries the spinner frame, so it must rebuild every
+    /// tick — but the body only changes when a thinking delta
+    /// lands. Without this, every spinner tick re-copied and
+    /// re-wrapped the full accumulated thinking text.
+    thinking_cache: Option<ThinkingRenderCache>,
+    /// Single-slot cache for the block's link map. The flat-
+    /// cache rebuild scans every rendered line for URLs each
+    /// frame because streaming blocks bypass the per-block
+    /// `LineCache`; the scan output only changes when text /
+    /// thinking / width change, never on a pure spinner tick.
+    links_cache: Option<StreamingLinksCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +183,28 @@ struct StreamingRenderCache {
     /// grows (another token) or metadata changes — avoids cloning every
     /// `Span`/`Cow` on steady-state streaming paints.
     lines: Arc<Vec<Arc<Line<'static>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ThinkingRenderCache {
+    thinking_len: usize,
+    width: u16,
+    /// Wrapped body lines — everything below the `Thinking`
+    /// header line, which is rebuilt per tick around this slab.
+    body: Arc<Vec<Arc<Line<'static>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingLinksCache {
+    text_len: usize,
+    thinking_len: usize,
+    width: u16,
+    /// Total rendered line count the links were computed for.
+    /// Guards against any drift between the cached map and the
+    /// lines actually emitted (the flat link map must stay
+    /// parallel to the flat line list).
+    line_count: usize,
+    links: Arc<Vec<Vec<LinkRange>>>,
 }
 
 impl StreamingAssistantRender {
@@ -214,6 +249,64 @@ impl StreamingAssistantRender {
             lines: Arc::clone(&shared),
         });
         shared
+    }
+
+    /// Wrapped thinking body lines (everything below the
+    /// `Thinking` header). Keyed on `(thinking.len(), width)` —
+    /// thinking text is append-only during a stream, so a stable
+    /// length means stable content. Pure spinner ticks hit the
+    /// cache; only a thinking delta or a resize re-wraps.
+    fn thinking_body_arcs(&mut self, thinking: &str, width: u16) -> Arc<Vec<Arc<Line<'static>>>> {
+        if let Some(c) = &self.thinking_cache
+            && c.thinking_len == thinking.len()
+            && c.width == width
+        {
+            return Arc::clone(&c.body);
+        }
+        let body: Vec<Arc<Line<'static>>> =
+            prefix_body_lines(thinking, width, usize::MAX, thinking_body_style())
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+        let shared = Arc::new(body);
+        self.thinking_cache = Some(ThinkingRenderCache {
+            thinking_len: thinking.len(),
+            width,
+            body: Arc::clone(&shared),
+        });
+        shared
+    }
+
+    /// Link map for the block's full rendered output. The
+    /// spinner header can never carry a URL, so links are stable
+    /// while `(text_len, thinking_len, width)` and the emitted
+    /// line count hold — pure spinner ticks skip the per-line
+    /// URL scan entirely.
+    fn links_for_arcs(
+        &mut self,
+        lines: &[Arc<Line<'static>>],
+        theme: &MarkdownTheme,
+        text_len: usize,
+        thinking_len: usize,
+        width: u16,
+    ) -> Arc<Vec<Vec<LinkRange>>> {
+        if let Some(c) = &self.links_cache
+            && c.text_len == text_len
+            && c.thinking_len == thinking_len
+            && c.width == width
+            && c.line_count == lines.len()
+        {
+            return Arc::clone(&c.links);
+        }
+        let links = Arc::new(find_link_ranges_for_arcs(lines, theme));
+        self.links_cache = Some(StreamingLinksCache {
+            text_len,
+            thinking_len,
+            width,
+            line_count: lines.len(),
+            links: Arc::clone(&links),
+        });
+        links
     }
 
     #[cfg(test)]
@@ -352,6 +445,22 @@ pub struct OutputPane {
     /// the rendered output clears this flag; `build_lines`
     /// rebuilds when unset.
     flat_cache_valid: bool,
+    /// Offsets into `flat_lines` where each block's contribution
+    /// begins (including the separator blank pushed before
+    /// blocks after the first). Parallel to the blocks rendered
+    /// by the most recent `build_flat_lines` at
+    /// `flat_cache_width`. Lets a streaming-frame rebuild
+    /// truncate to the still-valid prefix and re-render only the
+    /// animated tail instead of re-extending the whole
+    /// transcript every frame.
+    block_line_starts: Vec<usize>,
+    /// How many leading blocks of `flat_lines` are still an
+    /// accurate render at `flat_cache_width`. Clamped by the
+    /// `invalidate_*` helpers when a specific block mutates;
+    /// reset to the first animated block index after every
+    /// rebuild (animated blocks change per tick, so the valid
+    /// prefix must end before the first one).
+    flat_valid_blocks: usize,
     /// Flat link map covering the most recent `build_lines`
     /// output. Indexed by global line number; empty `Vec`s for
     /// lines without clickable URLs. Rebuilt when the flat
@@ -397,6 +506,12 @@ pub struct OutputPane {
     rendered_snapshot: Option<RenderedSnapshot>,
     #[cfg(test)]
     flat_build_count: u64,
+    /// Block index the most recent `build_flat_lines` resumed
+    /// from (0 = full rebuild). Tests assert that streaming-
+    /// frame rebuilds splice onto the settled prefix instead of
+    /// re-extending the whole transcript.
+    #[cfg(test)]
+    last_resume_at: usize,
     /// Counts the number of urgent renders that actually reused
     /// the cell snapshot (i.e., skipped the `set_line` loop).
     /// Tests assert on this to pin the fast-path behavior.
@@ -415,6 +530,8 @@ impl OutputPane {
             flat_lines: Vec::new(),
             flat_cache_width: None,
             flat_cache_valid: false,
+            block_line_starts: Vec::new(),
+            flat_valid_blocks: 0,
             last_link_map: Vec::new(),
             last_render_top: 0,
             scroll_offset: 0,
@@ -427,6 +544,8 @@ impl OutputPane {
             rendered_snapshot: None,
             #[cfg(test)]
             flat_build_count: 0,
+            #[cfg(test)]
+            last_resume_at: 0,
             #[cfg(test)]
             snapshot_reuse_count: 0,
         }
@@ -497,8 +616,13 @@ impl OutputPane {
                 // PR 01 of tui_polish_2026-04-26: streaming
                 // render cache is a single Option slot now.
                 state.cache = None;
+                state.thinking_cache = None;
+                state.links_cache = None;
             }
         }
+        // Render-context changes restyle every block, so no
+        // prefix of the flat output survives.
+        self.flat_valid_blocks = 0;
         self.invalidate_flat_cache();
     }
 
@@ -527,6 +651,9 @@ impl OutputPane {
         if let Some(slot) = self.caches.last_mut() {
             *slot = None;
         }
+        self.flat_valid_blocks = self
+            .flat_valid_blocks
+            .min(self.blocks.len().saturating_sub(1));
         self.invalidate_flat_cache();
     }
 
@@ -534,6 +661,7 @@ impl OutputPane {
         if let Some(slot) = self.caches.get_mut(index) {
             *slot = None;
         }
+        self.flat_valid_blocks = self.flat_valid_blocks.min(index);
         self.invalidate_flat_cache();
     }
 
@@ -709,6 +837,8 @@ impl OutputPane {
         self.streaming_assistant_renders.clear();
         self.flat_lines.clear();
         self.flat_cache_width = None;
+        self.block_line_starts.clear();
+        self.flat_valid_blocks = 0;
         self.last_link_map.clear();
         self.scroll_offset = 0;
         self.auto_scroll = true;
@@ -1031,20 +1161,55 @@ impl OutputPane {
         let mut slowest_miss_us: u64 = 0;
         let mut slowest_miss_block: &'static str = "";
 
-        // Reuse the existing flat_lines allocation; .clear()
-        // drops the elements but keeps the backing capacity,
-        // so subsequent pushes don't reallocate on a stable
-        // transcript size.
-        self.flat_lines.clear();
+        // Animated blocks live at/near the tail of the
+        // transcript, so during streaming the flat output for
+        // everything before the first animated block is
+        // unchanged between frames (unless an `invalidate_*`
+        // call clamped `flat_valid_blocks`). Truncate to that
+        // still-valid prefix and re-render only the tail —
+        // a per-frame cost proportional to the live blocks, not
+        // the whole transcript.
+        let first_animated = self
+            .blocks
+            .iter()
+            .position(block_has_animated_content)
+            .unwrap_or(self.blocks.len());
+        let resume_at = if self.flat_cache_width == Some(width) {
+            self.flat_valid_blocks
+                .min(first_animated)
+                .min(self.block_line_starts.len())
+        } else {
+            // Width changed: every line re-wraps, no prefix
+            // survives.
+            0
+        };
+        #[cfg(test)]
+        {
+            self.last_resume_at = resume_at;
+        }
+        let keep_lines = if resume_at == 0 {
+            0
+        } else if resume_at == self.block_line_starts.len() {
+            self.flat_lines.len()
+        } else {
+            self.block_line_starts[resume_at]
+        };
+        // Truncate (not clear) so the backing capacity — and the
+        // valid prefix — survive; a full rebuild is just
+        // `resume_at == 0`.
+        self.flat_lines.truncate(keep_lines);
+        self.last_link_map.truncate(keep_lines);
+        self.block_line_starts.truncate(resume_at);
         let out = &mut self.flat_lines;
-        // Rebuild the link map from scratch so the indexing
-        // stays in lockstep with `out`. Same-length parallel
-        // structure; empty entries for lines without URLs.
-        self.last_link_map.clear();
+        // The link map stays in lockstep with `out`: same-length
+        // parallel structure, empty entries for lines without
+        // URLs.
         let link_map = &mut self.last_link_map;
+        let starts = &mut self.block_line_starts;
         let theme = self.render_context.theme;
-        for index in 0..self.blocks.len() {
+        for index in resume_at..self.blocks.len() {
             let block = &self.blocks[index];
+            starts.push(out.len());
             if !out.is_empty() {
                 out.push(Arc::new(Line::default()));
                 link_map.push(Vec::new());
@@ -1128,7 +1293,33 @@ impl OutputPane {
                 BlockComputed::SharedLines(lines_arcs) => {
                     let computed_links = {
                         let mut s = PerfSpan::enter(PerfSpanKind::FindLinkRanges);
-                        let links = find_link_ranges_for_arcs(&lines_arcs, &theme);
+                        // SharedLines only comes from the live
+                        // streaming assistant block; its link map
+                        // is stable across pure spinner ticks, so
+                        // serve it from the single-slot cache
+                        // keyed on the accumulated lengths instead
+                        // of re-scanning every span per frame.
+                        let links = if let RenderedBlock::AssistantMessage {
+                            text, thinking, ..
+                        } = block
+                            && let Some(state) = self
+                                .streaming_assistant_renders
+                                .get_mut(index)
+                                .and_then(Option::as_mut)
+                        {
+                            state
+                                .links_for_arcs(
+                                    &lines_arcs,
+                                    &theme,
+                                    text.len(),
+                                    thinking.len(),
+                                    width,
+                                )
+                                .as_ref()
+                                .clone()
+                        } else {
+                            find_link_ranges_for_arcs(&lines_arcs, &theme)
+                        };
                         if let Some(s) = s.as_mut() {
                             s.record("lines", u64::try_from(lines_arcs.len()).unwrap_or(u64::MAX));
                             s.record("ranges", u64::try_from(links.len()).unwrap_or(u64::MAX));
@@ -1170,7 +1361,12 @@ impl OutputPane {
         // on function exit.
         let _ = out;
         let _ = link_map;
+        let _ = starts;
         self.flat_cache_width = Some(width);
+        // Everything before the first animated block is stable
+        // until an `invalidate_*` clamp says otherwise; the next
+        // streaming-frame rebuild resumes from here.
+        self.flat_valid_blocks = first_animated;
         // Flat cache is valid at this width only if no
         // animated blocks are present — animated blocks
         // require a spinner update on every frame. The fast-
@@ -1459,18 +1655,26 @@ fn block_lines(
             // visible. `is_executing` blocks always show the
             // "executing..." spinner regardless of mode.
             let is_error = result.as_ref().is_some_and(|value| value.is_error);
-            let body = if let Some(result) = result {
+            // Borrow the result body where possible: executing
+            // blocks bypass the per-block cache, so an owned body
+            // here would re-clone the full partial output on
+            // every spinner tick.
+            let body: Cow<'_, str> = if let Some(result) = result {
                 if compact_hides_body(tool_name, result, ctx.tool_output_mode) {
-                    String::new()
+                    Cow::Borrowed("")
                 } else if let Some(elapsed) = result.elapsed {
-                    format!("{}\n\nTook {:.1}s", result.content, elapsed.as_secs_f64(),)
+                    Cow::Owned(format!(
+                        "{}\n\nTook {:.1}s",
+                        result.content,
+                        elapsed.as_secs_f64(),
+                    ))
                 } else {
-                    result.content.clone()
+                    Cow::Borrowed(result.content.as_str())
                 }
             } else if *is_executing {
-                "executing...".to_string()
+                Cow::Borrowed("executing...")
             } else {
-                String::new()
+                Cow::Borrowed("")
             };
             // Dispatch: errors keep the framed box so the red
             // border is unmissable; edit/write keep the box so
@@ -1481,7 +1685,7 @@ fn block_lines(
                 if is_error || (!is_executing && uses_boxed_success_layout(tool_name)) {
                     boxed_lines(
                         format_tool_title(tool_name, args_display),
-                        body,
+                        &body,
                         width,
                         is_error,
                         *is_executing,
@@ -1496,7 +1700,7 @@ fn block_lines(
                     );
                     prefix_lines(
                         header,
-                        body,
+                        &body,
                         width,
                         PREFIX_TOOL_BODY_LIMIT,
                         PrefixBodyStyle::tool_success(),
@@ -1602,23 +1806,39 @@ fn padding_spaces(width: usize) -> Option<std::borrow::Cow<'static, str>> {
 }
 
 fn assistant_block_arcs(
-    assistant: AssistantRenderInput<'_>,
+    mut assistant: AssistantRenderInput<'_>,
     width: u16,
     spinner_frame: &str,
     ctx: &RenderContext,
 ) -> Vec<Arc<Line<'static>>> {
     let inline_thinking_status =
         assistant.is_streaming && assistant.text.is_empty() && !assistant.thinking.is_empty();
+    let thinking_spinner = inline_thinking_status.then_some(spinner_frame);
 
     let mut out: Vec<Arc<Line<'static>>> = Vec::new();
-    extend_line_section_into_arcs(
-        &mut out,
-        assistant_thinking_lines(
-            assistant.thinking,
-            width,
-            inline_thinking_status.then_some(spinner_frame),
-        ),
-    );
+    if !assistant.thinking.is_empty() {
+        if assistant.is_streaming
+            && let Some(state) = assistant.streaming_render.as_deref_mut()
+        {
+            // Streaming path: only the header line depends on the
+            // spinner frame, so it's rebuilt per tick around the
+            // cached wrapped body. `out` is empty here — the
+            // thinking section is always first — so no separator
+            // is needed (mirrors `extend_line_section_into_arcs`).
+            out.push(Arc::new(thinking_header_line(thinking_spinner)));
+            out.extend(
+                state
+                    .thinking_body_arcs(assistant.thinking, width)
+                    .iter()
+                    .cloned(),
+            );
+        } else {
+            extend_line_section_into_arcs(
+                &mut out,
+                assistant_thinking_lines(assistant.thinking, width, thinking_spinner),
+            );
+        }
+    }
 
     if assistant.is_streaming {
         if let Some(state) = assistant.streaming_render {
@@ -1689,7 +1909,7 @@ fn assistant_error_lines(message: &str, width: u16) -> Vec<Line<'static>> {
     ];
     prefix_lines(
         header,
-        message.to_string(),
+        message,
         width,
         usize::MAX,
         PrefixBodyStyle {
@@ -1707,11 +1927,21 @@ fn assistant_thinking_lines(
     if thinking.is_empty() {
         return Vec::new();
     }
+    let mut lines = vec![thinking_header_line(streaming_spinner)];
+    lines.extend(prefix_body_lines(
+        thinking,
+        width,
+        usize::MAX,
+        thinking_body_style(),
+    ));
+    lines
+}
 
-    // `• Thinking` header using the same bullet vocabulary as
-    // tool calls. While thinking is actively streaming (no
-    // visible answer yet), swap the bullet for the spinner
-    // frame so the active section is the eye-catch.
+/// `• Thinking` header using the same bullet vocabulary as
+/// tool calls. While thinking is actively streaming (no
+/// visible answer yet), swap the bullet for the spinner
+/// frame so the active section is the eye-catch.
+fn thinking_header_line(streaming_spinner: Option<&str>) -> Line<'static> {
     let (bullet, bullet_style) = match streaming_spinner {
         Some(frame) => (format!("{frame} "), Style::default().fg(Color::Yellow)),
         None => (
@@ -1721,29 +1951,26 @@ fn assistant_thinking_lines(
                 .add_modifier(Modifier::DIM),
         ),
     };
-    let header = vec![
+    Line::from(vec![
         Span::styled(bullet, bullet_style),
         Span::styled(
             "Thinking".to_string(),
             thinking_label_style().add_modifier(Modifier::BOLD),
         ),
-    ];
-    prefix_lines(
-        header,
-        thinking.to_string(),
-        width,
-        usize::MAX,
-        PrefixBodyStyle {
-            // Indent: dim modifier — adapts to current fg.
-            indent: Style::default().add_modifier(Modifier::DIM),
-            // Body: italic + dim, explicit visual secondary
-            // channel for reasoning text so it reads as
-            // "notes" rather than "answer."
-            body: Style::default()
-                .fg(Color::Indexed(248))
-                .add_modifier(Modifier::ITALIC | Modifier::DIM),
-        },
-    )
+    ])
+}
+
+fn thinking_body_style() -> PrefixBodyStyle {
+    PrefixBodyStyle {
+        // Indent: dim modifier — adapts to current fg.
+        indent: Style::default().add_modifier(Modifier::DIM),
+        // Body: italic + dim, explicit visual secondary
+        // channel for reasoning text so it reads as
+        // "notes" rather than "answer."
+        body: Style::default()
+            .fg(Color::Indexed(248))
+            .add_modifier(Modifier::ITALIC | Modifier::DIM),
+    }
 }
 
 /// Render assistant answer text as markdown for finalized turns
@@ -2016,7 +2243,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
 
 fn boxed_lines(
     title: String,
-    body: String,
+    body: &str,
     width: u16,
     is_error: bool,
     is_executing: bool,
@@ -2037,7 +2264,7 @@ fn boxed_lines(
     };
 
     let mut lines = vec![Line::from(Span::styled(top, border_style))];
-    for text in wrap_plain_text(&body, (width.saturating_sub(4)) as u16) {
+    for text in wrap_plain_text(body, (width.saturating_sub(4)) as u16) {
         let text_style = diff_line_style(&text, is_error);
         let visible_chars = text.chars().count();
         let padding = " ".repeat(width.saturating_sub(4 + visible_chars));
@@ -2176,30 +2403,41 @@ impl PrefixBodyStyle {
 /// every line is load-bearing).
 fn prefix_lines(
     header_spans: Vec<Span<'static>>,
-    body: String,
+    body: &str,
     width: u16,
     max_body_lines: usize,
     style: PrefixBodyStyle,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(header_spans)];
+    lines.extend(prefix_body_lines(body, width, max_body_lines, style));
+    lines
+}
+
+/// The indented body region of `prefix_lines`, without the
+/// header. Split out so the streaming thinking cache can rebuild
+/// the spinner header every tick while reusing the wrapped body.
+fn prefix_body_lines(
+    body: &str,
+    width: u16,
+    max_body_lines: usize,
+    style: PrefixBodyStyle,
+) -> Vec<Line<'static>> {
     if body.is_empty() {
-        return lines;
+        return Vec::new();
     }
     let indent_chars = PREFIX_FIRST_INDENT.chars().count() as u16;
     let body_width = width.saturating_sub(indent_chars).max(1);
-    let wrapped = wrap_plain_text(&body, body_width);
+    let wrapped = wrap_plain_text(body, body_width);
     // Strip trailing blanks so "Took 0.1s\n\n" doesn't burn a
     // body slot on a blank line.
     let mut effective = wrapped;
     while effective.last().is_some_and(|l| l.trim().is_empty()) {
         effective.pop();
     }
-    if effective.is_empty() {
-        return lines;
-    }
     let total = effective.len();
     let shown = total.min(max_body_lines);
-    for (idx, text) in effective.iter().take(shown).enumerate() {
+    let mut lines = Vec::with_capacity(shown + 1);
+    for (idx, text) in effective.into_iter().take(shown).enumerate() {
         let prefix = if idx == 0 {
             PREFIX_FIRST_INDENT
         } else {
@@ -2207,7 +2445,7 @@ fn prefix_lines(
         };
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), style.indent),
-            Span::styled(text.clone(), style.body),
+            Span::styled(text, style.body),
         ]));
     }
     if total > shown {
@@ -3229,6 +3467,161 @@ mod cache_tests {
         direct.finalize_last_assistant(body.into(), String::new(), 1, None);
 
         assert_eq!(streamed.build_lines(80, "."), direct.build_lines(80, "."));
+    }
+
+    /// RC4: the wrapped thinking body is served from the
+    /// single-slot cache while only the spinner header rebuilds.
+    /// A thinking delta or a width change must re-wrap.
+    #[test]
+    fn streaming_thinking_body_is_reused_across_spinner_ticks() {
+        let mut state = StreamingAssistantRender::default();
+        let thinking = "step one of the reasoning\nstep two of the reasoning";
+        let first = state.thinking_body_arcs(thinking, 40);
+        let second = state.thinking_body_arcs(thinking, 40);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged thinking at the same width must hit the cache"
+        );
+        let longer = format!("{thinking}\nstep three");
+        let after_delta = state.thinking_body_arcs(&longer, 40);
+        assert!(
+            !Arc::ptr_eq(&second, &after_delta),
+            "a thinking delta must re-wrap the body"
+        );
+        let after_resize = state.thinking_body_arcs(&longer, 20);
+        assert!(
+            !Arc::ptr_eq(&after_delta, &after_resize),
+            "a width change must re-wrap the body"
+        );
+    }
+
+    /// The cached streaming thinking path must produce exactly
+    /// the lines the uncached `assistant_thinking_lines` shape
+    /// produces — the cache only changes who pays for the wrap.
+    #[test]
+    fn streaming_thinking_render_matches_uncached_thinking_lines() {
+        let thinking = "pondering the question at some length so the body wraps";
+        let mut pane = OutputPane::new();
+        pane.add_streaming_assistant();
+        pane.append_thinking_to_last_assistant(thinking);
+
+        // Two builds so the second is served from the thinking
+        // cache; a different spinner frame each time, exactly
+        // like live ticks.
+        let _ = pane.build_lines(40, "⠋");
+        let cached = pane.build_lines(40, "⠙");
+        let expected = assistant_thinking_lines(thinking, 40, Some("⠙"));
+        assert_eq!(
+            &cached[..expected.len()],
+            &expected[..],
+            "cached streaming thinking must render identically"
+        );
+    }
+
+    /// RC4: a streaming-frame rebuild must splice onto the
+    /// settled prefix (resume at the streaming block) and still
+    /// produce byte-identical output to a from-scratch build.
+    #[test]
+    fn streaming_rebuild_resumes_from_first_animated_block_with_identical_output() {
+        let mut pane = pane_with_settled_history();
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("token one");
+        let _ = pane.build_lines(80, ".");
+        let streaming_index = pane.blocks().len() - 1;
+
+        pane.append_to_last_assistant(" token two");
+        let incremental = pane.build_lines(80, ".");
+        assert_eq!(
+            pane.last_resume_at, streaming_index,
+            "rebuild must resume at the streaming block, not block 0"
+        );
+
+        let mut fresh = pane_with_settled_history();
+        fresh.add_streaming_assistant();
+        fresh.append_to_last_assistant("token one token two");
+        let full = fresh.build_lines(80, ".");
+        assert_eq!(fresh.last_resume_at, 0, "fresh pane builds from scratch");
+        assert_eq!(
+            incremental, full,
+            "prefix splice must not change the rendered output"
+        );
+    }
+
+    /// Guards the prefix-splice invalidation: mutating a block
+    /// *before* the streaming tail (late tool-result update)
+    /// must clamp the valid prefix so the change is rendered.
+    #[test]
+    fn mutating_an_earlier_block_repaints_despite_streaming_prefix_reuse() {
+        let mut pane = pane_with_settled_history();
+        pane.add_tool_call("call-9".into(), "bash".into(), "ls".into());
+        pane.finalize_tool_result("call-9", "out-v1".into(), false, None);
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("streaming answer");
+        let _ = pane.build_lines(80, ".");
+
+        pane.update_tool_result("call-9", "out-v2".into(), false, None);
+        let lines = pane.build_lines(80, ".");
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("out-v2"), "updated tool body missing: {text}");
+        assert!(!text.contains("out-v1"), "stale tool body painted: {text}");
+    }
+
+    /// A width change re-wraps everything — the prefix recorded
+    /// at the old width must not be spliced.
+    #[test]
+    fn width_change_forces_full_rebuild_instead_of_prefix_splice() {
+        let mut pane = pane_with_settled_history();
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("token");
+        let _ = pane.build_lines(80, ".");
+        let _ = pane.build_lines(40, ".");
+        assert_eq!(
+            pane.last_resume_at, 0,
+            "a width change must rebuild from block 0"
+        );
+    }
+
+    /// RC4: the streaming block's link map is cached across
+    /// pure spinner ticks and refreshed when a delta lands.
+    #[test]
+    fn streaming_link_map_is_cached_across_spinner_ticks() {
+        let mut pane = OutputPane::new();
+        pane.add_streaming_assistant();
+        pane.append_to_last_assistant("see [docs](https://example.com/docs) now");
+        let _ = pane.build_lines(80, "⠋");
+        let first = pane.streaming_assistant_renders[0]
+            .as_ref()
+            .and_then(|s| s.links_cache.as_ref())
+            .map(|c| Arc::clone(&c.links))
+            .expect("links cache populated after first build");
+
+        // Spinner tick only: same Arc, no re-scan.
+        let _ = pane.build_lines(80, "⠙");
+        let second = pane.streaming_assistant_renders[0]
+            .as_ref()
+            .and_then(|s| s.links_cache.as_ref())
+            .map(|c| Arc::clone(&c.links))
+            .expect("links cache still populated");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "spinner tick must serve the cached link map"
+        );
+
+        // A delta with a second URL must refresh the map and
+        // land both links in the pane's flat link map.
+        pane.append_to_last_assistant(" and [more](https://example.org/more)");
+        let _ = pane.build_lines(80, "⠹");
+        let urls: Vec<&str> = pane
+            .last_link_map
+            .iter()
+            .flatten()
+            .map(|range| range.url.as_str())
+            .collect();
+        assert!(urls.contains(&"https://example.com/docs"), "{urls:?}");
+        assert!(urls.contains(&"https://example.org/more"), "{urls:?}");
     }
 
     #[test]

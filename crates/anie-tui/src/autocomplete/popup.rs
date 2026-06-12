@@ -69,13 +69,11 @@ impl AutocompletePopup {
     }
 
     /// Currently-highlighted suggestion, if any.
-    #[allow(dead_code)]
     pub(crate) fn selected(&self) -> Option<&Suggestion> {
         self.list.selected()
     }
 
     /// Prefix that will be replaced when a suggestion is applied.
-    #[allow(dead_code)]
     pub(crate) fn prefix(&self) -> &str {
         &self.prefix
     }
@@ -83,13 +81,11 @@ impl AutocompletePopup {
     /// Whether this popup is for a command name or an argument
     /// value. The editor consults this to decide whether to
     /// insert a trailing space after apply.
-    #[allow(dead_code)]
     pub(crate) fn kind(&self) -> &SuggestionKind {
         &self.kind
     }
 
     /// Move the highlight up (`-1`) or down (`1`).
-    #[allow(dead_code)]
     pub(crate) fn move_selection(&mut self, delta: isize) {
         self.list.move_selection(delta);
     }
