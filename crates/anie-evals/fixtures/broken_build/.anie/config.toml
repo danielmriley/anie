@@ -1,0 +1,9 @@
+# Fixture-local project config. The eval runner copies this fixture
+# into a fresh temp cwd and runs `anie -C <cwd>`, so anie's project
+# config discovery picks this up and arms the harness-run verify
+# policy (plan 03 §2a of docs/local_model_augmentation/; rlm mode
+# only).
+[verify]
+command = "sh check.sh"
+timeout_s = 30
+max_output_lines = 10

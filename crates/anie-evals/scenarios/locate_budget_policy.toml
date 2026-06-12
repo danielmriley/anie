@@ -8,4 +8,8 @@ prompt = "Which type enforces optional per-run/session cost ceilings in anie, an
 contains = ["BudgetPolicy", "StopRun"]
 must_call_tool = "grep"
 min_tool_calls = 1
-max_tokens = 90000
+# Plan 02 PR 8 of docs/local_model_augmentation/: map-on
+# expectation — the injected repo map names budget_policy.rs in its
+# tree, so one targeted grep + one read should answer this without
+# an exploratory walk of the workspace.
+max_tokens = 24000

@@ -8,5 +8,8 @@ prompt = "Which struct tracks per-phase compaction counts in anie, and in which 
 contains = ["CompactionStatsAtomic", "compaction_stats.rs"]
 must_call_tool = "grep"
 min_tool_calls = 1
-max_tokens = 80000
+# Plan 02 PR 8 of docs/local_model_augmentation/: map-on
+# expectation — compaction_stats.rs is in the injected map's tree,
+# so the grep is confirmation, not discovery.
+max_tokens = 24000
 max_wall_clock_ms = 240000

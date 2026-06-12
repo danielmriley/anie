@@ -14,30 +14,54 @@ use anyhow::Result;
 use anie_agent::ToolRegistry;
 use anie_config::AnieConfig;
 
+use crate::controller::PromptTier;
 use crate::skills::SkillRegistry;
 
 /// Owns the latest system-prompt text plus the stamp of context
 /// files it was built from. The stamp is a `Vec<(path, mtime)>`
 /// rather than a single max-mtime so deletions of older files are
-/// detected.
+/// detected. The prompt-weight tier is part of the staleness key
+/// (plan 04 of `docs/local_model_augmentation/`): a
+/// `/context-length` change that crosses the tier boundary must
+/// rebuild the prompt even when no context file moved.
 pub(crate) struct SystemPromptCache {
     system_prompt: String,
     context_files_stamp: Vec<(PathBuf, Option<SystemTime>)>,
+    tier: PromptTier,
 }
 
 impl SystemPromptCache {
     /// Build the cache fresh from the given context.
+    ///
+    /// Bootstrap builds `Full` — the effective window isn't
+    /// resolved until the controller state exists. The first
+    /// `refresh_if_stale` at the top of the first run re-tiers
+    /// before any model call, so a Small-tier session never
+    /// sends the Full prompt.
     pub(crate) fn build(
         cwd: &Path,
         tools: &ToolRegistry,
         skills: &SkillRegistry,
         config: &AnieConfig,
     ) -> Result<Self> {
-        let system_prompt = crate::controller::build_system_prompt(cwd, tools, skills, config)?;
+        Self::build_with_tier(cwd, tools, skills, config, PromptTier::Full)
+    }
+
+    /// Build the cache fresh for a specific prompt tier.
+    pub(crate) fn build_with_tier(
+        cwd: &Path,
+        tools: &ToolRegistry,
+        skills: &SkillRegistry,
+        config: &AnieConfig,
+        tier: PromptTier,
+    ) -> Result<Self> {
+        let system_prompt =
+            crate::controller::build_system_prompt(cwd, tools, skills, config, tier)?;
         let context_files_stamp = crate::controller::context_files_stamp(cwd, config);
         Ok(Self {
             system_prompt,
             context_files_stamp,
+            tier,
         })
     }
 
@@ -53,25 +77,29 @@ impl SystemPromptCache {
         tools: &ToolRegistry,
         skills: &SkillRegistry,
         config: &AnieConfig,
+        tier: PromptTier,
     ) -> Result<()> {
-        *self = Self::build(cwd, tools, skills, config)?;
+        *self = Self::build_with_tier(cwd, tools, skills, config, tier)?;
         Ok(())
     }
 
-    /// Rebuild the prompt if the set of context files or any of
-    /// their mtimes changed. Returns `true` if a rebuild happened.
+    /// Rebuild the prompt if the set of context files, any of
+    /// their mtimes, or the prompt tier changed. Returns `true`
+    /// if a rebuild happened.
     pub(crate) fn refresh_if_stale(
         &mut self,
         cwd: &Path,
         tools: &ToolRegistry,
         skills: &SkillRegistry,
         config: &AnieConfig,
+        tier: PromptTier,
     ) -> bool {
         let current_stamp = crate::controller::context_files_stamp(cwd, config);
-        if current_stamp == self.context_files_stamp {
+        if current_stamp == self.context_files_stamp && tier == self.tier {
             return false;
         }
-        let Ok(prompt) = crate::controller::build_system_prompt(cwd, tools, skills, config) else {
+        let Ok(prompt) = crate::controller::build_system_prompt(cwd, tools, skills, config, tier)
+        else {
             // Rebuild failed — leave the cache as-is rather than
             // poisoning it with a partial value. The stamp stays
             // unchanged so we'll retry next turn.
@@ -79,6 +107,7 @@ impl SystemPromptCache {
         };
         self.system_prompt = prompt;
         self.context_files_stamp = current_stamp;
+        self.tier = tier;
         true
     }
 }
@@ -116,5 +145,35 @@ mod tests {
             "deleting a non-newest file should change stamp"
         );
         assert_eq!(second.len(), 1);
+    }
+
+    /// Plan 04 of `docs/local_model_augmentation/`: the tier is
+    /// part of the cache's staleness key — crossing the Small/
+    /// Full boundary (e.g. via `/context-length`) must rebuild
+    /// the prompt even when no context file changed.
+    #[test]
+    fn prompt_cache_key_distinguishes_tiers() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+
+        let tools = ToolRegistry::new();
+        let skills = SkillRegistry::empty();
+        let config = AnieConfig::default();
+
+        // `build` defaults to Full (bootstrap behavior).
+        let mut cache = SystemPromptCache::build(cwd, &tools, &skills, &config).expect("build");
+
+        assert!(
+            cache.refresh_if_stale(cwd, &tools, &skills, &config, PromptTier::Small),
+            "tier change alone must rebuild"
+        );
+        assert!(
+            !cache.refresh_if_stale(cwd, &tools, &skills, &config, PromptTier::Small),
+            "same tier, same files → no rebuild"
+        );
+        assert!(
+            cache.refresh_if_stale(cwd, &tools, &skills, &config, PromptTier::Full),
+            "crossing back must rebuild again"
+        );
     }
 }

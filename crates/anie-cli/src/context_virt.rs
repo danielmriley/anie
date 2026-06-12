@@ -383,6 +383,18 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// reranker reads them next turn.
     embed_tx: Option<mpsc::Sender<crate::bg_embedder::EmbedRequest>>,
 
+    /// Plan 04 §2d of `docs/local_model_augmentation/`:
+    /// render the Small-tier "v2" ledger — plain
+    /// `tool: "value"` lines with no `(id=...)` notation and
+    /// a recurse instruction reduced to the single
+    /// `message_grep` shape. The field session (notes F2)
+    /// showed the v1 syntax manual leaking into bash
+    /// commands on a 0.8B model. `false` (Full tier, or
+    /// `ANIE_LEDGER=v1`) keeps the v1 ledger byte-identical.
+    /// Wire schema is untouched: all recurse scopes still
+    /// work, they're just not advertised.
+    small_tier_ledger: bool,
+
     /// Cross-fire cache for the current prompt's embedding,
     /// keyed by the latest User message's timestamp. Filled
     /// by a background task (`spawn_prompt_embed_if_missing`)
@@ -434,8 +446,17 @@ impl ContextVirtualizationPolicy {
             summarizer_tx: None,
             embedder: None,
             embed_tx: None,
+            small_tier_ledger: false,
             prompt_embed_cache: Arc::new(Mutex::new(PromptEmbedCache::Empty)),
         }
+    }
+
+    /// Switch the per-turn ledger to the Small-tier v2 shape
+    /// (plan 04 §2d). The controller sets this from the
+    /// prompt tier + the `ANIE_LEDGER=v1` escape hatch.
+    pub(crate) fn with_small_tier_ledger(mut self, enabled: bool) -> Self {
+        self.small_tier_ledger = enabled;
+        self
     }
 
     /// Attach a Plan-08 embedder + background worker. The
@@ -954,6 +975,34 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> V
     lines
 }
 
+/// Plan 04 §2d: render `(tool_name, entries)` pairs as plain
+/// Small-tier ledger lines — `web_search: "query one", "query
+/// two"`. Deliberately NO `(id=...)` suffix: the v1 notation
+/// was pattern-matched into bash commands by the field-session
+/// model (notes F2). Same display cap as the v1 renderer.
+fn render_plain_tool_call_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (tool_name, args) in summary {
+        if args.is_empty() {
+            continue;
+        }
+        let total = args.len();
+        let display = total.min(TOOL_CALL_DISPLAY_CAP);
+        let rendered: Vec<String> = args
+            .iter()
+            .take(display)
+            .map(|e| format!("\"{}\"", e.arg_value))
+            .collect();
+        let suffix = if total > display {
+            format!(", +{} more", total - display)
+        } else {
+            String::new()
+        };
+        lines.push(format!("{tool_name}: {}{suffix}", rendered.join(", ")));
+    }
+    lines
+}
+
 /// Render the per-fire breadcrumb shown in the transcript
 /// when the rlm policy does meaningful work. Compact,
 /// single-line; the user reads this to confirm "yes, the
@@ -1180,12 +1229,50 @@ impl ContextVirtualizationPolicy {
         paged
     }
 
+    /// Plan 04 §2d: the Small-tier ledger. Plain
+    /// `tool: "value"` lines — no ids, no scope grammar —
+    /// because the only syntax a small model can use
+    /// correctly is no syntax at all. Exactly one recurse
+    /// shape is advertised (`message_grep`, the one the
+    /// field session showed the model reaching for); the
+    /// other scopes stay live on the wire, just unlisted.
+    async fn build_small_tier_ledger_lines(&self, active_len: usize) -> Vec<String> {
+        let external = self.external.read().await;
+        let total = external.len();
+        let mut lines = vec![
+            "<system-reminder>".to_string(),
+            format!(
+                "Archive: {total} older messages are saved outside this conversation ({active_len} active)."
+            ),
+        ];
+        let summary = collect_tool_call_summary(&external);
+        let call_lines = render_plain_tool_call_lines(&summary);
+        if !call_lines.is_empty() {
+            lines.push("These tool calls were already made — do NOT repeat them:".to_string());
+            lines.extend(call_lines);
+        }
+        lines.push(
+            "To search the archived results, call recurse with arguments {\"scope\": {\"kind\": \"message_grep\", \"pattern\": \"<words>\"}}.".to_string(),
+        );
+        lines.push("</system-reminder>".to_string());
+        lines
+    }
+
     /// Build the structured ledger as a `User` message
     /// wrapped in `<system-reminder>` tags. Counts come from
     /// the shared `ExternalContext` indexes; tool-result
     /// breakdown is sorted by frequency and capped at 8 names
     /// to keep the ledger bounded (target ≤500 tokens).
     async fn build_ledger(&self, active_len: usize, paged_in_count: usize) -> Message {
+        if self.small_tier_ledger {
+            let lines = self.build_small_tier_ledger_lines(active_len).await;
+            return Message::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: lines.join("\n"),
+                }],
+                timestamp: now_millis(),
+            });
+        }
         let lines = {
             let external = self.external.read().await;
             let total = external.len();
@@ -1780,6 +1867,101 @@ mod tests {
         assert!(ledger_text.contains("3 tool results"));
         assert!(ledger_text.contains("bash x2"));
         assert!(ledger_text.contains("read x1"));
+    }
+
+    /// Plan 04 §2d: the Small-tier ledger lists prior calls
+    /// as plain `tool: "value"` lines — the `(id=...)`
+    /// notation that the field session showed leaking into
+    /// bash commands (notes F2) never appears.
+    #[tokio::test]
+    async fn small_tier_ledger_contains_no_id_notation() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context = vec![
+            user("what's the time?", 1),
+            assistant_with_tool_call("web_search", serde_json::json!({"query": "rust testing"}), 2),
+            tool_result("call_2", "web_search", "result body", 3),
+        ];
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()))
+                .with_small_tier_ledger(true);
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let text = user_text(survivors.last().expect("non-empty")).expect("ledger text");
+        assert!(text.contains("web_search: \"rust testing\""), "{text}");
+        assert!(text.contains("do NOT repeat"), "{text}");
+        assert!(!text.contains("(id="), "{text}");
+        assert!(!text.contains("call_2"), "no tool-call ids anywhere: {text}");
+    }
+
+    /// Plan 04 §2d: the Small-tier recurse instruction is
+    /// exactly one JSON shape (`message_grep`); the other
+    /// scopes stay usable on the wire but are not advertised,
+    /// and the v1 `scope.kind=` grammar is gone.
+    #[tokio::test]
+    async fn small_tier_recurse_instruction_advertises_only_message_grep() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context = vec![user("hi", 1), assistant("hello", 2)];
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()))
+                .with_small_tier_ledger(true);
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let text = user_text(survivors.last().expect("non-empty")).expect("ledger text");
+        assert!(
+            text.contains("{\"scope\": {\"kind\": \"message_grep\", \"pattern\": \"<words>\"}}"),
+            "{text}"
+        );
+        assert!(!text.contains("scope.kind="), "{text}");
+        assert!(!text.contains("tool_result"), "{text}");
+        assert!(!text.contains("tool_call_id"), "{text}");
+        assert!(!text.contains("archive_id"), "{text}");
+    }
+
+    /// Plan 04 §2d regression guard: with the Small-tier flag
+    /// off (Full tier, or `ANIE_LEDGER=v1`), the ledger is
+    /// byte-identical to the pre-plan-04 rendering. The
+    /// expected string IS the v1 fixture — drift fails the
+    /// byte compare.
+    #[tokio::test]
+    async fn full_tier_ledger_unchanged() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let context = vec![
+            user("u0", 1),
+            assistant_with_tool_call("web_search", serde_json::json!({"query": "rust testing"}), 2),
+            tool_result("call_2", "web_search", "result body", 3),
+        ];
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
+        let response = policy.before_model(sample_request(&context)).await;
+        let survivors = match response {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let text = user_text(survivors.last().expect("non-empty")).expect("ledger text");
+        let expected = "<system-reminder>\n\
+            external context — 3 archived messages (0 evicted, 3 active)\n\
+            \n\
+            Before issuing a new tool call, scan the lists below.\n\
+            If the URL, query, command, or path you're about to use is already listed,\n\
+            the result is in the archive — do NOT re-run the tool. Use `recurse` instead:\n\
+            \x20 - `scope.kind=message_grep`, `pattern=<regex>` — search archived messages\n\
+            \x20   by keyword. Easiest option; needs no id.\n\
+            \x20 - `scope.kind=tool_result`, `tool_call_id=<id>` — fetch one prior result\n\
+            \x20   verbatim. Each ledger entry is `<value> (id=<call_id>)`; pass the\n\
+            \x20   `<call_id>` (without the surrounding parens) as the tool_call_id.\n\
+            \x20 - `scope.kind=summary`, `id=<archive_id>` — fetch the gist. Cheapest.\n\
+            Re-running a tool whose output is already archived wastes user time.\n\
+            \n\
+            - 1 tool results: web_search x1\n\
+            - web_search queries: rust testing (id=call_2)\n\
+            </system-reminder>";
+        assert_eq!(text, expected);
     }
 
     /// Ledger is not archived to `external` — the recurse

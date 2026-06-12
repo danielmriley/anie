@@ -1741,7 +1741,12 @@ impl InteractiveController {
             context.clone(),
             Some(self.event_tx.clone()),
         );
-        let agent = build_agent(&self.state, self.build_compaction_gate(), rlm_extras);
+        let agent = build_agent(
+            &self.state,
+            self.build_compaction_gate(),
+            rlm_extras,
+            Some(self.event_tx.clone()),
+        );
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -1798,7 +1803,12 @@ impl InteractiveController {
             context.clone(),
             Some(self.event_tx.clone()),
         );
-        let agent = build_agent(&self.state, self.build_compaction_gate(), rlm_extras);
+        let agent = build_agent(
+            &self.state,
+            self.build_compaction_gate(),
+            rlm_extras,
+            Some(self.event_tx.clone()),
+        );
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let event_tx = self.event_tx.clone();
@@ -1915,6 +1925,12 @@ pub(crate) struct ControllerState {
     /// Always present (even in non-rlm modes, where it
     /// stays at 0) so the field is uniform across modes.
     pub(crate) rlm_archived_messages: Arc<std::sync::atomic::AtomicUsize>,
+    /// Session-scoped repo-map cache shared between the per-run
+    /// `RepoMapPolicy` and the `repo_map` drill-down tool. Built
+    /// lazily on the first injection; rebuilt only when its
+    /// (path, mtime) stamp goes stale at a run boundary. Plan 02
+    /// of `docs/local_model_augmentation/`.
+    pub(crate) repo_map_cache: crate::repo_map::SharedRepoMap,
     /// The model's plan/todo list for this session. Owned here so the
     /// `todo_write` tool (writer), the status bar (reader via
     /// `status_event`), and the verifier policy (reader) all share one
@@ -1987,6 +2003,22 @@ impl ControllerState {
 
     fn current_model_uses_ollama_chat_api(&self) -> bool {
         self.config.current_model().api == ApiKind::OllamaChatApi
+    }
+
+    /// Prompt-weight tier for the current effective context
+    /// window (post-`/context-length` override). Plan 04 of
+    /// `docs/local_model_augmentation/`.
+    ///
+    /// Small-tier compaction is a local-model (rlm) measure:
+    /// outside rlm mode the tier is always `Full`, so hosted /
+    /// current-mode prompts stay byte-identical regardless of
+    /// the model's window (2026-06-12 review: a hosted 32k
+    /// model must not get truncated catalogs).
+    pub(crate) fn prompt_tier(&self) -> PromptTier {
+        if !self.harness_mode.installs_rlm_features() {
+            return PromptTier::Full;
+        }
+        PromptTier::from_effective_window(self.config.effective_ollama_context_window())
     }
 
     fn context_length_non_ollama_message(&self) -> String {
@@ -2500,11 +2532,13 @@ impl ControllerState {
             self.config.anie_config().clone(),
         ));
         let cwd = self.session.cwd().to_path_buf();
+        let tier = self.prompt_tier();
         self.prompt_cache.replace(
             &cwd,
             &self.tool_registry,
             &self.skill_registry,
             self.config.anie_config(),
+            tier,
         )?;
         self.persist_runtime_state_logged("reload_config");
         Ok(())
@@ -2533,14 +2567,20 @@ impl ControllerState {
         decomposer.decompose(user_task).await
     }
 
-    /// Rebuild the system prompt if the set of context files or any of their mtimes changed.
+    /// Rebuild the system prompt if the set of context files,
+    /// any of their mtimes, or the prompt tier changed. Runs
+    /// at the top of every prompt/continuation run, so a
+    /// `/context-length` change re-tiers the prompt before
+    /// the next model call.
     fn refresh_system_prompt_if_needed(&mut self) {
         let cwd = self.session.cwd().to_path_buf();
+        let tier = self.prompt_tier();
         self.prompt_cache.refresh_if_stale(
             &cwd,
             &self.tool_registry,
             &self.skill_registry,
             self.config.anie_config(),
+            tier,
         );
     }
 }
@@ -2571,6 +2611,7 @@ fn build_agent(
     state: &ControllerState,
     compaction_gate: Option<Arc<dyn anie_agent::CompactionGate>>,
     rlm_extras: RlmExtras,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> AgentLoop {
     // Most runs (current / baseline modes) reuse the bootstrap
     // tool registry verbatim — cheap `Arc::clone`. Only `rlm`
@@ -2589,6 +2630,18 @@ fn build_agent(
     // live-world questions" drowns out the per-turn
     // ledger's request to prefer recurse.
     let system_prompt = compose_system_prompt(state);
+    // Plan 04 §2e of `docs/local_model_augmentation/`: a
+    // prompt past half the rlm ceiling means the window is
+    // mostly spent before the conversation starts. Warn once
+    // per process — the prompt is byte-stable across turns,
+    // so repeating it every run is pure noise.
+    if state.harness_mode.installs_rlm_features()
+        && let Some(message) =
+            prompt_budget_warning(estimate_text_tokens(&system_prompt), rlm_active_ceiling_tokens())
+    {
+        static PROMPT_BUDGET_WARNED: std::sync::Once = std::sync::Once::new();
+        PROMPT_BUDGET_WARNED.call_once(|| warn!("{message}"));
+    }
     let mut config = AgentLoopConfig::new(
         state.config.current_model().clone(),
         system_prompt,
@@ -2602,18 +2655,41 @@ fn build_agent(
     .with_tool_call_repair(should_repair_tool_calls(state))
     .with_failure_loop_threshold(failure_loop_threshold(state))
     .with_recurse_depth_threshold(recurse_depth_threshold(state));
-    // Compose the before-model seam. Order: rlm context-virtualization
-    // (replace) first, then the verifier (append), then the budget gate
-    // (stop). Each is opt-in; with none installed the loop keeps its Noop
-    // default (byte-identical to today); with exactly one, it installs
+    // Plan 01 §9b of `docs/local_model_augmentation/`: ground the
+    // repair side-request prompts in the per-tool example calls.
+    // Gated on repair itself so non-rlm configs stay untouched.
+    if should_repair_tool_calls(state) {
+        config = config.with_repair_examples(crate::tool_examples::repair_examples(
+            tool_registry.definitions_borrowed(),
+        ));
+    }
+    // Compose the before-model seam. Order: repo-map injection
+    // (append, first model turn only), then rlm context-virtualization
+    // (replace), then the verifier (append), then harness-run
+    // verification (append), then the budget gate (stop). The map runs
+    // BEFORE the virtualization policy so it is part of the working
+    // set the evictor budgets against (plan 02 §2b of
+    // `docs/local_model_augmentation/`). Each is
+    // opt-in; with none installed the loop keeps its Noop default
+    // (byte-identical to today); with exactly one, it installs
     // directly; with several, they fold through ChainedBeforeModelPolicy.
     let mut policies: Vec<Arc<dyn anie_agent::BeforeModelPolicy>> = Vec::new();
+    if crate::repo_map::repo_map_enabled(state.harness_mode) {
+        policies.push(Arc::new(crate::repo_map::RepoMapPolicy::new(
+            state.session.cwd().to_path_buf(),
+            crate::repo_map::repo_map_token_budget(state.prompt_tier()),
+            Arc::clone(&state.repo_map_cache),
+        )));
+    }
     if let Some(rlm) = rlm_extras.policy {
         policies.push(rlm);
     }
     let verifier = crate::verifier::VerifierPolicy::from_env(Arc::clone(&state.todo_list));
     if verifier.is_enabled() {
         policies.push(Arc::new(verifier));
+    }
+    if let Some(verify) = build_verify_policy(state, event_tx) {
+        policies.push(Arc::new(verify));
     }
     let budget = crate::budget_policy::BudgetPolicy::new(
         state.config.anie_config().budget.clone(),
@@ -2663,6 +2739,36 @@ fn env_flag_enabled(name: &str) -> bool {
         std::env::var(name).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+/// Plan 03 §2a of `docs/local_model_augmentation/`. Install the
+/// harness-run verification policy only when `[verify].command` is
+/// configured — an unconfigured section is a byte-identical noop.
+/// Active in `--harness-mode=rlm` by default; `ANIE_DISABLE_VERIFY=1`
+/// turns it off for smoke-test bisection.
+fn build_verify_policy(
+    state: &ControllerState,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
+) -> Option<crate::verify_runner::VerifyPolicy> {
+    if !state.harness_mode.installs_rlm_features() {
+        return None;
+    }
+    if env_flag_enabled("ANIE_DISABLE_VERIFY") {
+        return None;
+    }
+    let verify = &state.config.anie_config().verify;
+    let command = verify.command.clone()?;
+    let cwd = state.session.cwd().to_path_buf();
+    let sandbox =
+        crate::verify_runner::sandbox_spec(&state.config.anie_config().tools.sandbox, &cwd);
+    let runner = crate::verify_runner::VerifyRunner::new(
+        command,
+        std::time::Duration::from_secs(verify.timeout_s),
+        usize::try_from(verify.max_output_lines).unwrap_or(usize::MAX),
+        cwd,
+        sandbox,
+    );
+    Some(crate::verify_runner::VerifyPolicy::new(runner, event_tx))
 }
 
 /// PR 2 of `docs/harness_mitigations_2026-05-01/`. Returns
@@ -2769,6 +2875,89 @@ pub(crate) fn render_skills_listing(
     out
 }
 
+/// Prompt-weight tier. `Small` = effective context window
+/// ≤ 32k (post-`/context-length` override) — every
+/// system-prompt token visibly displaces working room, so
+/// catalogs, examples, and the rlm augment all shrink.
+/// `Full` keeps today's byte-identical prompts. Derived
+/// from the window, not from model-size guesses: a 14B at
+/// 64k is `Full`. Plan 04 of `docs/local_model_augmentation/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTier {
+    Small,
+    Full,
+}
+
+/// Default Small/Full boundary. Tunable via
+/// `ANIE_SMALL_TIER_MAX_WINDOW`.
+const DEFAULT_SMALL_TIER_MAX_WINDOW_TOKENS: u64 = 32_768;
+
+impl PromptTier {
+    pub(crate) fn from_effective_window(window_tokens: u64) -> Self {
+        if window_tokens <= small_tier_max_window_tokens() {
+            Self::Small
+        } else {
+            Self::Full
+        }
+    }
+}
+
+fn small_tier_max_window_tokens() -> u64 {
+    std::env::var("ANIE_SMALL_TIER_MAX_WINDOW")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_SMALL_TIER_MAX_WINDOW_TOKENS)
+}
+
+/// Token cap for context files in the Small tier. Tunable
+/// via `ANIE_CONTEXT_FILES_TOKENS`. Plan 04 §2c.
+const DEFAULT_CONTEXT_FILES_TOKEN_CAP: u64 = 1_500;
+
+fn context_files_token_cap() -> u64 {
+    std::env::var("ANIE_CONTEXT_FILES_TOKENS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CONTEXT_FILES_TOKEN_CAP)
+}
+
+/// Byte-heuristic token estimate for prompt text. Matches
+/// `anie_session::estimate_tokens`'s text rule (bytes / 4)
+/// so the Small-tier budgets and the eviction pipeline
+/// measure with the same yardstick.
+pub(crate) fn estimate_text_tokens(text: &str) -> u64 {
+    (text.len() as u64) / 4
+}
+
+/// Plan 04 §2e: with a finite rlm ceiling, a system prompt
+/// that eats more than half the window leaves the model no
+/// working room — misconfiguration that previously degraded
+/// silently (field notes F5: 11.3k prompt vs 16.4k ceiling).
+/// Returns the warning to log, or `None` when within budget
+/// or when the ceiling is the `u64::MAX` noop install.
+fn prompt_budget_warning(prompt_tokens: u64, ceiling_tokens: u64) -> Option<String> {
+    if ceiling_tokens == u64::MAX || prompt_tokens <= ceiling_tokens / 2 {
+        return None;
+    }
+    Some(format!(
+        "estimated system prompt is {prompt_tokens} tokens — more than half the \
+         {ceiling_tokens}-token active-context ceiling, leaving little working room. \
+         Trim skills/context files or raise ANIE_ACTIVE_CEILING_TOKENS."
+    ))
+}
+
+/// Plan 04 §2d: the Small tier swaps the syntax-manual
+/// ledger + augment for the v2 plain-line shape.
+/// `ANIE_LEDGER=v1` is the escape hatch back to the old
+/// format; Full tier always keeps v1.
+fn small_tier_ledger_enabled(tier: PromptTier, ledger_env: Option<&str>) -> bool {
+    tier == PromptTier::Small && ledger_env.map(str::trim) != Some("v1")
+}
+
+fn use_small_tier_ledger(state: &ControllerState) -> bool {
+    small_tier_ledger_enabled(state.prompt_tier(), std::env::var("ANIE_LEDGER").ok().as_deref())
+}
+
 /// rlm-mode system-prompt augment. Establishes the policy
 /// before the conversation starts so it competes with —
 /// not just supplements — the cached prompt's "use
@@ -2777,19 +2966,34 @@ pub(crate) fn render_skills_listing(
 /// what closes the re-fetch loop.
 const RLM_SYSTEM_PROMPT_AUGMENT: &str = "\n\n# Context virtualization (rlm mode)\n\nThis run uses an external archive of prior conversation. Every tool call you issue is recorded there with its arguments. Each turn you receive a `<system-reminder>` ledger listing the URLs, queries, commands, and paths already used.\n\nLedger entry format: each entry is `<value> (id=<call_id>)`. The `<value>` is the URL/query/command/path itself (what you'd compare against the user's question); the `<call_id>` is the runtime tool-call identifier you pass to recurse. Example: `https://example.com/page (id=ollama_tool_call_8_2)` means the value is `https://example.com/page` and the call_id is `ollama_tool_call_8_2`. Never pass the parens or the literal string `(id=...)` as a tool_call_id.\n\nWhen the user asks a follow-up question, FIRST scan the ledger. If the answer would come from a URL, query, command, or path already listed, do NOT re-run the tool. Use `recurse` instead:\n  - `scope.kind=message_grep`, `pattern=<regex>` — search archived messages by keyword. Easiest option; needs no id. Use this first when you're not sure which prior result has the answer.\n  - `scope.kind=tool_result`, `tool_call_id=<id>` — fetch one prior result verbatim. Pass the `<call_id>` from a ledger entry as the tool_call_id (without the parens, without the `id=` prefix).\n  - `scope.kind=summary`, `id=<archive_id>` — fetch the gist (cheapest).\n\nThis applies even to live-world questions (weather, news, prices) when the relevant pages are already in the archive — re-fetching wastes the user's time. Reach for `web_read` / `web_search` only when no archived material would answer the question.\n\n# Verify before claiming success\n\nThe ledger also lists the bash commands you've run. After any `edit` or `write` to a file you're testing, find the most recent build/test/run command in the ledger and re-execute it before claiming the change works. If the recent failure ledger lists [tool error] entries on a tool call you just made, do NOT skip past them — re-verify the underlying state (re-read the file, re-run the command). The harness will surface a `[loop warning]` `<system-reminder>` if it sees the same tool failing repeatedly with the same arguments — when that fires, change your approach instead of retrying.\n\n# Skills\n\nWhen the system prompt lists `Available skills`, those skills are pre-written guidance for specific situations. If a skill's description matches what you're about to do (writing C++ that uses raw memory, switching topics to look up live data, fixing a bug a previous tool call surfaced), load it FIRST with the `skill` tool — the body may save you from a known-bad failure mode. Loading is cheap; not loading when relevant is the actual cost.";
 
+/// Plan 04 §2d replacement for [`RLM_SYSTEM_PROMPT_AUGMENT`]
+/// in the Small tier. <150 tokens; teaches NO ledger syntax —
+/// the field session (notes F2) showed the 700-token syntax
+/// manual leaking into bash commands on a 0.8B model. Covers
+/// only: the archive exists, don't repeat listed calls, the
+/// one recurse shape worth knowing, verify after edits.
+const RLM_SYSTEM_PROMPT_AUGMENT_SMALL: &str = "\n\n# Conversation archive (rlm mode)\n\nOlder messages are moved to an archive instead of staying in this conversation. Each turn a `<system-reminder>` ledger lists the tool calls already made — their results are saved, so do NOT repeat them. To search the archived results, call the `recurse` tool with arguments {\"scope\": {\"kind\": \"message_grep\", \"pattern\": \"<words>\"}}. After you edit or write a file, re-run the most recent build or test command before saying the change works.";
+
 /// Build the per-run system prompt. In non-rlm modes
 /// returns the cached prompt verbatim. In rlm mode
-/// appends [`RLM_SYSTEM_PROMPT_AUGMENT`] and the per-tool
-/// example-call block (Plan 01 PR 3 of
-/// `docs/local_model_augmentation/`). Both appendices are
-/// static for the lifetime of the registry, so the prompt
-/// stays byte-stable across turns (prefix-cache discipline).
+/// appends [`RLM_SYSTEM_PROMPT_AUGMENT`] (or the Small-tier
+/// short form when ledger v2 is active, plan 04 §2d) and
+/// the per-tool example-call block (Plan 01 PR 3 of
+/// `docs/local_model_augmentation/`). All appendices are
+/// static for the lifetime of the registry + tier, so the
+/// prompt stays byte-stable across turns (prefix-cache
+/// discipline).
 pub(crate) fn compose_system_prompt(state: &ControllerState) -> String {
     let mut prompt = state.prompt_cache.current().to_string();
     if state.harness_mode.installs_rlm_features() {
-        prompt.push_str(RLM_SYSTEM_PROMPT_AUGMENT);
+        if use_small_tier_ledger(state) {
+            prompt.push_str(RLM_SYSTEM_PROMPT_AUGMENT_SMALL);
+        } else {
+            prompt.push_str(RLM_SYSTEM_PROMPT_AUGMENT);
+        }
         prompt.push_str(&crate::tool_examples::render_tool_examples(
             state.tool_registry.definitions_borrowed(),
+            state.prompt_tier(),
         ));
     }
     prompt
@@ -3139,7 +3343,13 @@ fn build_rlm_extras(
         Arc::clone(&session_state.pushed),
     )
     .with_external_size_atomic(Arc::clone(&state.rlm_archived_messages))
-    .with_summarizer(session_state.summary_tx.clone());
+    .with_summarizer(session_state.summary_tx.clone())
+    // Plan 04 §2d: Small tier gets the v2 plain-line ledger
+    // (no id notation); `ANIE_LEDGER=v1` restores the old
+    // format. Must stay in lockstep with the augment choice
+    // in `compose_system_prompt` — both read
+    // `use_small_tier_ledger`.
+    .with_small_tier_ledger(use_small_tier_ledger(state));
     if let Some(tx) = event_tx {
         policy = policy.with_event_sender(tx);
     }
@@ -3152,17 +3362,52 @@ fn build_rlm_extras(
     }
 }
 
+/// First sentence of a tool description, for the Small-tier
+/// one-line catalog (plan 04 §2a). "Sentence" = up to the
+/// first `.` that ends a word; descriptions without one come
+/// through whole. Newlines collapse to spaces either way so
+/// the catalog stays one line per tool.
+fn first_sentence(description: &str) -> String {
+    let flattened = description.replace('\n', " ");
+    let trimmed = flattened.trim();
+    match trimmed
+        .char_indices()
+        .find(|&(idx, ch)| {
+            ch == '.'
+                && trimmed[idx + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+        })
+        .map(|(idx, ch)| idx + ch.len_utf8())
+    {
+        Some(end) => trimmed[..end].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
 /// Build the system prompt for interactive, print, and RPC runs.
+///
+/// `tier` shapes the prompt-side catalogs only (plan 04 of
+/// `docs/local_model_augmentation/`): `Full` is byte-identical
+/// to the pre-plan-04 prompt; `Small` compacts the tool list
+/// to one line per tool, budgets the skills catalog, and caps
+/// context files at [`DEFAULT_CONTEXT_FILES_TOKEN_CAP`]
+/// tokens. The wire `tools` array is untouched either way.
 pub fn build_system_prompt(
     cwd: &Path,
     tools: &ToolRegistry,
     skills: &crate::skills::SkillRegistry,
     config: &AnieConfig,
+    tier: PromptTier,
 ) -> Result<String> {
     let tool_list = tools
         .definitions()
         .into_iter()
-        .map(|tool| format!("- {}: {}", tool.name, tool.description))
+        .map(|tool| match tier {
+            PromptTier::Full => format!("- {}: {}", tool.name, tool.description),
+            PromptTier::Small => format!("- {}: {}", tool.name, first_sentence(&tool.description)),
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -3175,16 +3420,52 @@ pub fn build_system_prompt(
     };
 
     let mut parts = vec![default_base];
-    let skill_catalog = crate::skills::render_catalog(skills);
+    let skill_catalog = crate::skills::render_catalog(skills, tier);
     if !skill_catalog.is_empty() {
         parts.push(skill_catalog);
     }
-    for context_file in collect_context_files(cwd, &config.context)? {
-        parts.push(format!(
-            "# Project Context\n\n## {}\n\n{}",
-            context_file.path.display(),
-            context_file.contents,
-        ));
+    let context_files = collect_context_files(cwd, &config.context)?;
+    match tier {
+        PromptTier::Full => {
+            for context_file in context_files {
+                parts.push(format!(
+                    "# Project Context\n\n## {}\n\n{}",
+                    context_file.path.display(),
+                    context_file.contents,
+                ));
+            }
+        }
+        PromptTier::Small => {
+            // Plan 04 §2c: include files in nearness order
+            // (`collect_context_files` walks cwd upward, so
+            // project files come first) until the token cap,
+            // then stop — skipping ahead would let a far file
+            // shadow a nearer one. The note keeps the omission
+            // visible to the model and the user.
+            let cap = context_files_token_cap();
+            let mut used = 0u64;
+            let mut omitted = 0usize;
+            for context_file in context_files {
+                let section = format!(
+                    "# Project Context\n\n## {}\n\n{}",
+                    context_file.path.display(),
+                    context_file.contents,
+                );
+                let cost = estimate_text_tokens(&section);
+                if omitted > 0 || used.saturating_add(cost) > cap {
+                    omitted += 1;
+                    continue;
+                }
+                used += cost;
+                parts.push(section);
+            }
+            if omitted > 0 {
+                parts.push(format!(
+                    "{omitted} context file{} omitted; ask the user if instructions seem missing.",
+                    if omitted == 1 { "" } else { "s" },
+                ));
+            }
+        }
     }
     parts.push(format!("Current date: {}", current_date_ymd()?));
     parts.push(format!("Current working directory: {}", cwd.display()));

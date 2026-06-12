@@ -8,4 +8,7 @@ prompt = "What is the name of the provider trait in anie-provider, and what is i
 contains = ["Provider", "stream"]
 must_call_tool = "grep"
 min_tool_calls = 1
-max_tokens = 80000
+# Plan 04 PR 15 of docs/local_model_augmentation/: Small-tier
+# prompt-weight expectation — a one-grep answer should fit a ~4k
+# turn-0 prompt across a handful of turns, not an 80k budget.
+max_tokens = 24000

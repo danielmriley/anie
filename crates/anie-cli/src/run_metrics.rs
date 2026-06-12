@@ -27,7 +27,17 @@ use crate::harness_mode::HarnessMode;
 /// |         | result details. Plan 01 PR 4 of                     |
 /// |         | `docs/local_model_augmentation/`. Older artifacts   |
 /// |         | load with the counters defaulted to zero.           |
-pub const RUN_METRICS_SCHEMA_VERSION: u32 = 2;
+/// | 3       | `tool_repair.repaired_then_failed`, counted off the |
+/// |         | `repair_outcome: executed_with_error` detail marker |
+/// |         | (a repaired call that then failed at execution).    |
+/// |         | Plan 01 §9b. v2 artifacts load with the counter     |
+/// |         | defaulted to zero.                                  |
+/// | 4       | `recovery` (plan 03 PR 12: verify runs/failures,    |
+/// |         | loop perturbations, grounded edit failures) and     |
+/// |         | `prompt.system_prompt_tokens` (plan 04 PR 15), one  |
+/// |         | combined bump. Older artifacts load with both       |
+/// |         | blocks defaulted.                                   |
+pub const RUN_METRICS_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunMetrics {
@@ -50,7 +60,69 @@ pub struct RunMetrics {
     /// still deserialize.
     #[serde(default)]
     pub tool_repair: ToolRepairMetrics,
+    /// Plan 03 PR 12 of `docs/local_model_augmentation/`:
+    /// write-side recovery counters (schema v4). Defaulted so
+    /// older artifacts still deserialize.
+    #[serde(default)]
+    pub recovery: RecoveryMetrics,
+    /// Plan 04 PR 15 of `docs/local_model_augmentation/`:
+    /// prompt-weight metrics (schema v4). Defaulted so older
+    /// artifacts still deserialize.
+    #[serde(default)]
+    pub prompt: PromptMetrics,
 }
+
+/// Counters for the plan-03 write-side recovery pipeline, derived
+/// from signals already on the event stream:
+///
+/// - `verify_runs` / `verify_failures`: the harness verify policy's
+///   `SystemMessage` events (`verify_runner::VERIFY_EVENT_PREFIX` /
+///   `VERIFY_FAILURE_EVENT_PREFIX`).
+/// - `loop_perturbations`: the `[loop warning]` `SystemMessage` the
+///   failure-loop detector emits at the same threshold crossing that
+///   arms the temperature perturbation (`agent_loop.rs::
+///   observe_failure_loop`). anie-specific caveat: a similar-call
+///   streak of 5 also arms the shared slot but emits no event, and
+///   `ANIE_LOOP_PERTURB=0` keeps the warning while disabling the
+///   bump — so this counts detector crossings, the observable
+///   signal, not literal temperature bumps.
+/// - `grounded_edit_failures`: tool results carrying the grounding
+///   attachment (`agent_loop.rs::edit_grounding_note`'s stable
+///   prefix).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RecoveryMetrics {
+    /// Harness-run verify command executions (plan 03 §2a).
+    pub verify_runs: u32,
+    /// Verify executions that failed (non-zero exit, timeout, or
+    /// spawn failure).
+    pub verify_failures: u32,
+    /// Failure-loop threshold crossings that arm the temperature
+    /// perturbation (plan 03 §2b; see the caveat above).
+    pub loop_perturbations: u32,
+    /// Edit/apply_patch failures that received a grounded
+    /// current-content attachment (plan 03 §2c).
+    pub grounded_edit_failures: u32,
+}
+
+/// Prompt-weight metrics (plan 04 §2e / PR 15).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PromptMetrics {
+    /// Estimated tokens in the composed system prompt (the same
+    /// bytes/4 yardstick as `anie_session::estimate_tokens`'s text
+    /// rule). `0` when the producer didn't report it.
+    pub system_prompt_tokens: u64,
+}
+
+/// Stable prefix of the failure-loop detector's SystemMessage
+/// (`agent_loop.rs::observe_failure_loop`). The detector lives in
+/// `anie-agent`, which doesn't export the literal — the drift risk
+/// is accepted and guarded by the agent-side tests on the message
+/// text.
+const LOOP_WARNING_EVENT_PREFIX: &str = "[loop warning]";
+
+/// Stable prefix of the grounded edit-failure attachment
+/// (`agent_loop.rs::edit_grounding_note`).
+const EDIT_GROUNDING_NOTE_PREFIX: &str = "[harness note] Current content of ";
 
 /// Counters for the Plan-01 tool-call rescue pipeline, derived
 /// from markers the agent loop leaves in `ToolExecEnd` result
@@ -65,6 +137,11 @@ pub struct ToolRepairMetrics {
     /// Calls where repair was attempted and the call still
     /// failed validation.
     pub failed_after_repair: u32,
+    /// Calls the repair round made schema-valid that then failed
+    /// at EXECUTION (repaired-but-worse; schema v3). Plan 01 §9b
+    /// of `docs/local_model_augmentation/`.
+    #[serde(default)]
+    pub repaired_then_failed: u32,
 }
 
 /// Field names mirror `Usage` exactly. `total_tokens` here is the summed
@@ -116,6 +193,8 @@ pub struct RunMetricsAccumulator {
     tools: ToolMetrics,
     compaction: CompactionMetrics,
     tool_repair: ToolRepairMetrics,
+    recovery: RecoveryMetrics,
+    prompt: PromptMetrics,
     /// `call_id -> tool_name`, seeded from `ToolExecStart`, so the
     /// nameless `ToolExecEnd` can attribute per-tool outcomes.
     pending_tools: HashMap<String, String>,
@@ -135,8 +214,17 @@ impl RunMetricsAccumulator {
             tools: ToolMetrics::default(),
             compaction: CompactionMetrics::default(),
             tool_repair: ToolRepairMetrics::default(),
+            recovery: RecoveryMetrics::default(),
+            prompt: PromptMetrics::default(),
             pending_tools: HashMap::new(),
         }
+    }
+
+    /// Record the composed system prompt's estimated weight (plan 04
+    /// PR 15). Call once, at construction time, with the same prompt
+    /// the run sends — `run_print_mode` does so right after `new`.
+    pub fn set_system_prompt(&mut self, system_prompt: &str) {
+        self.prompt.system_prompt_tokens = crate::controller::estimate_text_tokens(system_prompt);
     }
 
     /// Fold one event into the running totals. No I/O.
@@ -194,6 +282,38 @@ impl RunMetricsAccumulator {
                 if result.details.get("argument_repair_failed").is_some() {
                     self.tool_repair.failed_after_repair += 1;
                 }
+                // Schema v3 (Plan 01 §9b): repaired-but-worse — the
+                // repaired call executed and failed.
+                if result
+                    .details
+                    .get("repair_outcome")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("executed_with_error")
+                {
+                    self.tool_repair.repaired_then_failed += 1;
+                }
+                // Schema v4 (plan 03 §2c): a grounded edit failure
+                // carries the current-content attachment in the
+                // result.
+                if result.content.iter().any(|block| {
+                    matches!(block, anie_protocol::ContentBlock::Text { text }
+                        if text.starts_with(EDIT_GROUNDING_NOTE_PREFIX))
+                }) {
+                    self.recovery.grounded_edit_failures += 1;
+                }
+            }
+            // Schema v4 (plan 03 §2a/§2b): verify runs and
+            // loop-perturbation crossings surface as SystemMessage
+            // events with stable prefixes.
+            AgentEvent::SystemMessage { text } => {
+                if text.starts_with(crate::verify_runner::VERIFY_EVENT_PREFIX) {
+                    self.recovery.verify_runs += 1;
+                    if text.starts_with(crate::verify_runner::VERIFY_FAILURE_EVENT_PREFIX) {
+                        self.recovery.verify_failures += 1;
+                    }
+                } else if text.starts_with(LOOP_WARNING_EVENT_PREFIX) {
+                    self.recovery.loop_perturbations += 1;
+                }
             }
             AgentEvent::CompactionEnd { phase, .. } => {
                 self.compaction.total += 1;
@@ -222,6 +342,8 @@ impl RunMetricsAccumulator {
             tools: self.tools,
             compaction: self.compaction,
             tool_repair: self.tool_repair,
+            recovery: self.recovery,
+            prompt: self.prompt,
         }
     }
 }
@@ -444,7 +566,31 @@ mod tests {
         assert_eq!(m.tool_repair.coerced, 1);
         assert_eq!(m.tool_repair.repaired, 1);
         assert_eq!(m.tool_repair.failed_after_repair, 1);
+        assert_eq!(m.tool_repair.repaired_then_failed, 0);
         assert_eq!(m.tools.calls, 4, "rescue counters don't replace call counts");
+    }
+
+    /// Schema v3 (Plan 01 §9b): a repaired call that then failed
+    /// at execution carries both the repair note and the
+    /// `repair_outcome` marker; the accumulator counts it under
+    /// `repaired` AND `repaired_then_failed` (it was repaired —
+    /// the repair just didn't help).
+    #[test]
+    fn repaired_then_failed_counts_off_the_execution_outcome_marker() {
+        let m = fold(&[
+            tool_start("c1", "bash"),
+            tool_end_with_details(
+                "c1",
+                true,
+                serde_json::json!({
+                    "argument_repair_rounds": 1,
+                    "repair_outcome": "executed_with_error"
+                }),
+            ),
+        ]);
+        assert_eq!(m.tool_repair.repaired, 1);
+        assert_eq!(m.tool_repair.repaired_then_failed, 1);
+        assert_eq!(m.tool_repair.failed_after_repair, 0);
     }
 
     /// Forward-compat: a schema-v1 artifact (no `tool_repair`
@@ -465,6 +611,103 @@ mod tests {
         });
         let back: RunMetrics = serde_json::from_value(v1).expect("v1 artifact loads");
         assert_eq!(back.tool_repair, ToolRepairMetrics::default());
+    }
+
+    /// Forward-compat: a schema-v2 artifact (a `tool_repair`
+    /// block without `repaired_then_failed`) loads with the new
+    /// counter defaulted, not an error.
+    #[test]
+    fn v2_metrics_schema_loads_with_repaired_then_failed_defaulted() {
+        let v2 = serde_json::json!({
+            "schema_version": 2,
+            "harness_mode": "rlm",
+            "model": "m",
+            "provider": "p",
+            "wall_clock_ms": 5,
+            "turns": 1,
+            "tokens": TokenMetrics::default(),
+            "cost": Cost::default(),
+            "tools": ToolMetrics::default(),
+            "compaction": CompactionMetrics::default(),
+            "tool_repair": {
+                "coerced": 4,
+                "repaired": 3,
+                "failed_after_repair": 1
+            },
+        });
+        let back: RunMetrics = serde_json::from_value(v2).expect("v2 artifact loads");
+        assert_eq!(back.tool_repair.repaired, 3);
+        assert_eq!(back.tool_repair.repaired_then_failed, 0);
+    }
+
+    /// Plan 03 PR 12 (schema v4): recovery counters fold off the
+    /// observable signals — verify SystemMessages, loop-warning
+    /// SystemMessages, and the grounded-content attachment in tool
+    /// results. Unrelated SystemMessages count nothing.
+    #[test]
+    fn run_metrics_reports_recovery_counters() {
+        let grounded = AgentEvent::ToolExecEnd {
+            call_id: "c1".into(),
+            result: ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: format!("{EDIT_GROUNDING_NOTE_PREFIX}src/foo.rs:120-180 ..."),
+                }],
+                details: serde_json::Value::Null,
+            },
+            is_error: true,
+        };
+        let m = fold(&[
+            AgentEvent::SystemMessage {
+                text: "[verify] passed: cargo check".into(),
+            },
+            AgentEvent::SystemMessage {
+                text: "[verify] FAILED (exit 101): cargo check".into(),
+            },
+            AgentEvent::SystemMessage {
+                text: "[loop warning] tool `edit` failed 3 times in a row ...".into(),
+            },
+            AgentEvent::SystemMessage {
+                text: "switched model to x".into(),
+            },
+            tool_start("c1", "edit"),
+            grounded,
+        ]);
+        assert_eq!(m.recovery.verify_runs, 2);
+        assert_eq!(m.recovery.verify_failures, 1);
+        assert_eq!(m.recovery.loop_perturbations, 1);
+        assert_eq!(m.recovery.grounded_edit_failures, 1);
+    }
+
+    /// Forward-compat: a schema-v3 artifact (no `recovery` /
+    /// `prompt` blocks) loads with both defaulted, not an error.
+    #[test]
+    fn older_metrics_schema_loads_with_recovery_defaulted() {
+        let v3 = serde_json::json!({
+            "schema_version": 3,
+            "harness_mode": "rlm",
+            "model": "m",
+            "provider": "p",
+            "wall_clock_ms": 5,
+            "turns": 1,
+            "tokens": TokenMetrics::default(),
+            "cost": Cost::default(),
+            "tools": ToolMetrics::default(),
+            "compaction": CompactionMetrics::default(),
+            "tool_repair": ToolRepairMetrics::default(),
+        });
+        let back: RunMetrics = serde_json::from_value(v3).expect("v3 artifact loads");
+        assert_eq!(back.recovery, RecoveryMetrics::default());
+        assert_eq!(back.prompt, PromptMetrics::default());
+    }
+
+    /// Plan 04 PR 15: the prompt-weight estimate uses the bytes/4
+    /// yardstick shared with the eviction pipeline.
+    #[test]
+    fn system_prompt_tokens_use_the_bytes_over_four_yardstick() {
+        let mut a = acc();
+        a.set_system_prompt(&"x".repeat(400));
+        let m = a.finish();
+        assert_eq!(m.prompt.system_prompt_tokens, 100);
     }
 
     #[test]

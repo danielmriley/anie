@@ -7,24 +7,24 @@
 //! erroring.
 //!
 //! This test feeds a fully-populated JSON literal matching anie-cli's
-//! *current* serialization (schema v2, including the `cost`,
-//! `compaction`, and `tool_repair` blocks and the full `tokens`
-//! shape) through `RunMetricsView` and asserts every modelled field
-//! survives with its non-default value. If anie-cli renames a field
-//! the view reads, the matching assertion fails — turning a silent
-//! data-loss regression into a loud test failure.
+//! *current* serialization (schema v4, including the `cost`,
+//! `compaction`, `tool_repair`, `recovery`, and `prompt` blocks and
+//! the full `tokens` shape) through `RunMetricsView` and asserts every
+//! modelled field survives with its non-default value. If anie-cli
+//! renames a field the view reads, the matching assertion fails —
+//! turning a silent data-loss regression into a loud test failure.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use anie_evals::RunMetricsView;
 
-/// Mirror of anie-cli's `RunMetrics` serialization as of schema v2
+/// Mirror of anie-cli's `RunMetrics` serialization as of schema v4
 /// (`crates/anie-cli/src/run_metrics.rs`). Every field carries a
 /// distinct non-default value so the round-trip can prove each one
 /// landed in the right place rather than defaulting.
 fn fully_populated_run_metrics_json() -> serde_json::Value {
     serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 4,
         "harness_mode": "augmented",
         "model": "qwen2.5-coder:7b",
         "provider": "ollama",
@@ -59,18 +59,28 @@ fn fully_populated_run_metrics_json() -> serde_json::Value {
         "tool_repair": {
             "coerced": 4_u32,
             "repaired": 3_u32,
-            "failed_after_repair": 1_u32
+            "failed_after_repair": 1_u32,
+            "repaired_then_failed": 2_u32
+        },
+        "recovery": {
+            "verify_runs": 5_u32,
+            "verify_failures": 2_u32,
+            "loop_perturbations": 1_u32,
+            "grounded_edit_failures": 3_u32
+        },
+        "prompt": {
+            "system_prompt_tokens": 2_345_u64
         }
     })
 }
 
 #[test]
-fn run_metrics_view_round_trips_every_modelled_field_from_cli_schema_v2() {
+fn run_metrics_view_round_trips_every_modelled_field_from_cli_schema_v4() {
     let json = fully_populated_run_metrics_json();
     let view: RunMetricsView =
-        serde_json::from_value(json).expect("anie-cli schema-v2 JSON must deserialize into the view");
+        serde_json::from_value(json).expect("anie-cli schema-v4 JSON must deserialize into the view");
 
-    assert_eq!(view.schema_version, 2, "schema_version");
+    assert_eq!(view.schema_version, 4, "schema_version");
     assert_eq!(view.harness_mode, "augmented", "harness_mode");
     assert_eq!(view.wall_clock_ms, 12_345, "wall_clock_ms");
     assert_eq!(view.turns, 7, "turns");
@@ -96,19 +106,72 @@ fn run_metrics_view_round_trips_every_modelled_field_from_cli_schema_v2() {
     assert_eq!(write_file.calls, 5, "by_tool[write_file].calls");
     assert_eq!(write_file.failures, 2, "by_tool[write_file].failures");
 
-    // schema-v2 rescue counters — the field this guard most wants to
-    // protect, since the runner scores tool-reliability off it.
+    // Rescue counters (schema v2, extended in v3) — the fields this
+    // guard most wants to protect, since the runner scores
+    // tool-reliability off them.
     assert_eq!(view.tool_repair.coerced, 4, "tool_repair.coerced");
     assert_eq!(view.tool_repair.repaired, 3, "tool_repair.repaired");
     assert_eq!(
         view.tool_repair.failed_after_repair, 1,
         "tool_repair.failed_after_repair"
     );
+    assert_eq!(
+        view.tool_repair.repaired_then_failed, 2,
+        "tool_repair.repaired_then_failed"
+    );
+
+    // Recovery + prompt blocks (schema v4, plans 03/04 of
+    // `docs/local_model_augmentation/`).
+    assert_eq!(view.recovery.verify_runs, 5, "recovery.verify_runs");
+    assert_eq!(view.recovery.verify_failures, 2, "recovery.verify_failures");
+    assert_eq!(
+        view.recovery.loop_perturbations, 1,
+        "recovery.loop_perturbations"
+    );
+    assert_eq!(
+        view.recovery.grounded_edit_failures, 3,
+        "recovery.grounded_edit_failures"
+    );
+    assert_eq!(
+        view.prompt.system_prompt_tokens, 2_345,
+        "prompt.system_prompt_tokens"
+    );
+}
+
+#[test]
+fn v2_tool_repair_block_loads_with_repaired_then_failed_defaulted() {
+    // Forward-compat: a v2 artifact's `tool_repair` block predates
+    // `repaired_then_failed`; the view must default it, not error.
+    let mut json = fully_populated_run_metrics_json();
+    json["schema_version"] = serde_json::json!(2);
+    json["tool_repair"] = serde_json::json!({
+        "coerced": 4_u32,
+        "repaired": 3_u32,
+        "failed_after_repair": 1_u32
+    });
+    json.as_object_mut().unwrap().remove("recovery");
+    json.as_object_mut().unwrap().remove("prompt");
+    let view: RunMetricsView = serde_json::from_value(json).expect("v2 JSON loads");
+    assert_eq!(view.tool_repair.repaired, 3);
+    assert_eq!(view.tool_repair.repaired_then_failed, 0);
+}
+
+#[test]
+fn v3_artifact_loads_with_recovery_and_prompt_defaulted() {
+    // Forward-compat: a v3 artifact predates the `recovery` and
+    // `prompt` blocks; the view must default both, not error.
+    let mut json = fully_populated_run_metrics_json();
+    json["schema_version"] = serde_json::json!(3);
+    json.as_object_mut().unwrap().remove("recovery");
+    json.as_object_mut().unwrap().remove("prompt");
+    let view: RunMetricsView = serde_json::from_value(json).expect("v3 JSON loads");
+    assert_eq!(view.recovery, anie_evals::RecoveryView::default());
+    assert_eq!(view.prompt, anie_evals::PromptView::default());
 }
 
 #[test]
 fn run_metrics_view_matches_cli_expected_schema_version() {
     // The view's expected schema version must track anie-cli's
     // `RUN_METRICS_SCHEMA_VERSION`; the literal above is built for it.
-    assert_eq!(anie_evals::EXPECTED_RUN_METRICS_SCHEMA_VERSION, 2);
+    assert_eq!(anie_evals::EXPECTED_RUN_METRICS_SCHEMA_VERSION, 4);
 }

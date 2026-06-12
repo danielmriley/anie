@@ -8,4 +8,7 @@ prompt = "Read README.md and tell me whether anie supports MCP. Quote the releva
 contains = ["MCP"]
 must_call_tool = "read"
 min_tool_calls = 1
-max_tokens = 80000
+# Plan 04 PR 15 of docs/local_model_augmentation/: Small-tier
+# prompt-weight expectation — a single-read answer should fit a ~4k
+# turn-0 prompt across a handful of turns, not an 80k budget.
+max_tokens = 24000

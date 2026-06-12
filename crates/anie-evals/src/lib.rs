@@ -63,7 +63,7 @@ pub enum EvalError {
 /// The `RunMetrics` schema version this runner understands. Mirrors
 /// `anie-cli`'s `RUN_METRICS_SCHEMA_VERSION`; a mismatch means the metrics
 /// JSON may have changed field semantics and must not be silently scored.
-pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 2;
+pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 4;
 
 /// A deserialization view of anie-cli's `RunMetrics` JSON. anie-specific
 /// (deviation): this mirrors `anie-cli/src/run_metrics.rs` rather than
@@ -83,10 +83,37 @@ pub struct RunMetricsView {
     pub tokens: TokenView,
     #[serde(default)]
     pub tools: ToolView,
-    /// Plan 01 PR 4 rescue counters (schema v2). Defaulted so
-    /// the view also reads any stray v1-shaped JSON in tests.
+    /// Plan 01 rescue counters (schema v2, extended in v3).
+    /// Defaulted so the view also reads any stray v1-shaped
+    /// JSON in tests.
     #[serde(default)]
     pub tool_repair: ToolRepairView,
+    /// Plan 03 recovery counters (schema v4). Defaulted so
+    /// pre-v4 JSON still reads.
+    #[serde(default)]
+    pub recovery: RecoveryView,
+    /// Plan 04 prompt-weight metrics (schema v4). Defaulted so
+    /// pre-v4 JSON still reads.
+    #[serde(default)]
+    pub prompt: PromptView,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct RecoveryView {
+    #[serde(default)]
+    pub verify_runs: u32,
+    #[serde(default)]
+    pub verify_failures: u32,
+    #[serde(default)]
+    pub loop_perturbations: u32,
+    #[serde(default)]
+    pub grounded_edit_failures: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct PromptView {
+    #[serde(default)]
+    pub system_prompt_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -97,6 +124,11 @@ pub struct ToolRepairView {
     pub repaired: u32,
     #[serde(default)]
     pub failed_after_repair: u32,
+    /// Schema v3 (Plan 01 §9b): repaired calls that then failed
+    /// at execution. Defaulted so v2-shaped JSON in tests still
+    /// reads.
+    #[serde(default)]
+    pub repaired_then_failed: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

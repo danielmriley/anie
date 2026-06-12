@@ -218,6 +218,8 @@ mod tests {
             tokens: TokenView { total_tokens },
             tools: ToolView::default(),
             tool_repair: crate::ToolRepairView::default(),
+            recovery: crate::RecoveryView::default(),
+            prompt: crate::PromptView::default(),
         }
     }
 

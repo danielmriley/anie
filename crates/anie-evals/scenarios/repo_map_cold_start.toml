@@ -1,0 +1,20 @@
+# Plan 02 PR 8 of docs/local_model_augmentation/: cold-start
+# navigation on a tiny non-anie fixture. With the repo map injected
+# at turn 0 (rlm mode), the answer is already in the map's signature
+# skeleton (`src/util.py:N: def slugify(title):`), so the run should
+# need at most one confirming read inside a tight token budget;
+# map-off runs (`ANIE_REPO_MAP=0` or non-rlm modes) have to explore.
+# No must_call_tool: a map-on run legitimately answers with zero
+# tool calls.
+name = "repo_map_cold_start"
+family = "repo_navigation"
+description = "Cold-start orientation in an unfamiliar tiny project; the repo map should make exploration nearly free."
+
+prompt = "In this project, which file and function turn a task title into a URL-friendly slug? Answer with the file path and the function name."
+
+[fixture]
+dir = "crates/anie-evals/fixtures/mini_tasks"
+
+[expect]
+contains = ["util.py", "slugify"]
+max_tokens = 16000

@@ -20,6 +20,14 @@
 
 use anie_protocol::ToolDef;
 
+use crate::controller::PromptTier;
+
+/// Plan 04 §2a of `docs/local_model_augmentation/`: in the
+/// Small tier the example block keeps only the core tools —
+/// examples are the highest-value tokens we send a small
+/// model, but nine of them outweigh a 16k window.
+const SMALL_TIER_EXAMPLE_TOOLS: &[&str] = &["read", "write", "edit", "bash", "grep"];
+
 /// Example arguments for a known tool, as a JSON value so the
 /// rendering (and its escaping) is owned by serde rather than
 /// hand-written strings.
@@ -49,12 +57,17 @@ fn example_for(tool_name: &str) -> Option<serde_json::Value> {
 /// Render the example block for the given (already sorted)
 /// tool definitions. Tools without a known example are simply
 /// omitted; an empty result means no block at all, so callers
-/// can append unconditionally. The output depends only on the
-/// registered tool names — static per registry, so the system
-/// prompt stays prefix-cache stable across turns.
-pub(crate) fn render_tool_examples(definitions: &[ToolDef]) -> String {
+/// can append unconditionally. In the Small tier only the
+/// [`SMALL_TIER_EXAMPLE_TOOLS`] subset renders (plan 04 §2a).
+/// The output depends only on the registered tool names and
+/// the tier — static per registry, so the system prompt stays
+/// prefix-cache stable across turns.
+pub(crate) fn render_tool_examples(definitions: &[ToolDef], tier: PromptTier) -> String {
     let lines: Vec<String> = definitions
         .iter()
+        .filter(|def| {
+            tier == PromptTier::Full || SMALL_TIER_EXAMPLE_TOOLS.contains(&def.name.as_str())
+        })
         .filter_map(|def| example_for(&def.name).map(|example| format!("- {}: {example}", def.name)))
         .collect();
     if lines.is_empty() {
@@ -65,6 +78,22 @@ pub(crate) fn render_tool_examples(definitions: &[ToolDef]) -> String {
          shapes exactly:\n{}",
         lines.join("\n")
     )
+}
+
+/// Tool name → rendered example arguments for the registered
+/// definitions, for grounding the repair side-request prompt
+/// (`AgentLoopConfig::with_repair_examples`). Built from the
+/// same static map as the catalog block so the two can't
+/// drift. Plan 01 §9b of `docs/local_model_augmentation/`.
+pub(crate) fn repair_examples(
+    definitions: &[ToolDef],
+) -> std::collections::HashMap<String, String> {
+    definitions
+        .iter()
+        .filter_map(|def| {
+            example_for(&def.name).map(|example| (def.name.clone(), example.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -82,15 +111,44 @@ mod tests {
 
     #[test]
     fn examples_render_only_for_registered_tools() {
-        let rendered = render_tool_examples(&[def("bash"), def("not-a-real-tool")]);
+        let rendered = render_tool_examples(&[def("bash"), def("not-a-real-tool")], PromptTier::Full);
         assert!(rendered.contains("- bash: "), "{rendered}");
         assert!(!rendered.contains("not-a-real-tool"), "{rendered}");
     }
 
     #[test]
     fn no_known_tools_renders_empty_string() {
-        assert_eq!(render_tool_examples(&[def("mystery")]), "");
-        assert_eq!(render_tool_examples(&[]), "");
+        assert_eq!(render_tool_examples(&[def("mystery")], PromptTier::Full), "");
+        assert_eq!(render_tool_examples(&[], PromptTier::Full), "");
+    }
+
+    /// Plan 04 §2a: the Small tier keeps the example block but
+    /// drops to the five core tools, capping its prompt weight.
+    /// Full tier still renders every known example.
+    #[test]
+    fn small_tier_examples_cover_only_the_core_tools() {
+        let defs: Vec<ToolDef> = ["read", "write", "edit", "bash", "grep", "find", "ls", "todo_write"]
+            .iter()
+            .map(|name| def(name))
+            .collect();
+        let small = render_tool_examples(&defs, PromptTier::Small);
+        for core in SMALL_TIER_EXAMPLE_TOOLS {
+            assert!(small.contains(&format!("- {core}: ")), "{small}");
+        }
+        for dropped in ["find", "ls", "todo_write"] {
+            assert!(!small.contains(&format!("- {dropped}: ")), "{small}");
+        }
+        let full = render_tool_examples(&defs, PromptTier::Full);
+        assert!(full.contains("- find: "), "{full}");
+        assert!(full.contains("- todo_write: "), "{full}");
+    }
+
+    #[test]
+    fn repair_examples_map_covers_known_tools_and_skips_unknown_ones() {
+        let map = repair_examples(&[def("bash"), def("not-a-real-tool")]);
+        assert_eq!(map.len(), 1, "{map:?}");
+        let bash = map.get("bash").expect("bash example present");
+        assert!(bash.contains("\"command\""), "{bash}");
     }
 
     /// The drift guard: every example in the static map must

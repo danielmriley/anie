@@ -28,6 +28,7 @@ mod parallel_decompose;
 mod print_mode;
 mod recurse_factory;
 mod recurse_provider;
+mod repo_map;
 mod retry_policy;
 mod rpc;
 mod run_metrics;
@@ -38,6 +39,7 @@ mod skills;
 mod tool_examples;
 mod user_error;
 mod verifier;
+mod verify_runner;
 
 use std::{path::PathBuf, sync::OnceLock};
 
@@ -47,7 +49,7 @@ use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-pub use controller::build_system_prompt;
+pub use controller::{PromptTier, build_system_prompt};
 
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 

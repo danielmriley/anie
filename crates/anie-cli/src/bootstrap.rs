@@ -118,6 +118,19 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         ));
         Arc::new(tool_registry.with_added([skill_tool]))
     };
+    // Plan 02 PR 7 of `docs/local_model_augmentation/`: the
+    // `repo_map` drill-down tool is registered only when the map
+    // policy is active (mirrors SkillTool's conditional
+    // registration above — an always-on entry would be catalog
+    // noise in modes where no map is ever injected). The cache is
+    // shared with the per-run `RepoMapPolicy` via ControllerState.
+    let repo_map_cache = crate::repo_map::SharedRepoMap::default();
+    let tool_registry = with_repo_map_tool(
+        tool_registry,
+        !suppress_tools && crate::repo_map::repo_map_enabled(cli.harness_mode),
+        &cwd,
+        &repo_map_cache,
+    );
     let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)?;
     let request_options_resolver: Arc<dyn RequestOptionsResolver> =
         Arc::new(AuthResolver::new(cli.api_key.clone(), config.clone()));
@@ -161,6 +174,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: cli.harness_mode,
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache,
         todo_list,
         cost_meter,
     };
@@ -169,6 +183,31 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         warn!(%error, "failed to persist runtime state during bootstrap");
     }
     Ok(state)
+}
+
+/// Conditionally add the `repo_map` drill-down tool. `enabled`
+/// is the map-policy gate (`repo_map_enabled` + tool suppression);
+/// disabled returns the registry untouched so non-rlm catalogs
+/// stay byte-identical. The tool's fallback build budget uses the
+/// Full-tier default — like `SystemPromptCache::build`, the tier
+/// isn't resolved until the controller state exists, and the
+/// policy (which knows the tier) populates the shared cache at
+/// the first model turn before any tool call can land.
+fn with_repo_map_tool(
+    registry: Arc<ToolRegistry>,
+    enabled: bool,
+    cwd: &Path,
+    cache: &crate::repo_map::SharedRepoMap,
+) -> Arc<ToolRegistry> {
+    if !enabled {
+        return registry;
+    }
+    let tool: Arc<dyn anie_agent::Tool> = Arc::new(crate::repo_map::RepoMapTool::new(
+        cwd.to_path_buf(),
+        crate::repo_map::repo_map_token_budget(crate::controller::PromptTier::Full),
+        Arc::clone(cache),
+    ));
+    Arc::new(registry.with_added([tool]))
 }
 
 #[cfg(test)]
@@ -464,6 +503,33 @@ done
             mcp_tools.is_empty(),
             "suppressed-tools / baseline mode spawns no MCP servers"
         );
+    }
+}
+
+#[cfg(test)]
+mod repo_map_bootstrap_tests {
+    use super::*;
+
+    /// Plan 02 PR 7: the drill-down tool rides the same gate as
+    /// the map policy — when the policy is disabled the catalog
+    /// must stay byte-identical to today (no orphan `repo_map`
+    /// entry advertising a map that's never injected).
+    #[test]
+    fn tool_is_unregistered_when_map_policy_is_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = build_tool_registry(tmp.path(), false);
+        let cache = crate::repo_map::SharedRepoMap::default();
+
+        let disabled = with_repo_map_tool(Arc::clone(&base), false, tmp.path(), &cache);
+        assert!(disabled.get("repo_map").is_none());
+        assert_eq!(
+            disabled.definitions().len(),
+            base.definitions().len(),
+            "disabled gate must leave the registry untouched"
+        );
+
+        let enabled = with_repo_map_tool(base, true, tmp.path(), &cache);
+        assert!(enabled.get("repo_map").is_some());
     }
 }
 

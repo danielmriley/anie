@@ -188,6 +188,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache: crate::repo_map::SharedRepoMap::default(),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
@@ -268,6 +269,7 @@ fn controller_with_runtime_state_path(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache: crate::repo_map::SharedRepoMap::default(),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
@@ -625,7 +627,13 @@ fn compose_system_prompt_only_augments_in_rlm_mode() {
     let composed = compose_system_prompt(&state_baseline.state);
     assert_eq!(composed, cached, "baseline mode should not augment");
 
-    // Rlm mode: augment appended verbatim.
+    // Rlm mode: augment appended verbatim. A 32k window lands
+    // in the Small tier (plan 04), which swaps in the compact
+    // augment — pin the Full-tier augment against a window
+    // above the boundary.
+    let mut full_tier_model = model("gpt-4o", "openai");
+    full_tier_model.context_window = 131_072;
+    state_baseline.state.config.set_model(full_tier_model);
     state_baseline.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
     let composed = compose_system_prompt(&state_baseline.state);
     assert!(
@@ -789,9 +797,14 @@ fn build_system_prompt_omits_skill_catalog_when_registry_empty() {
     tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
     let skills = crate::skills::SkillRegistry::empty();
     let config = AnieConfig::default();
-    let prompt =
-        crate::controller::build_system_prompt(Path::new("/tmp"), &tools, &skills, &config)
-            .expect("build_system_prompt");
+    let prompt = crate::controller::build_system_prompt(
+        Path::new("/tmp"),
+        &tools,
+        &skills,
+        &config,
+        PromptTier::Full,
+    )
+    .expect("build_system_prompt");
 
     assert!(
         !prompt.contains("Available skills"),
@@ -819,9 +832,14 @@ fn build_system_prompt_omits_retest_directive_in_base_prompt() {
     tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
     let skills = crate::skills::SkillRegistry::empty();
     let config = AnieConfig::default();
-    let prompt =
-        crate::controller::build_system_prompt(Path::new("/tmp"), &tools, &skills, &config)
-            .expect("build_system_prompt");
+    let prompt = crate::controller::build_system_prompt(
+        Path::new("/tmp"),
+        &tools,
+        &skills,
+        &config,
+        PromptTier::Full,
+    )
+    .expect("build_system_prompt");
 
     assert!(
         !prompt.contains("you MUST re-run the most recent verification command"),
@@ -829,6 +847,200 @@ fn build_system_prompt_omits_retest_directive_in_base_prompt() {
          (re-running tests is rlm-mode behavior — keep base prompt \
          framing-neutral): {prompt}"
     );
+}
+
+/// Plan 04 of `docs/local_model_augmentation/`: the tier is
+/// derived from the effective window — inclusive at the 32k
+/// default boundary, so qwen-class 32k models land Small while
+/// a 14B at 64k stays Full.
+#[test]
+fn prompt_tier_boundary_is_32k_inclusive() {
+    assert_eq!(PromptTier::from_effective_window(16_384), PromptTier::Small);
+    assert_eq!(PromptTier::from_effective_window(32_768), PromptTier::Small);
+    assert_eq!(PromptTier::from_effective_window(32_769), PromptTier::Full);
+    assert_eq!(PromptTier::from_effective_window(131_072), PromptTier::Full);
+}
+
+/// Plan 04 §2a: the Small-tier tool catalog is one line per
+/// tool — name + first sentence — instead of the full
+/// multi-sentence descriptions.
+#[test]
+fn small_tier_catalog_renders_one_line_per_tool() {
+    // `first_sentence` semantics first, on fixed strings.
+    assert_eq!(first_sentence("Reads a file. Use offset for big files."), "Reads a file.");
+    assert_eq!(first_sentence("No trailing period"), "No trailing period");
+    assert_eq!(first_sentence("Handles v1.2 paths. Second sentence."), "Handles v1.2 paths.");
+    assert_eq!(first_sentence("Line one\nline two. Rest."), "Line one line two.");
+
+    let dir = tempdir().expect("tempdir");
+    let tools = build_tool_registry(dir.path(), false);
+    let skills = crate::skills::SkillRegistry::empty();
+    let config = AnieConfig::default();
+    let small = crate::controller::build_system_prompt(
+        dir.path(),
+        &tools,
+        &skills,
+        &config,
+        PromptTier::Small,
+    )
+    .expect("small prompt");
+    for def in tools.definitions() {
+        let expected = format!("- {}: {}", def.name, first_sentence(&def.description));
+        assert!(small.contains(&expected), "missing compact line for {}: {small}", def.name);
+    }
+    // The compaction is real: at least one default tool has a
+    // multi-sentence description that shrank.
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .any(|def| first_sentence(&def.description).len() < def.description.trim().len()),
+        "expected at least one default tool description to shrink in the Small tier"
+    );
+}
+
+/// Plan 04 regression guard: the Full tier is byte-identical
+/// to the pre-plan-04 prompt. The expected string here IS the
+/// old rendering, reconstructed literally — any drift in the
+/// Full-tier path fails this byte compare.
+#[test]
+fn full_tier_prompt_is_byte_identical_to_today() {
+    use anie_agent::ToolRegistry;
+
+    let dir = tempdir().expect("tempdir");
+    let cwd = dir.path().join("cwd");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::write(cwd.join("CLAUDE.md"), "Project instructions.\n").expect("write context file");
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
+    let mut skills = crate::skills::SkillRegistry::empty();
+    skills.insert_for_test(crate::skills::Skill {
+        name: "alpha".into(),
+        description: "Alpha skill.".into(),
+        disable_model_invocation: false,
+        license: None,
+        allowed_tools: Vec::new(),
+        body: "body".into(),
+        source: crate::skills::SkillSource::Bundled,
+        root_dir: std::path::PathBuf::new(),
+        manifest_path: std::path::PathBuf::new(),
+    });
+    let config = AnieConfig::default();
+
+    let prompt =
+        crate::controller::build_system_prompt(&cwd, &tools, &skills, &config, PromptTier::Full)
+            .expect("full prompt");
+
+    let tool = &tools.definitions()[0];
+    let expected = format!(
+        "You are an expert coding assistant. You help users by reading files, executing commands, editing code, and writing new files. When web tools are available, you can also answer questions that need information from the live internet — current weather, news, library/package status, documentation lookups, prices, definitions — not just coding research. Don't decline a real-world question on the assumption that your scope is the local project; check the tool list.\n\nAvailable tools:\n- {}: {}\n\nGuidelines:\n- Use bash for file operations like ls, grep, find\n- Use read to examine files (use offset + limit for large files)\n- Use edit for precise changes\n- Use write only for new files or complete rewrites\n- Use web_search + web_read for any question about the live state of the world (weather, news, current events, library docs, prices, etc.) when those tools are available\n- Be concise in your responses\n\nAvailable skills (load with the `skill` tool when relevant):\n- alpha: Alpha skill.\n\n\n# Project Context\n\n## {}\n\nProject instructions.\n\n\nCurrent date: {}\n\nCurrent working directory: {}",
+        tool.name,
+        tool.description,
+        cwd.join("CLAUDE.md").display(),
+        current_date_ymd().expect("date"),
+        cwd.display(),
+    );
+    assert_eq!(prompt, expected);
+}
+
+/// Plan 04 §2c: Small-tier context files are included in
+/// nearness order until the ~1,500-token cap, then dropped
+/// with a one-line note. Full tier keeps everything.
+#[test]
+fn context_files_truncate_at_budget_with_omission_note() {
+    use anie_agent::ToolRegistry;
+
+    let dir = tempdir().expect("tempdir");
+    let cwd = dir.path().join("cwd");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    // AGENTS.md loads first (config filename order) and fits;
+    // the 8KB CLAUDE.md (~2k estimated tokens) blows the
+    // 1,500-token default cap and is omitted.
+    fs::write(cwd.join("AGENTS.md"), "short instructions\n").expect("write agents");
+    fs::write(cwd.join("CLAUDE.md"), "x".repeat(8_000)).expect("write claude");
+
+    let tools = ToolRegistry::new();
+    let skills = crate::skills::SkillRegistry::empty();
+    let config = AnieConfig::default();
+
+    let small =
+        crate::controller::build_system_prompt(&cwd, &tools, &skills, &config, PromptTier::Small)
+            .expect("small prompt");
+    assert!(small.contains("short instructions"), "{small}");
+    assert!(
+        !small.contains(&format!("## {}", cwd.join("CLAUDE.md").display())),
+        "over-budget file should be omitted: {small}"
+    );
+    assert!(
+        small.contains("1 context file omitted; ask the user if instructions seem missing."),
+        "{small}"
+    );
+
+    let full =
+        crate::controller::build_system_prompt(&cwd, &tools, &skills, &config, PromptTier::Full)
+            .expect("full prompt");
+    assert!(full.contains(&"x".repeat(8_000)), "full tier keeps everything");
+    assert!(!full.contains("context file omitted"), "{full}");
+}
+
+/// Plan 04 §2e: a system prompt past half the rlm ceiling gets
+/// a startup warning instead of degrading silently (field
+/// notes F5: 11.3k prompt against a 16.4k ceiling).
+#[test]
+fn startup_warns_when_prompt_exceeds_half_the_ceiling() {
+    let warning = prompt_budget_warning(11_291, 16_384).expect("over half → warn");
+    assert!(warning.contains("11291"), "{warning}");
+    assert!(warning.contains("16384"), "{warning}");
+    assert!(prompt_budget_warning(8_192, 16_384).is_none(), "at half → quiet");
+    assert!(
+        prompt_budget_warning(1_000_000, u64::MAX).is_none(),
+        "noop ceiling install never warns"
+    );
+}
+
+/// Plan 04 §2d: ledger v2 is a Small-tier behavior with an
+/// `ANIE_LEDGER=v1` escape hatch; the Full tier never uses it.
+#[test]
+fn env_ledger_v1_restores_old_format_for_small_tier() {
+    assert!(small_tier_ledger_enabled(PromptTier::Small, None));
+    assert!(!small_tier_ledger_enabled(PromptTier::Small, Some("v1")));
+    assert!(!small_tier_ledger_enabled(PromptTier::Small, Some(" v1 ")));
+    assert!(small_tier_ledger_enabled(PromptTier::Small, Some("v2")));
+    assert!(!small_tier_ledger_enabled(PromptTier::Full, None));
+    assert!(!small_tier_ledger_enabled(PromptTier::Full, Some("v1")));
+}
+
+/// Plan 04 §2d: in the Small tier the rlm augment drops the
+/// ~700-token ledger syntax manual (which the field session
+/// showed leaking into bash commands, notes F2) for a <150-
+/// token version that advertises only the `message_grep`
+/// recurse shape — and no `(id=...)` notation anywhere.
+#[test]
+fn small_tier_rlm_augment_drops_ledger_syntax_manual() {
+    // <150 tokens by the same bytes/4 estimate the budgets use.
+    assert!(
+        RLM_SYSTEM_PROMPT_AUGMENT_SMALL.len() / 4 < 150,
+        "small augment must stay under 150 tokens, got ~{}",
+        RLM_SYSTEM_PROMPT_AUGMENT_SMALL.len() / 4
+    );
+
+    // Default fixture model has a 32k window → Small tier.
+    let (mut controller, _event_rx, _tx) = build_dispatch_controller(Vec::new(), 16);
+    controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    assert_eq!(controller.state.prompt_tier(), PromptTier::Small);
+
+    let composed = compose_system_prompt(&controller.state);
+    assert!(composed.contains("# Conversation archive (rlm mode)"), "{composed}");
+    assert!(composed.contains("{\"scope\": {\"kind\": \"message_grep\", \"pattern\":"), "{composed}");
+    assert!(!composed.contains("(id="), "no id notation in the small augment: {composed}");
+    assert!(!composed.contains("scope.kind="), "no scope grammar: {composed}");
+    assert!(
+        !composed.contains("Context virtualization (rlm mode)"),
+        "full augment must not also be present: {composed}"
+    );
+    // Verify-after-edit guidance survives the shrink.
+    assert!(composed.contains("re-run the most recent build or test command"), "{composed}");
 }
 
 #[test]
@@ -1149,6 +1361,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache: crate::repo_map::SharedRepoMap::default(),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
@@ -1167,13 +1380,21 @@ fn build_state_with_registry(
     runtime_state: RuntimeState,
     provider_registry: ProviderRegistry,
 ) -> ControllerState {
+    build_state_with_registry_and_config(model, runtime_state, provider_registry, AnieConfig::default())
+}
+
+fn build_state_with_registry_and_config(
+    model: Model,
+    runtime_state: RuntimeState,
+    provider_registry: ProviderRegistry,
+    config: AnieConfig,
+) -> ControllerState {
     let tempdir = tempdir().expect("tempdir");
     let cwd = tempdir.path().join("cwd");
     let sessions_dir = tempdir.path().join("sessions");
     fs::create_dir_all(&cwd).expect("create cwd");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
-    let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
     let prompt_cache =
@@ -1201,6 +1422,7 @@ fn build_state_with_registry(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache: crate::repo_map::SharedRepoMap::default(),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
@@ -2075,7 +2297,7 @@ async fn build_agent_snapshots_num_ctx_override_into_agent_loop_config() {
         runtime_state,
         provider_registry,
     );
-    let agent = build_agent(&state, None, RlmExtras::empty());
+    let agent = build_agent(&state, None, RlmExtras::empty(), None);
     let (event_tx, _event_rx) = mpsc::channel(16);
 
     let result = agent
@@ -2169,6 +2391,7 @@ fn controller_for_context_length_test_with_cap(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache: crate::repo_map::SharedRepoMap::default(),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
@@ -2548,7 +2771,7 @@ async fn context_length_override_applies_to_next_request_without_reload() {
         .handle_action(UiAction::ContextLength(Some("16384".into())))
         .await
         .expect("set context length");
-    let agent = build_agent(&controller.state, None, RlmExtras::empty());
+    let agent = build_agent(&controller.state, None, RlmExtras::empty(), None);
     let (event_tx, _event_rx) = mpsc::channel(16);
     let result = agent
         .run(
@@ -2642,6 +2865,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache: crate::repo_map::SharedRepoMap::default(),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
@@ -2785,6 +3009,7 @@ fn spawn_live_controller(
         compaction_stats: Arc::new(crate::compaction_stats::CompactionStatsAtomic::default()),
         harness_mode: crate::harness_mode::HarnessMode::default(),
         rlm_archived_messages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        repo_map_cache: crate::repo_map::SharedRepoMap::default(),
         todo_list: Arc::new(std::sync::Mutex::new(anie_tools::TodoList::default())),
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
@@ -4176,4 +4401,47 @@ async fn resume_most_recent_switches_to_sibling_session() {
         sibling_id,
         "controller should have switched away from {original_id} to {sibling_id}"
     );
+}
+
+// ---- plan 03 §2a: harness-run verification gating ----
+
+fn state_with_verify_command(command: Option<&str>) -> ControllerState {
+    let mut config = AnieConfig::default();
+    config.verify.command = command.map(str::to_string);
+    build_state_with_registry_and_config(
+        model("m", "p"),
+        RuntimeState::default(),
+        ProviderRegistry::new(),
+        config,
+    )
+}
+
+/// Plan 03 §2a: with no `[verify].command` the policy is not even
+/// constructed — the before-model chain is byte-identical to a config
+/// without the section.
+#[test]
+fn unconfigured_verify_section_is_byte_identical_noop() {
+    let mut state = state_with_verify_command(None);
+    state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    assert!(build_verify_policy(&state, None).is_none());
+}
+
+#[test]
+fn verify_policy_installs_only_in_rlm_mode_with_a_configured_command() {
+    let mut state = state_with_verify_command(Some("cargo check"));
+    state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    assert!(build_verify_policy(&state, None).is_some());
+    // Hosted/current behavior unchanged: rlm-gated like the other
+    // write-side mitigations.
+    state.harness_mode = crate::harness_mode::HarnessMode::Current;
+    assert!(build_verify_policy(&state, None).is_none());
+}
+
+#[test]
+fn anie_disable_verify_env_kills_the_policy() {
+    let mut state = state_with_verify_command(Some("cargo check"));
+    state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    temp_env::with_var("ANIE_DISABLE_VERIFY", Some("1"), || {
+        assert!(build_verify_policy(&state, None).is_none());
+    });
 }

@@ -1,0 +1,20 @@
+# Plan 03 §9 of docs/local_model_augmentation/: the negative
+# control for the Signal C similar-call detector. Legitimate
+# pagination — chunked reads of one file that differ only in
+# offset — must NOT trip the near-duplicate note at streak 3 or
+# arm the temperature perturbation at streak 5. A pass here
+# (the paged read completes and the answer lands inside budget)
+# shows the detector's numeric-leaf exemption is holding; a
+# derailed run (the harness telling the model to stop calling
+# `read`, or a perturbed final turn) shows it regressed.
+name = "paged_read_negative_control"
+family = "tool_use"
+description = "Chunked read of one file via offset/limit; the similar-call detector must stay quiet on healthy pagination."
+
+prompt = "Read crates/anie-agent/src/failure_loop.rs in chunks of at most 200 lines each, using the read tool's offset and limit parameters — do not read the whole file in one call. Keep paging until you reach the end of the file. Then report the name of the public function that produces a stable hash of tool-call arguments."
+
+[expect]
+contains = ["stable_args_hash"]
+must_call_tool = "read"
+min_tool_calls = 3
+max_tokens = 90000

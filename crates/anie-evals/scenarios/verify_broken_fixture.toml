@@ -1,0 +1,23 @@
+# Plan 03 PR 12 of docs/local_model_augmentation/: harness-run
+# verification end-to-end. The fixture's build stand-in (check.sh)
+# fails until a one-line fix in greeting.txt; the fixture-local
+# .anie/config.toml arms [verify], so after the model's edit the
+# harness runs the check itself and injects `verify passed: sh
+# check.sh` — which the prompt asks the model to repeat.
+#
+# NOTE: the verify policy is rlm-gated. Run this scenario with
+# `--modes rlm` (under `current` it doubles as the plan's negative
+# control: no harness verify fires, so the `contains` check fails
+# unless the model re-runs the check itself and quotes the harness
+# phrasing).
+name = "verify_broken_fixture"
+family = "verification"
+description = "Broken-build fixture: the harness verify command must run after the fix and report success."
+prompt = "The check `sh check.sh` in this directory currently fails because greeting.txt has a typo. Fix greeting.txt so the check passes. The harness re-runs the check after your edit and tells you the result in a system reminder; finish by repeating that result line verbatim."
+
+[fixture]
+dir = "crates/anie-evals/fixtures/broken_build"
+
+[expect]
+contains = ["verify passed"]
+max_tokens = 24000

@@ -40,9 +40,10 @@
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -71,6 +72,75 @@ pub const PROJECT_CLAUDE_SKILLS_DIR: &str = ".claude/skills";
 /// is a coarse proxy for token count (ratio is ~3-4 bytes/token
 /// for English; this corresponds roughly to ~4096 tokens).
 pub const SKILL_BODY_BYTE_WARN_THRESHOLD: usize = 16_384;
+
+/// Plan 04 §2b of `docs/local_model_augmentation/` (tier-
+/// independent fix): skill-load warnings dedup on the file's
+/// *content hash*, persisted across launches — a skill that
+/// fails parsing (or trips the body soft cap) at every launch
+/// was burying real warnings in the logs. Changed content
+/// warns again.
+struct SkillWarnDedup {
+    seen: HashSet<u64>,
+    store_path: Option<PathBuf>,
+}
+
+impl SkillWarnDedup {
+    fn load(store_path: Option<PathBuf>) -> Self {
+        let seen = store_path
+            .as_deref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|raw| raw.lines().filter_map(|line| line.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        Self { seen, store_path }
+    }
+
+    /// True exactly once per content hash; best-effort persists
+    /// the hash so the next launch stays quiet for unchanged
+    /// content.
+    fn should_warn(&mut self, content: &[u8]) -> bool {
+        let digest = content_digest(content);
+        if !self.seen.insert(digest) {
+            return false;
+        }
+        if let Some(path) = &self.store_path {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            use std::io::Write as _;
+            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "{digest}");
+            }
+        }
+        true
+    }
+}
+
+/// FNV-1a — stable across processes and toolchain versions,
+/// which `DefaultHasher` doesn't guarantee for a persisted
+/// format.
+fn content_digest(content: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in content {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Process-wide dedup gate for skill-load warnings, backed by
+/// `~/.anie/skill_warn_hashes`.
+fn should_warn_for_content(content: &[u8]) -> bool {
+    static DEDUP: OnceLock<Mutex<SkillWarnDedup>> = OnceLock::new();
+    DEDUP
+        .get_or_init(|| {
+            Mutex::new(SkillWarnDedup::load(
+                anie_config::anie_dir().map(|dir| dir.join("skill_warn_hashes")),
+            ))
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .should_warn(content)
+}
 
 /// Where a skill was discovered. Higher-precedence layers
 /// shadow lower ones on name collisions. Order in this enum
@@ -310,11 +380,20 @@ impl SkillRegistry {
                 Ok(Some(skill)) => self.insert_with_precedence(skill),
                 Ok(None) => {} // not a skill file/dir, silently skip
                 Err(error) => {
-                    warn!(
-                        path = %path.display(),
-                        %error,
-                        "failed to load skill — skipping"
-                    );
+                    // Unreadable content falls back to warning
+                    // every time — losing dedup beats losing
+                    // the warning.
+                    let manifest = if path.is_dir() { path.join("SKILL.md") } else { path.clone() };
+                    if fs::read(&manifest)
+                        .ok()
+                        .is_none_or(|content| should_warn_for_content(&content))
+                    {
+                        warn!(
+                            path = %path.display(),
+                            %error,
+                            "failed to load skill — skipping"
+                        );
+                    }
                 }
             }
         }
@@ -479,7 +558,7 @@ fn parse_manifest_from_text(
     if fm.description.trim().is_empty() {
         return Err(anyhow!("skill description must be non-empty"));
     }
-    if body.len() > SKILL_BODY_BYTE_WARN_THRESHOLD {
+    if body.len() > SKILL_BODY_BYTE_WARN_THRESHOLD && should_warn_for_content(body.as_bytes()) {
         warn!(
             name = %fm.name,
             body_bytes = body.len(),
@@ -555,25 +634,77 @@ fn split_frontmatter(raw: &str) -> Result<(&str, &str)> {
     Ok((frontmatter_text, body))
 }
 
+/// Maximum entries the Small-tier catalog renders. Plan 04
+/// §2b of `docs/local_model_augmentation/`.
+const SMALL_TIER_CATALOG_MAX_ENTRIES: usize = 6;
+
+/// Small-tier catalog ordering group: bundled first, then
+/// project, then user (plan 04 §2b). Within a group, entries
+/// stay name-sorted for prompt-cache stability.
+fn small_tier_group(source: SkillSource) -> u8 {
+    match source {
+        SkillSource::Bundled => 0,
+        SkillSource::ProjectAnie | SkillSource::ProjectShared | SkillSource::ProjectClaude => 1,
+        SkillSource::UserAnie | SkillSource::UserShared | SkillSource::UserClaude => 2,
+    }
+}
+
 /// Render the skill catalog as a system-prompt fragment.
 /// Returns an empty string when the registry is empty so
 /// callers can append unconditionally without ending up with
 /// stray "Available skills:" headers.
-pub fn render_catalog(registry: &SkillRegistry) -> String {
-    let entries = registry.catalog();
+///
+/// `PromptTier::Full` is byte-identical to the pre-plan-04
+/// catalog. `PromptTier::Small` (plan 04 §2b) excludes skills
+/// whose body exceeds [`SKILL_BODY_BYTE_WARN_THRESHOLD`]
+/// (loading a 32KB body into a 16k-ceiling context can never
+/// be right; `/skill:<name>` still works), caps the catalog
+/// at [`SMALL_TIER_CATALOG_MAX_ENTRIES`] entries in
+/// bundled → project → user order, and names the omitted
+/// count so the model and user know the list is partial.
+pub fn render_catalog(registry: &SkillRegistry, tier: crate::controller::PromptTier) -> String {
+    let entries: Vec<&Skill> = registry
+        .iter()
+        .filter(|skill| !skill.disable_model_invocation)
+        .collect();
     if entries.is_empty() {
+        return String::new();
+    }
+    let (selected, omitted) = match tier {
+        crate::controller::PromptTier::Full => (entries, 0),
+        crate::controller::PromptTier::Small => {
+            let total = entries.len();
+            let mut fitting: Vec<&Skill> = entries
+                .into_iter()
+                .filter(|skill| skill.body.len() <= SKILL_BODY_BYTE_WARN_THRESHOLD)
+                .collect();
+            // `iter()` is name-sorted; a stable sort by group
+            // preserves that order within each group.
+            fitting.sort_by_key(|skill| small_tier_group(skill.source));
+            fitting.truncate(SMALL_TIER_CATALOG_MAX_ENTRIES);
+            let omitted = total - fitting.len();
+            (fitting, omitted)
+        }
+    };
+    if selected.is_empty() && omitted == 0 {
         return String::new();
     }
     let mut out = String::from(
         "Available skills (load with the `skill` tool when relevant):\n",
     );
-    for entry in entries {
+    for skill in selected {
         // Single-line description: replace any embedded
         // newlines with spaces so the catalog stays one
         // entry per line. Long descriptions wrap visually
         // in the model's tokenization, which is fine.
-        let one_line = entry.description.replace('\n', " ");
-        out.push_str(&format!("- {}: {}\n", entry.name, one_line));
+        let one_line = skill.description.replace('\n', " ");
+        out.push_str(&format!("- {}: {}\n", skill.name, one_line));
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "({omitted} more skill{} not listed; `/skills` shows all)\n",
+            if omitted == 1 { "" } else { "s" },
+        ));
     }
     out
 }
@@ -748,10 +879,13 @@ mod tests {
         );
     }
 
+    use crate::controller::PromptTier;
+
     #[test]
     fn render_catalog_returns_empty_string_when_no_skills() {
         let registry = SkillRegistry::empty();
-        assert_eq!(render_catalog(&registry), "");
+        assert_eq!(render_catalog(&registry, PromptTier::Full), "");
+        assert_eq!(render_catalog(&registry, PromptTier::Small), "");
     }
 
     #[test]
@@ -770,7 +904,7 @@ mod tests {
         );
         let mut registry = SkillRegistry::empty();
         registry.absorb_root(&root, SkillSource::Bundled);
-        let rendered = render_catalog(&registry);
+        let rendered = render_catalog(&registry, PromptTier::Full);
         assert!(rendered.starts_with("Available skills"));
         assert!(rendered.contains("- alpha: First skill"));
         assert!(rendered.contains("- beta: Second skill"));
@@ -790,8 +924,108 @@ mod tests {
         .expect("write");
         let mut registry = SkillRegistry::empty();
         registry.absorb_root(dir.path(), SkillSource::Bundled);
-        let rendered = render_catalog(&registry);
+        let rendered = render_catalog(&registry, PromptTier::Full);
         assert!(rendered.contains("- multi: First line second line"), "got:\n{rendered}");
+    }
+
+    /// Plan 04 §2b: a skill whose body exceeds the soft cap is
+    /// excluded from the Small-tier catalog — a 32KB body in a
+    /// 16k-ceiling context can never be right. It stays in the
+    /// Full-tier catalog and remains loadable via `/skill:<name>`.
+    #[test]
+    fn oversized_skill_bodies_are_excluded_from_small_tier_catalog() {
+        let mut registry = SkillRegistry::empty();
+        let mut oversized = Skill {
+            name: "huge".into(),
+            description: "A huge skill".into(),
+            disable_model_invocation: false,
+            license: None,
+            allowed_tools: Vec::new(),
+            body: "x".repeat(SKILL_BODY_BYTE_WARN_THRESHOLD + 1),
+            source: SkillSource::Bundled,
+            root_dir: PathBuf::new(),
+            manifest_path: PathBuf::new(),
+        };
+        registry.insert_for_test(oversized.clone());
+        oversized.name = "tiny".into();
+        oversized.description = "A tiny skill".into();
+        oversized.body = "small body".into();
+        registry.insert_for_test(oversized);
+
+        let small = render_catalog(&registry, PromptTier::Small);
+        assert!(small.contains("- tiny: "), "{small}");
+        assert!(!small.contains("- huge: "), "{small}");
+        assert!(small.contains("1 more skill not listed"), "{small}");
+
+        let full = render_catalog(&registry, PromptTier::Full);
+        assert!(full.contains("- huge: "), "{full}");
+        assert!(!full.contains("not listed"), "{full}");
+    }
+
+    /// Plan 04 §2b: the Small-tier catalog caps at 6 entries in
+    /// bundled → project → user order (name-sorted within each
+    /// group, keeping the rendering deterministic for the prefix
+    /// cache) and names the omitted count.
+    #[test]
+    fn small_tier_catalog_caps_at_six_entries_bundled_then_project_then_user() {
+        let mut registry = SkillRegistry::empty();
+        let mut add = |name: &str, source: SkillSource| {
+            registry.insert_for_test(Skill {
+                name: name.into(),
+                description: format!("{name} description"),
+                disable_model_invocation: false,
+                license: None,
+                allowed_tools: Vec::new(),
+                body: "body".into(),
+                source,
+                root_dir: PathBuf::new(),
+                manifest_path: PathBuf::new(),
+            });
+        };
+        // Names deliberately sort *against* the group order
+        // (user skills first alphabetically) so this fails if
+        // the grouping ever regresses to a plain name sort.
+        add("aaa-user", SkillSource::UserAnie);
+        add("aab-user", SkillSource::UserClaude);
+        add("aac-project", SkillSource::ProjectAnie);
+        add("zzz-project", SkillSource::ProjectClaude);
+        add("nnn-bundle", SkillSource::Bundled);
+        add("ooo-bundle", SkillSource::Bundled);
+        add("ppp-bundle", SkillSource::Bundled);
+
+        let small = render_catalog(&registry, PromptTier::Small);
+        let listed: Vec<&str> = small
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .filter_map(|line| line.split(':').next())
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["nnn-bundle", "ooo-bundle", "ppp-bundle", "aac-project", "zzz-project", "aaa-user"],
+            "{small}"
+        );
+        assert!(small.contains("(1 more skill not listed; `/skills` shows all)"), "{small}");
+    }
+
+    /// Plan 04 §2b (tier-independent): repeated launches with the
+    /// same broken or oversized skill warn once per content hash —
+    /// the dedup set persists across `load`s of the same store.
+    #[test]
+    fn skill_warning_dedup_fires_once_per_content_hash_across_loads() {
+        let dir = tempdir().expect("tempdir");
+        let store = dir.path().join("state").join("skill_warn_hashes");
+
+        let mut dedup = SkillWarnDedup::load(Some(store.clone()));
+        assert!(dedup.should_warn(b"broken skill v1"), "first sighting warns");
+        assert!(!dedup.should_warn(b"broken skill v1"), "same content stays quiet");
+        assert!(dedup.should_warn(b"broken skill v2"), "changed content warns again");
+
+        // Simulate the next launch: a fresh load from the same
+        // store stays quiet for both already-warned contents.
+        let mut next_launch = SkillWarnDedup::load(Some(store));
+        assert!(!next_launch.should_warn(b"broken skill v1"));
+        assert!(!next_launch.should_warn(b"broken skill v2"));
+        assert!(next_launch.should_warn(b"a third skill"));
     }
 
     #[test]

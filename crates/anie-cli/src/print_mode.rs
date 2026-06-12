@@ -19,11 +19,15 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
     // Capture metrics identity before `state` moves into the controller;
     // the accumulator is only built when `--metrics-out` is set.
     let mut metrics = cli.metrics_out.as_ref().map(|_| {
-        crate::run_metrics::RunMetricsAccumulator::new(
+        let mut accumulator = crate::run_metrics::RunMetricsAccumulator::new(
             cli.harness_mode,
             &state.config.current_model().id,
             &state.config.current_model().provider,
-        )
+        );
+        // Plan 04 PR15: record the composed system-prompt weight so
+        // the eval matrix can track prompt-budget regressions.
+        accumulator.set_system_prompt(&crate::controller::compose_system_prompt(&state));
+        accumulator
     });
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel(256);
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
