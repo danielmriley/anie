@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use anie_agent::{Tool, ToolError, ToolExecutionContext};
 use anie_protocol::ToolDef;
 
+use crate::grep::is_not_git_dir;
 use crate::shared::{resolve_path, text_result};
 
 const DEFAULT_FIND_LIMIT: usize = 1_000;
@@ -169,6 +170,7 @@ fn run_find(
         .git_ignore(true)
         .git_exclude(true)
         .parents(true)
+        .filter_entry(is_not_git_dir)
         .overrides(overrides);
 
     let mut output = String::new();
@@ -305,6 +307,22 @@ mod tests {
         assert_eq!(result.details["count"], 5);
         assert_eq!(result.details["truncated"], true);
         assert!(text_body(&result).contains("5 result limit reached"));
+    }
+
+    #[tokio::test]
+    async fn find_does_not_return_paths_under_git_directory() {
+        let tempdir = tempdir().expect("tempdir");
+        make_tree(
+            tempdir.path(),
+            &["src/a.rs", ".git/hooks/pre-commit.rs", ".git/objects/x.rs"],
+        );
+        let result = run_find_tool(tempdir.path(), serde_json::json!({ "pattern": "**/*.rs" }))
+            .await
+            .expect("find");
+        let body = text_body(&result);
+        assert!(body.contains("src/a.rs"), "{body}");
+        assert!(!body.contains(".git"), "{body}");
+        assert_eq!(result.details["count"], 1);
     }
 
     #[tokio::test]

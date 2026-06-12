@@ -20,8 +20,10 @@ use std::{
 
 use async_trait::async_trait;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch};
-use ignore::{WalkBuilder, types::TypesBuilder};
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
+};
+use ignore::{DirEntry, WalkBuilder, types::TypesBuilder};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -259,6 +261,11 @@ fn run_search(
     searcher_builder
         .before_context(options.context)
         .after_context(options.context)
+        // Stop reading a file the moment a NUL byte appears so a
+        // binary blob is never regex-scanned in full — the local
+        // model gets a clean text result, not megabytes of noise,
+        // and we don't burn CPU the model needs.
+        .binary_detection(BinaryDetection::quit(b'\x00'))
         .line_number(true);
 
     let mut walk_builder = WalkBuilder::new(search_root);
@@ -268,7 +275,8 @@ fn run_search(
         .ignore(true)
         .git_ignore(true)
         .git_exclude(true)
-        .parents(true);
+        .parents(true)
+        .filter_entry(is_not_git_dir);
 
     if let Some(file_type) = options.file_type.as_ref() {
         let mut type_builder = TypesBuilder::new();
@@ -466,6 +474,15 @@ impl<'a> Sink for MatchCollector<'a> {
         let cont = self.append_line(prefix, line_number, ctx.bytes());
         Ok(cont)
     }
+}
+
+/// Walk predicate shared by `grep` and `find`: skip any entry whose
+/// file name is `.git`. `.gitignore` typically doesn't list `.git`
+/// itself, so without this the walker descends into object packs and
+/// refs — wasted I/O on data the local model never wants. Pruning the
+/// directory entry stops the walker from recursing into it at all.
+pub(crate) fn is_not_git_dir(entry: &DirEntry) -> bool {
+    entry.file_name() != ".git"
 }
 
 /// Escape regex metacharacters so a literal-mode search treats the
@@ -678,6 +695,45 @@ mod tests {
             .expect("grep");
         assert_eq!(result.details["match_count"], 0);
         assert!(text_body(&result).contains("No matches"));
+    }
+
+    #[tokio::test]
+    async fn grep_does_not_match_inside_git_directory() {
+        let tempdir = tempdir().expect("tempdir");
+        make_tree(
+            tempdir.path(),
+            &[
+                ("visible.txt", "needle\n"),
+                (".git/config", "needle\n"),
+                (".git/objects/pack/info", "needle\n"),
+            ],
+        );
+        let result = run_grep(tempdir.path(), serde_json::json!({ "pattern": "needle" }))
+            .await
+            .expect("grep");
+        let body = text_body(&result);
+        assert!(body.contains("visible.txt"), "{body}");
+        assert!(!body.contains(".git"), "{body}");
+        assert_eq!(result.details["match_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn grep_skips_binary_files_after_nul_byte() {
+        let tempdir = tempdir().expect("tempdir");
+        // A NUL byte before the pattern marks the file binary; the
+        // searcher quits and never reports the match. The text file
+        // with the same pattern still matches, proving the pattern
+        // itself is fine.
+        let binary = b"prefix\x00needle\n";
+        std::fs::write(tempdir.path().join("blob.bin"), binary).expect("write binary");
+        std::fs::write(tempdir.path().join("text.txt"), b"needle\n").expect("write text");
+        let result = run_grep(tempdir.path(), serde_json::json!({ "pattern": "needle" }))
+            .await
+            .expect("grep");
+        let body = text_body(&result);
+        assert!(body.contains("text.txt"), "{body}");
+        assert!(!body.contains("blob.bin"), "{body}");
+        assert_eq!(result.details["match_count"], 1);
     }
 
     #[tokio::test]
