@@ -180,3 +180,34 @@ variants (documented roadmap stubs).
 5. Trim batch: ~250-300 LOC removable across dead code, duplication,
    and the two speculative abstractions; plus the StatusRenderCache
    stale-paint fix.
+
+---
+
+## Status addendum (2026-06-12): fixes landed
+
+Addressed in commits `9c6b8dd`..`04509fd` (multi-agent fix campaign +
+integration gate + adversarial diff review, zero critical/high
+regressions found):
+
+- **RC1/RC2/RC3 fixed** (`04509fd`): head-truncation summaries by
+  default on Ollama (`ANIE_SUMMARIZER=llm` to opt in), embedder
+  default-off for Ollama parents (`ANIE_EMBEDDING_MODEL=<name>` to opt
+  in), prompt embeds off the turn path + HTTP timeouts, session-scoped
+  workers with cancellation (also invalidated on `/model`).
+- **RC4 fixed** (`6cf713c`): two-tier frame budget (33ms streaming),
+  thinking/link caches, flat-list prefix splice, StatusRenderCache
+  stale-paint bug. Markdown prefix-split deliberately NOT re-attempted
+  (removed once before for correctness — tui_polish PR 01).
+- **Tools/IO** (`9c6b8dd`, `2a25226`): grep binary-quit + .git skip on
+  both walkers; checkpoint store kept open, (mtime,len) skip, compact
+  manifest; lightweight session listing.
+- **Trim** (`ce4c9cb`, `145fb53`, `6cf713c`, `04509fd`): hooks system
+  removed, stream_builder extracted, /loop+/goal extracted,
+  ToolRegistry::with_added, OAuth dedup, discovery-helper dedup (all 3
+  copies), dead SelectList/ArgumentSource code, stale allow shims.
+
+Still open (deliberate deferrals): before_model O(context+archive)
+scan per step and page_in_relevant clone costs (medium; needs token-set
+caching design), event-payload Arc-ification, grep max_filesize cap,
+checkpoint blob compression/GC (needs a compression dep decision),
+tail-only wrap of executing-tool output (visible behavior change).
