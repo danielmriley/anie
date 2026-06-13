@@ -6,6 +6,9 @@ prompt = "Find the apply_patch tool in anie-tools. What marker opens and closes 
 
 [expect]
 contains = ["Begin Patch", "End Patch"]
-must_call_tool = "grep"
-min_tool_calls = 1
-max_tokens = 90000
+# bench/PR1: no must_call_tool — grep is incidental discovery, not the
+# behavior under test. The two needles are the opening AND closing
+# markers (a conjunction), so this stays `contains` (all-of).
+# Cap = 1.5x the better mode's observed total (rlm 4720) rounded up to
+# the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 8000

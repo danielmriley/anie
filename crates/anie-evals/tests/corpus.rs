@@ -23,12 +23,24 @@ fn every_committed_scenario_parses_and_is_well_formed() {
         let e = &scenario.expect;
         assert!(
             !e.contains.is_empty()
+                || !e.contains_any.is_empty()
                 || e.must_call_tool.is_some()
                 || e.max_tokens.is_some()
                 || e.max_wall_clock_ms.is_some(),
             "{} has no checks",
             path.display()
         );
+        // Navigation scenarios grade the *answer*, not tool choice. After
+        // dropping incidental `must_call_tool` checks (bench/PR1), a nav
+        // scenario with only a budget cap would score correct answers as
+        // failures, so every one must carry a content assertion.
+        if scenario.family == "repo_navigation" {
+            assert!(
+                e.has_content_assertion(),
+                "{} is a repo_navigation scenario but has no contains/contains_any assertion",
+                path.display()
+            );
+        }
         families.insert(scenario.family.clone());
         count += 1;
     }

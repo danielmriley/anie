@@ -4,11 +4,20 @@ description = "Read the README and summarize a specific capability."
 
 prompt = "Read README.md and tell me whether anie supports MCP. Quote the relevant highlight line."
 
+# The repo at HEAD, so README.md actually exists in the sandbox cwd —
+# without a fixture the run lands in an empty temp dir and the quote
+# the prompt asks for is impossible.
+[fixture]
+git_ref = "HEAD"
+
 [expect]
 contains = ["MCP"]
-must_call_tool = "read"
-min_tool_calls = 1
-# Plan 04 PR 15 of docs/local_model_augmentation/: Small-tier
-# prompt-weight expectation — a single-read answer should fit a ~4k
-# turn-0 prompt across a handful of turns, not an 80k budget.
-max_tokens = 24000
+# bench/PR1: no must_call_tool — the read is incidental; grade the
+# answer about MCP support, not the tool path. "MCP" alone would be
+# vacuous (it echoes the prompt), so the needles below are verbatim
+# chunks of the README's MCP highlight line: any honest quote of it
+# contains at least one, while a read-nothing guess contains none.
+contains_any = ["servers over stdio", "registered automatically", "mcp__"]
+# Cap = 1.5x the better mode's observed total (current 9438) rounded up
+# to the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 16000

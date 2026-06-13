@@ -37,6 +37,12 @@ pub struct Expect {
     /// Final assistant text must contain ALL of these substrings.
     #[serde(default)]
     pub contains: Vec<String>,
+    /// Final assistant text must contain AT LEAST ONE of these substrings.
+    /// Use this for facts with multiple valid phrasings (e.g. an answer
+    /// the model may spell as either of two synonyms) where `contains`'s
+    /// all-of semantics would wrongly fail a correct answer.
+    #[serde(default)]
+    pub contains_any: Vec<String>,
     /// At least one (or `min_tool_calls`) call(s) to this tool.
     #[serde(default)]
     pub must_call_tool: Option<String>,
@@ -57,9 +63,18 @@ impl Expect {
     #[must_use]
     pub fn has_assertions(&self) -> bool {
         !self.contains.is_empty()
+            || !self.contains_any.is_empty()
             || self.must_call_tool.is_some()
             || self.max_tokens.is_some()
             || self.max_wall_clock_ms.is_some()
+    }
+
+    /// Whether the scenario carries any content assertion (`contains` or
+    /// `contains_any`). The corpus guard requires this for navigation
+    /// scenarios so they grade the answer, not just tool choice / budget.
+    #[must_use]
+    pub fn has_content_assertion(&self) -> bool {
+        !self.contains.is_empty() || !self.contains_any.is_empty()
     }
 }
 
@@ -141,6 +156,23 @@ pub fn evaluate_checks(
             } else {
                 CheckOutcome::Fail {
                     reason: format!("final text missing: {missing:?}"),
+                }
+            },
+        });
+    }
+
+    if !expect.contains_any.is_empty() {
+        let found = expect
+            .contains_any
+            .iter()
+            .any(|needle| final_text.contains(needle.as_str()));
+        results.push(CheckResult {
+            check: "contains_any".into(),
+            outcome: if found {
+                CheckOutcome::Pass
+            } else {
+                CheckOutcome::Fail {
+                    reason: format!("final text contains none of: {:?}", expect.contains_any),
                 }
             },
         });
@@ -268,6 +300,50 @@ mod tests {
         let results = evaluate_checks(&expect, "alpha only", &metrics(0, 0));
         assert!(!all_passed(&results));
         assert!(matches!(results[0].outcome, CheckOutcome::Fail { .. }));
+    }
+
+    #[test]
+    fn contains_any_passes_when_at_least_one_alternative_present() {
+        let expect = Expect {
+            contains_any: vec!["alpha".into(), "beta".into()],
+            ..Expect::default()
+        };
+        // Only one of the two alternatives is present — that is enough.
+        let results = evaluate_checks(&expect, "only beta here", &metrics(0, 0));
+        assert!(all_passed(&results));
+        assert_eq!(results[0].check, "contains_any");
+    }
+
+    #[test]
+    fn contains_any_fails_only_when_no_alternative_present() {
+        let expect = Expect {
+            contains_any: vec!["alpha".into(), "beta".into()],
+            ..Expect::default()
+        };
+        let results = evaluate_checks(&expect, "neither word", &metrics(0, 0));
+        assert!(!all_passed(&results));
+        assert!(matches!(results[0].outcome, CheckOutcome::Fail { .. }));
+    }
+
+    #[test]
+    fn contains_any_round_trips_through_toml() {
+        let s = parse_scenario(
+            "name = \"x\"\nfamily = \"f\"\nprompt = \"p\"\n[expect]\ncontains_any = [\"a\", \"b\"]\n",
+        )
+        .expect("parse");
+        assert_eq!(s.expect.contains_any, vec!["a".to_string(), "b".to_string()]);
+        assert!(s.expect.has_assertions());
+        assert!(s.expect.has_content_assertion());
+    }
+
+    #[test]
+    fn contains_any_alone_satisfies_the_assertion_guard() {
+        // A scenario whose only assertion is contains_any must not be
+        // rejected as assertion-free.
+        parse_scenario(
+            "name = \"x\"\nfamily = \"f\"\nprompt = \"p\"\n[expect]\ncontains_any = [\"a\"]\n",
+        )
+        .expect("contains_any counts as an assertion");
     }
 
     #[test]

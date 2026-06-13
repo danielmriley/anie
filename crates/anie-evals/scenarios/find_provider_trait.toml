@@ -6,9 +6,10 @@ prompt = "What is the name of the provider trait in anie-provider, and what is i
 
 [expect]
 contains = ["Provider", "stream"]
-must_call_tool = "grep"
-min_tool_calls = 1
-# Plan 04 PR 15 of docs/local_model_augmentation/: Small-tier
-# prompt-weight expectation — a one-grep answer should fit a ~4k
-# turn-0 prompt across a handful of turns, not an 80k budget.
-max_tokens = 24000
+# bench/PR1: no must_call_tool — grep is incidental discovery here,
+# not the behavior under test. The two needles are a conjunction (the
+# trait name AND its streaming method), each a distinct fact, so this
+# stays `contains` (all-of), not `contains_any`.
+# Cap = 1.5x the better mode's observed total (rlm 31817) rounded up
+# to the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 48000

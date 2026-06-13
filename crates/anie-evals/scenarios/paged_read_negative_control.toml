@@ -15,6 +15,11 @@ prompt = "Read crates/anie-agent/src/failure_loop.rs in chunks of at most 200 li
 
 [expect]
 contains = ["stable_args_hash"]
+# must_call_tool kept: this is the negative control for the similar-call
+# detector, so the >= 3 paginated `read` calls ARE the behavior under
+# test — they must complete without tripping the near-duplicate note.
 must_call_tool = "read"
 min_tool_calls = 3
-max_tokens = 90000
+# Cap = 1.5x the better mode's observed total (current 20370) rounded up
+# to the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 32000

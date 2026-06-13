@@ -6,6 +6,11 @@ prompt = "Plan and execute this survey using the todo_write tool to track your s
 
 [expect]
 contains = ["scenario"]
+# must_call_tool kept: todo_write IS the behavior under test here (its
+# nested array-of-objects argument shape is the small-model failure mode
+# this scenario stresses), not incidental discovery.
 must_call_tool = "todo_write"
 min_tool_calls = 2
-max_tokens = 90000
+# Cap = 1.5x the better mode's observed total (current 30432) rounded up
+# to the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 48000

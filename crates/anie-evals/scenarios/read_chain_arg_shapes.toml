@@ -6,6 +6,10 @@ prompt = "Read crates/anie-agent/src/arg_coerce.rs and report the exact name and
 
 [expect]
 contains = ["coerce_arguments"]
-must_call_tool = "read"
-min_tool_calls = 2
-max_tokens = 90000
+# bench/PR1: no must_call_tool — the read is incidental discovery here;
+# grade whether the model names the exported function. (The offset/limit
+# argument-shape stress this scenario describes is observed via the
+# tool-reliability RunMetrics sidecar, not gated as a pass/fail check.)
+# Cap = 1.5x the better mode's observed total (current 14752) rounded up
+# to the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 24000

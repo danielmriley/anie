@@ -6,6 +6,9 @@ prompt = "Find where the constant MAX_TOOL_REPAIR_ROUNDS is defined in this repo
 
 [expect]
 contains = ["MAX_MODEL_OUTPUT_MALFORMED_RETRIES"]
-must_call_tool = "grep"
-min_tool_calls = 2
-max_tokens = 90000
+# bench/PR1: no must_call_tool — the grep-then-read chain is incidental
+# to the fact under test; grade whether the model reports the mirrored
+# constant, not how it got there.
+# Cap = 1.5x the better mode's observed total (current 5312) rounded up
+# to the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 8000

@@ -1,0 +1,8 @@
+# Local virtualenv for benchmark tooling (see swebench/README.md)
+.venv/
+
+# Working state: cached clones, per-instance worktrees, predictions,
+# metrics sidecars, run logs. Reproducible from the dataset; never commit.
+work/
+
+__pycache__/

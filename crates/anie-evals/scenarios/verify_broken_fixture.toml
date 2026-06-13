@@ -20,4 +20,6 @@ dir = "crates/anie-evals/fixtures/broken_build"
 
 [expect]
 contains = ["verify passed"]
-max_tokens = 24000
+# Cap = 1.5x the better mode's observed total (rlm 20435) rounded up to
+# the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 32000

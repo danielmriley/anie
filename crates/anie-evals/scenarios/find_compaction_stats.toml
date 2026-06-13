@@ -6,10 +6,10 @@ prompt = "Which struct tracks per-phase compaction counts in anie, and in which 
 
 [expect]
 contains = ["CompactionStatsAtomic", "compaction_stats.rs"]
-must_call_tool = "grep"
-min_tool_calls = 1
-# Plan 02 PR 8 of docs/local_model_augmentation/: map-on
-# expectation — compaction_stats.rs is in the injected map's tree,
-# so the grep is confirmation, not discovery.
-max_tokens = 24000
+# bench/PR1: no must_call_tool. gemma4:e4b is grep-averse but often
+# right; compaction_stats.rs is in the injected map's tree, so the
+# grep was confirmation, not discovery. Grade the answer, not the path.
+# Cap = 1.5x the better mode's observed total (rlm 18777) rounded up
+# to the next 4k (docs/local_model_augmentation/execution/lift_e4b_v2.json).
+max_tokens = 32000
 max_wall_clock_ms = 240000

@@ -1,9 +1,15 @@
 # Eval scenarios
 
 Each TOML is one single-turn scenario scored by deterministic automated
-checks (`contains`, `must_call_tool`, `max_tokens`, `max_wall_clock_ms`)
-— no LLM-as-judge in this first cut. Families: `repo_navigation`,
-`tool_use`. Run against the anie repo as the fixture (`--repo-root .`):
+checks (`contains`, `contains_any`, `must_call_tool`, `max_tokens`,
+`max_wall_clock_ms`) — no LLM-as-judge in this first cut. `contains` is
+all-of (every substring must appear); `contains_any` is any-of (at least
+one), for facts with multiple valid phrasings. Navigation scenarios drop
+incidental `must_call_tool` checks and grade the answer instead, so every
+`repo_navigation` scenario must carry a `contains`/`contains_any`
+assertion (enforced by `tests/corpus.rs`). Families: `repo_navigation`,
+`tool_use`, `verification`. Run against the anie repo as the fixture
+(`--repo-root .`):
 
 ```
 cargo build --release
