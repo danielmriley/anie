@@ -115,6 +115,7 @@ tokens, tool calls, turns).
 | 2026-06-12 | Full campaign (PR13-19) | qwen3.5:0.8b | time-scenario: failures 36%→17%, hallucinated tools 6→0, answered correctly via bash `date` | same |
 | 2026-06-12 | Corpus matrix (11 scenarios) | gemma4:e4b | current 2/11, rlm 3/11; rlm wins exactly its target scenarios (repo_map_cold_start 19k→4k tok, verify_broken_fixture) but spends MORE tokens on multi-turn navigation (276k vs 197k total) | lift_e4b.{json,md} in this dir; n=1 per cell — see analysis notes below |
 | 2026-06-12 | rlm_context_v2 exit gate | gemma4:e4b | rlm/current token ratio 1.40 -> 0.92; find_compaction_stats 66k/247s -> 18k/34s; truncation 0/22; rlm passes 3->4/11 | lift_e4b_v2.{json,md} |
+| 2026-06-13 | SWE-bench Lite n=25 (OFFICIAL grader) | gemma4:e4b | anie rlm 1/25 resolved vs mini-swe-agent 0/25; anie 5.8 turns / 37.7k tok vs 19.8 turns / 57.9k tok — won the one instance the control left empty (django-11133) | docs/external_benchmarks/results_2026-06-13.md |
 
 ## Plan 04 — Context-budget discipline (added 2026-06-12)
 
