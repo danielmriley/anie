@@ -544,25 +544,34 @@ impl RunMetricsAccumulator {
         }
     }
 
-    /// Snapshot into the serializable artifact.
+    /// Snapshot the running totals without consuming the accumulator.
+    /// Used for incremental, crash-safe sidecar flushes during a run
+    /// (a killed run — e.g. a benchmark wall-clock timeout — then still
+    /// leaves its latest metrics on disk instead of nothing).
     #[must_use]
-    pub fn finish(self) -> RunMetrics {
+    pub fn snapshot(&self) -> RunMetrics {
         RunMetrics {
             schema_version: RUN_METRICS_SCHEMA_VERSION,
-            harness_mode: self.harness_mode,
-            model: self.model,
-            provider: self.provider,
+            harness_mode: self.harness_mode.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
             wall_clock_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             turns: self.turns,
-            tokens: self.tokens,
-            cost: self.cost,
-            tools: self.tools,
-            compaction: self.compaction,
-            tool_repair: self.tool_repair,
-            recovery: self.recovery,
-            prompt: self.prompt,
-            context: self.context,
+            tokens: self.tokens.clone(),
+            cost: self.cost.clone(),
+            tools: self.tools.clone(),
+            compaction: self.compaction.clone(),
+            tool_repair: self.tool_repair.clone(),
+            recovery: self.recovery.clone(),
+            prompt: self.prompt.clone(),
+            context: self.context.clone(),
         }
+    }
+
+    /// Snapshot into the serializable artifact at end of run.
+    #[must_use]
+    pub fn finish(self) -> RunMetrics {
+        self.snapshot()
     }
 }
 

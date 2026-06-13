@@ -281,7 +281,7 @@ def main() -> int:
         # ollama_chat/ uses /api/chat with native tool-call support.
         help="full litellm model id (default: ollama_chat/<model>)",
     )
-    parser.add_argument("--budget-s", type=int, default=480, help="wall-clock kill per instance, seconds (default: 480)")
+    parser.add_argument("--budget-s", type=int, default=900, help="wall-clock kill per instance, seconds (default: 900; matches run_anie so both arms share the budget)")
     parser.add_argument("--out", type=Path, default=None, help="predictions.jsonl path (default: benchmarks/work/predictions/mini-swe-agent__<model>.jsonl)")
     parser.add_argument("--child", metavar="SPEC_JSON", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()

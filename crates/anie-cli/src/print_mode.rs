@@ -67,6 +67,7 @@ pub(crate) async fn run_print_mode(cli: Cli) -> Result<()> {
         &mut printed_assistant_output,
         &mut pending_terminal_text,
         metrics.as_mut(),
+        cli.metrics_out.as_deref(),
     )
     .await?;
 
@@ -96,10 +97,28 @@ async fn process_print_events(
     printed_assistant_output: &mut bool,
     pending_terminal_text: &mut Option<String>,
     mut metrics: Option<&mut crate::run_metrics::RunMetricsAccumulator>,
+    metrics_path: Option<&std::path::Path>,
 ) -> Result<()> {
     while let Some(event) = agent_event_rx.recv().await {
         if let Some(accumulator) = metrics.as_deref_mut() {
             accumulator.observe(&event);
+        }
+        // Crash-safe incremental flush at coarse boundaries (NOT per
+        // token delta — that would fsync per token). A run killed mid-
+        // flight (e.g. a benchmark wall-clock timeout) then leaves its
+        // latest metrics on disk instead of nothing. The final write in
+        // `run_print_mode` still overwrites this with the complete totals.
+        if matches!(
+            event,
+            AgentEvent::MessageEnd { .. }
+                | AgentEvent::ToolExecEnd { .. }
+                | AgentEvent::CompactionEnd { .. }
+        ) {
+            if let (Some(accumulator), Some(path)) = (metrics.as_deref(), metrics_path) {
+                if let Ok(json) = serde_json::to_vec_pretty(&accumulator.snapshot()) {
+                    let _ = anie_config::atomic_write(path, &json);
+                }
+            }
         }
         match event {
             AgentEvent::MessageStart {
@@ -359,6 +378,8 @@ mod tests {
         let mut a = false;
         let mut b = false;
         let mut c = None;
+        let tmp = std::env::temp_dir().join(format!("anie-incr-metrics-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
         process_print_events(
             &mut rx,
             &mut stdout,
@@ -367,9 +388,19 @@ mod tests {
             &mut b,
             &mut c,
             Some(&mut accumulator),
+            Some(tmp.as_path()),
         )
         .await
         .expect("process");
+
+        // The incremental flush must have written a valid snapshot at the
+        // turn boundary — a killed run would have left exactly this.
+        let flushed: crate::run_metrics::RunMetrics =
+            serde_json::from_slice(&std::fs::read(&tmp).expect("incremental sidecar exists"))
+                .expect("valid snapshot json");
+        assert_eq!(flushed.turns, 1, "incremental flush captured the turn");
+        assert_eq!(flushed.tools.calls, 1, "incremental flush captured the tool call");
+        let _ = std::fs::remove_file(&tmp);
 
         let metrics = accumulator.finish();
         assert_eq!(metrics.tools.calls, 1);
@@ -397,6 +428,7 @@ mod tests {
             &mut streamed_text,
             &mut printed_assistant_output,
             &mut pending_terminal_text,
+            None,
             None,
         )
         .await

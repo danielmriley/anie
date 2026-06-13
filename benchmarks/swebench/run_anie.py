@@ -83,6 +83,20 @@ def run_one(instance: dict, args: argparse.Namespace, run_name: str) -> tuple[st
             proc.wait()
     wall = time.monotonic() - started
 
+    # Belt-and-suspenders for the lift matrix: anie now flushes its
+    # metrics sidecar incrementally (crash-safe), so a SIGKILL'd run
+    # leaves its latest totals. If even that is absent (killed before
+    # the first turn boundary), drop a minimal stub so the instance is
+    # still counted in the denominator rather than silently dropped.
+    if not metrics_path.exists():
+        stub = {
+            "instance_id": iid,
+            "status": status,
+            "wall_clock_ms": int(wall * 1000),
+            "incomplete": True,
+        }
+        metrics_path.write_text(json.dumps(stub, indent=2))
+
     # Whatever is in the tree when the budget expires is the prediction —
     # a partial fix from a killed run is still a legitimate submission.
     patch = common.worktree_diff(worktree)
@@ -97,7 +111,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=25, help="subset size (default: 25)")
     parser.add_argument("--model", default="gemma4:e4b", help="model id passed to anie (default: gemma4:e4b)")
     parser.add_argument("--mode", default="rlm", choices=["baseline", "current", "rlm"], help="anie --harness-mode (default: rlm)")
-    parser.add_argument("--budget-s", type=int, default=480, help="wall-clock kill per instance, seconds (default: 480)")
+    parser.add_argument("--budget-s", type=int, default=900, help="wall-clock kill per instance, seconds (default: 900; the n=25 e4b run timed out 13/25 at 480)")
     parser.add_argument("--out", type=Path, default=None, help="predictions.jsonl path (default: benchmarks/work/predictions/anie__<mode>__<model>.jsonl)")
     args = parser.parse_args()
 
