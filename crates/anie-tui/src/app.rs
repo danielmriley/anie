@@ -1268,6 +1268,10 @@ impl App {
                 }
             }
             AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => {}
+            // Edit-guard telemetry is metrics-only; the TUI shows
+            // nothing for it (the injected directive surfaces as a
+            // normal user message on the re-engaged turn).
+            AgentEvent::EditGuard { .. } => {}
             AgentEvent::SessionList { sessions } => {
                 self.open_session_picker(sessions);
             }
@@ -2740,6 +2744,7 @@ fn agent_event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::CompactionStart { .. } => "CompactionStart",
         AgentEvent::CompactionEnd { .. } => "CompactionEnd",
         AgentEvent::RetryScheduled { .. } => "RetryScheduled",
+        AgentEvent::EditGuard { .. } => "EditGuard",
         AgentEvent::SessionList { .. } => "SessionList",
     }
 }

@@ -67,6 +67,15 @@ pub struct AnieConfig {
     /// `docs/local_model_augmentation/03_harness_verification_and_recovery.md`.
     #[serde(default)]
     pub verify: VerifyConfig,
+    /// Edit-completion guard settings. The guard engages at the
+    /// agent loop's completion boundary when an edit was expected
+    /// but no file was mutated, injecting a directive to either
+    /// make the edit or explicitly conclude no change is needed.
+    /// Defaults are inert here — the controller arms the guard
+    /// only in rlm mode (see `anie-cli`'s `build_agent`). See
+    /// `docs/edit_completion_guard/README.md`.
+    #[serde(default)]
+    pub guard: GuardConfig,
     /// True if a loaded config file (`~/.anie/config.toml` or
     /// a project-local `.anie/config.toml`) explicitly set the
     /// `[model]` section. Lets callers distinguish "the user
@@ -208,6 +217,44 @@ fn default_verify_timeout_s() -> u64 {
 
 fn default_verify_max_output_lines() -> u64 {
     40
+}
+
+/// Edit-completion guard configuration. The guard is a
+/// completion-boundary intervention: when the agent loop would
+/// otherwise terminate without having mutated a file but an edit
+/// was expected, it injects a directive and lets the loop
+/// continue, bounded by `guard_rounds`.
+///
+/// These values are inert until the controller arms the guard
+/// (rlm-default-on; `ANIE_EDIT_GUARD=0` disables). anie-specific
+/// (not in pi): pi has no completion-boundary edit guard. See
+/// `docs/edit_completion_guard/README.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuardConfig {
+    /// Explicit override for whether the run requires editing a
+    /// file. `None` (the default) defers to the model-judged
+    /// classifier side-request; `Some(true)` short-circuits it
+    /// (the benchmark sets this). Maps to `AgentLoopConfig`'s
+    /// `edit_expected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_edit: Option<bool>,
+    /// Hard cap on guard interventions per run. The guard can
+    /// never fire more than this many times. Default 1.
+    #[serde(default = "default_guard_rounds")]
+    pub guard_rounds: u32,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            require_edit: None,
+            guard_rounds: default_guard_rounds(),
+        }
+    }
+}
+
+fn default_guard_rounds() -> u32 {
+    1
 }
 
 fn default_mcp_enabled() -> bool {
@@ -1270,6 +1317,18 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.verify.max_output_lines = max_output_lines;
         }
     }
+
+    // Guard settings overlay field-by-field so a project config
+    // can set `require_edit` without resetting `guard_rounds`, or
+    // vice versa, against a global layer.
+    if let Some(guard) = partial.guard {
+        if guard.require_edit.is_some() {
+            config.guard.require_edit = guard.require_edit;
+        }
+        if let Some(guard_rounds) = guard.guard_rounds {
+            config.guard.guard_rounds = guard_rounds;
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -1306,6 +1365,24 @@ struct PartialAnieConfig {
     budget: Option<BudgetConfig>,
     #[serde(default)]
     verify: Option<PartialVerifyConfig>,
+    #[serde(default)]
+    guard: Option<PartialGuardConfig>,
+}
+
+/// Optional `[guard]` overrides loaded from `config.toml`. Each
+/// field is `Option<...>` so omitted keys preserve the
+/// `GuardConfig::default()` values rather than zero-init.
+/// Mirrors the partial-config pattern used for `[verify]`.
+///
+/// `require_edit` is `Option<Option<bool>>`-flattened to
+/// `Option<bool>`: the outer presence is "did the config mention
+/// it", and a present value maps straight through. A config that
+/// omits `require_edit` leaves the resolved value at its
+/// `None` default.
+#[derive(Debug, Default, Deserialize)]
+struct PartialGuardConfig {
+    require_edit: Option<bool>,
+    guard_rounds: Option<u32>,
 }
 
 /// Optional `[verify]` overrides loaded from `config.toml`. Each
@@ -2556,5 +2633,42 @@ mod tests {
         assert!(config.verify.command.is_none());
         assert_eq!(config.verify.timeout_s, 120);
         assert_eq!(config.verify.max_output_lines, 40);
+    }
+
+    #[test]
+    fn guard_section_defaults_and_roundtrip() {
+        // Forward-compat: a config written before `[guard]` existed
+        // must load cleanly with `require_edit` defaulting to None
+        // (defer to the classifier) and `guard_rounds` to 1.
+        let bare = load_body("[model]\nprovider = \"openai\"\nid = \"gpt-4o\"\n");
+        assert_eq!(bare.guard, GuardConfig::default());
+        assert_eq!(bare.guard.require_edit, None);
+        assert_eq!(bare.guard.guard_rounds, 1);
+
+        // A `[guard]` block with only `require_edit` set must take
+        // the `guard_rounds` default (1) rather than zero-init.
+        let partial = load_body("[guard]\nrequire_edit = true\n");
+        assert_eq!(partial.guard.require_edit, Some(true));
+        assert_eq!(
+            partial.guard.guard_rounds, 1,
+            "omitted guard_rounds must default to 1, not 0"
+        );
+
+        // Full block round-trips both fields.
+        let full = load_body(
+            r#"
+            [guard]
+            require_edit = false
+            guard_rounds = 3
+            "#,
+        );
+        assert_eq!(full.guard.require_edit, Some(false));
+        assert_eq!(full.guard.guard_rounds, 3);
+
+        // Serialize -> deserialize is lossless for a non-default
+        // guard config.
+        let serialized = toml::to_string(&full).expect("serialize config");
+        let reparsed = load_body(&serialized);
+        assert_eq!(reparsed.guard, full.guard);
     }
 }

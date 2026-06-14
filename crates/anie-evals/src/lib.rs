@@ -7,10 +7,12 @@
 //! `docs/eval_harness/README.md`.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+mod classifier;
 mod report;
 mod runner;
 mod scenario;
 
+pub use classifier::{ClassifierOutcome, score_classifier};
 pub use report::{to_json, to_markdown};
 pub use runner::{
     DEFAULT_RUN_TIMEOUT, FixtureSandbox, build_anie_argv, run_scenario, setup_fixture,
@@ -63,7 +65,7 @@ pub enum EvalError {
 /// The `RunMetrics` schema version this runner understands. Mirrors
 /// `anie-cli`'s `RUN_METRICS_SCHEMA_VERSION`; a mismatch means the metrics
 /// JSON may have changed field semantics and must not be silently scored.
-pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 5;
+pub const EXPECTED_RUN_METRICS_SCHEMA_VERSION: u32 = 6;
 
 /// A deserialization view of anie-cli's `RunMetrics` JSON. anie-specific
 /// (deviation): this mirrors `anie-cli/src/run_metrics.rs` rather than
@@ -100,6 +102,25 @@ pub struct RunMetricsView {
     /// Defaulted so pre-v5 JSON still reads.
     #[serde(default)]
     pub context: ContextView,
+    /// Edit-completion-guard telemetry (schema v6,
+    /// `docs/edit_completion_guard/`). Defaulted so pre-v6 JSON
+    /// still reads.
+    #[serde(default)]
+    pub edit_guard: EditGuardView,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct EditGuardView {
+    /// The classifier verdict, when it ran. Absent from JSON (and
+    /// `None` here) when an explicit override skipped the classifier.
+    #[serde(default)]
+    pub classified_expected: Option<bool>,
+    #[serde(default)]
+    pub guard_fired: u32,
+    #[serde(default)]
+    pub guard_rounds: u32,
+    #[serde(default)]
+    pub edit_after_guard: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

@@ -61,8 +61,16 @@ def run_one(instance: dict, args: argparse.Namespace, run_name: str) -> tuple[st
         "--model", args.model,
         "-C", str(worktree),
         "--metrics-out", str(metrics_path),
-        prompt,
     ]
+    # Every SWE-bench instance has a ground-truth patch, so editing is
+    # always required. Declaring it with --require-edit short-circuits
+    # anie's model-judged edit-expectation classifier (one fewer side
+    # call, and guaranteed-correct gating). --no-require-edit drops the
+    # flag so anie classifies instead, turning the run into a
+    # classifier-accuracy measurement (see README).
+    if args.require_edit:
+        cmd.append("--require-edit")
+    cmd.append(prompt)
 
     started = time.monotonic()
     status = "ok"
@@ -113,6 +121,16 @@ def main() -> int:
     parser.add_argument("--mode", default="rlm", choices=["baseline", "current", "rlm"], help="anie --harness-mode (default: rlm)")
     parser.add_argument("--budget-s", type=int, default=900, help="wall-clock kill per instance, seconds (default: 900; the n=25 e4b run timed out 13/25 at 480)")
     parser.add_argument("--out", type=Path, default=None, help="predictions.jsonl path (default: benchmarks/work/predictions/anie__<mode>__<model>.jsonl)")
+    parser.add_argument(
+        "--require-edit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pass anie --require-edit so the edit-completion guard treats "
+        "the task as edit-required, short-circuiting its classifier (default: "
+        "on; every SWE-bench instance has a ground-truth patch). Use "
+        "--no-require-edit to let anie classify instead and record the verdict "
+        "in edit_guard.classified_expected for a classifier-accuracy pass",
+    )
     args = parser.parse_args()
 
     if not ANIE_BIN.exists():

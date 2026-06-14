@@ -24,7 +24,7 @@ for ((i=0; i<${#args[@]}; i++)); do
 done
 if [ "$mode" = "rlm" ]; then tot=30000; else tot=40000; fi
 cat > "$metrics" <<EOF
-{"schema_version":5,"harness_mode":"$mode","model":"mock","provider":"mock","wall_clock_ms":120,"turns":1,"tokens":{"input_tokens":$tot,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":$tot},"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"tools":{"calls":2,"failures":0,"by_tool":{"grep":{"calls":2,"failures":0}}},"compaction":{"pre_prompt":0,"mid_turn":0,"reactive_overflow":0,"total":0},"recovery":{"verify_runs":0,"verify_failures":0,"loop_perturbations":0,"grounded_edit_failures":0},"prompt":{"system_prompt_tokens":0},"context":{"evictions":0,"evicted_tokens":0,"page_ins":0,"page_in_tokens":0,"ledger_tokens_total":0,"prefill_tokens_total":0,"truncation_suspected":0}}
+{"schema_version":6,"harness_mode":"$mode","model":"mock","provider":"mock","wall_clock_ms":120,"turns":1,"tokens":{"input_tokens":$tot,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":$tot},"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"tools":{"calls":2,"failures":0,"by_tool":{"grep":{"calls":2,"failures":0}}},"compaction":{"pre_prompt":0,"mid_turn":0,"reactive_overflow":0,"total":0},"recovery":{"verify_runs":0,"verify_failures":0,"loop_perturbations":0,"grounded_edit_failures":0},"prompt":{"system_prompt_tokens":0},"context":{"evictions":0,"evicted_tokens":0,"page_ins":0,"page_in_tokens":0,"ledger_tokens_total":0,"prefill_tokens_total":0,"truncation_suspected":0},"edit_guard":{"guard_fired":0,"guard_rounds":0,"edit_after_guard":0}}
 EOF
 echo "Found CompactionStatsAtomic in compaction_stats.rs"
 "#;
@@ -178,7 +178,7 @@ for ((i=0; i<${#args[@]}; i++)); do
   case "${args[i]}" in --metrics-out) metrics="${args[i+1]}" ;; esac
 done
 cat > "$metrics" <<EOM
-{"schema_version":5,"harness_mode":"current","model":"mock","provider":"mock","wall_clock_ms":1,"turns":1,"tokens":{"input_tokens":1,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":1},"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"tools":{"calls":0,"failures":0,"by_tool":{}},"compaction":{"pre_prompt":0,"mid_turn":0,"reactive_overflow":0,"total":0}}
+{"schema_version":6,"harness_mode":"current","model":"mock","provider":"mock","wall_clock_ms":1,"turns":1,"tokens":{"input_tokens":1,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"total_tokens":1},"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0},"tools":{"calls":0,"failures":0,"by_tool":{}},"compaction":{"pre_prompt":0,"mid_turn":0,"reactive_overflow":0,"total":0}}
 EOM
 exit 3
 "#;

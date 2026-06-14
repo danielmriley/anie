@@ -684,6 +684,7 @@ mod tests {
             resume: None,
             cwd: None,
             metrics_out: None,
+            require_edit: false,
         };
         let config = AnieConfig::default();
         let runtime_state = RuntimeState::default();
@@ -718,6 +719,7 @@ mod tests {
             resume: None,
             cwd: None,
             metrics_out: None,
+            require_edit: false,
         }
     }
 

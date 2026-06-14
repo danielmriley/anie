@@ -201,6 +201,7 @@ fn ev_kind(e: &AgentEvent) -> &'static str {
         AgentEvent::CompactionStart { .. } => "CompactionStart",
         AgentEvent::CompactionEnd { .. } => "CompactionEnd",
         AgentEvent::RetryScheduled { .. } => "RetryScheduled",
+        AgentEvent::EditGuard { .. } => "EditGuard",
         AgentEvent::SessionList { .. } => "SessionList",
     }
 }

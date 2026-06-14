@@ -177,6 +177,7 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
         repo_map_cache,
         todo_list,
         cost_meter,
+        require_edit: cli.require_edit,
     };
     state.apply_session_overrides();
     if let Err(error) = state.persist_runtime_state() {

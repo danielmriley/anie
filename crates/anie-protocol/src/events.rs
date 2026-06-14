@@ -27,6 +27,31 @@ pub enum CompactionPhase {
     ReactiveOverflow,
 }
 
+/// Edit-completion-guard telemetry, attached to
+/// [`AgentEvent::EditGuard`]. The guard is a completion-boundary
+/// intervention (`docs/edit_completion_guard/`): when a run that
+/// should have edited a file is about to terminate without one,
+/// it injects a directive and re-engages the loop. Two moments
+/// are worth recording, so the metrics accumulator can score the
+/// guard's value:
+///
+/// - [`Self::Classified`]: the one-shot model-judged
+///   edit-expectation classifier resolved a verdict for the run.
+///   Emitted at most once per run, and only when no explicit
+///   `edit_expected` override short-circuited the classifier.
+/// - [`Self::Fired`]: the guard engaged and injected an edit
+///   directive, spending one round of its budget. `round` is
+///   1-based (the first fire is `1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditGuardSignal {
+    /// The model-judged classifier ran and decided whether the
+    /// run is edit-expected. Carries the verdict.
+    Classified(bool),
+    /// The guard engaged and injected a directive. `round` is the
+    /// 1-based intervention count (first fire is `1`).
+    Fired { round: u32 },
+}
+
 /// In-process events emitted by the agent loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
@@ -143,6 +168,12 @@ pub enum AgentEvent {
         delay_ms: u64,
         error: String,
     },
+    /// Edit-completion-guard telemetry (`docs/edit_completion_guard/`,
+    /// PR 3). Surfaces the classifier verdict and each guard fire so
+    /// the metrics accumulator can score the guard. In-process only
+    /// (not RPC-serialized); the metrics mirror in `anie-cli` is
+    /// where the serializable counters live.
+    EditGuard { signal: EditGuardSignal },
     /// The controller's reply to a session-picker request: the list of
     /// sessions to display, newest first. Carries a flat protocol-local
     /// [`SessionSummary`] so `anie-protocol` stays free of an

@@ -362,6 +362,7 @@ fn event_kinds(events: &[AgentEvent]) -> Vec<&'static str> {
             AgentEvent::CompactionStart { .. } => "CompactionStart",
             AgentEvent::CompactionEnd { .. } => "CompactionEnd",
             AgentEvent::RetryScheduled { .. } => "RetryScheduled",
+            AgentEvent::EditGuard { .. } => "EditGuard",
             AgentEvent::SessionList { .. } => "SessionList",
         })
         .collect()
@@ -2397,5 +2398,380 @@ async fn agent_run_continues_when_gate_errors() {
     assert!(
         result.terminal_error.is_none(),
         "gate failure must not produce a terminal error on the run",
+    );
+}
+
+// ---- Edit-completion guard (PR 1 of docs/edit_completion_guard/) ----
+
+/// Wraps any provider and counts `stream` calls so tests can
+/// assert the classifier side-request did (or did not) fire.
+struct CountingProvider {
+    inner: Box<dyn Provider>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Provider for CountingProvider {
+    fn stream(
+        &self,
+        model: &Model,
+        context: LlmContext,
+        options: StreamOptions,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.stream(model, context, options)
+    }
+
+    fn convert_messages(&self, messages: &[Message]) -> Vec<LlmMessage> {
+        self.inner.convert_messages(messages)
+    }
+
+    fn convert_tools(&self, tools: &[ToolDef]) -> Vec<serde_json::Value> {
+        self.inner.convert_tools(tools)
+    }
+}
+
+/// A mutating tool (`write`) for guard tests — its successful
+/// execution must count as a file mutation. Reuses `TestTool`'s
+/// machinery; only the name is load-bearing.
+fn write_tool() -> TestTool {
+    TestTool::new(
+        "write",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } },
+            "additionalProperties": true
+        }),
+        "wrote",
+    )
+}
+
+fn guard_agent(
+    provider: Box<dyn Provider>,
+    tool_registry: Arc<ToolRegistry>,
+    edit_guard_rounds: u32,
+    edit_expected: Option<bool>,
+) -> AgentLoop {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(ApiKind::OpenAICompletions, provider);
+
+    AgentLoop::new(
+        Arc::new(provider_registry),
+        tool_registry,
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_edit_guard(edit_guard_rounds)
+        .with_edit_expected(edit_expected),
+    )
+}
+
+fn assistant_messages(result: &crate::AgentRunResult) -> usize {
+    result
+        .generated_messages
+        .iter()
+        .filter(|message| matches!(message, Message::Assistant(_)))
+        .count()
+}
+
+/// The core success path: a run that ends in prose with no edit,
+/// when edits are expected and the budget is armed, gets re-
+/// engaged with a directive and continues instead of finishing.
+#[tokio::test]
+async fn guard_fires_and_continues_when_edit_expected_and_no_mutation() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(write_tool()));
+    let agent = guard_agent(
+        Box::new(MockProvider::new(vec![
+            // Turn 1: the model answers in prose, no tool call.
+            MockStreamScript::from_message(final_assistant("Here is the answer in prose.")),
+            // Turn 2 (after the directive): it edits, then a
+            // final message ends the run.
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "write",
+                serde_json::json!({"value": "patch"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("Edited the file.")),
+        ])),
+        Arc::new(tools),
+        1,
+        Some(true),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("fix the bug")], Vec::new()).await;
+
+    assert!(result.terminal_error.is_none());
+    // Original prose turn + the re-engaged edit turn + the final
+    // turn after the tool result = three assistant messages. A run
+    // that finished at the first prose ending would have exactly
+    // one.
+    assert_eq!(
+        assistant_messages(&result),
+        3,
+        "guard must re-engage the loop for a second model turn",
+    );
+    assert!(
+        result
+            .generated_messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_))),
+        "the re-engaged turn produced the edit",
+    );
+}
+
+/// When a file was actually mutated this run, the completion
+/// boundary is legitimate: the guard must stay silent even with
+/// the budget armed and edits expected.
+#[tokio::test]
+async fn guard_does_not_fire_when_a_file_was_mutated() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(write_tool()));
+    let agent = guard_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
+                "call_1",
+                "write",
+                serde_json::json!({"value": "patch"}),
+            )])),
+            MockStreamScript::from_message(final_assistant("Done editing.")),
+        ])),
+        Arc::new(tools),
+        1,
+        Some(true),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("fix the bug")], Vec::new()).await;
+
+    assert!(result.terminal_error.is_none());
+    // Exactly the scripted turns: edit turn + final turn. No third
+    // model turn means the guard did not re-engage.
+    assert_eq!(assistant_messages(&result), 2);
+    assert!(
+        !result.generated_messages.iter().any(|message| matches!(
+            message,
+            Message::User(_)
+        )),
+        "no directive user message should have been persisted",
+    );
+}
+
+/// An explicit "no change needed" conclusion suppresses the guard
+/// even when no file was edited — the model gave the legitimate
+/// out, so the run terminates.
+#[tokio::test]
+async fn guard_suppressed_by_no_change_needed_conclusion() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(write_tool()));
+    let agent = guard_agent(
+        Box::new(MockProvider::new(vec![MockStreamScript::from_message(
+            final_assistant("I investigated and no change is needed; the code is already correct."),
+        )])),
+        Arc::new(tools),
+        1,
+        Some(true),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("fix the bug")], Vec::new()).await;
+
+    assert!(result.terminal_error.is_none());
+    assert_eq!(
+        assistant_messages(&result),
+        1,
+        "the no-change conclusion must terminate the run without re-engaging",
+    );
+}
+
+/// The guard can never intervene more than `edit_guard_rounds`
+/// times: with a budget of 1, two consecutive prose endings yield
+/// exactly one directive and then the run is allowed to finish.
+#[tokio::test]
+async fn guard_bounded_by_round_budget() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(write_tool()));
+    let agent = guard_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant("First prose ending, no edit.")),
+            // After the single directive the model still ends in
+            // prose; the budget is spent, so this must terminate.
+            MockStreamScript::from_message(final_assistant("Second prose ending, still no edit.")),
+        ])),
+        Arc::new(tools),
+        1,
+        Some(true),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("fix the bug")], Vec::new()).await;
+
+    assert!(result.terminal_error.is_none());
+    // Two model turns total: the original and the one re-engaged
+    // turn. A third would mean the budget was exceeded.
+    assert_eq!(
+        assistant_messages(&result),
+        2,
+        "the guard must intervene at most edit_guard_rounds (1) times",
+    );
+}
+
+/// An explicit edit-expectation override short-circuits the
+/// classifier: no extra provider call is made to judge it.
+#[tokio::test]
+async fn classifier_no_runs_when_edit_expected_is_explicit() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(write_tool()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = CountingProvider {
+        inner: Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant("Prose ending, no edit.")),
+            MockStreamScript::from_message(final_assistant("Edited (pretend).")),
+        ])),
+        calls: Arc::clone(&calls),
+    };
+    let agent = guard_agent(Box::new(provider), Arc::new(tools), 1, Some(true));
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("fix the bug")], Vec::new()).await;
+
+    assert!(result.terminal_error.is_none());
+    // Exactly two model turns and not one more: a classifier side-
+    // request would have been a third `stream` call.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "explicit edit_expected must skip the classifier side-request",
+    );
+}
+
+/// With `edit_expected == None` the guard consults the model-
+/// judged classifier. A "no" verdict keeps the guard from firing;
+/// a "yes" verdict makes it fire. Both directions are pinned here.
+#[tokio::test]
+async fn classifier_decides_when_edit_expected_is_none() {
+    // Case A: classifier says "no" -> guard stays silent.
+    let mut tools_no = ToolRegistry::new();
+    tools_no.register(Arc::new(write_tool()));
+    let calls_no = Arc::new(AtomicUsize::new(0));
+    let agent_no = guard_agent(
+        Box::new(CountingProvider {
+            inner: Box::new(MockProvider::new(vec![
+                MockStreamScript::from_message(final_assistant("Prose ending, no edit.")),
+                // Classifier side-request verdict.
+                MockStreamScript::from_message(final_assistant("no")),
+            ])),
+            calls: Arc::clone(&calls_no),
+        }),
+        Arc::new(tools_no),
+        1,
+        None,
+    );
+
+    let (result_no, _events) =
+        collect_run(agent_no, vec![user_prompt("what does this function do?")], Vec::new()).await;
+    assert!(result_no.terminal_error.is_none());
+    assert_eq!(
+        assistant_messages(&result_no),
+        1,
+        "a 'no' classifier verdict must keep the guard from firing",
+    );
+    assert_eq!(
+        calls_no.load(Ordering::SeqCst),
+        2,
+        "one model turn plus exactly one classifier side-request",
+    );
+
+    // Case B: classifier says "yes" -> guard fires and re-engages.
+    let mut tools_yes = ToolRegistry::new();
+    tools_yes.register(Arc::new(write_tool()));
+    let agent_yes = guard_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant("Prose ending, no edit.")),
+            // Classifier side-request verdict.
+            MockStreamScript::from_message(final_assistant("yes")),
+            // Re-engaged turn.
+            MockStreamScript::from_message(final_assistant("Now editing.")),
+        ])),
+        Arc::new(tools_yes),
+        1,
+        None,
+    );
+
+    let (result_yes, _events) =
+        collect_run(agent_yes, vec![user_prompt("fix the bug")], Vec::new()).await;
+    assert!(result_yes.terminal_error.is_none());
+    assert_eq!(
+        assistant_messages(&result_yes),
+        2,
+        "a 'yes' classifier verdict must let the guard re-engage the loop",
+    );
+}
+
+/// Conservative default (2026-06-14 review): on the model-judged
+/// (None) path, an ambiguous/unparseable classifier answer must
+/// default to NOT firing — a false-positive guard fire would nag an
+/// interactive user mid-question. (The benchmark sets --require-edit
+/// and never reaches this path.)
+#[tokio::test]
+async fn ambiguous_classifier_verdict_does_not_fire_the_guard() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(write_tool()));
+    let agent = guard_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant("Prose ending, no edit.")),
+            // Classifier returns neither yes nor no.
+            MockStreamScript::from_message(final_assistant("It depends on context.")),
+        ])),
+        Arc::new(tools),
+        1,
+        None,
+    );
+
+    let (result, _events) =
+        collect_run(agent, vec![user_prompt("what does this function do?")], Vec::new()).await;
+    assert!(result.terminal_error.is_none());
+    assert_eq!(
+        assistant_messages(&result),
+        1,
+        "an ambiguous classifier verdict must leave the guard silent",
+    );
+}
+
+/// With the guard disabled (the default `edit_guard_rounds == 0`),
+/// a prose-only run produces exactly the pre-guard event sequence
+/// — even with `edit_expected` set. The guard must be a pure
+/// addition gated entirely on the budget.
+#[tokio::test]
+async fn guard_disabled_by_default_leaves_loop_byte_identical() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(write_tool()));
+    let agent = guard_agent(
+        Box::new(MockProvider::new(vec![MockStreamScript::from_message(
+            final_assistant("Prose ending, no edit."),
+        )])),
+        Arc::new(tools),
+        0,
+        Some(true),
+    );
+
+    let (result, events) = collect_run(agent, vec![user_prompt("fix the bug")], Vec::new()).await;
+
+    assert!(result.terminal_error.is_none());
+    assert_eq!(assistant_messages(&result), 1);
+    assert_eq!(
+        event_kinds(&events),
+        vec![
+            "AgentStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageEnd",
+            "MessageStart",
+            "MessageEnd",
+            "TurnEnd",
+            "AgentEnd",
+        ],
+        "a disabled guard must leave the event stream byte-identical",
     );
 }

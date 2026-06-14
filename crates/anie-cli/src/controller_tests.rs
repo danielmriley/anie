@@ -193,6 +193,7 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        require_edit: false,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -274,6 +275,7 @@ fn controller_with_runtime_state_path(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        require_edit: false,
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1500,6 +1502,7 @@ fn build_dispatch_controller_with_runtime_state_path(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        require_edit: false,
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -1561,6 +1564,7 @@ fn build_state_with_registry_and_config(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        require_edit: false,
     }
 }
 
@@ -2538,6 +2542,7 @@ fn controller_for_context_length_test_with_cap(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        require_edit: false,
     };
 
     let (ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -3020,6 +3025,7 @@ async fn help_command_emits_system_message_with_registry_output() {
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        require_edit: false,
     };
 
     let (_ui_action_tx, ui_action_rx) = mpsc::unbounded_channel();
@@ -3164,6 +3170,7 @@ fn spawn_live_controller(
         cost_meter: Arc::new(crate::cost_meter::CostMeter::new(
             anie_provider::CostPerMillion::zero(),
         )),
+        require_edit: false,
     };
 
     let (event_tx, event_rx) = mpsc::channel(128);
@@ -4594,4 +4601,114 @@ fn anie_disable_verify_env_kills_the_policy() {
     temp_env::with_var("ANIE_DISABLE_VERIFY", Some("1"), || {
         assert!(build_verify_policy(&state, None).is_none());
     });
+}
+
+/// PR 2 of `docs/edit_completion_guard/`: build a state with a
+/// given guard config, defaulting harness mode to rlm (where the
+/// guard is armed). Callers flip `harness_mode` / `require_edit`
+/// as the case under test demands.
+fn state_with_guard_config(guard: anie_config::GuardConfig) -> ControllerState {
+    let config = AnieConfig {
+        guard,
+        ..AnieConfig::default()
+    };
+    let mut state = build_state_with_registry_and_config(
+        model("m", "p"),
+        RuntimeState::default(),
+        ProviderRegistry::new(),
+        config,
+    );
+    state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
+    state
+}
+
+#[test]
+fn edit_guard_enabled_by_default_in_rlm_mode() {
+    // rlm-default-on: with the default `[guard]` (guard_rounds = 1)
+    // and env not disabling it, the guard arms with one round.
+    let state = state_with_guard_config(anie_config::GuardConfig::default());
+    assert_eq!(edit_guard_rounds(&state, false), 1);
+}
+
+#[test]
+fn edit_guard_off_outside_rlm() {
+    // The guard is rlm-scaffolding: in current / baseline modes it
+    // is disabled (0 rounds => byte-identical loop) regardless of
+    // the configured `guard_rounds`.
+    let mut state = state_with_guard_config(anie_config::GuardConfig {
+        require_edit: None,
+        guard_rounds: 5,
+    });
+    state.harness_mode = crate::harness_mode::HarnessMode::Current;
+    assert_eq!(edit_guard_rounds(&state, false), 0);
+    state.harness_mode = crate::harness_mode::HarnessMode::Baseline;
+    assert_eq!(edit_guard_rounds(&state, false), 0);
+}
+
+#[test]
+fn edit_guard_disabled_by_env() {
+    // `ANIE_EDIT_GUARD=0` disables the guard even in rlm mode. The
+    // env value is passed as a param so the gate is exercised
+    // race-free without touching the process environment.
+    let state = state_with_guard_config(anie_config::GuardConfig::default());
+    assert_eq!(
+        edit_guard_rounds(&state, true),
+        0,
+        "ANIE_EDIT_GUARD=0 must disable the guard"
+    );
+
+    // And the env reader itself recognizes the literal `0` (and only
+    // `0`) as the disable signal. Qualify the path: this test shares
+    // its name with the function under test.
+    temp_env::with_var("ANIE_EDIT_GUARD", Some("0"), || {
+        assert!(super::edit_guard_disabled_by_env());
+    });
+    temp_env::with_var("ANIE_EDIT_GUARD", Some("1"), || {
+        assert!(!super::edit_guard_disabled_by_env());
+    });
+    temp_env::with_var("ANIE_EDIT_GUARD", None::<&str>, || {
+        assert!(!super::edit_guard_disabled_by_env());
+    });
+}
+
+#[test]
+fn require_edit_flag_sets_edit_expected_true() {
+    // The `--require-edit` flag short-circuits the classifier:
+    // edit_expected = Some(true).
+    let mut state = state_with_guard_config(anie_config::GuardConfig::default());
+    state.require_edit = true;
+    assert_eq!(edit_expected(&state), Some(true));
+
+    // `[guard].require_edit = true` reaches the same verdict
+    // without the flag.
+    let cfg_state = state_with_guard_config(anie_config::GuardConfig {
+        require_edit: Some(true),
+        guard_rounds: 1,
+    });
+    assert_eq!(edit_expected(&cfg_state), Some(true));
+
+    // `[guard].require_edit = false` is an explicit opt-out:
+    // Some(false) short-circuits the classifier to "never fire"
+    // (2026-06-14 review — the three Option states are absent =>
+    // classify, true => always, false => never).
+    let optout_state = state_with_guard_config(anie_config::GuardConfig {
+        require_edit: Some(false),
+        guard_rounds: 1,
+    });
+    assert_eq!(edit_expected(&optout_state), Some(false));
+
+    // The CLI flag still forces true even over a config opt-out.
+    let mut flag_over_optout = state_with_guard_config(anie_config::GuardConfig {
+        require_edit: Some(false),
+        guard_rounds: 1,
+    });
+    flag_over_optout.require_edit = true;
+    assert_eq!(edit_expected(&flag_over_optout), Some(true));
+
+    // An unset section => None, deferring to the model-judged
+    // classifier.
+    assert_eq!(
+        edit_expected(&state_with_guard_config(anie_config::GuardConfig::default())),
+        None
+    );
 }

@@ -7,9 +7,10 @@
 //! erroring.
 //!
 //! This test feeds a fully-populated JSON literal matching anie-cli's
-//! *current* serialization (schema v5, including the `cost`,
-//! `compaction`, `tool_repair`, `recovery`, `prompt`, and `context`
-//! blocks and the full `tokens` shape) through `RunMetricsView` and
+//! *current* serialization (schema v6, including the `cost`,
+//! `compaction`, `tool_repair`, `recovery`, `prompt`, `context`, and
+//! `edit_guard` blocks and the full `tokens` shape) through
+//! `RunMetricsView` and
 //! asserts every modelled field survives with its non-default value.
 //! If anie-cli renames a field the view reads, the matching assertion
 //! fails — turning a silent data-loss regression into a loud test
@@ -19,13 +20,13 @@
 
 use anie_evals::RunMetricsView;
 
-/// Mirror of anie-cli's `RunMetrics` serialization as of schema v5
+/// Mirror of anie-cli's `RunMetrics` serialization as of schema v6
 /// (`crates/anie-cli/src/run_metrics.rs`). Every field carries a
 /// distinct non-default value so the round-trip can prove each one
 /// landed in the right place rather than defaulting.
 fn fully_populated_run_metrics_json() -> serde_json::Value {
     serde_json::json!({
-        "schema_version": 5,
+        "schema_version": 6,
         "harness_mode": "augmented",
         "model": "qwen2.5-coder:7b",
         "provider": "ollama",
@@ -80,17 +81,23 @@ fn fully_populated_run_metrics_json() -> serde_json::Value {
             "ledger_tokens_total": 640_u64,
             "prefill_tokens_total": 91_000_u64,
             "truncation_suspected": 3_u64
+        },
+        "edit_guard": {
+            "classified_expected": true,
+            "guard_fired": 2_u32,
+            "guard_rounds": 2_u32,
+            "edit_after_guard": 1_u32
         }
     })
 }
 
 #[test]
-fn run_metrics_view_round_trips_every_modelled_field_from_cli_schema_v5() {
+fn run_metrics_view_round_trips_every_modelled_field_from_cli_schema_v6() {
     let json = fully_populated_run_metrics_json();
     let view: RunMetricsView =
-        serde_json::from_value(json).expect("anie-cli schema-v5 JSON must deserialize into the view");
+        serde_json::from_value(json).expect("anie-cli schema-v6 JSON must deserialize into the view");
 
-    assert_eq!(view.schema_version, 5, "schema_version");
+    assert_eq!(view.schema_version, 6, "schema_version");
     assert_eq!(view.harness_mode, "augmented", "harness_mode");
     assert_eq!(view.wall_clock_ms, 12_345, "wall_clock_ms");
     assert_eq!(view.turns, 7, "turns");
@@ -166,6 +173,21 @@ fn run_metrics_view_round_trips_every_modelled_field_from_cli_schema_v5() {
         view.context.truncation_suspected, 3,
         "context.truncation_suspected"
     );
+
+    // Edit-completion-guard telemetry (schema v6,
+    // `docs/edit_completion_guard/`). The classifier-accuracy eval
+    // scores off these, so a cli-side rename must be loud.
+    assert_eq!(
+        view.edit_guard.classified_expected,
+        Some(true),
+        "edit_guard.classified_expected"
+    );
+    assert_eq!(view.edit_guard.guard_fired, 2, "edit_guard.guard_fired");
+    assert_eq!(view.edit_guard.guard_rounds, 2, "edit_guard.guard_rounds");
+    assert_eq!(
+        view.edit_guard.edit_after_guard, 1,
+        "edit_guard.edit_after_guard"
+    );
 }
 
 #[test]
@@ -182,6 +204,7 @@ fn v2_tool_repair_block_loads_with_repaired_then_failed_defaulted() {
     json.as_object_mut().unwrap().remove("recovery");
     json.as_object_mut().unwrap().remove("prompt");
     json.as_object_mut().unwrap().remove("context");
+    json.as_object_mut().unwrap().remove("edit_guard");
     let view: RunMetricsView = serde_json::from_value(json).expect("v2 JSON loads");
     assert_eq!(view.tool_repair.repaired, 3);
     assert_eq!(view.tool_repair.repaired_then_failed, 0);
@@ -196,6 +219,7 @@ fn v3_artifact_loads_with_recovery_and_prompt_defaulted() {
     json.as_object_mut().unwrap().remove("recovery");
     json.as_object_mut().unwrap().remove("prompt");
     json.as_object_mut().unwrap().remove("context");
+    json.as_object_mut().unwrap().remove("edit_guard");
     let view: RunMetricsView = serde_json::from_value(json).expect("v3 JSON loads");
     assert_eq!(view.recovery, anie_evals::RecoveryView::default());
     assert_eq!(view.prompt, anie_evals::PromptView::default());
@@ -208,13 +232,25 @@ fn v4_artifact_loads_with_context_defaulted() {
     let mut json = fully_populated_run_metrics_json();
     json["schema_version"] = serde_json::json!(4);
     json.as_object_mut().unwrap().remove("context");
+    json.as_object_mut().unwrap().remove("edit_guard");
     let view: RunMetricsView = serde_json::from_value(json).expect("v4 JSON loads");
     assert_eq!(view.context, anie_evals::ContextView::default());
+}
+
+#[test]
+fn v5_artifact_loads_with_edit_guard_defaulted() {
+    // Forward-compat: a v5 artifact predates the `edit_guard` block;
+    // the view must default it, not error.
+    let mut json = fully_populated_run_metrics_json();
+    json["schema_version"] = serde_json::json!(5);
+    json.as_object_mut().unwrap().remove("edit_guard");
+    let view: RunMetricsView = serde_json::from_value(json).expect("v5 JSON loads");
+    assert_eq!(view.edit_guard, anie_evals::EditGuardView::default());
 }
 
 #[test]
 fn run_metrics_view_matches_cli_expected_schema_version() {
     // The view's expected schema version must track anie-cli's
     // `RUN_METRICS_SCHEMA_VERSION`; the literal above is built for it.
-    assert_eq!(anie_evals::EXPECTED_RUN_METRICS_SCHEMA_VERSION, 5);
+    assert_eq!(anie_evals::EXPECTED_RUN_METRICS_SCHEMA_VERSION, 6);
 }

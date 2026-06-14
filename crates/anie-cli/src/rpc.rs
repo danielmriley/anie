@@ -293,6 +293,10 @@ impl From<AgentEvent> for RpcEvent {
             | AgentEvent::MessageEnd { .. }
             | AgentEvent::MessageDelta { .. }
             | AgentEvent::ToolExecUpdate { .. }
+            // EditGuard is internal telemetry folded by RunMetrics; it
+            // carries no JSONL RPC payload (the metrics sidecar is its
+            // consumer).
+            | AgentEvent::EditGuard { .. }
             // SessionList drives the interactive TUI picker only; the
             // JSONL RPC stream has no picker, so it carries no payload.
             | AgentEvent::SessionList { .. } => Self::System {

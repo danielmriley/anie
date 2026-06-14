@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use anie_protocol::{AgentEvent, CompactionPhase, Cost, Message};
+use anie_protocol::{AgentEvent, CompactionPhase, Cost, EditGuardSignal, Message};
 
 use crate::harness_mode::HarnessMode;
 
@@ -42,7 +42,14 @@ use crate::harness_mode::HarnessMode;
 /// |         | totals off `prompt_eval_count`, and the             |
 /// |         | silent-truncation suspicion counter). Older         |
 /// |         | artifacts load with the block defaulted.            |
-pub const RUN_METRICS_SCHEMA_VERSION: u32 = 5;
+/// | 6       | `edit_guard` block (edit-completion guard, PR 3 of  |
+/// |         | `docs/edit_completion_guard/`): the classifier      |
+/// |         | verdict, guard-fire count, rounds spent, and edits  |
+/// |         | made after a fire — all folded off                  |
+/// |         | `AgentEvent::EditGuard` and the mutating-tool       |
+/// |         | `ToolExecEnd`s that follow a fire. Older artifacts  |
+/// |         | load with the block defaulted.                      |
+pub const RUN_METRICS_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunMetrics {
@@ -80,6 +87,48 @@ pub struct RunMetrics {
     /// still deserialize.
     #[serde(default)]
     pub context: ContextMetrics,
+    /// PR 3 of `docs/edit_completion_guard/`: edit-completion-guard
+    /// instrumentation (schema v6). Defaulted so older artifacts
+    /// still deserialize.
+    #[serde(default)]
+    pub edit_guard: EditGuardMetrics,
+}
+
+/// Edit-completion-guard telemetry (PR 3 of
+/// `docs/edit_completion_guard/`), folded off
+/// `AgentEvent::EditGuard` plus the mutating-tool `ToolExecEnd`s
+/// that follow a fire:
+///
+/// - `classified_expected`: the model-judged classifier's verdict,
+///   when it ran. `None` when an explicit `--require-edit` /
+///   `[guard].require_edit` override short-circuited the classifier
+///   (no classification was performed), so `None` is meaningfully
+///   distinct from a recorded `Some(false)` and is skipped on
+///   serialize. Set at most once per run (the classifier is
+///   one-shot and cached).
+/// - `guard_fired`: number of `EditGuardSignal::Fired` events — how
+///   many times the guard engaged and injected a directive.
+/// - `guard_rounds`: total budget rounds spent across those fires.
+///   Each fire spends exactly one round today, so this tracks
+///   `guard_fired`; kept distinct because the round count is the
+///   budget-facing number the spec asks to measure separately.
+/// - `edit_after_guard`: successful file-mutating tool calls
+///   (`edit` / `write` / `apply_patch`) observed AFTER the first
+///   guard fire — the signal that the intervention actually pushed
+///   the model into editing. Mutations before any fire don't count
+///   (the guard never engages once a mutation has happened).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EditGuardMetrics {
+    /// The classifier verdict, when the classifier ran. `None` (and
+    /// omitted from JSON) when an explicit override skipped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified_expected: Option<bool>,
+    /// Guard-fire count (`EditGuardSignal::Fired` events).
+    pub guard_fired: u32,
+    /// Total budget rounds spent across the fires.
+    pub guard_rounds: u32,
+    /// Successful file mutations observed after the first fire.
+    pub edit_after_guard: u32,
 }
 
 /// Context-virtualization telemetry (rlm2/PR1). Folds the per-fire
@@ -265,6 +314,14 @@ const LOOP_WARNING_EVENT_PREFIX: &str = "[loop warning]";
 /// (`agent_loop.rs::edit_grounding_note`).
 const EDIT_GROUNDING_NOTE_PREFIX: &str = "[harness note] Current content of ";
 
+/// Tool names whose successful execution counts as a file mutation
+/// for the edit-completion guard. Mirrors `MUTATING_TOOLS` in both
+/// `anie-agent/src/agent_loop.rs` and `anie-cli/src/verify_runner.rs`
+/// — the same three tools. The literals live in `anie-agent`, which
+/// doesn't export them; the drift risk is accepted and guarded by
+/// the agent-side guard tests on the same set.
+const MUTATING_TOOLS: [&str; 3] = ["edit", "write", "apply_patch"];
+
 /// Counters for the Plan-01 tool-call rescue pipeline, derived
 /// from markers the agent loop leaves in `ToolExecEnd` result
 /// details (`argument_coercions`, `argument_repair_rounds`,
@@ -337,6 +394,13 @@ pub struct RunMetricsAccumulator {
     recovery: RecoveryMetrics,
     prompt: PromptMetrics,
     context: ContextMetrics,
+    edit_guard: EditGuardMetrics,
+    /// Whether the edit-completion guard has fired at least once.
+    /// `edit_after_guard` only counts mutations observed once this
+    /// is set, so a mutation before any fire (impossible in practice
+    /// — the guard never engages after a mutation — but cheap to be
+    /// precise about) is never miscounted as guard-attributable.
+    guard_has_fired: bool,
     /// The `sent_context_tokens` from the most recent `RlmStatsUpdate`,
     /// pending comparison against the NEXT turn's Ollama
     /// `prompt_eval_count`. `None` until the rlm policy reports a send;
@@ -371,6 +435,8 @@ impl RunMetricsAccumulator {
             recovery: RecoveryMetrics::default(),
             prompt: PromptMetrics::default(),
             context: ContextMetrics::default(),
+            edit_guard: EditGuardMetrics::default(),
+            guard_has_fired: false,
             pending_sent_context_tokens: None,
             ollama_num_ctx: None,
             pending_tools: HashMap::new(),
@@ -481,6 +547,16 @@ impl RunMetricsAccumulator {
                     .pending_tools
                     .remove(call_id)
                     .unwrap_or_else(|| "<unknown>".to_string());
+                // PR 3 (edit_completion_guard): a successful file
+                // mutation after the guard has fired is the signal
+                // the intervention worked. Checked before `name` is
+                // moved into the per-tool map below.
+                if self.guard_has_fired
+                    && !*is_error
+                    && MUTATING_TOOLS.contains(&name.as_str())
+                {
+                    self.edit_guard.edit_after_guard += 1;
+                }
                 self.tools.calls += 1;
                 let outcome = self.tools.by_tool.entry(name).or_default();
                 outcome.calls += 1;
@@ -532,6 +608,20 @@ impl RunMetricsAccumulator {
                     self.recovery.loop_perturbations += 1;
                 }
             }
+            // PR 3 (edit_completion_guard): fold the guard's
+            // classifier verdict and each fire. `Fired` arms
+            // `guard_has_fired` so subsequent mutating-tool ends
+            // count toward `edit_after_guard`.
+            AgentEvent::EditGuard { signal } => match signal {
+                EditGuardSignal::Classified(verdict) => {
+                    self.edit_guard.classified_expected = Some(*verdict);
+                }
+                EditGuardSignal::Fired { .. } => {
+                    self.edit_guard.guard_fired += 1;
+                    self.edit_guard.guard_rounds += 1;
+                    self.guard_has_fired = true;
+                }
+            },
             AgentEvent::CompactionEnd { phase, .. } => {
                 self.compaction.total += 1;
                 match phase {
@@ -565,6 +655,7 @@ impl RunMetricsAccumulator {
             recovery: self.recovery.clone(),
             prompt: self.prompt.clone(),
             context: self.context.clone(),
+            edit_guard: self.edit_guard.clone(),
         }
     }
 
@@ -638,6 +729,18 @@ mod tests {
             paged_in_tokens,
             ledger_tokens,
             sent_context_tokens,
+        }
+    }
+
+    fn guard_classified(verdict: bool) -> AgentEvent {
+        AgentEvent::EditGuard {
+            signal: EditGuardSignal::Classified(verdict),
+        }
+    }
+
+    fn guard_fired(round: u32) -> AgentEvent {
+        AgentEvent::EditGuard {
+            signal: EditGuardSignal::Fired { round },
         }
     }
 
@@ -1224,6 +1327,94 @@ mod tests {
         });
         let back: RunMetrics = serde_json::from_value(v4).expect("v4 artifact loads");
         assert_eq!(back.context, ContextMetrics::default());
+    }
+
+    /// PR 3 (edit_completion_guard): the accumulator folds the
+    /// classifier verdict and each guard fire, and counts a
+    /// successful mutating-tool end that lands AFTER the fire as an
+    /// `edit_after_guard` — the signal the intervention worked.
+    #[test]
+    fn edit_guard_metrics_fold_classifier_verdict_fires_and_post_fire_edits() {
+        let m = fold(&[
+            // Classifier ran and said the run is edit-expected.
+            guard_classified(true),
+            // The guard engaged once.
+            guard_fired(1),
+            // A real edit lands on the re-engaged turn.
+            tool_start("c1", "edit"),
+            tool_end("c1", false),
+        ]);
+        assert_eq!(m.edit_guard.classified_expected, Some(true));
+        assert_eq!(m.edit_guard.guard_fired, 1);
+        assert_eq!(m.edit_guard.guard_rounds, 1);
+        assert_eq!(m.edit_guard.edit_after_guard, 1);
+    }
+
+    /// A mutating tool that succeeds BEFORE any fire is not
+    /// guard-attributable, and a non-mutating or failed tool after a
+    /// fire never counts toward `edit_after_guard`.
+    #[test]
+    fn edit_after_guard_counts_only_successful_mutations_following_a_fire() {
+        let m = fold(&[
+            // Pre-fire edit: not attributable to the guard.
+            tool_start("c0", "edit"),
+            tool_end("c0", false),
+            guard_fired(1),
+            // Post-fire but non-mutating: ignored.
+            tool_start("c1", "grep"),
+            tool_end("c1", false),
+            // Post-fire mutating but failed: ignored.
+            tool_start("c2", "write"),
+            tool_end("c2", true),
+            // Post-fire successful mutation: counts.
+            tool_start("c3", "apply_patch"),
+            tool_end("c3", false),
+        ]);
+        assert_eq!(m.edit_guard.guard_fired, 1);
+        assert_eq!(
+            m.edit_guard.edit_after_guard, 1,
+            "only the post-fire successful mutation counts",
+        );
+    }
+
+    /// When the classifier never runs (explicit override path emits
+    /// no `Classified` event), `classified_expected` stays `None`
+    /// and is omitted from the serialized artifact — `None` is
+    /// "classifier skipped", meaningfully distinct from a recorded
+    /// `Some(false)`.
+    #[test]
+    fn classified_expected_is_none_and_omitted_when_classifier_did_not_run() {
+        let m = fold(&[guard_fired(1)]);
+        assert_eq!(m.edit_guard.classified_expected, None);
+        let json = serde_json::to_value(&m).expect("serialize");
+        assert!(
+            json["edit_guard"].get("classified_expected").is_none(),
+            "a skipped classifier omits the field rather than emitting null",
+        );
+    }
+
+    /// Forward-compat: a schema-v5 artifact (no `edit_guard` block)
+    /// loads with the block defaulted, not an error.
+    #[test]
+    fn v5_metrics_artifact_loads_with_edit_guard_block_defaulted() {
+        let v5 = serde_json::json!({
+            "schema_version": 5,
+            "harness_mode": "rlm",
+            "model": "m",
+            "provider": "ollama",
+            "wall_clock_ms": 5,
+            "turns": 1,
+            "tokens": TokenMetrics::default(),
+            "cost": Cost::default(),
+            "tools": ToolMetrics::default(),
+            "compaction": CompactionMetrics::default(),
+            "tool_repair": ToolRepairMetrics::default(),
+            "recovery": RecoveryMetrics::default(),
+            "prompt": PromptMetrics::default(),
+            "context": ContextMetrics::default(),
+        });
+        let back: RunMetrics = serde_json::from_value(v5).expect("v5 artifact loads");
+        assert_eq!(back.edit_guard, EditGuardMetrics::default());
     }
 
     #[test]

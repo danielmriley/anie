@@ -11,7 +11,7 @@ mod tools;
 mod usage;
 
 pub use content::{ContentBlock, ToolCall};
-pub use events::{AgentEvent, CompactionPhase, SessionSummary};
+pub use events::{AgentEvent, CompactionPhase, EditGuardSignal, SessionSummary};
 pub use messages::{AssistantMessage, CustomMessage, Message, ToolResultMessage, UserMessage};
 pub use stop_reason::StopReason;
 pub use stream::StreamDelta;

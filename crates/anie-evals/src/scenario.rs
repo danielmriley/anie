@@ -253,6 +253,7 @@ mod tests {
             recovery: crate::RecoveryView::default(),
             prompt: crate::PromptView::default(),
             context: crate::ContextView::default(),
+            edit_guard: crate::EditGuardView::default(),
         }
     }
 

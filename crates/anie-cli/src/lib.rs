@@ -119,6 +119,13 @@ pub struct Cli {
     /// mode only). The eval harness sets this; see `docs/eval_harness/`.
     #[arg(long, value_name = "PATH")]
     pub metrics_out: Option<PathBuf>,
+    /// Assert that this run requires editing a file. Arms the
+    /// edit-completion guard with `edit_expected = Some(true)`,
+    /// short-circuiting its model-judged classifier (the
+    /// SWE-bench harness sets this on ground-truth "fix" tasks).
+    /// See `docs/edit_completion_guard/README.md`.
+    #[arg(long)]
+    pub require_edit: bool,
 }
 
 /// Supported top-level subcommands.

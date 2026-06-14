@@ -37,10 +37,79 @@ Flags:
 | `--mode` | `rlm` | `anie --harness-mode` (`baseline` / `current` / `rlm`) |
 | `--budget-s` | 480 | wall-clock kill per instance; the whole anie process group is SIGKILLed at the deadline and whatever is in the worktree becomes the prediction |
 | `--out` | `benchmarks/work/predictions/anie__<mode>__<model>.jsonl` | predictions file |
+| `--require-edit` / `--no-require-edit` | `--require-edit` (on) | pass `anie --require-edit` so the edit-completion guard treats every instance as edit-required. `--no-require-edit` drops the flag to measure anie's classifier instead — see [Classifier-accuracy pass](#classifier-accuracy-pass-no-require-edit) |
 
 The runner is **resumable**: instance_ids already present in `--out`
 are skipped, so an interrupted run can be relaunched with the same
 arguments.
+
+## The edit-completion guard (`--require-edit`)
+
+anie's edit-completion guard
+(`docs/edit_completion_guard/README.md`) re-engages the agent loop
+when a run that was *expected* to edit a file ends having mutated
+nothing — a frequent small-model failure on SWE-bench (the baseline
+runs produced no file edit on 20–24 of 25 instances). The guard only
+arms when the task is edit-expected, and that expectation is set in
+precedence:
+
+1. **Explicit** — `anie --require-edit`. Guaranteed-correct, no extra
+   model call.
+2. **Model-judged** (default when the flag is absent) — a one-shot
+   "does this task require editing files? yes/no" classifier side
+   call, cached for the run.
+
+Every SWE-bench instance ships a ground-truth patch, so editing is
+*always* required. The runner therefore passes `--require-edit` by
+default: the ground truth is known, so there is no reason to spend a
+classifier call or risk a wrong "no" verdict. With `--require-edit`
+set the classifier is skipped, so the metrics sidecar omits
+`edit_guard.classified_expected` entirely (it is `None`, "classifier
+did not run" — distinct from a recorded `false`).
+
+### Classifier-accuracy pass (`--no-require-edit`)
+
+Because the SWE-bench ground truth is *always* "edit required", the
+subset doubles as a labelled test set for anie's classifier. Run with
+`--no-require-edit` to drop the flag and let anie classify each
+instance itself:
+
+```bash
+benchmarks/.venv/bin/python benchmarks/swebench/run_anie.py \
+    --limit 25 --model gemma4:e4b --mode rlm --budget-s 480 \
+    --no-require-edit \
+    --out benchmarks/work/predictions/anie__rlm__gemma4-e4b__classify.jsonl
+```
+
+(Use a distinct `--out` so the measurement run's sidecars don't mix
+with a `--require-edit` generation run's.) Each instance's sidecar
+then records the classifier verdict at
+`edit_guard.classified_expected` (`true` / `false`); the field is
+present precisely *because* the classifier ran. Ground truth is `true`
+for every instance, so:
+
+- `classified_expected: true` → correct,
+- `classified_expected: false` → **false negative** (the classifier
+  failed to recognise an edit-required task),
+- field absent → the classifier did not run for that instance (e.g.
+  the run was killed before the classification side call) — not
+  scored.
+
+Read the verdicts straight off the sidecars to get the false-negative
+rate on known-yes ground truth:
+
+```bash
+# false negatives (classifier said "no" on an edit-required task):
+grep -l '"classified_expected": *false' \
+    benchmarks/work/metrics/anie__rlm__gemma4-e4b__classify/*.metrics.json | wc -l
+# instances the classifier actually ran on:
+grep -l '"classified_expected"' \
+    benchmarks/work/metrics/anie__rlm__gemma4-e4b__classify/*.metrics.json | wc -l
+```
+
+`anie_evals::score_classifier` is the in-tree scorer for the same
+verdict (ground-truth `true` for SWE-bench): a present `false` is a
+`FalseNegative`, an absent field is `NotClassified` (not scored).
 
 ## Control arm (mini-swe-agent)
 
@@ -115,10 +184,12 @@ a graded run.
    `benchmarks/work/instances/<instance_id>` (hard-reset + cleaned if
    it already exists, so every attempt starts pristine).
 3. `target/debug/anie --print --harness-mode=<mode> --model <model>
-   -C <worktree> --metrics-out <id>.metrics.json <prompt>`, where the
-   prompt is the instance's `problem_statement` behind a fixed preamble
-   ("fix the issue; modify source, not tests"). anie's stdout/stderr go
-   to `benchmarks/work/logs/<run>/<id>.log`.
+   -C <worktree> --metrics-out <id>.metrics.json [--require-edit]
+   <prompt>`, where the prompt is the instance's `problem_statement`
+   behind a fixed preamble ("fix the issue; modify source, not tests")
+   and `--require-edit` is passed unless `--no-require-edit` was given
+   (see [the edit-completion guard](#the-edit-completion-guard---require-edit)).
+   anie's stdout/stderr go to `benchmarks/work/logs/<run>/<id>.log`.
 4. `git add -A && git diff --cached` in the worktree → the
    `model_patch` (staging first so files the agent *created* are in the
    patch; this matches what mini-swe-agent and other SWE-bench scaffolds

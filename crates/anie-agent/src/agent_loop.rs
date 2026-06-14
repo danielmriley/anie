@@ -188,8 +188,8 @@ mod send_event_tests {
 }
 
 use anie_protocol::{
-    AgentEvent, AssistantMessage, ContentBlock, Message, StopReason, StreamDelta, ToolCall,
-    ToolDef, ToolResult, ToolResultMessage, Usage, UserMessage, now_millis,
+    AgentEvent, AssistantMessage, ContentBlock, EditGuardSignal, Message, StopReason, StreamDelta,
+    ToolCall, ToolDef, ToolResult, ToolResultMessage, Usage, UserMessage, now_millis,
 };
 use anie_provider::{
     LlmContext, Model, ProviderError, ProviderEvent, ProviderRegistry, ProviderStream,
@@ -532,6 +532,21 @@ pub struct AgentLoopConfig {
     /// CLI passes its `tool_examples` map when repair is
     /// enabled. Plan 01 §9b of `docs/local_model_augmentation/`.
     repair_examples: HashMap<String, String>,
+    /// Edit-completion guard budget: the maximum number of times
+    /// the guard may re-engage a run that reached its completion
+    /// boundary without editing any file. `0` (default) disables
+    /// the guard entirely and keeps the loop byte-identical to a
+    /// pre-guard run; the CLI installs the real default in rlm
+    /// mode. PR 1 of `docs/edit_completion_guard/`.
+    edit_guard_rounds: u32,
+    /// Whether the run is expected to edit files. `Some(true)` /
+    /// `Some(false)` short-circuits the model-judged classifier;
+    /// `None` (default) defers to a one-shot classification
+    /// side-request resolved the first time the guard would
+    /// otherwise engage, then cached for the run. Only consulted
+    /// when `edit_guard_rounds > 0`. PR 1 of
+    /// `docs/edit_completion_guard/`.
+    edit_expected: Option<bool>,
 }
 
 /// Cap on generative repair attempts per invalid tool call.
@@ -590,7 +605,32 @@ impl AgentLoopConfig {
             recurse_depth_threshold: None,
             tool_call_repair: false,
             repair_examples: HashMap::new(),
+            edit_guard_rounds: 0,
+            edit_expected: None,
         }
+    }
+
+    /// Set the edit-completion guard budget. `rounds == 0`
+    /// (default) disables the guard; any positive value arms it,
+    /// allowing the loop to re-engage up to `rounds` times when a
+    /// run reaches its completion boundary having mutated no
+    /// file. PR 1 of `docs/edit_completion_guard/`.
+    #[must_use]
+    pub fn with_edit_guard(mut self, rounds: u32) -> Self {
+        self.edit_guard_rounds = rounds;
+        self
+    }
+
+    /// Set the edit-expectation override consulted by the guard.
+    /// `Some(true)` / `Some(false)` short-circuits the model-
+    /// judged classifier; `None` (default) defers to the one-shot
+    /// classification side-request. Only consulted when the guard
+    /// is armed (`with_edit_guard(rounds)` with `rounds > 0`).
+    /// PR 1 of `docs/edit_completion_guard/`.
+    #[must_use]
+    pub fn with_edit_expected(mut self, edit_expected: Option<bool>) -> Self {
+        self.edit_expected = edit_expected;
+        self
     }
 
     /// Toggle the bounded tool-call repair round. When enabled,
@@ -766,6 +806,23 @@ struct AgentRunState {
     /// for tracing fields and surfaced to `BeforeModelPolicy`
     /// via `BeforeModelRequest::step_index`.
     step_index: u64,
+    /// Count of successful file-mutating tool calls
+    /// (`edit` / `write` / `apply_patch`) observed this run. The
+    /// edit-completion guard fires only when this is zero at the
+    /// completion boundary. PR 1 of `docs/edit_completion_guard/`.
+    file_mutations: u32,
+    /// Remaining edit-completion-guard interventions. Seeded from
+    /// `AgentLoopConfig::edit_guard_rounds` at machine
+    /// construction and decremented each time the guard fires.
+    /// `0` means the guard is disabled or its budget is spent.
+    /// PR 1 of `docs/edit_completion_guard/`.
+    edit_guard_remaining: u32,
+    /// Cached resolution of the model-judged edit-expectation
+    /// classifier. `None` until the guard first considers
+    /// engaging; then `Some(verdict)` for the rest of the run so
+    /// the side-request runs at most once. PR 1 of
+    /// `docs/edit_completion_guard/`.
+    edit_expected_cache: Option<bool>,
 }
 
 impl AgentRunState {
@@ -782,6 +839,9 @@ impl AgentRunState {
             finished: false,
             suppress_tail_agent_end: false,
             step_index: 0,
+            file_mutations: 0,
+            edit_guard_remaining: 0,
+            edit_expected_cache: None,
         }
     }
 
@@ -1077,7 +1137,8 @@ impl AgentLoop {
             provider = %self.config.model.provider,
             prompt_count = prompts.len(),
         );
-        let state = AgentRunState::new(&prompts, context);
+        let mut state = AgentRunState::new(&prompts, context);
+        state.edit_guard_remaining = self.config.edit_guard_rounds;
         async {
             self.start_run(&prompts, event_tx).await;
         }
@@ -2037,6 +2098,186 @@ impl AgentLoop {
             })
     }
 
+    /// Completion-boundary edit guard. Called when the loop is
+    /// about to terminate on a clean, tool-call-free final
+    /// assistant message. Returns the (possibly overridden) next
+    /// decision: `Continue(ModelTurn)` when the guard fires (an
+    /// edit directive has been injected into the context), or
+    /// `Finish` when it declines.
+    ///
+    /// The guard fires only when ALL hold:
+    /// 1. the budget is armed and unspent (`edit_guard_remaining > 0`),
+    /// 2. no file was mutated this run (`file_mutations == 0`),
+    /// 3. the final message did not explicitly conclude that no
+    ///    change is needed (suppression heuristic), and
+    /// 4. the run is edit-expected — an explicit override, else a
+    ///    one-shot model-judged classification cached for the run.
+    ///
+    /// PR 1 of `docs/edit_completion_guard/`.
+    async fn maybe_engage_edit_guard(
+        &self,
+        assistant: &AssistantMessage,
+        state: &mut AgentRunState,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> AgentDecision {
+        if state.edit_guard_remaining == 0 || state.file_mutations > 0 {
+            return AgentDecision::Finish;
+        }
+        // A run cancelled at the completion boundary must not spend a
+        // classifier side-request or inject another turn — just finish
+        // (2026-06-14 review).
+        if cancel.is_cancelled() {
+            return AgentDecision::Finish;
+        }
+
+        let final_text = assistant_text(assistant);
+        if concludes_no_change_needed(&final_text) {
+            return AgentDecision::Finish;
+        }
+
+        if !self.resolve_edit_expected(state, event_tx, cancel).await {
+            return AgentDecision::Finish;
+        }
+
+        // Fire: spend one round and inject the directive. The
+        // round that just elapsed (before decrement) determines
+        // the escalation level so a 2-round budget escalates on
+        // its second intervention.
+        let rounds_used = self.config.edit_guard_rounds - state.edit_guard_remaining;
+        state.edit_guard_remaining -= 1;
+        let directive = edit_guard_directive(rounds_used, self.config.edit_guard_rounds);
+        state.extend_context([Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: directive }],
+            timestamp: now_millis(),
+        })]);
+
+        tracing::info!(
+            rounds_remaining = state.edit_guard_remaining,
+            "edit-completion guard fired: re-engaging run with edit directive"
+        );
+
+        // PR 3 of `docs/edit_completion_guard/`: surface the fire so
+        // the metrics accumulator can count guard activity. `round`
+        // is 1-based — `rounds_used` is the count of rounds already
+        // spent before this one.
+        send_event(
+            event_tx,
+            AgentEvent::EditGuard {
+                signal: EditGuardSignal::Fired {
+                    round: rounds_used + 1,
+                },
+            },
+        )
+        .await;
+
+        // A fresh `ModelTurn` needs its own `TurnStart` to keep
+        // the event stream balanced (every model turn after the
+        // first is opened by the prior step's terminal decision).
+        send_event(event_tx, AgentEvent::TurnStart).await;
+        AgentDecision::Continue(AgentIntent::ModelTurn)
+    }
+
+    /// Resolve whether the run is edit-expected for guard
+    /// purposes. An explicit `edit_expected` override wins and is
+    /// returned directly. Otherwise a one-shot classification
+    /// side-request decides, cached on `state` so it runs at most
+    /// once per run. PR 1 of `docs/edit_completion_guard/`.
+    ///
+    /// PR 3: when the classifier actually runs (no explicit
+    /// override, cache miss) its verdict is surfaced once via
+    /// `AgentEvent::EditGuard` so the metrics accumulator can
+    /// record `classified_expected`. The explicit-override path
+    /// emits nothing — `classified_expected` stays `None` because
+    /// no classification was performed.
+    async fn resolve_edit_expected(
+        &self,
+        state: &mut AgentRunState,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        if let Some(explicit) = self.config.edit_expected {
+            return explicit;
+        }
+        if let Some(cached) = state.edit_expected_cache {
+            return cached;
+        }
+        let task = original_task_text(state.context());
+        let verdict = self.classify_edit_expected(&task, cancel).await;
+        state.edit_expected_cache = Some(verdict);
+        send_event(
+            event_tx,
+            AgentEvent::EditGuard {
+                signal: EditGuardSignal::Classified(verdict),
+            },
+        )
+        .await;
+        verdict
+    }
+
+    /// One-shot model-judged edit-expectation classifier. Mirrors
+    /// [`Self::request_tool_call_repair`]: a single-message
+    /// context, no tools advertised, a drained throwaway channel
+    /// so the exchange never touches the transcript or main
+    /// context. Parses the first `yes`/`no` token; defaults to
+    /// **`false`** on an ambiguous or empty answer.
+    ///
+    /// This path runs only when edit-expectation was NOT declared
+    /// explicitly (interactive use; the benchmark sets
+    /// `--require-edit` and never reaches here). On that path a
+    /// false-positive guard fire would nag a user mid-question, so
+    /// an uncertain classifier must fail *toward not firing* — the
+    /// conservative direction for "don't make the harness worse"
+    /// (2026-06-14 review). PR 1 of `docs/edit_completion_guard/`.
+    async fn classify_edit_expected(&self, task: &str, cancel: &CancellationToken) -> bool {
+        let prompt = format!(
+            "Does this task require editing files (writing or modifying \
+             source)? Answer with exactly one word: yes or no.\n\nTask:\n{task}"
+        );
+        let messages = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: prompt }],
+            timestamp: now_millis(),
+        })];
+
+        let Ok(request) = self
+            .config
+            .request_options_resolver
+            .resolve(&self.config.model, &messages)
+            .await
+        else {
+            return true;
+        };
+        let Some(provider) = self.provider_registry.get(&self.config.model.api) else {
+            return true;
+        };
+        let mut model = self.config.model.clone();
+        if let Some(base_url_override) = request.base_url_override {
+            model.base_url = base_url_override;
+        }
+        let llm_context = LlmContext {
+            system_prompt: "You classify whether a coding task requires \
+                            editing files. Answer with exactly one word: \
+                            yes or no."
+                .to_string(),
+            messages: provider.convert_messages(&messages),
+            tools: Vec::new(),
+        };
+        let options = self.config.stream_options(request.api_key, request.headers);
+        let Ok(stream) = provider.stream(&model, llm_context, options) else {
+            return true;
+        };
+
+        // Throwaway, actively-drained channel — the classification
+        // exchange never reaches the transcript.
+        let (side_tx, mut side_rx) = mpsc::channel(64);
+        let drainer = tokio::spawn(async move { while side_rx.recv().await.is_some() {} });
+        let collected = self.collect_stream(stream, &side_tx, cancel).await;
+        drop(side_tx);
+        let _ = drainer.await;
+
+        parse_yes_no(&assistant_text(&collected.assistant)).unwrap_or(false)
+    }
+
     /// PR 1 + PR 2 of `docs/harness_mitigations_2026-05-01/`.
     /// Shared epilogue for the synthesized-failure paths
     /// (missing tool, validation error, before-hook block).
@@ -2457,10 +2698,50 @@ impl<'a> AgentRunMachine<'a> {
         .instrument(step_span)
         .await;
 
-        match self
+        // Edit-completion-guard bookkeeping: count successful
+        // file-mutating tool calls so the completion-boundary hook
+        // can tell an empty-patch run from one that actually
+        // edited. Cheap and unconditional; the guard itself is
+        // still gated on `edit_guard_remaining`. PR 1 of
+        // `docs/edit_completion_guard/`.
+        if let AgentObservation::ToolResults { results, .. } = &observation {
+            for result in results {
+                if !result.is_error && is_mutating_tool(&result.tool_name) {
+                    self.state.file_mutations = self.state.file_mutations.saturating_add(1);
+                }
+            }
+        }
+
+        let decision = self
             .agent_loop
-            .decide_next_step(&self.state, &observation, cancel)
+            .decide_next_step(&self.state, &observation, cancel);
+
+        // Completion-boundary guard: if the loop is about to end
+        // because the assistant produced a clean final message
+        // with no tool calls, give the guard a chance to re-engage
+        // the run with an edit directive instead. Only the
+        // no-tool-call clean-finish path is eligible; error /
+        // aborted / cancelled / preflight terminations are not.
+        let decision = if matches!(decision, AgentDecision::Finish)
+            && let AgentObservation::AssistantCollected {
+                assistant,
+                terminal_error: None,
+            } = &observation
+            && !matches!(
+                assistant.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            )
+            && extract_tool_calls(assistant).is_empty()
         {
+            let assistant = assistant.clone();
+            self.agent_loop
+                .maybe_engage_edit_guard(&assistant, &mut self.state, event_tx, cancel)
+                .await
+        } else {
+            decision
+        };
+
+        match decision {
             AgentDecision::Continue(next) => self.intent = next,
             AgentDecision::Finish => {
                 self.state.finish();
@@ -2511,6 +2792,111 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
             _ => None,
         })
         .collect()
+}
+
+/// Tool names whose successful execution counts as a file
+/// mutation for the edit-completion guard. Mirrors
+/// `MUTATING_TOOLS` in `anie-cli/src/verify_runner.rs` — the same
+/// three tools the verify runner treats as edits. PR 1 of
+/// `docs/edit_completion_guard/`.
+const MUTATING_TOOLS: [&str; 3] = ["edit", "write", "apply_patch"];
+
+fn is_mutating_tool(name: &str) -> bool {
+    MUTATING_TOOLS.contains(&name)
+}
+
+/// Concatenate the text blocks of an assistant message.
+fn assistant_text(assistant: &AssistantMessage) -> String {
+    join_text_blocks(&assistant.content)
+}
+
+fn join_text_blocks(blocks: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        if let ContentBlock::Text { text } = block {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// Recover the original user task text from the run context for
+/// the classifier prompt — the first user message's text. Empty
+/// when the context carries no user message (the classifier then
+/// defaults toward editing). PR 1 of `docs/edit_completion_guard/`.
+fn original_task_text(context: &[Message]) -> String {
+    context
+        .iter()
+        .find_map(|message| match message {
+            Message::User(user) => Some(join_text_blocks(&user.content)),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Conservative suppression heuristic: case-insensitive scan for
+/// an explicit "no change is needed" style conclusion in the
+/// final assistant text. Kept deliberately small — a false match
+/// here suppresses a legitimate guard fire, so each phrase must
+/// be one a model only writes when concluding no edit is needed.
+/// PR 1 of `docs/edit_completion_guard/`.
+fn concludes_no_change_needed(text: &str) -> bool {
+    // Conclusion-shaped phrases only. The bare "no change" was dropped
+    // (2026-06-14 review): it false-suppressed legitimate fires on text
+    // like "this makes no change to behavior, so the fix is ..." —
+    // swallowing exactly the cases the guard exists for.
+    const PHRASES: [&str; 8] = [
+        "no change needed",
+        "no change is needed",
+        "no change required",
+        "no changes needed",
+        "no changes are needed",
+        "nothing to change",
+        "cannot reproduce",
+        "already correct",
+    ];
+    let lowered = text.to_lowercase();
+    PHRASES.iter().any(|phrase| lowered.contains(phrase))
+}
+
+/// Parse the first `yes`/`no` token of a classifier reply.
+/// Returns `None` when neither appears (caller decides the
+/// default). PR 1 of `docs/edit_completion_guard/`.
+fn parse_yes_no(text: &str) -> Option<bool> {
+    for token in text.split(|c: char| !c.is_alphabetic()) {
+        match token.to_lowercase().as_str() {
+            "yes" => return Some(true),
+            "no" => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The directive injected when the guard fires. Gives the model
+/// the explicit "or say no change is needed" out so it is never
+/// forced into a garbage edit, and escalates slightly on the
+/// final round of a multi-round budget. PR 1 of
+/// `docs/edit_completion_guard/`.
+fn edit_guard_directive(rounds_used: u32, total_rounds: u32) -> String {
+    let escalate = total_rounds > 1 && rounds_used + 1 >= total_rounds;
+    if escalate {
+        "You ended again without editing any file. This is your last \
+         chance: if you have identified the fix, make the edit NOW with \
+         edit, write, or apply_patch. If no change is truly needed, say \
+         so explicitly and explain why — do not make a change just to \
+         make one."
+            .to_string()
+    } else {
+        "You ended without editing any file, but your edits are the \
+         deliverable. If you have identified the fix, make the edit now \
+         with edit, write, or apply_patch. If no change is truly needed, \
+         say so explicitly and explain why."
+            .to_string()
+    }
 }
 
 /// Plan 02 PR-A: return `Cow::Borrowed` on the common no-

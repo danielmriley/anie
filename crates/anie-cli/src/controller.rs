@@ -1967,6 +1967,13 @@ pub(crate) struct ControllerState {
     /// session, rebuilt from persisted usage on resume. Surfaced in
     /// `/state` and the TUI status bar.
     pub(crate) cost_meter: Arc<crate::cost_meter::CostMeter>,
+    /// `--require-edit` CLI flag. When `true` it short-circuits
+    /// the edit-completion guard's model-judged classifier and
+    /// asserts `edit_expected = Some(true)` for every run (the
+    /// benchmark sets it on ground-truth "yes" tasks). `false`
+    /// (the default) defers to `[guard].require_edit` and then
+    /// the classifier. See `docs/edit_completion_guard/README.md`.
+    pub(crate) require_edit: bool,
 }
 
 impl ControllerState {
@@ -2682,7 +2689,9 @@ fn build_agent(
     .with_wrap_failed_tool_results(should_wrap_failed_tool_results(state))
     .with_tool_call_repair(should_repair_tool_calls(state))
     .with_failure_loop_threshold(failure_loop_threshold(state))
-    .with_recurse_depth_threshold(recurse_depth_threshold(state));
+    .with_recurse_depth_threshold(recurse_depth_threshold(state))
+    .with_edit_guard(edit_guard_rounds(state, edit_guard_disabled_by_env()))
+    .with_edit_expected(edit_expected(state));
     // Plan 01 §9b of `docs/local_model_augmentation/`: ground the
     // repair side-request prompts in the per-tool example calls.
     // Gated on repair itself so non-rlm configs stay untouched.
@@ -2767,6 +2776,53 @@ fn env_flag_enabled(name: &str) -> bool {
         std::env::var(name).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+/// PR 2 of `docs/edit_completion_guard/`. Number of edit-guard
+/// rounds to arm at the agent loop's completion boundary. The
+/// guard is rlm-default-on: `[guard].guard_rounds` (default 1)
+/// in `--harness-mode=rlm`, `0` (disabled — byte-identical loop)
+/// outside rlm or when `disabled_by_env` is set
+/// (`ANIE_EDIT_GUARD=0`). The env value is passed in rather than
+/// read here so tests can exercise the gate race-free without
+/// mutating the process environment.
+fn edit_guard_rounds(state: &ControllerState, disabled_by_env: bool) -> u32 {
+    if !state.harness_mode.installs_rlm_features() {
+        return 0;
+    }
+    if disabled_by_env {
+        return 0;
+    }
+    state.config.anie_config().guard.guard_rounds
+}
+
+/// `ANIE_EDIT_GUARD=0` disables the edit-completion guard. Unlike
+/// the other mitigations' `ANIE_DISABLE_*=1` toggles, this gate
+/// keys off the literal value `0` (the benchmark / spec name).
+/// Read once at `build_agent` time and passed into
+/// `edit_guard_rounds` as a param for race-free tests.
+fn edit_guard_disabled_by_env() -> bool {
+    matches!(std::env::var("ANIE_EDIT_GUARD").as_deref(), Ok("0"))
+}
+
+/// PR 2 of `docs/edit_completion_guard/`. Resolve the explicit
+/// `edit_expected` override for the run. `Some(true)` when the
+/// `--require-edit` flag is set or `[guard].require_edit` is
+/// `Some(true)`; otherwise `None`, which defers to PR 1's
+/// model-judged classifier side-request. We never assert
+/// `Some(false)` from config here — a `require_edit = false`
+/// config means "no explicit override, let the classifier
+/// decide", which is exactly `None`.
+fn edit_expected(state: &ControllerState) -> Option<bool> {
+    // Precedence: the `--require-edit` CLI flag forces edit-expected;
+    // otherwise an explicit `[guard].require_edit` (true OR false) is
+    // honored as-is — `Some(false)` is a real opt-out that short-
+    // circuits the classifier to "never fire" (2026-06-14 review),
+    // distinct from an unset section (`None` => model-judged classify).
+    if state.require_edit {
+        return Some(true);
+    }
+    state.config.anie_config().guard.require_edit
 }
 
 /// Plan 03 §2a of `docs/local_model_augmentation/`. Install the
