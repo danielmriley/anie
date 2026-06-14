@@ -149,8 +149,95 @@ A high-stakes-step feature, gated — NOT a per-turn default.
 
 ## Deferred / not this
 
-- Faithful "structured analysis" judge (consensus/blind-spots JSON)
-  for non-verifiable tasks — needs a strong judge anie doesn't have
-  locally; revisit only with a hosted-judge escape hatch (out of the
-  pure-local scope).
+- (Addressed in the 2026-06-14 extension below: non-verifiable tasks
+  get a COMPOSITE judge — deterministic sub-checks + web-grounded
+  fact-check + cross-candidate consensus + narrow rubric — rather than
+  a single weak holistic local judge.)
 - Cross-model panels (swap thrash) — sampling diversity first.
+
+---
+
+## Extension (2026-06-14): collaboration modes + non-verifiable judging
+
+### Collaboration: independent panel vs talking agents
+
+The base design's panel is **independent** (candidates never see each
+other). Adding inter-agent communication is a real technique but
+inverts the small-model safety story:
+
+- **Symmetric debate** (agents see each other's answers, revise over
+  rounds until convergence): documented to help *frontier* models;
+  on small models it tends to **converge on a confidently-wrong
+  consensus** or mode-collapse (a weak model copies the
+  stronger-sounding peer) — the weak-judge problem moved *into* the
+  loop. Also: rounds are sequential, so they CANNOT batch on Ollama's
+  parallel slots — R× serial vs best-of-N's ~1× batched. Riskier AND
+  much slower locally. **Not recommended as a default.**
+- **Asymmetric, grounded collaboration** (distinct roles; the critic
+  must produce a *narrow, evidence-bound* objection — "find one
+  concrete problem; cite the exact line/claim"): this survives small
+  models, for the same reason this project's own multi-agent
+  workflows work (finder → adversarial verifier → synthesizer —
+  asymmetric roles, grounded objections, no symmetric persuasion).
+  An opt-in upgrade, not the default.
+
+Spectrum, safest first: **independent best-of-N** (default) →
+**generator + grounded critic** (opt-in) → symmetric debate
+(deferred; small-model echo-chamber risk).
+
+### Judging non-verifiable tasks (e.g. writing a paper)
+
+For code we replace the model-judge with the compiler. With no
+compiler, we are forced back toward OpenRouter's *actual* design (a
+structured-analysis judge) — deferred originally because a small
+local model is a poor *holistic* judge. The fix: never ask the
+holistic question. Build a **composite judge** of narrow, grounded
+checks (small models do concrete yes/no well, open synthesis badly):
+
+1. **Deterministic sub-checks**: structural completeness
+   (intro/method/results/conclusion), internal consistency (does a
+   later section contradict an earlier one?), every citation
+   resolves.
+2. **Web-grounded fact/citation check** (reuse web_search/web_read):
+   verify claims and sources against the real world — converts
+   "unverifiable" claims into verifiable ones; a reliable local
+   judge for the parts it covers.
+3. **Cross-candidate consensus map**: agreement across N diverse
+   candidates = higher confidence; divergence flags exactly the
+   claims to verify or escalate. (This is OpenRouter's
+   consensus/disagreement output, and it is genuinely useful here.)
+4. **Narrow per-criterion rubric model-judgments** — last resort,
+   never a single holistic "which is better?".
+
+**Verifiability governs autonomy.** The less verifiable the task, the
+more the harness should SURFACE its structured analysis instead of
+silently auto-selecting:
+
+| task | judge | output |
+|------|-------|--------|
+| code w/ tests | compiler/tests | auto-select the passing candidate |
+| paper (citations, facts, structure) | composite (1-4) | annotated drafts + "verify these / pick a direction" |
+| fully subjective prose | consensus + narrow rubric | surface to human; do not auto-pick |
+
+The harness's measured confidence in its own judge should set how
+much it decides vs. asks.
+
+### Why the two halves connect
+
+Grounded collaboration earns its cost **more on prose than on code**:
+a citation-checking, contradiction-flagging critic improves a draft
+in a way independent sampling cannot — whereas for code the tests
+already catch what a critic would say. So the upgrade path is:
+independent best-of-N as the universal safe default; asymmetric
+grounded collaboration as the opt-in that pays off most on exactly
+the non-verifiable tasks that lack a compiler judge.
+
+### Sequencing note
+
+This extension does NOT change the prerequisite: best-of-N (any
+form) is still a *multiplier* gated on the per-attempt floor first.
+The non-verifiable + collaboration work is a SECOND phase after the
+verifiable best-of-N proves out on the benchmark — it adds judge
+machinery and human-in-the-loop surfacing, which is more design
+surface and should not precede evidence that the panel mechanism
+helps at all.
