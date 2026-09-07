@@ -608,9 +608,7 @@ impl OutputPane {
     }
 
     fn invalidate_all_caches(&mut self) {
-        for slot in &mut self.caches {
-            *slot = None;
-        }
+        self.caches.fill(None);
         for state in &mut self.streaming_assistant_renders {
             if let Some(state) = state.as_mut() {
                 // PR 01 of tui_polish_2026-04-26: streaming
