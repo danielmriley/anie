@@ -39,7 +39,7 @@ directions.
 |---|---|---|
 | `anie-cli` | CLI parsing, mode dispatch, onboarding commands, controller state machine, retry policy, runtime-state persistence, slash-command registry, provider/tool/session wiring | Rendering internals, provider wire formats, tool implementation details |
 | `anie-tui` | Ratatui/crossterm UI state, active-draft input, overlays, slash-command UX, autocomplete, transcript rendering, model/provider picker surfaces | Agent orchestration, session mutation, provider calls |
-| `anie-agent` | Provider/tool-agnostic agent loop, REPL step machine (`AgentRunMachine`), `BeforeModelPolicy` hook, tool-call validation/execution, streaming event normalization into `AgentEvent` | Persistence, retry policy, auth storage, UI rendering |
+| `anie-agent` | Provider/tool-agnostic agent loop, REPL step machine (`AgentRunMachine`), `BeforeModelPolicy` hook, tool-call validation/execution, embedded XML/JSON tool-call parse + bounded repair, evidence brief, streaming event normalization into `AgentEvent` | Persistence, retry policy, auth storage, UI rendering |
 | `anie-provider` | Provider traits, model metadata, request options, normalized provider events, structured provider error taxonomy | Built-in HTTP implementations, credential lookup |
 | `anie-providers-builtin` | Built-in provider implementations, SSE/HTTP helpers, local-server probing, model discovery, built-in model catalog helpers | Controller policy, session persistence, credential storage |
 | `anie-tools` | Built-in tools and file-mutation serialization (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) | Agent loop policy, UI rendering, sandbox policy beyond its path behavior |
@@ -48,7 +48,7 @@ directions.
 | `anie-evals` | Non-interactive evaluation harness: TOML scenarios with deterministic automated checks, a subprocess runner that drives the real `anie` binary under each `--harness-mode` and reads its `--metrics-out` JSON, and JSON/Markdown comparison reports. A **leaf** crate — talks to anie only across the metrics-JSON boundary | Any `anie-*` library dependency (subprocess, not linkage); LLM-as-judge scoring |
 | `anie-protocol` | Shared message/content/tool/event/usage/stop-reason types | Persistence policy, provider-specific HTTP conversion |
 | `anie-session` | Append-only session file schema, file locking, context reconstruction, branch/fork support, compaction records | Config merging, auth, provider calls |
-| `anie-config` | Config schema, global/project config loading and merging, context-file discovery, web/Ollama/UI/tool config, comment-preserving config mutation | Secret storage, session history |
+| `anie-config` | Config schema, global/project config loading and merging, context-file discovery, web/Ollama/UI/tool config, model capability profiles, comment-preserving config mutation | Secret storage, session history |
 | `anie-auth` | Credential storage/resolution, OAuth provider clients, OAuth refresh locking, request-option resolution | Provider streaming, model selection policy |
 | `anie-integration-tests` | Cross-crate behavior tests | Runtime code |
 
@@ -161,6 +161,21 @@ the `Read` phase of every `ModelTurn`. The default install is
 the controller. Future hooks (after-model, on-tool-error, etc.) get
 their own traits when real consumers materialize. Plan series:
 `docs/repl_agent_loop/`.
+
+Local-model reliability (Phase B of
+`docs/local_small_model_harness_ideas.md`) hooks the existing loop
+without changing its intent set:
+
+- `build_system_prompt` / `SystemPromptCache` select a prompt preset
+  from the resolved profile (`generic_local_coder`, `qwen_coder`,
+  `deepseek_coder`; llama/mistral/gemma stubs share the generic stance).
+- After native `toolCall` blocks, the agent can parse XML/JSON embedded
+  calls (`XmlJsonBlock` / `JsonFence`). Malformed calls get a bounded
+  in-context repair (`max_parse_repairs`, default 2) asking for exactly
+  one corrected call. Ambiguous parses are not executed.
+- `EvidencePolicy` injects an observed Done / Validation / Not run brief
+  once tools have produced results. The brief cites only those
+  observations.
 
 ### Plan/todo state and the verifier seam
 
@@ -815,6 +830,14 @@ scripted use.
   and successful `bash`/`read` tool-output display mode
 - tool preferences: bash deny policy and web fetch budgets/network policy
 - Ollama preferences: optional workspace-wide native `num_ctx` cap
+- model capability profiles: optional fields flattened onto `[model]` and
+  `[[providers.*.models]]` (`prompt_template`, `tool_call_format`,
+  `preferred_temperature`, one-tool-per-step / `max_tool_calls_per_step`,
+  `tool_call_repair`, `good_at` / `weak_at`). Resolved from the selected
+  model (catalog overlay on family inference, then `[model]` overlay).
+  `[agent.local.tool_calls]` sets `max_parse_repairs` (default 2) and
+  `execute_ambiguous_calls` (default false). Hosted frontier models keep
+  native tool calls and the historical system prompt.
 
 Config load order:
 

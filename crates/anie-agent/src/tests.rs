@@ -2775,3 +2775,95 @@ async fn guard_disabled_by_default_leaves_loop_byte_identical() {
         "a disabled guard must leave the event stream byte-identical",
     );
 }
+
+fn parse_repair_agent(provider: Box<dyn Provider>, tool_registry: Arc<ToolRegistry>) -> AgentLoop {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(ApiKind::OpenAICompletions, provider);
+    AgentLoop::new(
+        Arc::new(provider_registry),
+        tool_registry,
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_embedded_tool_call_format(crate::EmbeddedToolCallFormat::XmlJsonBlock)
+        .with_max_parse_repairs(2)
+        .with_max_tool_calls_per_step(Some(1))
+        .with_tool_call_repair(true),
+    )
+}
+
+#[tokio::test]
+async fn broken_xml_tool_call_is_repaired_then_executed() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = parse_repair_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>\n{\"name\":\"count\",\"arguments\":{\"limit\":3}}\n</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant("done")),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("count")], Vec::new()).await;
+    let tool_result = first_tool_result(&result);
+    assert!(!tool_result.is_error, "repaired embedded call must execute");
+    assert_eq!(tool_result.tool_name, "count");
+    assert!(
+        result.final_context.iter().any(|message| match message {
+            Message::User(user) => user.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text { text } if text.contains("Your tool call was invalid")
+            )),
+            _ => false,
+        }),
+        "repair prompt must land in context"
+    );
+}
+
+#[tokio::test]
+async fn parse_repair_budget_exhaustion_does_not_execute_malformed_call() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = parse_repair_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("count")], Vec::new()).await;
+    assert!(
+        result
+            .generated_messages
+            .iter()
+            .all(|message| !matches!(message, Message::ToolResult(_))),
+        "exhausted parse-repair budget must not execute the call"
+    );
+    assert_eq!(
+        result
+            .generated_messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant(_)))
+            .count(),
+        3
+    );
+}

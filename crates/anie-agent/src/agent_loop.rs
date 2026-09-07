@@ -547,6 +547,24 @@ pub struct AgentLoopConfig {
     /// when `edit_guard_rounds > 0`. PR 1 of
     /// `docs/edit_completion_guard/`.
     edit_expected: Option<bool>,
+    /// How to look for tool calls on assistant text. `NativeOnly`
+    /// (default) keeps hosted behavior. Local profiles use
+    /// `XmlJsonBlock` / `JsonFence`. Phase B of
+    /// `docs/local_small_model_harness_ideas.md`.
+    embedded_tool_call_format: crate::EmbeddedToolCallFormat,
+    /// Cap on tool calls executed from one assistant turn.
+    /// `Some(1)` honors one-tool-per-step. `None` keeps all.
+    max_tool_calls_per_step: Option<u32>,
+    /// Budget for in-context parse-repair turns after a malformed
+    /// embedded tool call. `0` (default) does not repair and does
+    /// not execute the malformed call.
+    max_parse_repairs: u32,
+    /// When false (default), an ambiguous parse is not executed.
+    execute_ambiguous_calls: bool,
+    /// Default sampling temperature forwarded on model requests.
+    /// `None` leaves the provider default. Local profiles set this
+    /// from `preferred_temperature`.
+    preferred_temperature: Option<f32>,
 }
 
 /// Cap on generative repair attempts per invalid tool call.
@@ -607,6 +625,11 @@ impl AgentLoopConfig {
             repair_examples: HashMap::new(),
             edit_guard_rounds: 0,
             edit_expected: None,
+            embedded_tool_call_format: crate::EmbeddedToolCallFormat::NativeOnly,
+            max_tool_calls_per_step: None,
+            max_parse_repairs: 0,
+            execute_ambiguous_calls: false,
+            preferred_temperature: None,
         }
     }
 
@@ -652,6 +675,45 @@ impl AgentLoopConfig {
     #[must_use]
     pub fn with_repair_examples(mut self, examples: HashMap<String, String>) -> Self {
         self.repair_examples = examples;
+        self
+    }
+
+    /// Select the embedded tool-call parser. Default is native-only.
+    #[must_use]
+    pub fn with_embedded_tool_call_format(
+        mut self,
+        format: crate::EmbeddedToolCallFormat,
+    ) -> Self {
+        self.embedded_tool_call_format = format;
+        self
+    }
+
+    /// Cap executed tool calls per assistant turn (`Some(1)` =
+    /// one-tool-per-step).
+    #[must_use]
+    pub fn with_max_tool_calls_per_step(mut self, max: Option<u32>) -> Self {
+        self.max_tool_calls_per_step = max;
+        self
+    }
+
+    /// Bound in-context parse repairs for malformed embedded calls.
+    #[must_use]
+    pub fn with_max_parse_repairs(mut self, max: u32) -> Self {
+        self.max_parse_repairs = max;
+        self
+    }
+
+    /// When false, an ambiguous embedded parse is not executed.
+    #[must_use]
+    pub fn with_execute_ambiguous_calls(mut self, execute: bool) -> Self {
+        self.execute_ambiguous_calls = execute;
+        self
+    }
+
+    /// Forward a preferred sampling temperature on model requests.
+    #[must_use]
+    pub fn with_preferred_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.preferred_temperature = temperature;
         self
     }
 
@@ -722,7 +784,7 @@ impl AgentLoopConfig {
     ) -> StreamOptions {
         StreamOptions {
             api_key,
-            temperature: None,
+            temperature: self.preferred_temperature,
             // Intentionally `None`: the upstream owns the
             // `input + output <= context_window` invariant
             // server-side and knows the real tokenizer.
@@ -823,6 +885,12 @@ struct AgentRunState {
     /// the side-request runs at most once. PR 1 of
     /// `docs/edit_completion_guard/`.
     edit_expected_cache: Option<bool>,
+    /// Parse-repair rounds already spent this run.
+    parse_repairs_used: u32,
+    /// Set by `print_step` when a parse-repair prompt was just
+    /// injected so `decide_next_step` can continue with a ModelTurn
+    /// without re-testing the (already incremented) budget.
+    parse_repair_pending: bool,
 }
 
 impl AgentRunState {
@@ -842,6 +910,8 @@ impl AgentRunState {
             file_mutations: 0,
             edit_guard_remaining: 0,
             edit_expected_cache: None,
+            parse_repairs_used: 0,
+            parse_repair_pending: false,
         }
     }
 
@@ -1406,8 +1476,20 @@ impl AgentLoop {
                     assistant.stop_reason,
                     StopReason::Error | StopReason::Aborted,
                 );
-                let extracted = extract_tool_calls(assistant);
-                if terminal_error.is_some() || is_terminal_assistant || extracted.is_empty() {
+                state.parse_repair_pending = false;
+                let resolved = self.step_tool_calls(state, assistant);
+                if let crate::ResolvedToolCalls::NeedsRepair { reason, excerpt } = &resolved {
+                    state.extend_context([Message::User(UserMessage {
+                        content: vec![ContentBlock::Text {
+                            text: crate::parse_repair_prompt(reason, excerpt),
+                        }],
+                        timestamp: now_millis(),
+                    })]);
+                    state.parse_repairs_used = state.parse_repairs_used.saturating_add(1);
+                    state.parse_repair_pending = true;
+                }
+                let extracted_empty = !matches!(resolved, crate::ResolvedToolCalls::Execute(_));
+                if terminal_error.is_some() || is_terminal_assistant || extracted_empty {
                     // Three cases share this TurnEnd emission:
                     //   - terminal_error (stream failure): the
                     //     next decision is FinishWithError; tail
@@ -1431,6 +1513,9 @@ impl AgentLoop {
                         },
                     )
                     .await;
+                    if state.parse_repair_pending {
+                        send_event(event_tx, AgentEvent::TurnStart).await;
+                    }
                 }
             }
             AgentObservation::ToolResults { assistant, results } => {
@@ -1505,8 +1590,12 @@ impl AgentLoop {
                     return AgentDecision::Finish;
                 }
 
-                let tool_calls = extract_tool_calls(assistant);
-                if !tool_calls.is_empty() {
+                if state.parse_repair_pending {
+                    return AgentDecision::Continue(AgentIntent::ModelTurn);
+                }
+                if let crate::ResolvedToolCalls::Execute(tool_calls) =
+                    self.step_tool_calls(state, assistant)
+                {
                     return AgentDecision::Continue(AgentIntent::ExecuteTools {
                         assistant: assistant.clone(),
                         tool_calls,
@@ -2794,6 +2883,32 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
+impl AgentLoop {
+    fn step_tool_calls(
+        &self,
+        state: &AgentRunState,
+        assistant: &AssistantMessage,
+    ) -> crate::ResolvedToolCalls {
+        match crate::resolve_assistant_tool_calls(
+            assistant,
+            self.config.embedded_tool_call_format,
+            self.config.max_tool_calls_per_step,
+            self.config.execute_ambiguous_calls,
+        ) {
+            crate::ResolvedToolCalls::NeedsRepair { reason, excerpt } => {
+                if self.config.max_parse_repairs > 0
+                    && state.parse_repairs_used < self.config.max_parse_repairs
+                {
+                    crate::ResolvedToolCalls::NeedsRepair { reason, excerpt }
+                } else {
+                    crate::ResolvedToolCalls::None
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 /// Tool names whose successful execution counts as a file
 /// mutation for the edit-completion guard. Mirrors
 /// `MUTATING_TOOLS` in `anie-cli/src/verify_runner.rs` — the same
@@ -3478,6 +3593,14 @@ mod tests {
 
         assert_eq!(options.api_key.as_deref(), Some("key"));
         assert_eq!(options.num_ctx_override, Some(16_384));
+        assert_eq!(options.temperature, None);
+    }
+
+    #[test]
+    fn agent_loop_forwards_preferred_temperature_into_stream_options() {
+        let config = sample_agent_loop_config().with_preferred_temperature(Some(0.1));
+        let options = config.stream_options(None, HashMap::new());
+        assert_eq!(options.temperature, Some(0.1));
     }
 
     /// Plan 05 PR A: with no override, the tool execution

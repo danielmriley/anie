@@ -3,17 +3,27 @@
 
 mod agent_loop;
 mod arg_coerce;
+mod evidence;
 mod failure_loop;
 mod recurse;
 mod recurse_depth;
 mod stream_builder;
 mod tool;
+mod tool_call_parse;
 
 pub use agent_loop::{
     AgentLoop, AgentLoopConfig, AgentRunMachine, AgentRunResult, AgentStepBoundary,
     BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, BudgetLimit, BudgetScope,
     ChainedBeforeModelPolicy, CompactionGate, CompactionGateOutcome, MAX_TOOL_REPAIR_ROUNDS,
     NoopBeforeModelPolicy, RunStopReason, ToolExecutionMode, send_event,
+};
+pub use evidence::{
+    collect_observed_evidence, render_evidence_brief, ObservedEvidence, ObservedFact, ObservedKind,
+    EVIDENCE_FINAL_ANSWER_STANCE,
+};
+pub use tool_call_parse::{
+    parse_embedded_tool_calls, parse_repair_prompt, resolve_assistant_tool_calls,
+    EmbeddedToolCallFormat, ResolvedToolCalls, ToolCallParse,
 };
 pub use failure_loop::{DEFAULT_FAILURE_LOOP_THRESHOLD, stable_args_hash};
 pub use recurse_depth::DEFAULT_RECURSE_DEPTH_WARN_AT;

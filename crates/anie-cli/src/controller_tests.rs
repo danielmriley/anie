@@ -857,6 +857,68 @@ fn build_system_prompt_omits_retest_directive_in_base_prompt() {
          (re-running tests is rlm-mode behavior — keep base prompt \
          framing-neutral): {prompt}"
     );
+    assert!(
+        prompt.contains("You are an expert coding assistant"),
+        "hosted default must keep the historical base: {prompt}"
+    );
+    assert!(
+        !prompt.contains("You do not know this repository until you inspect it"),
+        "hosted default must not take a local-coder preset: {prompt}"
+    );
+}
+
+#[test]
+fn build_system_prompt_selects_qwen_coder_preset_from_model_id() {
+    use anie_agent::ToolRegistry;
+    use anie_config::AnieConfig;
+    use std::path::Path;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
+    let skills = crate::skills::SkillRegistry::empty();
+    let mut config = AnieConfig::default();
+    config.model.provider = "ollama".into();
+    config.model.id = "qwen2.5-coder:14b".into();
+    let prompt = crate::controller::build_system_prompt(
+        Path::new("/tmp"),
+        &tools,
+        &skills,
+        &config,
+        PromptTier::Full,
+    )
+    .expect("build_system_prompt");
+
+    assert!(prompt.contains("You do not know this repository until you inspect it"));
+    assert!(prompt.contains("<tool_call>"));
+    assert!(prompt.contains("Done:"));
+    assert!(prompt.contains("Validation:"));
+    assert!(prompt.contains("Not run:"));
+    assert!(prompt.contains("Do not claim tests passed unless"));
+    assert!(prompt.contains("Call at most one tool per step"));
+}
+
+#[test]
+fn build_system_prompt_selects_deepseek_coder_preset_from_model_id() {
+    use anie_agent::ToolRegistry;
+    use anie_config::AnieConfig;
+    use std::path::Path;
+
+    let tools = ToolRegistry::new();
+    let skills = crate::skills::SkillRegistry::empty();
+    let mut config = AnieConfig::default();
+    config.model.provider = "ollama".into();
+    config.model.id = "deepseek-coder-v2".into();
+    let prompt = crate::controller::build_system_prompt(
+        Path::new("/tmp"),
+        &tools,
+        &skills,
+        &config,
+        PromptTier::Full,
+    )
+    .expect("build_system_prompt");
+
+    assert!(prompt.contains("Be terse. One action per step"));
+    assert!(prompt.contains("You do not know this repository until you inspect it"));
 }
 
 /// Plan 04 of `docs/local_model_augmentation/`: the tier is
