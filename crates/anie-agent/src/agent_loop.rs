@@ -547,6 +547,24 @@ pub struct AgentLoopConfig {
     /// when `edit_guard_rounds > 0`. PR 1 of
     /// `docs/edit_completion_guard/`.
     edit_expected: Option<bool>,
+    /// How to look for tool calls on assistant text. `NativeOnly`
+    /// (default) keeps hosted behavior. Local profiles use
+    /// `XmlJsonBlock` / `JsonFence`. Phase B of
+    /// `docs/local_small_model_harness_ideas.md`.
+    embedded_tool_call_format: crate::EmbeddedToolCallFormat,
+    /// Cap on tool calls executed from one assistant turn.
+    /// `Some(1)` honors one-tool-per-step. `None` keeps all.
+    max_tool_calls_per_step: Option<u32>,
+    /// Budget for in-context parse-repair turns after a malformed
+    /// embedded tool call. `0` (default) does not repair and does
+    /// not execute the malformed call.
+    max_parse_repairs: u32,
+    /// When false (default), an ambiguous parse is not executed.
+    execute_ambiguous_calls: bool,
+    /// Default sampling temperature forwarded on model requests.
+    /// `None` leaves the provider default. Local profiles set this
+    /// from `preferred_temperature`.
+    preferred_temperature: Option<f32>,
 }
 
 /// Cap on generative repair attempts per invalid tool call.
@@ -607,6 +625,11 @@ impl AgentLoopConfig {
             repair_examples: HashMap::new(),
             edit_guard_rounds: 0,
             edit_expected: None,
+            embedded_tool_call_format: crate::EmbeddedToolCallFormat::NativeOnly,
+            max_tool_calls_per_step: None,
+            max_parse_repairs: 0,
+            execute_ambiguous_calls: false,
+            preferred_temperature: None,
         }
     }
 
@@ -652,6 +675,42 @@ impl AgentLoopConfig {
     #[must_use]
     pub fn with_repair_examples(mut self, examples: HashMap<String, String>) -> Self {
         self.repair_examples = examples;
+        self
+    }
+
+    /// Select the embedded tool-call parser. Default is native-only.
+    #[must_use]
+    pub fn with_embedded_tool_call_format(mut self, format: crate::EmbeddedToolCallFormat) -> Self {
+        self.embedded_tool_call_format = format;
+        self
+    }
+
+    /// Cap executed tool calls per assistant turn (`Some(1)` =
+    /// one-tool-per-step).
+    #[must_use]
+    pub fn with_max_tool_calls_per_step(mut self, max: Option<u32>) -> Self {
+        self.max_tool_calls_per_step = max;
+        self
+    }
+
+    /// Bound in-context parse repairs for malformed embedded calls.
+    #[must_use]
+    pub fn with_max_parse_repairs(mut self, max: u32) -> Self {
+        self.max_parse_repairs = max;
+        self
+    }
+
+    /// When false, an ambiguous embedded parse is not executed.
+    #[must_use]
+    pub fn with_execute_ambiguous_calls(mut self, execute: bool) -> Self {
+        self.execute_ambiguous_calls = execute;
+        self
+    }
+
+    /// Forward a preferred sampling temperature on model requests.
+    #[must_use]
+    pub fn with_preferred_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.preferred_temperature = temperature;
         self
     }
 
@@ -722,7 +781,7 @@ impl AgentLoopConfig {
     ) -> StreamOptions {
         StreamOptions {
             api_key,
-            temperature: None,
+            temperature: self.preferred_temperature,
             // Intentionally `None`: the upstream owns the
             // `input + output <= context_window` invariant
             // server-side and knows the real tokenizer.
@@ -761,7 +820,6 @@ impl AgentLoopConfig {
         self.get_follow_up_messages = Some(get_follow_up_messages);
         self
     }
-
 }
 
 /// Final agent-run output.
@@ -823,6 +881,12 @@ struct AgentRunState {
     /// the side-request runs at most once. PR 1 of
     /// `docs/edit_completion_guard/`.
     edit_expected_cache: Option<bool>,
+    /// Parse-repair rounds already spent this run.
+    parse_repairs_used: u32,
+    /// Set by `print_step` when a parse-repair prompt was just
+    /// injected so `decide_next_step` can continue with a ModelTurn
+    /// without re-testing the (already incremented) budget.
+    parse_repair_pending: bool,
 }
 
 impl AgentRunState {
@@ -842,6 +906,8 @@ impl AgentRunState {
             file_mutations: 0,
             edit_guard_remaining: 0,
             edit_expected_cache: None,
+            parse_repairs_used: 0,
+            parse_repair_pending: false,
         }
     }
 
@@ -1034,8 +1100,7 @@ pub struct AgentLoop {
     failure_loop_detector: Option<std::sync::Mutex<crate::failure_loop::FailureLoopDetector>>,
     /// PR 1 of `docs/rlm_subagents_2026-05-01/`. None when
     /// `config.recurse_depth_threshold` is `None`.
-    recurse_depth_detector:
-        Option<std::sync::Mutex<crate::recurse_depth::RecurseDepthDetector>>,
+    recurse_depth_detector: Option<std::sync::Mutex<crate::recurse_depth::RecurseDepthDetector>>,
     /// Signal C (plan 03 §9 of `docs/local_model_augmentation/`).
     /// Rides the failure-loop detector's install gate — the
     /// controller turns that on in rlm mode — with its own
@@ -1196,9 +1261,7 @@ impl AgentLoop {
                 assistant,
                 tool_calls,
             } => {
-                let results = self
-                    .execute_tool_calls(&tool_calls, event_tx, cancel)
-                    .await;
+                let results = self.execute_tool_calls(&tool_calls, event_tx, cancel).await;
                 AgentObservation::ToolResults { assistant, results }
             }
             AgentIntent::AppendFollowUps { messages } => {
@@ -1406,8 +1469,20 @@ impl AgentLoop {
                     assistant.stop_reason,
                     StopReason::Error | StopReason::Aborted,
                 );
-                let extracted = extract_tool_calls(assistant);
-                if terminal_error.is_some() || is_terminal_assistant || extracted.is_empty() {
+                state.parse_repair_pending = false;
+                let resolved = self.step_tool_calls(state, assistant);
+                if let crate::ResolvedToolCalls::NeedsRepair { reason, excerpt } = &resolved {
+                    state.extend_context([Message::User(UserMessage {
+                        content: vec![ContentBlock::Text {
+                            text: crate::parse_repair_prompt(reason, excerpt),
+                        }],
+                        timestamp: now_millis(),
+                    })]);
+                    state.parse_repairs_used = state.parse_repairs_used.saturating_add(1);
+                    state.parse_repair_pending = true;
+                }
+                let extracted_empty = !matches!(resolved, crate::ResolvedToolCalls::Execute(_));
+                if terminal_error.is_some() || is_terminal_assistant || extracted_empty {
                     // Three cases share this TurnEnd emission:
                     //   - terminal_error (stream failure): the
                     //     next decision is FinishWithError; tail
@@ -1431,6 +1506,9 @@ impl AgentLoop {
                         },
                     )
                     .await;
+                    if state.parse_repair_pending {
+                        send_event(event_tx, AgentEvent::TurnStart).await;
+                    }
                 }
             }
             AgentObservation::ToolResults { assistant, results } => {
@@ -1505,8 +1583,12 @@ impl AgentLoop {
                     return AgentDecision::Finish;
                 }
 
-                let tool_calls = extract_tool_calls(assistant);
-                if !tool_calls.is_empty() {
+                if state.parse_repair_pending {
+                    return AgentDecision::Continue(AgentIntent::ModelTurn);
+                }
+                if let crate::ResolvedToolCalls::Execute(tool_calls) =
+                    self.step_tool_calls(state, assistant)
+                {
                     return AgentDecision::Continue(AgentIntent::ExecuteTools {
                         assistant: assistant.clone(),
                         tool_calls,
@@ -1801,11 +1883,11 @@ impl AgentLoop {
                     tool_call.name = target;
                 }
                 None => {
-                    let result = error_tool_result(unknown_tool_error(
-                        &tool_call.name,
-                        &self.tool_registry,
-                    ));
-                    return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
+                    let result =
+                        error_tool_result(unknown_tool_error(&tool_call.name, &self.tool_registry));
+                    return self
+                        .finalize_synthetic_failure(&tool_call, result, event_tx)
+                        .await;
                 }
             }
         }
@@ -1814,7 +1896,9 @@ impl AgentLoop {
             // came from the registry); kept with the legacy wording
             // for the impossible path.
             let result = error_tool_result(format!("Tool not found: {}", tool_call.name));
-            return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
+            return self
+                .finalize_synthetic_failure(&tool_call, result, event_tx)
+                .await;
         };
 
         // Fetch the precompiled validator from the registry.
@@ -1916,7 +2000,9 @@ impl AgentLoop {
                     );
                 }
             }
-            return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
+            return self
+                .finalize_synthetic_failure(&tool_call, result, event_tx)
+                .await;
         }
 
         let (update_tx, mut update_rx) = mpsc::channel(16);
@@ -1953,7 +2039,8 @@ impl AgentLoop {
         if is_error && self.config.wrap_failed_tool_results {
             wrap_failed_tool_result(&tool_call.name, &mut result);
             // Plan 03 §2c: directive first, grounding second.
-            self.maybe_ground_edit_failure(&tool_call, &mut result).await;
+            self.maybe_ground_edit_failure(&tool_call, &mut result)
+                .await;
         }
 
         if !is_error {
@@ -1969,7 +2056,8 @@ impl AgentLoop {
 
         self.observe_failure_loop(&tool_call, is_error, &mut result, event_tx)
             .await;
-        self.observe_similar_calls(&tool_call, &mut result, event_tx).await;
+        self.observe_similar_calls(&tool_call, &mut result, event_tx)
+            .await;
 
         // PR 1 of `docs/rlm_subagents_2026-05-01/`. The recurse
         // tool encodes the depth at which it fired in
@@ -1977,7 +2065,8 @@ impl AgentLoop {
         // detector. Non-recurse tools have no depth field; the
         // method short-circuits.
         if !is_error && tool_call.name == "recurse" {
-            self.observe_recurse_depth(&tool_call, &result, event_tx).await;
+            self.observe_recurse_depth(&tool_call, &result, event_tx)
+                .await;
         }
 
         attach_tool_invocation_details(&tool_call, &mut result.details);
@@ -2296,7 +2385,8 @@ impl AgentLoop {
         }
         self.observe_failure_loop(tool_call, true, &mut result, event_tx)
             .await;
-        self.observe_similar_calls(tool_call, &mut result, event_tx).await;
+        self.observe_similar_calls(tool_call, &mut result, event_tx)
+            .await;
         send_event(
             event_tx,
             AgentEvent::ToolExecEnd {
@@ -2335,9 +2425,11 @@ impl AgentLoop {
         // rather than propagate.
         let warning = match detector.lock() {
             Ok(mut guard) => guard.observe(&tool_call.name, &tool_call.arguments, is_error),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .observe(&tool_call.name, &tool_call.arguments, is_error),
+            Err(poisoned) => {
+                poisoned
+                    .into_inner()
+                    .observe(&tool_call.name, &tool_call.arguments, is_error)
+            }
         };
         let Some(strikes) = warning else {
             return;
@@ -2792,6 +2884,32 @@ fn extract_tool_calls(assistant: &AssistantMessage) -> Vec<ToolCall> {
             _ => None,
         })
         .collect()
+}
+
+impl AgentLoop {
+    fn step_tool_calls(
+        &self,
+        state: &AgentRunState,
+        assistant: &AssistantMessage,
+    ) -> crate::ResolvedToolCalls {
+        match crate::resolve_assistant_tool_calls(
+            assistant,
+            self.config.embedded_tool_call_format,
+            self.config.max_tool_calls_per_step,
+            self.config.execute_ambiguous_calls,
+        ) {
+            crate::ResolvedToolCalls::NeedsRepair { reason, excerpt } => {
+                if self.config.max_parse_repairs > 0
+                    && state.parse_repairs_used < self.config.max_parse_repairs
+                {
+                    crate::ResolvedToolCalls::NeedsRepair { reason, excerpt }
+                } else {
+                    crate::ResolvedToolCalls::None
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 /// Tool names whose successful execution counts as a file
@@ -3402,7 +3520,6 @@ fn attach_tool_invocation_details(tool_call: &ToolCall, details: &mut serde_json
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -3478,6 +3595,14 @@ mod tests {
 
         assert_eq!(options.api_key.as_deref(), Some("key"));
         assert_eq!(options.num_ctx_override, Some(16_384));
+        assert_eq!(options.temperature, None);
+    }
+
+    #[test]
+    fn agent_loop_forwards_preferred_temperature_into_stream_options() {
+        let config = sample_agent_loop_config().with_preferred_temperature(Some(0.1));
+        let options = config.stream_options(None, HashMap::new());
+        assert_eq!(options.temperature, Some(0.1));
     }
 
     /// Plan 05 PR A: with no override, the tool execution
@@ -3953,8 +4078,12 @@ mod tests {
     fn wrap_failed_tool_result_preserves_multi_block_content() {
         let mut result = ToolResult {
             content: vec![
-                ContentBlock::Text { text: "first".into() },
-                ContentBlock::Text { text: "second".into() },
+                ContentBlock::Text {
+                    text: "first".into(),
+                },
+                ContentBlock::Text {
+                    text: "second".into(),
+                },
             ],
             details: serde_json::Value::Null,
         };
@@ -4042,8 +4171,8 @@ mod tests {
     #[test]
     fn attachment_is_capped_at_eighty_lines_with_line_markers() {
         let content: String = (1..=200).map(|n| format!("line {n}\n")).collect();
-        let note = super::edit_grounding_note("big.txt", 1, 200, &content)
-            .expect("region within file");
+        let note =
+            super::edit_grounding_note("big.txt", 1, 200, &content).expect("region within file");
         // Header announces the SHOWN span, not the requested one.
         assert!(
             note.starts_with("[harness note] Current content of big.txt:1-80"),
@@ -4062,13 +4191,15 @@ mod tests {
     #[test]
     fn grounding_note_skips_locators_past_end_of_file() {
         // The file shrank between the tool run and the read.
-        assert_eq!(super::edit_grounding_note("f.rs", 10, 12, "one\ntwo\n"), None);
+        assert_eq!(
+            super::edit_grounding_note("f.rs", 10, 12, "one\ntwo\n"),
+            None
+        );
     }
 
     #[test]
     fn grounding_note_clamps_span_end_to_file_length() {
-        let note =
-            super::edit_grounding_note("f.rs", 2, 99, "one\ntwo\nthree\n").expect("region");
+        let note = super::edit_grounding_note("f.rs", 2, 99, "one\ntwo\nthree\n").expect("region");
         assert!(note.contains("f.rs:2-3"), "{note}");
         assert!(note.contains("f.rs:2: two"), "{note}");
         assert!(note.contains("f.rs:3: three"), "{note}");

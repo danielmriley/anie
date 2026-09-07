@@ -259,7 +259,10 @@ fn lang_for(path: &Path) -> Option<Lang> {
 // (not `expect`) per the workspace's expect_used lint; the
 // regression test below pins all three as compilable.
 static RUST_SIG: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r"^(?:pub(?:\([^)]*\))?\s+(?:async\s+)?(?:unsafe\s+)?(?:fn|struct|enum|trait)\b|impl\b)").ok()
+    Regex::new(
+        r"^(?:pub(?:\([^)]*\))?\s+(?:async\s+)?(?:unsafe\s+)?(?:fn|struct|enum|trait)\b|impl\b)",
+    )
+    .ok()
 });
 static PYTHON_SIG: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"^(?:async\s+)?def\s+\w+|^class\s+\w+").ok());
@@ -421,8 +424,11 @@ mod tests {
             "pub fn alpha() {}\npub struct Beta;\nimpl Beta {}\n",
         )
         .expect("write rs");
-        fs::write(root.join("tool.py"), "def gamma():\n    pass\nclass Delta:\n    pass\n")
-            .expect("write py");
+        fs::write(
+            root.join("tool.py"),
+            "def gamma():\n    pass\nclass Delta:\n    pass\n",
+        )
+        .expect("write py");
         fs::write(
             root.join("app.ts"),
             "export function epsilon() {}\nclass Zeta {}\n",
@@ -474,12 +480,14 @@ mod tests {
         let map = build_repo_map(dir.path(), 100_000);
         let rs_path = Path::new("src").join("lib.rs");
         assert!(
-            map.text.contains(&format!("{}:1: pub fn alpha()", rs_path.display())),
+            map.text
+                .contains(&format!("{}:1: pub fn alpha()", rs_path.display())),
             "{}",
             map.text
         );
         assert!(
-            map.text.contains(&format!("{}:2: pub struct Beta;", rs_path.display())),
+            map.text
+                .contains(&format!("{}:2: pub struct Beta;", rs_path.display())),
             "{}",
             map.text
         );

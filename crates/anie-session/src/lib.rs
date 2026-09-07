@@ -1208,7 +1208,7 @@ impl SessionManager {
             }
         }
 
-        sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+        sessions.sort_by_key(|left| std::cmp::Reverse(left.modified));
         Ok(sessions)
     }
 
@@ -2626,10 +2626,7 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).expect("write session file");
         assert!(
-            serde_json::from_str::<SessionEntry>(
-                lines[2].as_str()
-            )
-            .is_err(),
+            serde_json::from_str::<SessionEntry>(lines[2].as_str()).is_err(),
             "the malformed line must not be a fully parseable entry, \
              or this test proves nothing"
         );

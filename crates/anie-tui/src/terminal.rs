@@ -698,23 +698,43 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::CrosstermBackend, widgets::Paragraph};
+    use ratatui::{Terminal, widgets::Paragraph};
     use std::sync::{Arc, Mutex};
 
-    /// Write adapter backed by an `Arc<Mutex<Vec<u8>>>` so the
-    /// test can inspect emitted bytes after the terminal has
-    /// finished writing. ratatui 0.29's `CrosstermBackend::writer`
-    /// is gated behind an unstable feature, so we own the buffer
-    /// on our side.
-    #[derive(Clone)]
-    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+    /// Headless backend for DECSET 2026 tests.
+    ///
+    /// `CrosstermBackend::size` / cursor queries talk to the
+    /// real TTY (`ioctl` TIOCGWINSZ, or equivalent). Headless
+    /// CI has no usable `/dev/tty`, so `Terminal::new` fails
+    /// with `WouldBlock` or `NotFound` — that is what the
+    /// ubuntu/macos test-matrix flakes were. This stand-in
+    /// returns a fixed 80×24 size and captures raw writes so
+    /// BSU/ESU and cell glyphs stay inspectable.
+    struct CapturedBackend {
+        buf: Arc<Mutex<Vec<u8>>>,
+        size: Size,
+    }
 
-    impl io::Write for CapturedWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0
+    impl CapturedBackend {
+        fn new(buf: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self {
+                buf,
+                size: Size::new(80, 24),
+            }
+        }
+
+        fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.buf
                 .lock()
-                .map_err(|_| io::Error::other("captured writer lock"))?
-                .extend_from_slice(buf);
+                .map_err(|_| io::Error::other("captured backend lock"))?
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    impl io::Write for CapturedBackend {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.push(buf)?;
             Ok(buf.len())
         }
 
@@ -723,10 +743,60 @@ mod tests {
         }
     }
 
-    fn captured_backend() -> (Arc<Mutex<Vec<u8>>>, CrosstermBackend<CapturedWriter>) {
+    impl Backend for CapturedBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            // Glyphs in iterator order so the content pin can
+            // find frame text in the capture. No TTY, no ANSI
+            // cursor addressing required for that assertion.
+            for (_x, _y, cell) in content {
+                self.push(cell.symbol().as_bytes())?;
+            }
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(Position::ORIGIN)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, _: P) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_backend() -> (Arc<Mutex<Vec<u8>>>, CapturedBackend) {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer = CapturedWriter(buf.clone());
-        (buf, CrosstermBackend::new(writer))
+        let backend = CapturedBackend::new(buf.clone());
+        (buf, backend)
     }
 
     /// BSU/ESU is applied around the draw when

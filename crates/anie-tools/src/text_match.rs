@@ -240,8 +240,7 @@ pub(crate) fn closest_match_region(
     // Cap the surfaced excerpt; the scoring window may be larger than the
     // attachment budget for a big multi-line oldText. `end_line` tracks
     // the shown range so the locator and the region agree.
-    let region_end =
-        (best_start + window.min(MAX_CLOSEST_MATCH_LINES)).min(content_lines.len());
+    let region_end = (best_start + window.min(MAX_CLOSEST_MATCH_LINES)).min(content_lines.len());
     let mut region = String::new();
     for (offset, line) in content_lines[best_start..region_end].iter().enumerate() {
         region.push_str(&format!("{}:{}: {}\n", path, best_start + offset + 1, line));
@@ -416,8 +415,7 @@ mod tests {
         let content: String = (1..=200).map(|n| format!("line {n}\n")).collect();
         let needle: String = (1..=120).map(|n| format!("line {n} changed\n")).collect();
 
-        let closest =
-            closest_match_region(&content, &needle, "big.txt").expect("closest region");
+        let closest = closest_match_region(&content, &needle, "big.txt").expect("closest region");
         let region_lines = closest.region.lines().count();
         assert_eq!(region_lines, MAX_CLOSEST_MATCH_LINES);
         // end_line - start_line + 1 must agree with the shown line count.
@@ -437,12 +435,7 @@ mod tests {
     fn exact_match_success_path_unchanged() {
         // A successful edit must not invoke closest-match machinery or
         // alter its output in any way.
-        let outcome = apply_edits(
-            "alpha\nbeta\ngamma",
-            &[edit("beta", "BETA")],
-            "f",
-        )
-        .expect("ok");
+        let outcome = apply_edits("alpha\nbeta\ngamma", &[edit("beta", "BETA")], "f").expect("ok");
         assert_eq!(outcome.updated, "alpha\nBETA\ngamma");
         assert_eq!(outcome.kinds, vec![MatchKind::Exact]);
     }

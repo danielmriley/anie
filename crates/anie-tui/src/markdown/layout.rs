@@ -947,9 +947,9 @@ fn compute_column_widths(
         .map(|(n, f)| n.saturating_sub(*f))
         .collect();
     let slack_total: usize = slacks.iter().sum();
-    if slack_total > 0 {
-        for i in 0..cols {
-            widths[i] += (slacks[i] * extra_budget) / slack_total;
+    for i in 0..cols {
+        if let Some(share) = (slacks[i] * extra_budget).checked_div(slack_total) {
+            widths[i] += share;
         }
     }
 

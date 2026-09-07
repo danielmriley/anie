@@ -1205,10 +1205,8 @@ impl InteractiveController {
                             .find(|info| info.id != current_id)
                             .map(|info| (info.id, info.name)),
                         Err(error) => {
-                            self.send_system_message(&format!(
-                                "Failed to list sessions: {error}"
-                            ))
-                            .await;
+                            self.send_system_message(&format!("Failed to list sessions: {error}"))
+                                .await;
                             return Ok(());
                         }
                     };
@@ -1317,10 +1315,8 @@ impl InteractiveController {
                 self.send_system_message(&body).await;
             }
             UiAction::ShowSkills => {
-                let body = render_skills_listing(
-                    &self.state.skill_registry,
-                    &self.state.active_skills,
-                );
+                let body =
+                    render_skills_listing(&self.state.skill_registry, &self.state.active_skills);
                 self.send_system_message(&body).await;
             }
             UiAction::ShowHelp => {
@@ -1542,10 +1538,7 @@ impl InteractiveController {
     /// 2. Render dry-run round annotations (parallel enabled
     ///    but Ollama-clamped to N=1 sequential).
     /// 3. Pass the plain plan through (parallel not enabled).
-    async fn maybe_run_parallel_decompose(
-        &self,
-        decompose_plan: Option<String>,
-    ) -> Option<String> {
+    async fn maybe_run_parallel_decompose(&self, decompose_plan: Option<String>) -> Option<String> {
         let plan = decompose_plan.as_deref()?;
         if !crate::parallel_decompose::parallel_decompose_enabled() {
             return decompose_plan;
@@ -1554,9 +1547,8 @@ impl InteractiveController {
             return decompose_plan;
         };
 
-        let max_concurrency = crate::parallel_decompose::safe_max_concurrency(
-            self.state.config.current_model().api,
-        );
+        let max_concurrency =
+            crate::parallel_decompose::safe_max_concurrency(self.state.config.current_model().api);
         let has_round_with_multiple = parsed.rounds.iter().any(|r| r.len() > 1);
         if max_concurrency < 2 || !has_round_with_multiple {
             // PR 5 dry-run: annotate, don't execute. Either
@@ -2606,12 +2598,15 @@ impl ControllerState {
     pub(crate) fn refresh_system_prompt_if_needed(&mut self) {
         let cwd = self.session.cwd().to_path_buf();
         let tier = self.prompt_tier();
-        self.prompt_cache.refresh_if_stale(
+        let model = self.config.current_model();
+        self.prompt_cache.refresh_if_stale_for_model(
             &cwd,
             &self.tool_registry,
             &self.skill_registry,
             self.config.anie_config(),
             tier,
+            &model.provider,
+            &model.id,
         );
     }
 }
@@ -2677,6 +2672,10 @@ fn build_agent(
         static PROMPT_BUDGET_WARNED: std::sync::Once = std::sync::Once::new();
         PROMPT_BUDGET_WARNED.call_once(|| warn!("{message}"));
     }
+    let profile = state.config.anie_config().resolve_profile(
+        &state.config.current_model().provider,
+        &state.config.current_model().id,
+    );
     let mut config = AgentLoopConfig::new(
         state.config.current_model().clone(),
         system_prompt,
@@ -2691,7 +2690,12 @@ fn build_agent(
     .with_failure_loop_threshold(failure_loop_threshold(state))
     .with_recurse_depth_threshold(recurse_depth_threshold(state))
     .with_edit_guard(edit_guard_rounds(state, edit_guard_disabled_by_env()))
-    .with_edit_expected(edit_expected(state));
+    .with_edit_expected(edit_expected(state))
+    .with_embedded_tool_call_format(embedded_tool_call_format(&profile))
+    .with_max_tool_calls_per_step(profile.max_tool_calls_per_step)
+    .with_max_parse_repairs(profile.max_parse_repairs)
+    .with_execute_ambiguous_calls(profile.execute_ambiguous_calls)
+    .with_preferred_temperature(profile.preferred_temperature);
     // Plan 01 §9b of `docs/local_model_augmentation/`: ground the
     // repair side-request prompts in the per-tool example calls.
     // Gated on repair itself so non-rlm configs stay untouched.
@@ -2711,6 +2715,9 @@ fn build_agent(
     // (byte-identical to today); with exactly one, it installs
     // directly; with several, they fold through ChainedBeforeModelPolicy.
     let mut policies: Vec<Arc<dyn anie_agent::BeforeModelPolicy>> = Vec::new();
+    if profile.uses_local_preset() {
+        policies.push(Arc::new(crate::prompt_presets::EvidencePolicy));
+    }
     if crate::repo_map::repo_map_enabled(state.harness_mode) {
         policies.push(Arc::new(crate::repo_map::RepoMapPolicy::new(
             state.session.cwd().to_path_buf(),
@@ -2765,10 +2772,32 @@ fn should_wrap_failed_tool_results(state: &ControllerState) -> bool {
 /// by default. `ANIE_DISABLE_TOOL_REPAIR=1` turns it off for
 /// smoke-test bisection.
 fn should_repair_tool_calls(state: &ControllerState) -> bool {
-    if !state.harness_mode.installs_rlm_features() {
+    if env_flag_enabled("ANIE_DISABLE_TOOL_REPAIR") {
         return false;
     }
-    !env_flag_enabled("ANIE_DISABLE_TOOL_REPAIR")
+    if state.harness_mode.installs_rlm_features() {
+        return true;
+    }
+    state
+        .config
+        .anie_config()
+        .resolve_profile(
+            &state.config.current_model().provider,
+            &state.config.current_model().id,
+        )
+        .tool_call_repair
+}
+
+fn embedded_tool_call_format(
+    profile: &anie_config::ResolvedModelProfile,
+) -> anie_agent::EmbeddedToolCallFormat {
+    match profile.tool_call_format {
+        anie_config::ToolCallFormat::Native => anie_agent::EmbeddedToolCallFormat::NativeOnly,
+        anie_config::ToolCallFormat::XmlJsonBlock => {
+            anie_agent::EmbeddedToolCallFormat::XmlJsonBlock
+        }
+        anie_config::ToolCallFormat::JsonFence => anie_agent::EmbeddedToolCallFormat::JsonFence,
+    }
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -2925,11 +2954,7 @@ pub(crate) fn render_skills_listing(
         return "No skills are currently registered.".to_string();
     }
     let mut out = String::from("Available skills:\n");
-    let max_name_len = registry
-        .iter()
-        .map(|s| s.name.len())
-        .max()
-        .unwrap_or(0);
+    let max_name_len = registry.iter().map(|s| s.name.len()).max().unwrap_or(0);
     for skill in registry.iter() {
         let mut tags: Vec<&str> = vec![skill.source.label()];
         if skill.disable_model_invocation {
@@ -2951,10 +2976,7 @@ pub(crate) fn render_skills_listing(
     if !active_set.is_empty() {
         let mut names: Vec<String> = active_set.into_iter().collect();
         names.sort();
-        out.push_str(&format!(
-            "\nActive in this run: {}",
-            names.join(", ")
-        ));
+        out.push_str(&format!("\nActive in this run: {}", names.join(", ")));
     }
     out
 }
@@ -3039,7 +3061,10 @@ fn small_tier_ledger_enabled(tier: PromptTier, ledger_env: Option<&str>) -> bool
 }
 
 fn use_small_tier_ledger(state: &ControllerState) -> bool {
-    small_tier_ledger_enabled(state.prompt_tier(), std::env::var("ANIE_LEDGER").ok().as_deref())
+    small_tier_ledger_enabled(
+        state.prompt_tier(),
+        std::env::var("ANIE_LEDGER").ok().as_deref(),
+    )
 }
 
 /// rlm-mode system-prompt augment. Establishes the policy
@@ -3373,13 +3398,10 @@ fn build_embedder(
         );
         return None;
     }
-    let embedder: Arc<dyn crate::embedder::Embedder> =
-        Arc::new(crate::embedder::OllamaEmbedder::new(
-            parent_model.base_url.clone(),
-            model_name.to_string(),
-        ));
-    let (tx, handle) =
-        crate::bg_embedder::spawn_embed_worker(Arc::clone(&embedder), store, cancel);
+    let embedder: Arc<dyn crate::embedder::Embedder> = Arc::new(
+        crate::embedder::OllamaEmbedder::new(parent_model.base_url.clone(), model_name.to_string()),
+    );
+    let (tx, handle) = crate::bg_embedder::spawn_embed_worker(Arc::clone(&embedder), store, cancel);
     Some((embedder, tx, handle))
 }
 
@@ -3629,6 +3651,26 @@ pub fn build_system_prompt(
     config: &AnieConfig,
     tier: PromptTier,
 ) -> Result<String> {
+    build_system_prompt_for(
+        cwd,
+        tools,
+        skills,
+        config,
+        tier,
+        &config.model.provider,
+        &config.model.id,
+    )
+}
+
+pub(crate) fn build_system_prompt_for(
+    cwd: &Path,
+    tools: &ToolRegistry,
+    skills: &crate::skills::SkillRegistry,
+    config: &AnieConfig,
+    tier: PromptTier,
+    provider: &str,
+    model_id: &str,
+) -> Result<String> {
     let tool_list = tools
         .definitions()
         .into_iter()
@@ -3639,13 +3681,17 @@ pub fn build_system_prompt(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let default_base = if tool_list.is_empty() {
-        "You are an expert coding assistant. Be concise in your responses.".to_string()
-    } else {
-        format!(
-            "You are an expert coding assistant. You help users by reading files, executing commands, editing code, and writing new files. When web tools are available, you can also answer questions that need information from the live internet — current weather, news, library/package status, documentation lookups, prices, definitions — not just coding research. Don't decline a real-world question on the assumption that your scope is the local project; check the tool list.\n\nAvailable tools:\n{tool_list}\n\nGuidelines:\n- Use bash for file operations like ls, grep, find\n- Use read to examine files (use offset + limit for large files)\n- Use edit for precise changes\n- Use write only for new files or complete rewrites\n- Use web_search + web_read for any question about the live state of the world (weather, news, current events, library docs, prices, etc.) when those tools are available\n- Be concise in your responses"
-        )
-    };
+    let profile = config.resolve_profile(provider, model_id);
+    let default_base = crate::prompt_presets::local_coder_base(&profile, &tool_list)
+        .unwrap_or_else(|| {
+            if tool_list.is_empty() {
+                "You are an expert coding assistant. Be concise in your responses.".to_string()
+            } else {
+                format!(
+                    "You are an expert coding assistant. You help users by reading files, executing commands, editing code, and writing new files. When web tools are available, you can also answer questions that need information from the live internet — current weather, news, library/package status, documentation lookups, prices, definitions — not just coding research. Don't decline a real-world question on the assumption that your scope is the local project; check the tool list.\n\nAvailable tools:\n{tool_list}\n\nGuidelines:\n- Use bash for file operations like ls, grep, find\n- Use read to examine files (use offset + limit for large files)\n- Use edit for precise changes\n- Use write only for new files or complete rewrites\n- Use web_search + web_read for any question about the live state of the world (weather, news, current events, library docs, prices, etc.) when those tools are available\n- Be concise in your responses"
+                )
+            }
+        });
 
     let mut parts = vec![default_base];
     let skill_catalog = crate::skills::render_catalog(skills, tier);

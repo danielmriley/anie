@@ -26,6 +26,7 @@ mod models_command;
 mod onboarding;
 mod parallel_decompose;
 mod print_mode;
+mod prompt_presets;
 mod recurse_factory;
 mod recurse_provider;
 mod repo_map;

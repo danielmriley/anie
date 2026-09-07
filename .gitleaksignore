@@ -1,0 +1,3 @@
+# Feature-flag name in provider-plan docs (`bedrock-sigv4`), not a credential.
+# Historic finding; gitleaks scans full git history. Do not rewrite history.
+b78b83daa206e0ad8710774402b6d20484f012c1:docs/add_providers/pi_comparison.md:generic-api-key:120

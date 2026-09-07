@@ -94,8 +94,8 @@ fn fully_populated_run_metrics_json() -> serde_json::Value {
 #[test]
 fn run_metrics_view_round_trips_every_modelled_field_from_cli_schema_v6() {
     let json = fully_populated_run_metrics_json();
-    let view: RunMetricsView =
-        serde_json::from_value(json).expect("anie-cli schema-v6 JSON must deserialize into the view");
+    let view: RunMetricsView = serde_json::from_value(json)
+        .expect("anie-cli schema-v6 JSON must deserialize into the view");
 
     assert_eq!(view.schema_version, 6, "schema_version");
     assert_eq!(view.harness_mode, "augmented", "harness_mode");

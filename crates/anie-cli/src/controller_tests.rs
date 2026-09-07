@@ -149,8 +149,8 @@ async fn run_prompt_with_provider_scripts(scripts: Vec<MockStreamScript>) -> Vec
     config.compaction.keep_recent_tokens = 2_000;
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
-    let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("prompt cache");
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)
+        .expect("prompt cache");
 
     let mut session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     preload_compactable_history(&mut session);
@@ -243,8 +243,8 @@ fn controller_with_runtime_state_path(
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
-    let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)
+        .expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let mut config_state = ConfigState::new(
         config.clone(),
@@ -402,7 +402,10 @@ async fn workers_are_not_respawned_on_second_prompt_run() {
         DEFAULT_RLM_ACTIVE_CEILING_TOKENS,
     );
     let (first_tx, first_store) = {
-        let session = controller.rlm_session.as_ref().expect("created on first rlm run");
+        let session = controller
+            .rlm_session
+            .as_ref()
+            .expect("created on first rlm run");
         (session.summary_tx.clone(), Arc::clone(&session.external))
     };
 
@@ -433,7 +436,8 @@ async fn workers_are_not_respawned_on_second_prompt_run() {
 async fn session_switch_drops_rlm_state_and_cancels_workers() {
     use std::sync::atomic::AtomicU32;
 
-    let (mut controller, mut _rx, _tx) = build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
+    let (mut controller, mut _rx, _tx) =
+        build_dispatch_controller(vec![model("gpt-4o", "openai")], 16);
     controller.state.harness_mode = crate::harness_mode::HarnessMode::Rlm;
     // The helper's tempdir is dropped on return, deleting
     // the bootstrap session's file. `NewSession` recreates
@@ -857,6 +861,68 @@ fn build_system_prompt_omits_retest_directive_in_base_prompt() {
          (re-running tests is rlm-mode behavior — keep base prompt \
          framing-neutral): {prompt}"
     );
+    assert!(
+        prompt.contains("You are an expert coding assistant"),
+        "hosted default must keep the historical base: {prompt}"
+    );
+    assert!(
+        !prompt.contains("You do not know this repository until you inspect it"),
+        "hosted default must not take a local-coder preset: {prompt}"
+    );
+}
+
+#[test]
+fn build_system_prompt_selects_qwen_coder_preset_from_model_id() {
+    use anie_agent::ToolRegistry;
+    use anie_config::AnieConfig;
+    use std::path::Path;
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(anie_tools::ReadTool::new("/tmp")));
+    let skills = crate::skills::SkillRegistry::empty();
+    let mut config = AnieConfig::default();
+    config.model.provider = "ollama".into();
+    config.model.id = "qwen2.5-coder:14b".into();
+    let prompt = crate::controller::build_system_prompt(
+        Path::new("/tmp"),
+        &tools,
+        &skills,
+        &config,
+        PromptTier::Full,
+    )
+    .expect("build_system_prompt");
+
+    assert!(prompt.contains("You do not know this repository until you inspect it"));
+    assert!(prompt.contains("<tool_call>"));
+    assert!(prompt.contains("Done:"));
+    assert!(prompt.contains("Validation:"));
+    assert!(prompt.contains("Not run:"));
+    assert!(prompt.contains("Do not claim tests passed unless"));
+    assert!(prompt.contains("Call at most one tool per step"));
+}
+
+#[test]
+fn build_system_prompt_selects_deepseek_coder_preset_from_model_id() {
+    use anie_agent::ToolRegistry;
+    use anie_config::AnieConfig;
+    use std::path::Path;
+
+    let tools = ToolRegistry::new();
+    let skills = crate::skills::SkillRegistry::empty();
+    let mut config = AnieConfig::default();
+    config.model.provider = "ollama".into();
+    config.model.id = "deepseek-coder-v2".into();
+    let prompt = crate::controller::build_system_prompt(
+        Path::new("/tmp"),
+        &tools,
+        &skills,
+        &config,
+        PromptTier::Full,
+    )
+    .expect("build_system_prompt");
+
+    assert!(prompt.contains("Be terse. One action per step"));
+    assert!(prompt.contains("You do not know this repository until you inspect it"));
 }
 
 /// Plan 04 of `docs/local_model_augmentation/`: the tier is
@@ -877,10 +943,19 @@ fn prompt_tier_boundary_is_32k_inclusive() {
 #[test]
 fn small_tier_catalog_renders_one_line_per_tool() {
     // `first_sentence` semantics first, on fixed strings.
-    assert_eq!(first_sentence("Reads a file. Use offset for big files."), "Reads a file.");
+    assert_eq!(
+        first_sentence("Reads a file. Use offset for big files."),
+        "Reads a file."
+    );
     assert_eq!(first_sentence("No trailing period"), "No trailing period");
-    assert_eq!(first_sentence("Handles v1.2 paths. Second sentence."), "Handles v1.2 paths.");
-    assert_eq!(first_sentence("Line one\nline two. Rest."), "Line one line two.");
+    assert_eq!(
+        first_sentence("Handles v1.2 paths. Second sentence."),
+        "Handles v1.2 paths."
+    );
+    assert_eq!(
+        first_sentence("Line one\nline two. Rest."),
+        "Line one line two."
+    );
 
     let dir = tempdir().expect("tempdir");
     let tools = build_tool_registry(dir.path(), false);
@@ -896,7 +971,11 @@ fn small_tier_catalog_renders_one_line_per_tool() {
     .expect("small prompt");
     for def in tools.definitions() {
         let expected = format!("- {}: {}", def.name, first_sentence(&def.description));
-        assert!(small.contains(&expected), "missing compact line for {}: {small}", def.name);
+        assert!(
+            small.contains(&expected),
+            "missing compact line for {}: {small}",
+            def.name
+        );
     }
     // The compaction is real: at least one default tool has a
     // multi-sentence description that shrank.
@@ -990,7 +1069,10 @@ fn context_files_truncate_at_budget_with_omission_note() {
     let full =
         crate::controller::build_system_prompt(&cwd, &tools, &skills, &config, PromptTier::Full)
             .expect("full prompt");
-    assert!(full.contains(&"x".repeat(8_000)), "full tier keeps everything");
+    assert!(
+        full.contains(&"x".repeat(8_000)),
+        "full tier keeps everything"
+    );
     assert!(!full.contains("context file omitted"), "{full}");
 }
 
@@ -1002,7 +1084,10 @@ fn startup_warns_when_prompt_exceeds_half_the_ceiling() {
     let warning = prompt_budget_warning(11_291, 16_384).expect("over half → warn");
     assert!(warning.contains("11291"), "{warning}");
     assert!(warning.contains("16384"), "{warning}");
-    assert!(prompt_budget_warning(8_192, 16_384).is_none(), "at half → quiet");
+    assert!(
+        prompt_budget_warning(8_192, 16_384).is_none(),
+        "at half → quiet"
+    );
     assert!(
         prompt_budget_warning(1_000_000, u64::MAX).is_none(),
         "noop ceiling install never warns"
@@ -1044,12 +1129,7 @@ fn explicit_ceiling_env_still_wins() {
     );
     // The opt-out escape hatch survives the derivation change.
     assert_eq!(
-        resolve_rlm_active_ceiling_tokens(
-            Some("18446744073709551615"),
-            None,
-            Some(16_384),
-            3_500
-        ),
+        resolve_rlm_active_ceiling_tokens(Some("18446744073709551615"), None, Some(16_384), 3_500),
         u64::MAX
     );
     // An unparseable explicit value falls through to the
@@ -1159,16 +1239,31 @@ fn small_tier_rlm_augment_drops_ledger_syntax_manual() {
     assert_eq!(controller.state.prompt_tier(), PromptTier::Small);
 
     let composed = compose_system_prompt(&controller.state);
-    assert!(composed.contains("# Conversation archive (rlm mode)"), "{composed}");
-    assert!(composed.contains("{\"scope\": {\"kind\": \"message_grep\", \"pattern\":"), "{composed}");
-    assert!(!composed.contains("(id="), "no id notation in the small augment: {composed}");
-    assert!(!composed.contains("scope.kind="), "no scope grammar: {composed}");
+    assert!(
+        composed.contains("# Conversation archive (rlm mode)"),
+        "{composed}"
+    );
+    assert!(
+        composed.contains("{\"scope\": {\"kind\": \"message_grep\", \"pattern\":"),
+        "{composed}"
+    );
+    assert!(
+        !composed.contains("(id="),
+        "no id notation in the small augment: {composed}"
+    );
+    assert!(
+        !composed.contains("scope.kind="),
+        "no scope grammar: {composed}"
+    );
     assert!(
         !composed.contains("Context virtualization (rlm mode)"),
         "full augment must not also be present: {composed}"
     );
     // Verify-after-edit guidance survives the shrink.
-    assert!(composed.contains("re-run the most recent build or test command"), "{composed}");
+    assert!(
+        composed.contains("re-run the most recent build or test command"),
+        "{composed}"
+    );
 }
 
 #[test]
@@ -1451,8 +1546,8 @@ fn build_dispatch_controller_with_runtime_state_path(
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
-    let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)
+        .expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let default_model = catalog
         .first()
@@ -1517,7 +1612,12 @@ fn build_state_with_registry(
     runtime_state: RuntimeState,
     provider_registry: ProviderRegistry,
 ) -> ControllerState {
-    build_state_with_registry_and_config(model, runtime_state, provider_registry, AnieConfig::default())
+    build_state_with_registry_and_config(
+        model,
+        runtime_state,
+        provider_registry,
+        AnieConfig::default(),
+    )
 }
 
 fn build_state_with_registry_and_config(
@@ -1534,8 +1634,8 @@ fn build_state_with_registry_and_config(
 
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
-    let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)
+        .expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
 
     ControllerState {
@@ -2508,8 +2608,8 @@ fn controller_for_context_length_test_with_cap(
 
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
-    let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)
+        .expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let default_model = ollama_model();
 
@@ -2993,8 +3093,8 @@ async fn help_command_emits_system_message_with_registry_output() {
     let config = AnieConfig::default();
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
-    let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("build prompt cache");
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)
+        .expect("build prompt cache");
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
     let command_registry = crate::commands::CommandRegistry::with_builtins();
     let expected = command_registry.format_help();
@@ -3133,8 +3233,8 @@ fn spawn_live_controller(
     config.compaction.enabled = false;
     let tool_registry = build_tool_registry(&cwd, true);
     let skill_registry = Arc::new(crate::skills::SkillRegistry::empty());
-    let prompt_cache =
-        SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config).expect("prompt cache");
+    let prompt_cache = SystemPromptCache::build(&cwd, &tool_registry, &skill_registry, &config)
+        .expect("prompt cache");
 
     let session = SessionManager::new_session(&sessions_dir, &cwd).expect("new session");
 

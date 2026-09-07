@@ -608,9 +608,7 @@ impl OutputPane {
     }
 
     fn invalidate_all_caches(&mut self) {
-        for slot in &mut self.caches {
-            *slot = None;
-        }
+        self.caches.fill(None);
         for state in &mut self.streaming_assistant_renders {
             if let Some(state) = state.as_mut() {
                 // PR 01 of tui_polish_2026-04-26: streaming
@@ -1299,27 +1297,26 @@ impl OutputPane {
                         // serve it from the single-slot cache
                         // keyed on the accumulated lengths instead
                         // of re-scanning every span per frame.
-                        let links = if let RenderedBlock::AssistantMessage {
-                            text, thinking, ..
-                        } = block
-                            && let Some(state) = self
-                                .streaming_assistant_renders
-                                .get_mut(index)
-                                .and_then(Option::as_mut)
-                        {
-                            state
-                                .links_for_arcs(
-                                    &lines_arcs,
-                                    &theme,
-                                    text.len(),
-                                    thinking.len(),
-                                    width,
-                                )
-                                .as_ref()
-                                .clone()
-                        } else {
-                            find_link_ranges_for_arcs(&lines_arcs, &theme)
-                        };
+                        let links =
+                            if let RenderedBlock::AssistantMessage { text, thinking, .. } = block
+                                && let Some(state) = self
+                                    .streaming_assistant_renders
+                                    .get_mut(index)
+                                    .and_then(Option::as_mut)
+                            {
+                                state
+                                    .links_for_arcs(
+                                        &lines_arcs,
+                                        &theme,
+                                        text.len(),
+                                        thinking.len(),
+                                        width,
+                                    )
+                                    .as_ref()
+                                    .clone()
+                            } else {
+                                find_link_ranges_for_arcs(&lines_arcs, &theme)
+                            };
                         if let Some(s) = s.as_mut() {
                             s.record("lines", u64::try_from(lines_arcs.len()).unwrap_or(u64::MAX));
                             s.record("ranges", u64::try_from(links.len()).unwrap_or(u64::MAX));

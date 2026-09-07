@@ -15,4 +15,12 @@ stopwords = [
   "auth-key",
   "env-key",
   "cli-key",
+  "bedrock-sigv4",
 ]
+
+[[allowlists]]
+description = "Feature-flag name in provider-plan docs, not a credential"
+condition = "AND"
+paths = ['''docs/add_providers/pi_comparison\.md''']
+regexTarget = "line"
+regexes = ['''bedrock-sigv4''']

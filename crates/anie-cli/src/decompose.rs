@@ -165,22 +165,23 @@ impl Decomposer {
             }
             Ok::<String, String>(buf)
         };
-        let raw = match tokio::time::timeout(
-            Duration::from_secs(DECOMPOSE_TIMEOUT_SECS),
-            collect_fut,
-        )
-        .await
-        {
-            Ok(Ok(text)) => text,
-            Ok(Err(error)) => {
-                warn!(%error, "decompose: stream error; skipping plan");
-                return None;
-            }
-            Err(_) => {
-                warn!(timeout_secs = DECOMPOSE_TIMEOUT_SECS, "decompose: timed out; skipping plan");
-                return None;
-            }
-        };
+        let raw =
+            match tokio::time::timeout(Duration::from_secs(DECOMPOSE_TIMEOUT_SECS), collect_fut)
+                .await
+            {
+                Ok(Ok(text)) => text,
+                Ok(Err(error)) => {
+                    warn!(%error, "decompose: stream error; skipping plan");
+                    return None;
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_secs = DECOMPOSE_TIMEOUT_SECS,
+                        "decompose: timed out; skipping plan"
+                    );
+                    return None;
+                }
+            };
 
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -244,7 +245,13 @@ mod tests {
 
     #[test]
     fn decompose_env_enabled_recognises_truthy_values() {
-        let cases = [("1", true), ("true", true), ("yes", true), ("0", false), ("", false)];
+        let cases = [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("0", false),
+            ("", false),
+        ];
         for (value, expected) in cases {
             // Using temp_env::with_var here would be cleanest;
             // for a unit test we set/unset directly. The test

@@ -102,9 +102,8 @@ pub(crate) async fn prepare_controller_state(cli: &Cli) -> Result<ControllerStat
     if !skill_registry.is_empty() {
         info!(skills = skill_registry.len(), "loaded skills from disk");
     }
-    let active_skills: crate::skill_tool::ActiveSkills = Arc::new(std::sync::RwLock::new(
-        std::collections::HashSet::new(),
-    ));
+    let active_skills: crate::skill_tool::ActiveSkills =
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
     // PR 2 of `docs/skills_2026-05-02/`: register the `skill`
     // tool when the registry has at least one skill. Without
     // skills the tool would be advertised in the catalog with

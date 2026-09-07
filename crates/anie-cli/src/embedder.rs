@@ -473,8 +473,7 @@ mod tests {
             Duration::from_millis(400),
             Duration::from_millis(250),
         );
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), embedder.embed("hello")).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), embedder.embed("hello")).await;
         let inner = result.expect("embed must fail within the configured timeout, not hang");
         assert!(inner.is_err(), "unroutable host should surface an error");
     }

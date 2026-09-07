@@ -68,7 +68,9 @@ pub(crate) fn render_tool_examples(definitions: &[ToolDef], tier: PromptTier) ->
         .filter(|def| {
             tier == PromptTier::Full || SMALL_TIER_EXAMPLE_TOOLS.contains(&def.name.as_str())
         })
-        .filter_map(|def| example_for(&def.name).map(|example| format!("- {}: {example}", def.name)))
+        .filter_map(|def| {
+            example_for(&def.name).map(|example| format!("- {}: {example}", def.name))
+        })
         .collect();
     if lines.is_empty() {
         return String::new();
@@ -111,14 +113,18 @@ mod tests {
 
     #[test]
     fn examples_render_only_for_registered_tools() {
-        let rendered = render_tool_examples(&[def("bash"), def("not-a-real-tool")], PromptTier::Full);
+        let rendered =
+            render_tool_examples(&[def("bash"), def("not-a-real-tool")], PromptTier::Full);
         assert!(rendered.contains("- bash: "), "{rendered}");
         assert!(!rendered.contains("not-a-real-tool"), "{rendered}");
     }
 
     #[test]
     fn no_known_tools_renders_empty_string() {
-        assert_eq!(render_tool_examples(&[def("mystery")], PromptTier::Full), "");
+        assert_eq!(
+            render_tool_examples(&[def("mystery")], PromptTier::Full),
+            ""
+        );
         assert_eq!(render_tool_examples(&[], PromptTier::Full), "");
     }
 
@@ -127,10 +133,19 @@ mod tests {
     /// Full tier still renders every known example.
     #[test]
     fn small_tier_examples_cover_only_the_core_tools() {
-        let defs: Vec<ToolDef> = ["read", "write", "edit", "bash", "grep", "find", "ls", "todo_write"]
-            .iter()
-            .map(|name| def(name))
-            .collect();
+        let defs: Vec<ToolDef> = [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "grep",
+            "find",
+            "ls",
+            "todo_write",
+        ]
+        .iter()
+        .map(|name| def(name))
+        .collect();
         let small = render_tool_examples(&defs, PromptTier::Small);
         for core in SMALL_TIER_EXAMPLE_TOOLS {
             assert!(small.contains(&format!("- {core}: ")), "{small}");

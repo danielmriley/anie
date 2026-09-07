@@ -378,7 +378,8 @@ mod tests {
         let mut a = false;
         let mut b = false;
         let mut c = None;
-        let tmp = std::env::temp_dir().join(format!("anie-incr-metrics-{}.json", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("anie-incr-metrics-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         process_print_events(
             &mut rx,
@@ -399,7 +400,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&tmp).expect("incremental sidecar exists"))
                 .expect("valid snapshot json");
         assert_eq!(flushed.turns, 1, "incremental flush captured the turn");
-        assert_eq!(flushed.tools.calls, 1, "incremental flush captured the tool call");
+        assert_eq!(
+            flushed.tools.calls, 1,
+            "incremental flush captured the tool call"
+        );
         let _ = std::fs::remove_file(&tmp);
 
         let metrics = accumulator.finish();

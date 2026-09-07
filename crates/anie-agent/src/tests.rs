@@ -805,7 +805,10 @@ async fn repair_prompt_includes_canonical_example_when_available() {
     );
 
     let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
-    assert!(!first_tool_result(&result).is_error, "repaired call executes");
+    assert!(
+        !first_tool_result(&result).is_error,
+        "repaired call executes"
+    );
 
     let contexts = contexts.lock().expect("contexts lock");
     let side_request = contexts
@@ -1140,8 +1143,7 @@ async fn similar_call_streak_of_five_perturbs_next_request_temperature() {
         3,
     );
 
-    let (_result, _events) =
-        collect_run(agent, vec![user_prompt("search loop")], Vec::new()).await;
+    let (_result, _events) = collect_run(agent, vec![user_prompt("search loop")], Vec::new()).await;
 
     let options = options.lock().expect("options lock");
     assert_eq!(options.len(), 6);
@@ -1185,10 +1187,12 @@ async fn identical_args_still_route_through_the_existing_failure_detector() {
 
     let loop_warnings = events
         .iter()
-        .filter(|event| matches!(
-            event,
-            AgentEvent::SystemMessage { text } if text.contains("[loop warning]")
-        ))
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::SystemMessage { text } if text.contains("[loop warning]")
+            )
+        })
         .count();
     assert_eq!(loop_warnings, 1, "failure detector unaffected by Signal C");
 }
@@ -1236,9 +1240,7 @@ async fn run_two_edit_match_failures() -> (String, crate::AgentRunResult) {
 
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(MatchFailingEditTool {
-        message: format!(
-            "edit #0 for {path} did not match anything; closest match: {path}:2-3"
-        ),
+        message: format!("edit #0 for {path} did not match anything; closest match: {path}:2-3"),
     }));
     let edit_call = |id: &str| {
         MockStreamScript::from_message(assistant_with_tool_calls(vec![tool_call(
@@ -1345,7 +1347,10 @@ async fn grounding_composes_after_the_wrap_directive() {
         "original error second: {blocks:?}"
     );
     assert!(
-        blocks.last().expect("blocks").contains("Current content of"),
+        blocks
+            .last()
+            .expect("blocks")
+            .contains("Current content of"),
         "grounding last: {blocks:?}"
     );
 }
@@ -1582,7 +1587,11 @@ async fn case_insensitive_tool_name_is_rescued() {
     let (result, _events) = collect_run(agent, vec![user_prompt("run")], Vec::new()).await;
 
     let tool_result = first_tool_result(&result);
-    assert!(!tool_result.is_error, "rescued call must execute: {:?}", tool_result.content);
+    assert!(
+        !tool_result.is_error,
+        "rescued call must execute: {:?}",
+        tool_result.content
+    );
     assert_eq!(
         tool_result.details.get("tool_name_rescued"),
         Some(&serde_json::json!({"from": "Count", "to": "count"})),
@@ -1866,7 +1875,10 @@ async fn failure_loop_detector_emits_warning_without_aborting() {
         )])),
         MockStreamScript::from_message(final_assistant("done")),
     ];
-    provider_registry.register(ApiKind::OpenAICompletions, Box::new(MockProvider::new(scripts)));
+    provider_registry.register(
+        ApiKind::OpenAICompletions,
+        Box::new(MockProvider::new(scripts)),
+    );
 
     let agent = AgentLoop::new(
         Arc::new(provider_registry),
@@ -1883,12 +1895,8 @@ async fn failure_loop_detector_emits_warning_without_aborting() {
         .with_failure_loop_threshold(Some(2)),
     );
 
-    let (result, events) = collect_run(
-        agent,
-        vec![user_prompt("trigger the loop")],
-        Vec::new(),
-    )
-    .await;
+    let (result, events) =
+        collect_run(agent, vec![user_prompt("trigger the loop")], Vec::new()).await;
 
     let loop_warnings: Vec<&String> = events
         .iter()
@@ -1980,7 +1988,10 @@ async fn failure_loop_detector_silent_when_threshold_unset() {
         )])),
         MockStreamScript::from_message(final_assistant("done")),
     ];
-    provider_registry.register(ApiKind::OpenAICompletions, Box::new(MockProvider::new(scripts)));
+    provider_registry.register(
+        ApiKind::OpenAICompletions,
+        Box::new(MockProvider::new(scripts)),
+    );
 
     let agent = AgentLoop::new(
         Arc::new(provider_registry),
@@ -1996,8 +2007,7 @@ async fn failure_loop_detector_silent_when_threshold_unset() {
         ),
     );
 
-    let (_result, events) =
-        collect_run(agent, vec![user_prompt("no detector")], Vec::new()).await;
+    let (_result, events) = collect_run(agent, vec![user_prompt("no detector")], Vec::new()).await;
 
     let loop_warnings: Vec<&String> = events
         .iter()
@@ -2553,10 +2563,10 @@ async fn guard_does_not_fire_when_a_file_was_mutated() {
     // model turn means the guard did not re-engage.
     assert_eq!(assistant_messages(&result), 2);
     assert!(
-        !result.generated_messages.iter().any(|message| matches!(
-            message,
-            Message::User(_)
-        )),
+        !result
+            .generated_messages
+            .iter()
+            .any(|message| matches!(message, Message::User(_))),
         "no directive user message should have been persisted",
     );
 }
@@ -2669,8 +2679,12 @@ async fn classifier_decides_when_edit_expected_is_none() {
         None,
     );
 
-    let (result_no, _events) =
-        collect_run(agent_no, vec![user_prompt("what does this function do?")], Vec::new()).await;
+    let (result_no, _events) = collect_run(
+        agent_no,
+        vec![user_prompt("what does this function do?")],
+        Vec::new(),
+    )
+    .await;
     assert!(result_no.terminal_error.is_none());
     assert_eq!(
         assistant_messages(&result_no),
@@ -2729,8 +2743,12 @@ async fn ambiguous_classifier_verdict_does_not_fire_the_guard() {
         None,
     );
 
-    let (result, _events) =
-        collect_run(agent, vec![user_prompt("what does this function do?")], Vec::new()).await;
+    let (result, _events) = collect_run(
+        agent,
+        vec![user_prompt("what does this function do?")],
+        Vec::new(),
+    )
+    .await;
     assert!(result.terminal_error.is_none());
     assert_eq!(
         assistant_messages(&result),
@@ -2773,5 +2791,97 @@ async fn guard_disabled_by_default_leaves_loop_byte_identical() {
             "AgentEnd",
         ],
         "a disabled guard must leave the event stream byte-identical",
+    );
+}
+
+fn parse_repair_agent(provider: Box<dyn Provider>, tool_registry: Arc<ToolRegistry>) -> AgentLoop {
+    let mut provider_registry = ProviderRegistry::new();
+    provider_registry.register(ApiKind::OpenAICompletions, provider);
+    AgentLoop::new(
+        Arc::new(provider_registry),
+        tool_registry,
+        AgentLoopConfig::new(
+            sample_model(),
+            "You are a test agent".into(),
+            ThinkingLevel::Off,
+            ToolExecutionMode::Sequential,
+            Arc::new(StaticResolver {
+                result: Ok(ResolvedRequestOptions::default()),
+            }),
+        )
+        .with_embedded_tool_call_format(crate::EmbeddedToolCallFormat::XmlJsonBlock)
+        .with_max_parse_repairs(2)
+        .with_max_tool_calls_per_step(Some(1))
+        .with_tool_call_repair(true),
+    )
+}
+
+#[tokio::test]
+async fn broken_xml_tool_call_is_repaired_then_executed() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = parse_repair_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>\n{\"name\":\"count\",\"arguments\":{\"limit\":3}}\n</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant("done")),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("count")], Vec::new()).await;
+    let tool_result = first_tool_result(&result);
+    assert!(!tool_result.is_error, "repaired embedded call must execute");
+    assert_eq!(tool_result.tool_name, "count");
+    assert!(
+        result.final_context.iter().any(|message| match message {
+            Message::User(user) => user.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text { text } if text.contains("Your tool call was invalid")
+            )),
+            _ => false,
+        }),
+        "repair prompt must land in context"
+    );
+}
+
+#[tokio::test]
+async fn parse_repair_budget_exhaustion_does_not_execute_malformed_call() {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(integer_arg_tool()));
+    let agent = parse_repair_agent(
+        Box::new(MockProvider::new(vec![
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+            MockStreamScript::from_message(final_assistant(
+                "<tool_call>{\"name\":\"count\",\"arguments\":{</tool_call>",
+            )),
+        ])),
+        Arc::new(tools),
+    );
+
+    let (result, _events) = collect_run(agent, vec![user_prompt("count")], Vec::new()).await;
+    assert!(
+        result
+            .generated_messages
+            .iter()
+            .all(|message| !matches!(message, Message::ToolResult(_))),
+        "exhausted parse-repair budget must not execute the call"
+    );
+    assert_eq!(
+        result
+            .generated_messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant(_)))
+            .count(),
+        3
     );
 }

@@ -178,9 +178,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path().join("skills");
         fs::create_dir_all(&root).expect("create root");
-        let manifest = format!(
-            "---\nname: {name}\ndescription: {description}\n---\n{body}\n"
-        );
+        let manifest = format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n");
         fs::write(root.join(format!("{name}.md")), manifest).expect("write");
         let mut reg = SkillRegistry::empty();
         reg.absorb_root_for_test(&root, SkillSource::Bundled);
@@ -384,14 +382,8 @@ mod tests {
         let rt = Runtime::new().expect("rt");
         let err = rt
             .block_on(async {
-                tool.execute(
-                    "call_1",
-                    json!({}),
-                    CancellationToken::new(),
-                    None,
-                    &ctx(),
-                )
-                .await
+                tool.execute("call_1", json!({}), CancellationToken::new(), None, &ctx())
+                    .await
             })
             .expect_err("should error");
         match err {

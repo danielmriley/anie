@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 mod mutation;
+mod profile;
 
 use anie_provider::{
     ApiKind, CostPerMillion, Model, ReasoningCapabilities, ReasoningControlMode,
@@ -24,6 +25,11 @@ use anie_provider::{
 };
 
 pub use mutation::ConfigMutator;
+pub use profile::{
+    AgentConfig, DEFAULT_MAX_PARSE_REPAIRS, LocalAgentConfig, LocalToolCallConfig,
+    ModelCapabilityProfile, PromptTemplateId, ResolvedModelProfile, ToolCallFormat,
+    infer_prompt_template,
+};
 
 static ATOMIC_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -76,6 +82,12 @@ pub struct AnieConfig {
     /// `docs/edit_completion_guard/README.md`.
     #[serde(default)]
     pub guard: GuardConfig,
+    /// Local-agent reliability knobs (`[agent.local.tool_calls]`).
+    /// Defaults keep hosted models on native tool calls with no
+    /// parse-repair budget. See `docs/local_small_model_harness_ideas.md`
+    /// Phase B.
+    #[serde(default)]
+    pub agent: AgentConfig,
     /// True if a loaded config file (`~/.anie/config.toml` or
     /// a project-local `.anie/config.toml`) explicitly set the
     /// `[model]` section. Lets callers distinguish "the user
@@ -85,6 +97,49 @@ pub struct AnieConfig {
     /// declared default. Not persisted — derived at load time.
     #[serde(skip)]
     pub model_explicitly_set: bool,
+}
+
+impl AnieConfig {
+    /// Resolve the capability profile for a selected model.
+    ///
+    /// Catalog fields overlay family inference; `[model]` fields
+    /// overlay the catalog when the configured id matches.
+    #[must_use]
+    pub fn resolve_profile(&self, provider: &str, model_id: &str) -> ResolvedModelProfile {
+        let catalog = self
+            .providers
+            .get(provider)
+            .and_then(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .find(|model| model.id == model_id)
+                    .map(|model| &model.profile)
+            })
+            .or_else(|| {
+                self.providers.values().find_map(|entry| {
+                    entry
+                        .models
+                        .iter()
+                        .find(|model| model.id == model_id)
+                        .map(|model| &model.profile)
+                })
+            });
+        let api_is_ollama = self
+            .providers
+            .get(provider)
+            .and_then(|entry| entry.api)
+            .is_some_and(|api| api == ApiKind::OllamaChatApi);
+        profile::resolve_profile(
+            &self.model.profile,
+            &self.model.id,
+            catalog,
+            provider,
+            model_id,
+            api_is_ollama,
+            &self.agent.local.tool_calls,
+        )
+    }
 }
 
 /// Ollama-specific configuration. Applies workspace-wide to
@@ -459,6 +514,9 @@ pub struct ModelConfig {
     pub id: String,
     /// Default thinking level.
     pub thinking: ThinkingLevel,
+    /// Optional capability-profile fields flattened onto `[model]`.
+    #[serde(flatten, default)]
+    pub profile: ModelCapabilityProfile,
 }
 
 impl Default for ModelConfig {
@@ -467,6 +525,7 @@ impl Default for ModelConfig {
             provider: "openai".into(),
             id: "gpt-4o".into(),
             thinking: ThinkingLevel::Medium,
+            profile: ModelCapabilityProfile::default(),
         }
     }
 }
@@ -517,6 +576,11 @@ pub struct CustomModelConfig {
     /// Whether the model supports images.
     #[serde(default)]
     pub supports_images: bool,
+    /// Optional capability-profile fields flattened onto the
+    /// custom-model entry (`prompt_template`, `tool_call_format`,
+    /// `preferred_temperature`, `good_at` / `weak_at`, …).
+    #[serde(flatten, default)]
+    pub profile: ModelCapabilityProfile,
 }
 
 /// Context-compaction settings.
@@ -1136,7 +1200,7 @@ pub fn collect_context_files(cwd: &Path, config: &ContextConfig) -> Result<Vec<C
 /// Return the default config template written on first run.
 #[must_use]
 pub fn default_config_template() -> &'static str {
-    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Process sandbox for the bash tool (Linux only; Landlock + seccomp).\n# Opt-in, off by default. When enabled, confined commands may read\n# anywhere but write only under writable_roots (empty => [cwd, TMPDIR]),\n# and cannot open network sockets unless allow_network = true. With\n# require_kernel_support = true (default) anie refuses to spawn if the\n# kernel lacks Landlock, rather than running unconfined.\n# [tools.sandbox]\n# enabled = false\n# writable_roots = []\n# allow_network = false\n# require_kernel_support = true\n\n# Ollama-wide settings (only meaningful for OllamaChatApi models).\n# Optional cap on the num_ctx anie sends to Ollama. Useful on\n# constrained hardware: a 16 GB Mac with a 32B+ model can hit\n# load failures at the 262144-token architectural max from\n# /api/show. Setting this lets anie clamp every Ollama model's\n# context window at catalog-load time. Per-model runtime\n# overrides via /context-length still win over this cap.\n# Acceptable values: >= 2048 (matches the /context-length minimum).\n# [ollama]\n# default_max_num_ctx = 32768\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# External MCP servers (stdio transport). Each enabled server is\n# spawned at startup; its tools register as mcp__<name>__<tool>.\n# A server that fails to start is skipped with a warning.\n# [mcp.servers.everything]\n# command = \"npx\"\n# args = [\"-y\", \"@modelcontextprotocol/server-everything\"]\n# enabled = true\n# startup_timeout_ms = 10000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
+    "# anie-rs configuration\n\n# Default model\n# [model]\n# provider = \"openai\"\n# id = \"gpt-4o\"\n# thinking = \"medium\"\n\n# Provider settings\n# [providers.openai]\n# api_key_env = \"OPENAI_API_KEY\"\n\n# Custom local OpenAI-compatible provider\n# [providers.ollama]\n# base_url = \"http://localhost:11434/v1\"\n# api = \"OpenAICompletions\"\n# [[providers.ollama.models]]\n# id = \"qwen3:32b\"\n# name = \"Qwen 3 32B\"\n# context_window = 32768\n# max_tokens = 8192\n# thinking_request_mode = \"ReasoningEffort\"\n# prompt_template = \"qwen_coder\"\n# tool_call_format = \"xml_json_block\"\n# tool_call_repair = true\n# preferred_temperature = 0.1\n# max_tool_calls_per_step = 1\n# good_at = [\"rust\", \"typescript\"]\n# weak_at = [\"long_horizon_planning\"]\n\n# Local-model parse-repair budget (Phase B).\n# [agent.local.tool_calls]\n# max_parse_repairs = 2\n# execute_ambiguous_calls = false\n\n# Bash deny policy. This is a guardrail, not a sandbox.\n# [tools.bash.policy]\n# enabled = true\n# deny_commands = [\"rm\", \"dd\", \"mkfs\"]\n# deny_patterns = [\"git\\\\s+push\\\\s+--force\"]\n\n# Process sandbox for the bash tool (Linux only; Landlock + seccomp).\n# Opt-in, off by default. When enabled, confined commands may read\n# anywhere but write only under writable_roots (empty => [cwd, TMPDIR]),\n# and cannot open network sockets unless allow_network = true. With\n# require_kernel_support = true (default) anie refuses to spawn if the\n# kernel lacks Landlock, rather than running unconfined.\n# [tools.sandbox]\n# enabled = false\n# writable_roots = []\n# allow_network = false\n# require_kernel_support = true\n\n# Ollama-wide settings (only meaningful for OllamaChatApi models).\n# Optional cap on the num_ctx anie sends to Ollama. Useful on\n# constrained hardware: a 16 GB Mac with a 32B+ model can hit\n# load failures at the 262144-token architectural max from\n# /api/show. Setting this lets anie clamp every Ollama model's\n# context window at catalog-load time. Per-model runtime\n# overrides via /context-length still win over this cap.\n# Acceptable values: >= 2048 (matches the /context-length minimum).\n# [ollama]\n# default_max_num_ctx = 32768\n\n# Compaction settings\n# [compaction]\n# enabled = true\n# reserve_tokens = 16384\n# keep_recent_tokens = 20000\n\n# External MCP servers (stdio transport). Each enabled server is\n# spawned at startup; its tools register as mcp__<name>__<tool>.\n# A server that fails to start is skipped with a warning.\n# [mcp.servers.everything]\n# command = \"npx\"\n# args = [\"-y\", \"@modelcontextprotocol/server-everything\"]\n# enabled = true\n# startup_timeout_ms = 10000\n\n# Project context files\n# [context]\n# filenames = [\"AGENTS.md\", \"CLAUDE.md\"]\n# max_file_bytes = 32768\n# max_total_bytes = 65536\n"
 }
 
 fn load_partial_config(path: &Path) -> Result<PartialAnieConfig> {
@@ -1166,6 +1230,7 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
         if let Some(thinking) = model.thinking {
             config.model.thinking = thinking;
         }
+        config.model.profile.overlay(&model.profile);
     }
 
     for (provider_name, partial_provider) in partial.providers {
@@ -1329,6 +1394,18 @@ fn merge_partial_config(config: &mut AnieConfig, partial: PartialAnieConfig) {
             config.guard.guard_rounds = guard_rounds;
         }
     }
+
+    if let Some(agent) = partial.agent
+        && let Some(local) = agent.local
+        && let Some(tool_calls) = local.tool_calls
+    {
+        if let Some(max_parse_repairs) = tool_calls.max_parse_repairs {
+            config.agent.local.tool_calls.max_parse_repairs = max_parse_repairs;
+        }
+        if let Some(execute_ambiguous_calls) = tool_calls.execute_ambiguous_calls {
+            config.agent.local.tool_calls.execute_ambiguous_calls = execute_ambiguous_calls;
+        }
+    }
 }
 
 fn apply_cli_overrides(config: &mut AnieConfig, overrides: CliOverrides) {
@@ -1367,6 +1444,8 @@ struct PartialAnieConfig {
     verify: Option<PartialVerifyConfig>,
     #[serde(default)]
     guard: Option<PartialGuardConfig>,
+    #[serde(default)]
+    agent: Option<PartialAgentConfig>,
 }
 
 /// Optional `[guard]` overrides loaded from `config.toml`. Each
@@ -1419,6 +1498,24 @@ struct PartialModelConfig {
     provider: Option<String>,
     id: Option<String>,
     thinking: Option<ThinkingLevel>,
+    #[serde(flatten)]
+    profile: ModelCapabilityProfile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialAgentConfig {
+    local: Option<PartialLocalAgentConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialLocalAgentConfig {
+    tool_calls: Option<PartialLocalToolCallConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialLocalToolCallConfig {
+    max_parse_repairs: Option<u32>,
+    execute_ambiguous_calls: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2257,6 +2354,7 @@ mod tests {
                     reasoning_tag_close: Some("</think>".into()),
                     thinking_request_mode: Some(ThinkingRequestMode::ReasoningEffort),
                     supports_images: false,
+                    profile: ModelCapabilityProfile::default(),
                 }],
             },
         );
@@ -2300,6 +2398,7 @@ mod tests {
                     reasoning_tag_close: None,
                     thinking_request_mode: None,
                     supports_images: false,
+                    profile: ModelCapabilityProfile::default(),
                 }],
             },
         );
@@ -2670,5 +2769,142 @@ mod tests {
         let serialized = toml::to_string(&full).expect("serialize config");
         let reparsed = load_body(&serialized);
         assert_eq!(reparsed.guard, full.guard);
+    }
+
+    #[test]
+    fn custom_model_profile_fields_load_from_provider_catalog() {
+        let config = load_body(
+            r#"
+            [model]
+            provider = "ollama"
+            id = "qwen2.5-coder:14b"
+
+            [providers.ollama]
+            base_url = "http://localhost:11434"
+            api = "OllamaChatApi"
+
+            [[providers.ollama.models]]
+            id = "qwen2.5-coder:14b"
+            name = "Qwen Coder 14B"
+            context_window = 131072
+            max_tokens = 8192
+            prompt_template = "qwen_coder"
+            tool_call_format = "xml_json_block"
+            tool_call_repair = true
+            preferred_temperature = 0.1
+            max_tool_calls_per_step = 1
+            good_at = ["rust", "typescript"]
+            weak_at = ["long_horizon_planning"]
+            "#,
+        );
+        let profile = config.resolve_profile("ollama", "qwen2.5-coder:14b");
+        assert_eq!(profile.prompt_template, Some(PromptTemplateId::QwenCoder));
+        assert_eq!(profile.tool_call_format, ToolCallFormat::XmlJsonBlock);
+        assert_eq!(profile.preferred_temperature, Some(0.1));
+        assert_eq!(profile.max_tool_calls_per_step, Some(1));
+        assert!(profile.tool_call_repair);
+        assert_eq!(profile.good_at, vec!["rust", "typescript"]);
+        assert_eq!(profile.weak_at, vec!["long_horizon_planning"]);
+        assert_eq!(profile.max_parse_repairs, DEFAULT_MAX_PARSE_REPAIRS);
+        assert!(!profile.execute_ambiguous_calls);
+    }
+
+    #[test]
+    fn model_section_profile_overlays_catalog_and_inference() {
+        let config = load_body(
+            r#"
+            [model]
+            provider = "ollama"
+            id = "qwen2.5-coder:14b"
+            prompt_template = "generic_local_coder"
+            preferred_temperature = 0.2
+            one_tool_per_step = false
+            supports_parallel_tools = true
+            max_tool_calls_per_step = 3
+
+            [providers.ollama]
+            base_url = "http://localhost:11434"
+            api = "OllamaChatApi"
+
+            [[providers.ollama.models]]
+            id = "qwen2.5-coder:14b"
+            name = "Qwen Coder 14B"
+            context_window = 32768
+            max_tokens = 8192
+            prompt_template = "qwen_coder"
+            preferred_temperature = 0.1
+            "#,
+        );
+        let profile = config.resolve_profile("ollama", "qwen2.5-coder:14b");
+        assert_eq!(
+            profile.prompt_template,
+            Some(PromptTemplateId::GenericLocalCoder)
+        );
+        assert_eq!(profile.preferred_temperature, Some(0.2));
+        assert_eq!(profile.max_tool_calls_per_step, Some(3));
+    }
+
+    #[test]
+    fn project_agent_local_tool_calls_overlay_global_defaults() {
+        let tempdir = tempdir().expect("tempdir");
+        let global_path = tempdir.path().join("global.toml");
+        let project_path = tempdir.path().join("project.toml");
+        fs::write(
+            &global_path,
+            "[model]\nprovider = \"ollama\"\nid = \"gemma4:e4b\"\n",
+        )
+        .expect("write global");
+        fs::write(
+            &project_path,
+            "[agent.local.tool_calls]\nmax_parse_repairs = 1\nexecute_ambiguous_calls = true\n",
+        )
+        .expect("write project");
+
+        let config = load_config_with_paths(
+            Some(&global_path),
+            Some(&project_path),
+            CliOverrides::default(),
+        )
+        .expect("load merged config");
+        assert_eq!(config.agent.local.tool_calls.max_parse_repairs, 1);
+        assert!(config.agent.local.tool_calls.execute_ambiguous_calls);
+
+        let profile = config.resolve_profile("ollama", "gemma4:e4b");
+        assert_eq!(profile.prompt_template, Some(PromptTemplateId::GemmaCoder));
+        assert_eq!(profile.max_parse_repairs, 1);
+        assert!(profile.execute_ambiguous_calls);
+    }
+
+    #[test]
+    fn hosted_default_model_resolves_to_native_profile() {
+        let config = AnieConfig::default();
+        let profile = config.resolve_profile(&config.model.provider, &config.model.id);
+        assert_eq!(profile, ResolvedModelProfile::hosted_default());
+    }
+
+    #[test]
+    fn older_custom_model_without_profile_fields_loads_cleanly() {
+        let config = load_body(
+            r#"
+            [providers.local]
+            base_url = "http://localhost:11434/v1"
+            api = "OpenAICompletions"
+
+            [[providers.local.models]]
+            id = "qwen"
+            name = "Qwen"
+            context_window = 32768
+            max_tokens = 8192
+            "#,
+        );
+        let model = config
+            .providers
+            .get("local")
+            .and_then(|provider| provider.models.first())
+            .expect("custom model");
+        assert_eq!(model.profile, ModelCapabilityProfile::default());
+        let profile = config.resolve_profile("local", "qwen");
+        assert_eq!(profile.prompt_template, Some(PromptTemplateId::QwenCoder));
+        assert!(profile.tool_call_repair);
     }
 }

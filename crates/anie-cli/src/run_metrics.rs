@@ -551,10 +551,7 @@ impl RunMetricsAccumulator {
                 // mutation after the guard has fired is the signal
                 // the intervention worked. Checked before `name` is
                 // moved into the per-tool map below.
-                if self.guard_has_fired
-                    && !*is_error
-                    && MUTATING_TOOLS.contains(&name.as_str())
-                {
+                if self.guard_has_fired && !*is_error && MUTATING_TOOLS.contains(&name.as_str()) {
                     self.edit_guard.edit_after_guard += 1;
                 }
                 self.tools.calls += 1;
@@ -911,7 +908,11 @@ mod tests {
         assert_eq!(back.schema_version, RUN_METRICS_SCHEMA_VERSION);
     }
 
-    fn tool_end_with_details(call_id: &str, is_error: bool, details: serde_json::Value) -> AgentEvent {
+    fn tool_end_with_details(
+        call_id: &str,
+        is_error: bool,
+        details: serde_json::Value,
+    ) -> AgentEvent {
         AgentEvent::ToolExecEnd {
             call_id: call_id.into(),
             result: ToolResult {
@@ -936,9 +937,17 @@ mod tests {
                 serde_json::json!({"argument_coercions": ["limit: coerced"]}),
             ),
             tool_start("c2", "edit"),
-            tool_end_with_details("c2", false, serde_json::json!({"argument_repair_rounds": 1})),
+            tool_end_with_details(
+                "c2",
+                false,
+                serde_json::json!({"argument_repair_rounds": 1}),
+            ),
             tool_start("c3", "edit"),
-            tool_end_with_details("c3", true, serde_json::json!({"argument_repair_failed": true})),
+            tool_end_with_details(
+                "c3",
+                true,
+                serde_json::json!({"argument_repair_failed": true}),
+            ),
             tool_start("c4", "bash"),
             tool_end("c4", false),
         ]);
@@ -946,7 +955,10 @@ mod tests {
         assert_eq!(m.tool_repair.repaired, 1);
         assert_eq!(m.tool_repair.failed_after_repair, 1);
         assert_eq!(m.tool_repair.repaired_then_failed, 0);
-        assert_eq!(m.tools.calls, 4, "rescue counters don't replace call counts");
+        assert_eq!(
+            m.tools.calls, 4,
+            "rescue counters don't replace call counts"
+        );
     }
 
     /// Schema v3 (Plan 01 §9b): a repaired call that then failed
@@ -1095,26 +1107,29 @@ mod tests {
     /// into `prefill_tokens_total`.
     #[test]
     fn rlm_stats_deltas_accumulate_into_context_metrics() {
-        let m = fold_with_num_ctx(16_000, &[
-            rlm_stats(2, 1_500, 1, 600, 80, 9_000),
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 9_000,
-                    output_tokens: 50,
-                    ..Usage::default()
-                },
-            ),
-            rlm_stats(1, 700, 0, 0, 90, 9_500),
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 9_400,
-                    output_tokens: 40,
-                    ..Usage::default()
-                },
-            ),
-        ]);
+        let m = fold_with_num_ctx(
+            16_000,
+            &[
+                rlm_stats(2, 1_500, 1, 600, 80, 9_000),
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 9_000,
+                        output_tokens: 50,
+                        ..Usage::default()
+                    },
+                ),
+                rlm_stats(1, 700, 0, 0, 90, 9_500),
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 9_400,
+                        output_tokens: 40,
+                        ..Usage::default()
+                    },
+                ),
+            ],
+        );
         assert_eq!(m.context.evictions, 3);
         assert_eq!(m.context.evicted_tokens, 2_200);
         assert_eq!(m.context.page_ins, 1);
@@ -1132,29 +1147,32 @@ mod tests {
     /// near-estimate is not.
     #[test]
     fn truncation_suspected_increments_on_context_shift_signature() {
-        let m = fold_with_num_ctx(12_000, &[
-            // Sent ~16k into a 12k window; Ollama re-evaluated the
-            // shifted window (~8k of it) → context-shift.
-            rlm_stats(0, 0, 0, 0, 100, 16_000),
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 8_000,
-                    output_tokens: 30,
-                    ..Usage::default()
-                },
-            ),
-            // Sent ~16k, prefilled ~15.5k (within the heuristic band) → fine.
-            rlm_stats(0, 0, 0, 0, 100, 16_000),
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 15_500,
-                    output_tokens: 30,
-                    ..Usage::default()
-                },
-            ),
-        ]);
+        let m = fold_with_num_ctx(
+            12_000,
+            &[
+                // Sent ~16k into a 12k window; Ollama re-evaluated the
+                // shifted window (~8k of it) → context-shift.
+                rlm_stats(0, 0, 0, 0, 100, 16_000),
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 8_000,
+                        output_tokens: 30,
+                        ..Usage::default()
+                    },
+                ),
+                // Sent ~16k, prefilled ~15.5k (within the heuristic band) → fine.
+                rlm_stats(0, 0, 0, 0, 100, 16_000),
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 15_500,
+                        output_tokens: 30,
+                        ..Usage::default()
+                    },
+                ),
+            ],
+        );
         assert_eq!(m.context.truncation_suspected, 1);
     }
 
@@ -1166,32 +1184,35 @@ mod tests {
     /// alarm and fire on every well-behaved multi-turn rlm run.
     #[test]
     fn prefix_cache_hit_prefill_is_not_truncation() {
-        let m = fold_with_num_ctx(12_000, &[
-            // Send fits the window: no shift is possible, however
-            // small the prefill.
-            rlm_stats(0, 0, 0, 0, 100, 9_000),
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 300,
-                    ..Usage::default()
-                },
-            ),
-            // Even over the window, a prefill far below it is the
-            // suffix-only cache-hit shape, not a shifted re-eval.
-            rlm_stats(0, 0, 0, 0, 100, 16_000),
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 300,
-                    ..Usage::default()
-                },
-            ),
-            // A fully-cached prompt omits `prompt_eval_count`
-            // entirely (input_tokens = 0).
-            rlm_stats(0, 0, 0, 0, 100, 16_000),
-            assistant_from("ollama", Usage::default()),
-        ]);
+        let m = fold_with_num_ctx(
+            12_000,
+            &[
+                // Send fits the window: no shift is possible, however
+                // small the prefill.
+                rlm_stats(0, 0, 0, 0, 100, 9_000),
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 300,
+                        ..Usage::default()
+                    },
+                ),
+                // Even over the window, a prefill far below it is the
+                // suffix-only cache-hit shape, not a shifted re-eval.
+                rlm_stats(0, 0, 0, 0, 100, 16_000),
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 300,
+                        ..Usage::default()
+                    },
+                ),
+                // A fully-cached prompt omits `prompt_eval_count`
+                // entirely (input_tokens = 0).
+                rlm_stats(0, 0, 0, 0, 100, 16_000),
+                assistant_from("ollama", Usage::default()),
+            ],
+        );
         assert_eq!(m.context.truncation_suspected, 0);
     }
 
@@ -1220,18 +1241,21 @@ mod tests {
     #[test]
     fn errored_or_aborted_replies_are_not_prefill_samples() {
         for stop_reason in [StopReason::Error, StopReason::Aborted] {
-            let m = fold_with_num_ctx(12_000, &[
-                rlm_stats(0, 0, 0, 0, 100, 16_000),
-                // Shift-shaped usage on an error-shaped reply.
-                assistant_stopped(
-                    "ollama",
-                    Usage {
-                        input_tokens: 8_000,
-                        ..Usage::default()
-                    },
-                    stop_reason,
-                ),
-            ]);
+            let m = fold_with_num_ctx(
+                12_000,
+                &[
+                    rlm_stats(0, 0, 0, 0, 100, 16_000),
+                    // Shift-shaped usage on an error-shaped reply.
+                    assistant_stopped(
+                        "ollama",
+                        Usage {
+                            input_tokens: 8_000,
+                            ..Usage::default()
+                        },
+                        stop_reason,
+                    ),
+                ],
+            );
             assert_eq!(
                 m.context.truncation_suspected, 0,
                 "{stop_reason:?} replies are not prefill samples"
@@ -1263,18 +1287,21 @@ mod tests {
     /// The prefill total stays Ollama-only too.
     #[test]
     fn truncation_never_suspected_for_non_ollama_provider() {
-        let m = fold_with_num_ctx(12_000, &[
-            rlm_stats(0, 0, 0, 0, 100, 16_000),
-            // Shift-shaped numbers, hosted provider → never flags.
-            assistant_from(
-                "openai",
-                Usage {
-                    input_tokens: 8_000,
-                    output_tokens: 30,
-                    ..Usage::default()
-                },
-            ),
-        ]);
+        let m = fold_with_num_ctx(
+            12_000,
+            &[
+                rlm_stats(0, 0, 0, 0, 100, 16_000),
+                // Shift-shaped numbers, hosted provider → never flags.
+                assistant_from(
+                    "openai",
+                    Usage {
+                        input_tokens: 8_000,
+                        output_tokens: 30,
+                        ..Usage::default()
+                    },
+                ),
+            ],
+        );
         assert_eq!(m.context.truncation_suspected, 0);
         assert_eq!(m.context.prefill_tokens_total, 0);
     }
@@ -1284,25 +1311,28 @@ mod tests {
     /// the estimate is consumed (`take`) on the first Ollama turn.
     #[test]
     fn truncation_estimate_does_not_carry_across_turns() {
-        let m = fold_with_num_ctx(12_000, &[
-            rlm_stats(0, 0, 0, 0, 0, 16_000),
-            // First Ollama turn consumes the estimate (shift signature).
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 8_000,
-                    ..Usage::default()
-                },
-            ),
-            // Second turn has no fresh estimate — must not re-fire.
-            assistant_from(
-                "ollama",
-                Usage {
-                    input_tokens: 8_000,
-                    ..Usage::default()
-                },
-            ),
-        ]);
+        let m = fold_with_num_ctx(
+            12_000,
+            &[
+                rlm_stats(0, 0, 0, 0, 0, 16_000),
+                // First Ollama turn consumes the estimate (shift signature).
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 8_000,
+                        ..Usage::default()
+                    },
+                ),
+                // Second turn has no fresh estimate — must not re-fire.
+                assistant_from(
+                    "ollama",
+                    Usage {
+                        input_tokens: 8_000,
+                        ..Usage::default()
+                    },
+                ),
+            ],
+        );
         assert_eq!(m.context.truncation_suspected, 1);
     }
 

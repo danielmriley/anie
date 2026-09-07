@@ -1345,8 +1345,10 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
         // no new page-ins) still qualifies as a no-op; a
         // recall appearing, disappearing (prompt changed,
         // sticky reset), or changing forces a rebuild.
-        let recall_unchanged = match (in_place_recall.and_then(first_text_of), recall_text.as_deref())
-        {
+        let recall_unchanged = match (
+            in_place_recall.and_then(first_text_of),
+            recall_text.as_deref(),
+        ) {
             (None, None) => true,
             (Some(old), Some(new)) => old == new,
             _ => false,
@@ -1518,9 +1520,7 @@ const TOOL_CALL_DISPLAY_CAP: usize = 8;
 fn format_elided_calls_line(elided: usize, plain: bool) -> String {
     let plural = if elided == 1 { "" } else { "s" };
     if plain {
-        format!(
-            "{elided} earlier call{plural} not listed — search them with recurse message_grep."
-        )
+        format!("{elided} earlier call{plural} not listed — search them with recurse message_grep.")
     } else {
         format!(
             "- {elided} earlier call{plural} not listed — search them with recurse \
@@ -1681,10 +1681,7 @@ fn render_tool_call_summary_lines(summary: &[(String, Vec<ToolCallEntry>)]) -> V
             .skip(total - display)
             .map(|e| format!("{} (id={})", e.arg_value, e.tool_call_id))
             .collect();
-        lines.push(format!(
-            "- {tool_name} {label}: {}",
-            rendered.join(", ")
-        ));
+        lines.push(format!("- {tool_name} {label}: {}", rendered.join(", ")));
     }
     if elided_total > 0 {
         lines.push(format_elided_calls_line(elided_total, false));
@@ -1888,10 +1885,7 @@ impl ContextVirtualizationPolicy {
         // different latest-prompt timestamp means a new run —
         // clear the sticky set AND the per-run spend counter.
         {
-            let mut state = self
-                .page_in_state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut state = self.page_in_state.lock().unwrap_or_else(|p| p.into_inner());
             if state.prompt_ts != Some(*prompt_ts) {
                 *state = PageInRunState {
                     prompt_ts: Some(*prompt_ts),
@@ -1903,10 +1897,7 @@ impl ContextVirtualizationPolicy {
         // is left, without holding the lock across the store
         // read below.
         let (sticky_ts, mut budget) = {
-            let state = self
-                .page_in_state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let state = self.page_in_state.lock().unwrap_or_else(|p| p.into_inner());
             let run_remaining = self.page_in_run_budget.saturating_sub(state.spent_tokens);
             (
                 state.sticky_ts.clone(),
@@ -2043,10 +2034,7 @@ impl ContextVirtualizationPolicy {
         // and render the full recall (old sticky sections +
         // this fire's additions). Counters cover only the
         // additions.
-        let mut state = self
-            .page_in_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut state = self.page_in_state.lock().unwrap_or_else(|p| p.into_inner());
         let mut paged = 0usize;
         let mut paged_tokens = 0u64;
         for (ts, section, cost) in accepted {
@@ -2073,10 +2061,7 @@ impl ContextVirtualizationPolicy {
     /// can't score new candidates (budget exhausted, empty
     /// candidate pool, prompt with no scorable text).
     fn render_sticky_recall(&self) -> Option<String> {
-        let state = self
-            .page_in_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let state = self.page_in_state.lock().unwrap_or_else(|p| p.into_inner());
         if state.sticky_sections.is_empty() {
             None
         } else {
@@ -2092,10 +2077,7 @@ impl ContextVirtualizationPolicy {
     /// via recurse.
     fn visible_body_ts(&self, working: &[Message]) -> HashSet<u64> {
         let mut ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
-        let state = self
-            .page_in_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let state = self.page_in_state.lock().unwrap_or_else(|p| p.into_inner());
         ts.extend(state.sticky_ts.iter().copied());
         ts
     }
@@ -2468,7 +2450,8 @@ mod tests {
     #[tokio::test]
     async fn ceiling_unlimited_returns_continue() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let policy = ContextVirtualizationPolicy::new(u64::MAX, 4, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(u64::MAX, 4, 0, store, shared_pushed(HashSet::new()));
         let context: Vec<Message> = (0..20).map(|i| user("hello", i as u64)).collect();
         let response = policy.before_model(sample_request(&context)).await;
         assert_eq!(response, BeforeModelResponse::Continue);
@@ -2483,7 +2466,8 @@ mod tests {
     async fn under_ceiling_keeps_all_messages_and_appends_ledger() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         // 10_000-token ceiling, content is tiny.
-        let policy = ContextVirtualizationPolicy::new(10_000, 4, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 4, 0, store, shared_pushed(HashSet::new()));
         let context = vec![user("hi", 1), assistant("hello", 2)];
         let response = policy.before_model(sample_request(&context)).await;
 
@@ -2513,7 +2497,8 @@ mod tests {
             .collect();
         // Ceiling = 5 tokens; pin_tail_tokens = 3 → pins the
         // last three 1-token messages.
-        let policy = ContextVirtualizationPolicy::new(5, 3, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(5, 3, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -2554,7 +2539,8 @@ mod tests {
         ];
         // Tiny ceiling forces eviction; KEEP_LAST_N=2 means
         // only the last 2 messages would normally pin.
-        let policy = ContextVirtualizationPolicy::new(2, 2, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(2, 2, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -2586,8 +2572,7 @@ mod tests {
     #[tokio::test]
     async fn latest_user_pin_skips_policy_reminder_messages() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
-        let reminder =
-            "<system-reminder source=\"repo-map\">\nsrc/lib.rs\n</system-reminder>";
+        let reminder = "<system-reminder source=\"repo-map\">\nsrc/lib.rs\n</system-reminder>";
         let context = vec![
             user("Just say done.", 1), // the directive — must survive
             assistant("ok let me read", 2),
@@ -2596,7 +2581,8 @@ mod tests {
             tool_result("c2", "read", "more file content", 5),
             user(reminder, 6), // policy-injected, newest user message
         ];
-        let policy = ContextVirtualizationPolicy::new(2, 2, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(2, 2, 0, store, shared_pushed(HashSet::new()));
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -2648,7 +2634,8 @@ mod tests {
         // pin_tail_tokens = 5 pins the last five 1-token
         // messages. The pinned tail will be over the ceiling
         // but the policy refuses to evict pinned messages.
-        let policy = ContextVirtualizationPolicy::new(1, 5, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(1, 5, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -2672,7 +2659,13 @@ mod tests {
         let context: Vec<Message> = (0..8)
             .map(|i| user(&format!("msg{i}"), 100 + i as u64))
             .collect();
-        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), shared_pushed(HashSet::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            5,
+            2,
+            0,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
         let _ = policy.before_model(sample_request(&context)).await;
         let external = store.read().await;
         // Every original message landed in external (or was
@@ -2695,7 +2688,8 @@ mod tests {
         // Pre-populated dedup set matching the snapshot
         // currently in the store.
         let pushed = ContextVirtualizationPolicy::pushed_set_from_snapshot(&context);
-        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&external), shared_pushed(pushed));
+        let policy =
+            ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&external), shared_pushed(pushed));
         let _ = policy.before_model(sample_request(&context)).await;
         let external = external.read().await;
         // Length unchanged: 5 from pre-population, 0
@@ -2718,7 +2712,13 @@ mod tests {
             assistant("ack2", 6),
             user("third", 7),
         ];
-        let policy = ContextVirtualizationPolicy::new(5, 2, 0, Arc::clone(&store), shared_pushed(HashSet::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            5,
+            2,
+            0,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
         let response = policy.before_model(sample_request(&context)).await;
 
         let survivors = match response {
@@ -2751,7 +2751,8 @@ mod tests {
     async fn ledger_replaced_each_turn_no_accumulation() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
 
         // Fire 1: ledger appended.
         let r1 = policy.before_model(sample_request(&context)).await;
@@ -2794,7 +2795,8 @@ mod tests {
             tool_result("c3", "read", "file", 4),
             assistant("ack", 5),
         ];
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -2834,14 +2836,17 @@ mod tests {
         // working set are skipped as redundant).
         let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
             user("what's the time?", 1),
-            assistant_with_tool_call("web_search", serde_json::json!({"query": "rust testing"}), 2),
+            assistant_with_tool_call(
+                "web_search",
+                serde_json::json!({"query": "rust testing"}),
+                2,
+            ),
             tool_result("call_2", "web_search", "result body", 3),
         ])));
         let pushed: HashSet<u64> = (1..=3).collect();
         let context = vec![user("and in Tokyo?", 200)];
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed))
-                .with_small_tier_ledger(true);
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed))
+            .with_small_tier_ledger(true);
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -2851,7 +2856,10 @@ mod tests {
         assert!(text.contains("web_search: \"rust testing\""), "{text}");
         assert!(text.contains("do NOT repeat"), "{text}");
         assert!(!text.contains("(id="), "{text}");
-        assert!(!text.contains("call_2"), "no tool-call ids anywhere: {text}");
+        assert!(
+            !text.contains("call_2"),
+            "no tool-call ids anywhere: {text}"
+        );
     }
 
     /// Plan 04 §2d: the Small-tier recurse instruction is
@@ -2893,13 +2901,16 @@ mod tests {
     async fn full_tier_ledger_unchanged() {
         let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
             user("u0", 1),
-            assistant_with_tool_call("web_search", serde_json::json!({"query": "rust testing"}), 2),
+            assistant_with_tool_call(
+                "web_search",
+                serde_json::json!({"query": "rust testing"}),
+                2,
+            ),
             tool_result("call_2", "web_search", "result body", 3),
         ])));
         let pushed: HashSet<u64> = (1..=3).collect();
         let context = vec![user("follow-up question", 200)];
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -2934,8 +2945,13 @@ mod tests {
     async fn ledger_not_archived_to_external() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let context: Vec<Message> = (0..3).map(|i| user(&format!("msg{i}"), i as u64)).collect();
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), shared_pushed(HashSet::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            0,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
         let _ = policy.before_model(sample_request(&context)).await;
         // External: 3 originals, 0 ledgers.
         assert_eq!(store.read().await.len(), 3);
@@ -3023,7 +3039,8 @@ mod tests {
             .chain([user("weather forecast for Tallahassee tomorrow", 100)])
             .collect();
         // Budget = 0; ceiling = 5 forces eviction.
-        let policy = ContextVirtualizationPolicy::new(5, 1, 0, store, shared_pushed(HashSet::new()));
+        let policy =
+            ContextVirtualizationPolicy::new(5, 1, 0, store, shared_pushed(HashSet::new()));
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -3063,7 +3080,13 @@ mod tests {
 
         // Tight ceiling forces eviction of message 1; budget
         // big enough to page it back.
-        let policy = ContextVirtualizationPolicy::new(5, 1, 50, Arc::clone(&store), shared_pushed(HashSet::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            5,
+            1,
+            50,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -3100,8 +3123,13 @@ mod tests {
         // weather report number N") is ~10 estimated tokens;
         // a 15-token budget admits one and rejects a second.
         let budget = 15_u64;
-        let policy =
-            ContextVirtualizationPolicy::new(2, 1, budget, Arc::clone(&store), shared_pushed(HashSet::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            2,
+            1,
+            budget,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -3143,8 +3171,13 @@ mod tests {
             .map(|i| user(&format!("weather weather {i}"), i as u64))
             .chain([user("what's the weather?", 100)])
             .collect();
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 6, 1_000, Arc::clone(&store), shared_pushed(HashSet::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            6,
+            1_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -3174,8 +3207,13 @@ mod tests {
             .collect();
         context.push(user("weather question", 100));
 
-        let policy =
-            ContextVirtualizationPolicy::new(2, 1, 1_000, Arc::clone(&store), shared_pushed(HashSet::new()));
+        let policy = ContextVirtualizationPolicy::new(
+            2,
+            1,
+            1_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -3217,7 +3255,11 @@ mod tests {
             .filter(|m| is_archive_recall(m))
             .filter_map(|m| user_text(m))
             .collect();
-        assert_eq!(recalls.len(), 1, "exactly one recall message: {survivors:?}");
+        assert_eq!(
+            recalls.len(),
+            1,
+            "exactly one recall message: {survivors:?}"
+        );
         assert!(recalls[0].contains("weather note alpha"), "{}", recalls[0]);
         assert!(recalls[0].contains("weather note beta"), "{}", recalls[0]);
         // Placement: immediately before the ledger, which
@@ -3337,7 +3379,13 @@ mod tests {
         // Use under-ceiling pipeline; ledger is built either
         // way. Pre-populate `pushed` so we don't re-archive.
         let pushed: HashSet<u64> = (100..=103).collect();
-        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, Arc::clone(&store), shared_pushed(pushed));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            0,
+            Arc::clone(&store),
+            shared_pushed(pushed),
+        );
         let context = vec![user("follow-up about codex", 200)];
         let response = policy.before_model(sample_request(&context)).await;
         let survivors = match response {
@@ -3390,7 +3438,11 @@ mod tests {
             .collect();
         let summary = vec![("web_read".to_string(), entries.clone())];
         let lines = render_tool_call_summary_lines(&summary);
-        assert_eq!(lines.len(), 2, "one tool line + one overflow line: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "one tool line + one overflow line: {lines:?}"
+        );
         let line = &lines[0];
         // The most recent 8 entries appear with their ids;
         // the 4 oldest (page0..page3) do not.
@@ -3406,7 +3458,11 @@ mod tests {
         // the no-syntax phrasing (no scope grammar).
         let plain = render_plain_tool_call_lines(&summary);
         assert_eq!(plain.len(), 2, "{plain:?}");
-        assert!(plain[0].contains("\"https://example.com/page4\""), "{}", plain[0]);
+        assert!(
+            plain[0].contains("\"https://example.com/page4\""),
+            "{}",
+            plain[0]
+        );
         assert!(!plain[0].contains("page3\""), "{}", plain[0]);
         assert!(plain[1].contains("4 earlier calls"), "{}", plain[1]);
         assert!(plain[1].contains("recurse message_grep"), "{}", plain[1]);
@@ -3590,9 +3646,14 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
 
         let pushed = HashSet::from([1u64]);
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), shared_pushed(pushed))
-                .with_embedder(embedder, tx);
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            2,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(pushed),
+        )
+        .with_embedder(embedder, tx);
 
         // Active context's prompt has no keyword overlap
         // with the candidate. With keyword scoring this
@@ -3716,9 +3777,14 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
 
         let pushed = HashSet::from([1u64, 2u64]);
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), shared_pushed(pushed))
-                .with_embedder(embedder, tx);
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            2,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(pushed),
+        )
+        .with_embedder(embedder, tx);
 
         let context = vec![user("looking for quux", 100)];
         let response = policy.before_model(sample_request(&context)).await;
@@ -3784,7 +3850,9 @@ mod tests {
         Message::ToolResult(ToolResultMessage {
             tool_call_id: call_id.into(),
             tool_name: tool_name.into(),
-            content: vec![ContentBlock::Text { text: "[tool error] failed".into() }],
+            content: vec![ContentBlock::Text {
+                text: "[tool error] failed".into(),
+            }],
             details: serde_json::Value::Null,
             is_error: true,
             timestamp: ts,
@@ -3836,7 +3904,11 @@ mod tests {
             ok_tool_result("c2", "bash", 4),
         ];
         let supersedable = find_supersedable_failures(&working);
-        assert_eq!(supersedable, vec![1], "only the failed result at idx 1 supersedable");
+        assert_eq!(
+            supersedable,
+            vec![1],
+            "only the failed result at idx 1 supersedable"
+        );
     }
 
     #[test]
@@ -3848,7 +3920,10 @@ mod tests {
             ok_tool_result("c2", "bash", 4),
         ];
         let supersedable = find_supersedable_failures(&working);
-        assert!(supersedable.is_empty(), "different args should not supersede");
+        assert!(
+            supersedable.is_empty(),
+            "different args should not supersede"
+        );
     }
 
     #[test]
@@ -3904,12 +3979,12 @@ mod tests {
         // Failure at idx 0, plenty of messages after it, NOT
         // in the pinned tail.
         let working = vec![
-            failed_tool_result("c1", "bash", 1),  // idx 0 — stale
+            failed_tool_result("c1", "bash", 1), // idx 0 — stale
             user("dummy", 2),
             user("dummy", 3),
             user("dummy", 4),
             user("dummy", 5),
-            user("latest", 6),                     // pinned tail
+            user("latest", 6), // pinned tail
         ];
         // Pinned tail = the last message only.
         let stale = find_stale_failures(&working, 5);
@@ -3922,7 +3997,7 @@ mod tests {
         let working = vec![
             user("first", 1),
             user("second", 2),
-            failed_tool_result("c1", "bash", 3),   // only 2 after
+            failed_tool_result("c1", "bash", 3), // only 2 after
             user("third", 4),
             user("latest", 5),
         ];
@@ -3941,7 +4016,7 @@ mod tests {
             user("c", 3),
             user("d", 4),
             user("e", 5),
-            failed_tool_result("c1", "bash", 6),   // last; pinned
+            failed_tool_result("c1", "bash", 6), // last; pinned
         ];
         // Pinned tail is the last 2 (start index 4). Idx 5
         // is in the tail.
@@ -3952,14 +4027,14 @@ mod tests {
     #[test]
     fn multiple_stale_failures_returned_in_order() {
         let working = vec![
-            failed_tool_result("c1", "bash", 1),   // idx 0 — stale
+            failed_tool_result("c1", "bash", 1), // idx 0 — stale
             user("a", 2),
-            failed_tool_result("c2", "edit", 3),   // idx 2 — stale
+            failed_tool_result("c2", "edit", 3), // idx 2 — stale
             user("b", 4),
             user("c", 5),
             user("d", 6),
             user("e", 7),
-            user("latest", 8),                     // pinned
+            user("latest", 8), // pinned
         ];
         let stale = find_stale_failures(&working, 7);
         assert_eq!(stale, vec![0, 2]);
@@ -3968,7 +4043,7 @@ mod tests {
     #[test]
     fn successful_results_never_marked_stale() {
         let working = vec![
-            ok_tool_result("c1", "bash", 1),       // idx 0 — NOT stale
+            ok_tool_result("c1", "bash", 1), // idx 0 — NOT stale
             user("a", 2),
             user("b", 3),
             user("c", 4),
@@ -4039,15 +4114,10 @@ mod tests {
     fn alarm_policy() -> (ContextVirtualizationPolicy, mpsc::Receiver<AgentEvent>) {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let (tx, rx) = mpsc::channel(32);
-        let policy = ContextVirtualizationPolicy::new(
-            10_000,
-            4,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_ollama_num_ctx(Some(ALARM_NUM_CTX))
-        .with_event_sender(tx);
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 4, 0, store, shared_pushed(HashSet::new()))
+                .with_ollama_num_ctx(Some(ALARM_NUM_CTX))
+                .with_event_sender(tx);
         (policy, rx)
     }
 
@@ -4088,10 +4158,18 @@ mod tests {
         ));
         policy.before_model(sample_request(&context)).await;
         let alarms = drain_system_messages(&mut rx);
-        assert_eq!(alarms.len(), 1, "alarm fires on the truncated turn: {alarms:?}");
+        assert_eq!(
+            alarms.len(),
+            1,
+            "alarm fires on the truncated turn: {alarms:?}"
+        );
         assert!(alarms[0].contains("silently truncated"), "{}", alarms[0]);
         assert!(alarms[0].contains("/context-length"), "{}", alarms[0]);
-        assert!(alarms[0].contains("ANIE_ACTIVE_CEILING_TOKENS"), "{}", alarms[0]);
+        assert!(
+            alarms[0].contains("ANIE_ACTIVE_CEILING_TOKENS"),
+            "{}",
+            alarms[0]
+        );
 
         // A second truncated turn still WARNs (not asserted)
         // but must NOT re-emit the SystemMessage.
@@ -4145,14 +4223,9 @@ mod tests {
     async fn truncation_alarm_off_without_a_known_num_ctx() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let (tx, mut rx) = mpsc::channel(32);
-        let policy = ContextVirtualizationPolicy::new(
-            10_000,
-            4,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_event_sender(tx);
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 4, 0, store, shared_pushed(HashSet::new()))
+                .with_event_sender(tx);
         let mut context = vec![user(&"long prompt ".repeat(100), 1)];
         policy.before_model(sample_request(&context)).await;
         drain_system_messages(&mut rx);
@@ -4316,10 +4389,7 @@ mod tests {
             shared_pushed(HashSet::new()),
         );
         let context = vec![user("hi", 1), assistant("hello", 2)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         assert!(is_ledger(sent_1.last().expect("non-empty")));
 
         let response = policy.before_model(sample_request(&sent_1)).await;
@@ -4390,10 +4460,8 @@ mod tests {
 
             // Turn 1: first fire injects the ledger.
             let context = vec![user("original question", 1), assistant("working on it", 2)];
-            let sent_1 = apply_response(
-                policy.before_model(sample_request(&context)).await,
-                context,
-            );
+            let sent_1 =
+                apply_response(policy.before_model(sample_request(&context)).await, context);
             assert!(is_ledger(sent_1.last().expect("non-empty")));
             let ledger_text_1 = user_text(sent_1.last().expect("non-empty"))
                 .expect("ledger text")
@@ -4459,10 +4527,7 @@ mod tests {
             shared_pushed(HashSet::new()),
         );
         let context = vec![user("original question", 1), assistant("working on it", 2)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         let ledger_text_1 = user_text(sent_1.last().expect("non-empty"))
             .expect("ledger text")
             .to_string();
@@ -4537,10 +4602,7 @@ mod tests {
     async fn truncation_alarm_still_fires_on_append_only_noop_turn() {
         let (policy, mut rx) = alarm_policy();
         let context = vec![user(&"long prompt ".repeat(100), 1)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         drain_system_messages(&mut rx);
 
         // The Ollama reply re-evaluated ~the whole window — far
@@ -4555,7 +4617,11 @@ mod tests {
         let response = policy.before_model(sample_request(&context_2)).await;
         assert_eq!(response, BeforeModelResponse::Continue);
         let alarms = drain_system_messages(&mut rx);
-        assert_eq!(alarms.len(), 1, "alarm must fire on the fast path: {alarms:?}");
+        assert_eq!(
+            alarms.len(),
+            1,
+            "alarm must fire on the fast path: {alarms:?}"
+        );
         assert!(alarms[0].contains("silently truncated"), "{}", alarms[0]);
 
         // And the fast path recorded a fresh baseline for the
@@ -4631,10 +4697,7 @@ mod tests {
 
         // Fire 1: the prompt matches the archived candidate.
         let context = vec![user("what was the Tallahassee weather conclusion?", 100)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         let recall_1 = recall_text_of(&sent_1).expect("recall after fire 1");
         assert!(recall_1.contains("archived Tallahassee weather discussion"));
 
@@ -4688,10 +4751,7 @@ mod tests {
             shared_pushed(HashSet::from([1u64])),
         );
         let context = vec![user("looking for relevant_keyword", 100)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         assert!(recall_text_of(&sent_1).is_some());
         let spent_after_1 = {
             let state = policy
@@ -4755,16 +4815,17 @@ mod tests {
         )
         .with_page_in_run_budget(12);
         let context = vec![user("weather?", 100)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         {
             let state = policy
                 .page_in_state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            assert_eq!(state.sticky_sections.len(), 1, "run budget admits one section");
+            assert_eq!(
+                state.sticky_sections.len(),
+                1,
+                "run budget admits one section"
+            );
             assert!(state.spent_tokens <= 12);
         }
 
@@ -4829,10 +4890,7 @@ mod tests {
             shared_pushed(HashSet::from([1u64])),
         );
         let context = vec![user("looking for relevant_keyword", 100)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         assert!(recall_text_of(&sent_1).is_some());
         assert!(is_ledger(sent_1.last().expect("non-empty")));
 
@@ -4862,10 +4920,7 @@ mod tests {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
         };
-        assert_eq!(
-            survivors.iter().filter(|m| is_archive_recall(m)).count(),
-            1
-        );
+        assert_eq!(survivors.iter().filter(|m| is_archive_recall(m)).count(), 1);
         assert_eq!(survivors.iter().filter(|m| is_ledger(m)).count(), 1);
         assert!(is_ledger(survivors.last().expect("non-empty")));
         assert!(is_archive_recall(&survivors[survivors.len() - 2]));
@@ -4885,14 +4940,9 @@ mod tests {
         let body = "y".repeat(80); // 20 estimated tokens per message
         let context: Vec<Message> = (0..10).map(|i| user(&body, i as u64)).collect();
         // Total ≈ 200; ceiling 100 → low-water target 60.
-        let policy = ContextVirtualizationPolicy::new(
-            100,
-            45,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_evict_low_water_pct(0.6);
+        let policy =
+            ContextVirtualizationPolicy::new(100, 45, 0, store, shared_pushed(HashSet::new()))
+                .with_evict_low_water_pct(0.6);
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -4924,14 +4974,9 @@ mod tests {
             tool_result("c1", "bash", &"big output ".repeat(100), 3),
             tool_result("c2", "bash", &"more output ".repeat(100), 4),
         ];
-        let policy = ContextVirtualizationPolicy::new(
-            5,
-            0,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_evict_low_water_pct(0.6);
+        let policy =
+            ContextVirtualizationPolicy::new(5, 0, 0, store, shared_pushed(HashSet::new()))
+                .with_evict_low_water_pct(0.6);
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -4944,7 +4989,10 @@ mod tests {
         assert!(ts.contains(&1), "latest user pinned: {survivors:?}");
         assert!(ts.contains(&2), "latest assistant pinned: {survivors:?}");
         assert!(ts.contains(&4), "trailing message pinned: {survivors:?}");
-        assert!(!ts.contains(&3), "the older tool result evicts: {survivors:?}");
+        assert!(
+            !ts.contains(&3),
+            "the older tool result evicts: {survivors:?}"
+        );
     }
 
     /// rlm2/PR5 size-aware eviction: among evictable
@@ -4964,14 +5012,9 @@ mod tests {
         ];
         // Total ≈ 1_260; ceiling 600 → target 360: evicting
         // the large tool result alone reaches it.
-        let policy = ContextVirtualizationPolicy::new(
-            600,
-            30,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_evict_low_water_pct(0.6);
+        let policy =
+            ContextVirtualizationPolicy::new(600, 30, 0, store, shared_pushed(HashSet::new()))
+                .with_evict_low_water_pct(0.6);
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -5037,14 +5080,9 @@ mod tests {
             assistant("narrative", 6),
             user("now summarize", 7),
         ];
-        let policy = ContextVirtualizationPolicy::new(
-            600,
-            30,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_evict_low_water_pct(0.6);
+        let policy =
+            ContextVirtualizationPolicy::new(600, 30, 0, store, shared_pushed(HashSet::new()))
+                .with_evict_low_water_pct(0.6);
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -5083,14 +5121,9 @@ mod tests {
         // Ceiling far below the filler; pin tail covers only the
         // trailing directive, so ts 2 + 3 are protected purely by
         // the latest-assistant anchor extending over its pair.
-        let policy = ContextVirtualizationPolicy::new(
-            50,
-            1,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_evict_low_water_pct(0.6);
+        let policy =
+            ContextVirtualizationPolicy::new(50, 1, 0, store, shared_pushed(HashSet::new()))
+                .with_evict_low_water_pct(0.6);
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -5130,14 +5163,9 @@ mod tests {
             context.push(tool_result(&id, "bash", &body, ts + 1));
         }
         context.push(user("how did it go?", 100));
-        let policy = ContextVirtualizationPolicy::new(
-            120,
-            40,
-            0,
-            store,
-            shared_pushed(HashSet::new()),
-        )
-        .with_evict_low_water_pct(0.6);
+        let policy =
+            ContextVirtualizationPolicy::new(120, 40, 0, store, shared_pushed(HashSet::new()))
+                .with_evict_low_water_pct(0.6);
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -5169,8 +5197,7 @@ mod tests {
             user("a question", 100),
             tool_result("call_1", "bash", "ls output", 2),
         ];
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
             other => panic!("expected ReplaceMessages, got {other:?}"),
@@ -5201,13 +5228,8 @@ mod tests {
             tool_result("call_1", "bash", "relevant_keyword output text", 2),
         ])));
         let pushed: HashSet<u64> = (1..=2).collect();
-        let policy = ContextVirtualizationPolicy::new(
-            10_000,
-            8,
-            10_000,
-            store,
-            shared_pushed(pushed),
-        );
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 8, 10_000, store, shared_pushed(pushed));
         let context = vec![user("looking for relevant_keyword", 100)];
         let survivors = match policy.before_model(sample_request(&context)).await {
             BeforeModelResponse::ReplaceMessages(s) => s,
@@ -5239,14 +5261,10 @@ mod tests {
             .collect();
         let pushed: HashSet<u64> = (1..=10).collect();
         let store = Arc::new(RwLock::new(ExternalContext::from_messages(archived)));
-        let policy =
-            ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
+        let policy = ContextVirtualizationPolicy::new(10_000, 8, 0, store, shared_pushed(pushed));
 
         let context = vec![user("question", 100), assistant("working on it", 101)];
-        let sent_1 = apply_response(
-            policy.before_model(sample_request(&context)).await,
-            context,
-        );
+        let sent_1 = apply_response(policy.before_model(sample_request(&context)).await, context);
         let ledger_text = user_text(sent_1.last().expect("non-empty")).expect("ledger text");
         assert!(ledger_text.contains("cmd9"), "{ledger_text}");
         assert!(!ledger_text.contains("cmd1 "), "{ledger_text}");

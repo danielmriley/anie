@@ -28,6 +28,7 @@ pub(crate) struct SystemPromptCache {
     system_prompt: String,
     context_files_stamp: Vec<(PathBuf, Option<SystemTime>)>,
     tier: PromptTier,
+    profile_key: String,
 }
 
 impl SystemPromptCache {
@@ -55,13 +56,36 @@ impl SystemPromptCache {
         config: &AnieConfig,
         tier: PromptTier,
     ) -> Result<Self> {
-        let system_prompt =
-            crate::controller::build_system_prompt(cwd, tools, skills, config, tier)?;
+        Self::build_for_model(
+            cwd,
+            tools,
+            skills,
+            config,
+            tier,
+            &config.model.provider,
+            &config.model.id,
+        )
+    }
+
+    pub(crate) fn build_for_model(
+        cwd: &Path,
+        tools: &ToolRegistry,
+        skills: &SkillRegistry,
+        config: &AnieConfig,
+        tier: PromptTier,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<Self> {
+        let system_prompt = crate::controller::build_system_prompt_for(
+            cwd, tools, skills, config, tier, provider, model_id,
+        )?;
         let context_files_stamp = crate::controller::context_files_stamp(cwd, config);
+        let profile_key = config.resolve_profile(provider, model_id).cache_key();
         Ok(Self {
             system_prompt,
             context_files_stamp,
             tier,
+            profile_key,
         })
     }
 
@@ -79,13 +103,27 @@ impl SystemPromptCache {
         config: &AnieConfig,
         tier: PromptTier,
     ) -> Result<()> {
-        *self = Self::build_with_tier(cwd, tools, skills, config, tier)?;
+        *self = Self::build_for_model(
+            cwd,
+            tools,
+            skills,
+            config,
+            tier,
+            &config.model.provider,
+            &config.model.id,
+        )?;
         Ok(())
     }
 
     /// Rebuild the prompt if the set of context files, any of
     /// their mtimes, or the prompt tier changed. Returns `true`
     /// if a rebuild happened.
+    ///
+    /// Tests-only wrapper over `refresh_if_stale_for_model` that
+    /// uses `[model]` from config. Production goes through the
+    /// live picker model (`ConfigState::current_model`), which
+    /// can diverge from that table.
+    #[cfg(test)]
     pub(crate) fn refresh_if_stale(
         &mut self,
         cwd: &Path,
@@ -94,20 +132,46 @@ impl SystemPromptCache {
         config: &AnieConfig,
         tier: PromptTier,
     ) -> bool {
+        self.refresh_if_stale_for_model(
+            cwd,
+            tools,
+            skills,
+            config,
+            tier,
+            &config.model.provider,
+            &config.model.id,
+        )
+    }
+
+    // Mirrors `build_for_model`'s inputs plus `&mut self`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refresh_if_stale_for_model(
+        &mut self,
+        cwd: &Path,
+        tools: &ToolRegistry,
+        skills: &SkillRegistry,
+        config: &AnieConfig,
+        tier: PromptTier,
+        provider: &str,
+        model_id: &str,
+    ) -> bool {
         let current_stamp = crate::controller::context_files_stamp(cwd, config);
-        if current_stamp == self.context_files_stamp && tier == self.tier {
+        let profile_key = config.resolve_profile(provider, model_id).cache_key();
+        if current_stamp == self.context_files_stamp
+            && tier == self.tier
+            && profile_key == self.profile_key
+        {
             return false;
         }
-        let Ok(prompt) = crate::controller::build_system_prompt(cwd, tools, skills, config, tier)
-        else {
-            // Rebuild failed — leave the cache as-is rather than
-            // poisoning it with a partial value. The stamp stays
-            // unchanged so we'll retry next turn.
+        let Ok(prompt) = crate::controller::build_system_prompt_for(
+            cwd, tools, skills, config, tier, provider, model_id,
+        ) else {
             return false;
         };
         self.system_prompt = prompt;
         self.context_files_stamp = current_stamp;
         self.tier = tier;
+        self.profile_key = profile_key;
         true
     }
 }
