@@ -1208,7 +1208,7 @@ impl SessionManager {
             }
         }
 
-        sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+        sessions.sort_by_key(|left| std::cmp::Reverse(left.modified));
         Ok(sessions)
     }
 
