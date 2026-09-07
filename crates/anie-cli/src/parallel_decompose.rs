@@ -177,8 +177,7 @@ pub(crate) fn render_with_rounds(plan: &ParsedPlan) -> String {
         let dep_note = if subtask.depends_on.is_empty() {
             String::new()
         } else {
-            let deps: Vec<String> =
-                subtask.depends_on.iter().map(|id| id.to_string()).collect();
+            let deps: Vec<String> = subtask.depends_on.iter().map(|id| id.to_string()).collect();
             format!(" (depends on {})", deps.join(", "))
         };
         out.push_str(&format!("{}. {}{}\n", subtask.id, subtask.text, dep_note));
@@ -254,9 +253,7 @@ pub(crate) fn safe_max_concurrency(api: anie_provider::ApiKind) -> u32 {
         return 1;
     }
     let bounded = raw.min(MAX_PARALLEL_DECOMPOSE_CAP);
-    if api == anie_provider::ApiKind::OllamaChatApi
-        && !ollama_force_parallel_enabled()
-    {
+    if api == anie_provider::ApiKind::OllamaChatApi && !ollama_force_parallel_enabled() {
         return 1;
     }
     bounded
@@ -328,15 +325,7 @@ pub(crate) async fn execute_parallel_plan(
             let permit_acquirer = std::sync::Arc::clone(&semaphore);
             handles.push(tokio::spawn(async move {
                 let _permit = permit_acquirer.acquire_owned().await.ok();
-                run_one_subtask(
-                    id,
-                    &text,
-                    factory,
-                    context,
-                    recursion_budget,
-                    &cancel,
-                )
-                .await
+                run_one_subtask(id, &text, factory, context, recursion_budget, &cancel).await
             }));
         }
         for handle in handles {
@@ -449,10 +438,7 @@ fn extract_final_text(messages: &[anie_protocol::Message]) -> String {
 /// Render the executed sub-task results as a system-reminder-
 /// tagged block. Replaces the plain plan injection when the
 /// concurrent executor ran successfully.
-pub(crate) fn render_completed_results(
-    parsed: &ParsedPlan,
-    results: &[SubtaskResult],
-) -> String {
+pub(crate) fn render_completed_results(parsed: &ParsedPlan, results: &[SubtaskResult]) -> String {
     let mut out = String::from(
         "<system-reminder source=\"decompose-executed\">\n\nSub-tasks have been completed by parallel sub-agents. Their results follow — synthesize them into your final answer for the user. Verify any code/output the sub-tasks produced before reporting success.\n\nPLAN:\n",
     );
@@ -608,7 +594,13 @@ mod tests {
 
     #[test]
     fn parallel_decompose_enabled_requires_at_least_two() {
-        let cases = [("", false), ("0", false), ("1", false), ("2", true), ("4", true)];
+        let cases = [
+            ("", false),
+            ("0", false),
+            ("1", false),
+            ("2", true),
+            ("4", true),
+        ];
         for (value, expected) in cases {
             // SAFETY: env mutation in tests; this crate runs
             // single-threaded for env-mutating tests.
@@ -634,9 +626,15 @@ mod tests {
             std::env::set_var("ANIE_PARALLEL_DECOMPOSE", "4");
             std::env::remove_var("ANIE_PARALLEL_DECOMPOSE_FORCE");
         }
-        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi), 1);
+        assert_eq!(
+            safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi),
+            1
+        );
         // API providers honor the env value.
-        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OpenAICompletions), 4);
+        assert_eq!(
+            safe_max_concurrency(anie_provider::ApiKind::OpenAICompletions),
+            4
+        );
         unsafe {
             std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
         }
@@ -648,7 +646,10 @@ mod tests {
             std::env::set_var("ANIE_PARALLEL_DECOMPOSE", "3");
             std::env::set_var("ANIE_PARALLEL_DECOMPOSE_FORCE", "1");
         }
-        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi), 3);
+        assert_eq!(
+            safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi),
+            3
+        );
         unsafe {
             std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
             std::env::remove_var("ANIE_PARALLEL_DECOMPOSE_FORCE");
@@ -674,8 +675,14 @@ mod tests {
         unsafe {
             std::env::remove_var("ANIE_PARALLEL_DECOMPOSE");
         }
-        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OpenAICompletions), 1);
-        assert_eq!(safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi), 1);
+        assert_eq!(
+            safe_max_concurrency(anie_provider::ApiKind::OpenAICompletions),
+            1
+        );
+        assert_eq!(
+            safe_max_concurrency(anie_provider::ApiKind::OllamaChatApi),
+            1
+        );
     }
 
     #[test]
@@ -723,7 +730,10 @@ mod tests {
             },
         ];
         let rendered = render_completed_results(&parsed, &results);
-        assert!(rendered.contains("[error]: network unavailable"), "{rendered}");
+        assert!(
+            rendered.contains("[error]: network unavailable"),
+            "{rendered}"
+        );
         assert!(rendered.contains("ok"), "{rendered}");
     }
 }

@@ -680,10 +680,7 @@ impl AgentLoopConfig {
 
     /// Select the embedded tool-call parser. Default is native-only.
     #[must_use]
-    pub fn with_embedded_tool_call_format(
-        mut self,
-        format: crate::EmbeddedToolCallFormat,
-    ) -> Self {
+    pub fn with_embedded_tool_call_format(mut self, format: crate::EmbeddedToolCallFormat) -> Self {
         self.embedded_tool_call_format = format;
         self
     }
@@ -823,7 +820,6 @@ impl AgentLoopConfig {
         self.get_follow_up_messages = Some(get_follow_up_messages);
         self
     }
-
 }
 
 /// Final agent-run output.
@@ -1104,8 +1100,7 @@ pub struct AgentLoop {
     failure_loop_detector: Option<std::sync::Mutex<crate::failure_loop::FailureLoopDetector>>,
     /// PR 1 of `docs/rlm_subagents_2026-05-01/`. None when
     /// `config.recurse_depth_threshold` is `None`.
-    recurse_depth_detector:
-        Option<std::sync::Mutex<crate::recurse_depth::RecurseDepthDetector>>,
+    recurse_depth_detector: Option<std::sync::Mutex<crate::recurse_depth::RecurseDepthDetector>>,
     /// Signal C (plan 03 §9 of `docs/local_model_augmentation/`).
     /// Rides the failure-loop detector's install gate — the
     /// controller turns that on in rlm mode — with its own
@@ -1266,9 +1261,7 @@ impl AgentLoop {
                 assistant,
                 tool_calls,
             } => {
-                let results = self
-                    .execute_tool_calls(&tool_calls, event_tx, cancel)
-                    .await;
+                let results = self.execute_tool_calls(&tool_calls, event_tx, cancel).await;
                 AgentObservation::ToolResults { assistant, results }
             }
             AgentIntent::AppendFollowUps { messages } => {
@@ -1890,11 +1883,11 @@ impl AgentLoop {
                     tool_call.name = target;
                 }
                 None => {
-                    let result = error_tool_result(unknown_tool_error(
-                        &tool_call.name,
-                        &self.tool_registry,
-                    ));
-                    return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
+                    let result =
+                        error_tool_result(unknown_tool_error(&tool_call.name, &self.tool_registry));
+                    return self
+                        .finalize_synthetic_failure(&tool_call, result, event_tx)
+                        .await;
                 }
             }
         }
@@ -1903,7 +1896,9 @@ impl AgentLoop {
             // came from the registry); kept with the legacy wording
             // for the impossible path.
             let result = error_tool_result(format!("Tool not found: {}", tool_call.name));
-            return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
+            return self
+                .finalize_synthetic_failure(&tool_call, result, event_tx)
+                .await;
         };
 
         // Fetch the precompiled validator from the registry.
@@ -2005,7 +2000,9 @@ impl AgentLoop {
                     );
                 }
             }
-            return self.finalize_synthetic_failure(&tool_call, result, event_tx).await;
+            return self
+                .finalize_synthetic_failure(&tool_call, result, event_tx)
+                .await;
         }
 
         let (update_tx, mut update_rx) = mpsc::channel(16);
@@ -2042,7 +2039,8 @@ impl AgentLoop {
         if is_error && self.config.wrap_failed_tool_results {
             wrap_failed_tool_result(&tool_call.name, &mut result);
             // Plan 03 §2c: directive first, grounding second.
-            self.maybe_ground_edit_failure(&tool_call, &mut result).await;
+            self.maybe_ground_edit_failure(&tool_call, &mut result)
+                .await;
         }
 
         if !is_error {
@@ -2058,7 +2056,8 @@ impl AgentLoop {
 
         self.observe_failure_loop(&tool_call, is_error, &mut result, event_tx)
             .await;
-        self.observe_similar_calls(&tool_call, &mut result, event_tx).await;
+        self.observe_similar_calls(&tool_call, &mut result, event_tx)
+            .await;
 
         // PR 1 of `docs/rlm_subagents_2026-05-01/`. The recurse
         // tool encodes the depth at which it fired in
@@ -2066,7 +2065,8 @@ impl AgentLoop {
         // detector. Non-recurse tools have no depth field; the
         // method short-circuits.
         if !is_error && tool_call.name == "recurse" {
-            self.observe_recurse_depth(&tool_call, &result, event_tx).await;
+            self.observe_recurse_depth(&tool_call, &result, event_tx)
+                .await;
         }
 
         attach_tool_invocation_details(&tool_call, &mut result.details);
@@ -2385,7 +2385,8 @@ impl AgentLoop {
         }
         self.observe_failure_loop(tool_call, true, &mut result, event_tx)
             .await;
-        self.observe_similar_calls(tool_call, &mut result, event_tx).await;
+        self.observe_similar_calls(tool_call, &mut result, event_tx)
+            .await;
         send_event(
             event_tx,
             AgentEvent::ToolExecEnd {
@@ -2424,9 +2425,11 @@ impl AgentLoop {
         // rather than propagate.
         let warning = match detector.lock() {
             Ok(mut guard) => guard.observe(&tool_call.name, &tool_call.arguments, is_error),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .observe(&tool_call.name, &tool_call.arguments, is_error),
+            Err(poisoned) => {
+                poisoned
+                    .into_inner()
+                    .observe(&tool_call.name, &tool_call.arguments, is_error)
+            }
         };
         let Some(strikes) = warning else {
             return;
@@ -3517,7 +3520,6 @@ fn attach_tool_invocation_details(tool_call: &ToolCall, details: &mut serde_json
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -4076,8 +4078,12 @@ mod tests {
     fn wrap_failed_tool_result_preserves_multi_block_content() {
         let mut result = ToolResult {
             content: vec![
-                ContentBlock::Text { text: "first".into() },
-                ContentBlock::Text { text: "second".into() },
+                ContentBlock::Text {
+                    text: "first".into(),
+                },
+                ContentBlock::Text {
+                    text: "second".into(),
+                },
             ],
             details: serde_json::Value::Null,
         };
@@ -4165,8 +4171,8 @@ mod tests {
     #[test]
     fn attachment_is_capped_at_eighty_lines_with_line_markers() {
         let content: String = (1..=200).map(|n| format!("line {n}\n")).collect();
-        let note = super::edit_grounding_note("big.txt", 1, 200, &content)
-            .expect("region within file");
+        let note =
+            super::edit_grounding_note("big.txt", 1, 200, &content).expect("region within file");
         // Header announces the SHOWN span, not the requested one.
         assert!(
             note.starts_with("[harness note] Current content of big.txt:1-80"),
@@ -4185,13 +4191,15 @@ mod tests {
     #[test]
     fn grounding_note_skips_locators_past_end_of_file() {
         // The file shrank between the tool run and the read.
-        assert_eq!(super::edit_grounding_note("f.rs", 10, 12, "one\ntwo\n"), None);
+        assert_eq!(
+            super::edit_grounding_note("f.rs", 10, 12, "one\ntwo\n"),
+            None
+        );
     }
 
     #[test]
     fn grounding_note_clamps_span_end_to_file_length() {
-        let note =
-            super::edit_grounding_note("f.rs", 2, 99, "one\ntwo\nthree\n").expect("region");
+        let note = super::edit_grounding_note("f.rs", 2, 99, "one\ntwo\nthree\n").expect("region");
         assert!(note.contains("f.rs:2-3"), "{note}");
         assert!(note.contains("f.rs:2: two"), "{note}");
         assert!(note.contains("f.rs:3: three"), "{note}");

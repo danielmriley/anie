@@ -81,11 +81,8 @@ impl SubAgentFactory for ControllerSubAgentFactory {
             Arc::clone(&self.request_options_resolver),
         )
         .with_ollama_num_ctx_override(self.ollama_num_ctx_override);
-        let inherited = build_inherited_registry(
-            &self.parent_tools,
-            ctx.depth,
-            self.recurse_inherit_limit,
-        );
+        let inherited =
+            build_inherited_registry(&self.parent_tools, ctx.depth, self.recurse_inherit_limit);
         Ok(AgentLoop::new(
             Arc::clone(&self.provider_registry),
             inherited,
@@ -118,8 +115,8 @@ fn should_inherit(tool_name: &str, depth: u8, recurse_inherit_limit: u8) -> bool
     match tool_name {
         // Always-inherited tools: self-contained, safe for
         // sub-agents to use independently.
-        "bash" | "read" | "edit" | "write" | "grep" | "find" | "ls" | "web_search"
-        | "web_read" | "skill" => true,
+        "bash" | "read" | "edit" | "write" | "grep" | "find" | "ls" | "web_search" | "web_read"
+        | "skill" => true,
         // recurse: depth-gated.
         "recurse" => depth < recurse_inherit_limit,
         // Unknown / future tools: default to NOT inheriting.
@@ -173,7 +170,9 @@ mod tests {
     fn registry_with(names: &[&str]) -> Arc<ToolRegistry> {
         let mut r = ToolRegistry::new();
         for name in names {
-            r.register(Arc::new(NamedTool { name: (*name).into() }));
+            r.register(Arc::new(NamedTool {
+                name: (*name).into(),
+            }));
         }
         Arc::new(r)
     }
@@ -181,13 +180,33 @@ mod tests {
     #[test]
     fn always_inherit_self_contained_tools() {
         let parent = registry_with(&[
-            "bash", "read", "edit", "write", "grep", "find", "ls", "web_search", "web_read",
+            "bash",
+            "read",
+            "edit",
+            "write",
+            "grep",
+            "find",
+            "ls",
+            "web_search",
+            "web_read",
             "skill",
         ]);
         let inherited = build_inherited_registry(&parent, /*depth*/ 0, /*limit*/ 3);
-        let names: Vec<String> = inherited.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = inherited
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         for expected in [
-            "bash", "read", "edit", "write", "grep", "find", "ls", "web_search", "web_read",
+            "bash",
+            "read",
+            "edit",
+            "write",
+            "grep",
+            "find",
+            "ls",
+            "web_search",
+            "web_read",
             "skill",
         ] {
             assert!(
@@ -201,7 +220,11 @@ mod tests {
     fn recurse_inherits_when_depth_below_limit() {
         let parent = registry_with(&["recurse", "bash"]);
         let inherited = build_inherited_registry(&parent, /*depth*/ 2, /*limit*/ 3);
-        let names: Vec<String> = inherited.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = inherited
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert!(names.contains(&"recurse".to_string()), "{names:?}");
     }
 
@@ -209,7 +232,11 @@ mod tests {
     fn recurse_filtered_when_depth_at_limit() {
         let parent = registry_with(&["recurse", "bash"]);
         let inherited = build_inherited_registry(&parent, /*depth*/ 3, /*limit*/ 3);
-        let names: Vec<String> = inherited.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = inherited
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert!(!names.contains(&"recurse".to_string()), "{names:?}");
         // bash still inherits at any depth.
         assert!(names.contains(&"bash".to_string()), "{names:?}");
@@ -219,7 +246,11 @@ mod tests {
     fn recurse_filtered_when_depth_above_limit() {
         let parent = registry_with(&["recurse"]);
         let inherited = build_inherited_registry(&parent, /*depth*/ 5, /*limit*/ 3);
-        let names: Vec<String> = inherited.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = inherited
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert!(!names.contains(&"recurse".to_string()), "{names:?}");
     }
 
@@ -230,8 +261,15 @@ mod tests {
         // filter intentionally.
         let parent = registry_with(&["bash", "future_dangerous_tool"]);
         let inherited = build_inherited_registry(&parent, /*depth*/ 0, /*limit*/ 3);
-        let names: Vec<String> = inherited.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = inherited
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert!(names.contains(&"bash".to_string()));
-        assert!(!names.contains(&"future_dangerous_tool".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"future_dangerous_tool".to_string()),
+            "{names:?}"
+        );
     }
 }

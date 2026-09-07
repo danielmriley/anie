@@ -508,7 +508,10 @@ mod tests {
         // A cap at/above the window passes the full window through.
         assert_eq!(default_num_ctx_clamp(131_072, Some("200000")), None);
         // Garbage falls back to the built-in cap rather than erroring.
-        assert_eq!(default_num_ctx_clamp(131_072, Some("garbage")), Some(32_768));
+        assert_eq!(
+            default_num_ctx_clamp(131_072, Some("garbage")),
+            Some(32_768)
+        );
     }
 
     #[test]

@@ -280,8 +280,8 @@ pub(crate) fn resolve_profile(
     api_is_ollama: bool,
     tool_calls: &LocalToolCallConfig,
 ) -> ResolvedModelProfile {
-    let inferred = infer_prompt_template(model_id)
-        .or_else(|| infer_local_fallback(provider, api_is_ollama));
+    let inferred =
+        infer_prompt_template(model_id).or_else(|| infer_local_fallback(provider, api_is_ollama));
 
     let mut merged = ModelCapabilityProfile {
         prompt_template: inferred,

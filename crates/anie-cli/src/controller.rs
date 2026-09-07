@@ -1205,10 +1205,8 @@ impl InteractiveController {
                             .find(|info| info.id != current_id)
                             .map(|info| (info.id, info.name)),
                         Err(error) => {
-                            self.send_system_message(&format!(
-                                "Failed to list sessions: {error}"
-                            ))
-                            .await;
+                            self.send_system_message(&format!("Failed to list sessions: {error}"))
+                                .await;
                             return Ok(());
                         }
                     };
@@ -1317,10 +1315,8 @@ impl InteractiveController {
                 self.send_system_message(&body).await;
             }
             UiAction::ShowSkills => {
-                let body = render_skills_listing(
-                    &self.state.skill_registry,
-                    &self.state.active_skills,
-                );
+                let body =
+                    render_skills_listing(&self.state.skill_registry, &self.state.active_skills);
                 self.send_system_message(&body).await;
             }
             UiAction::ShowHelp => {
@@ -1542,10 +1538,7 @@ impl InteractiveController {
     /// 2. Render dry-run round annotations (parallel enabled
     ///    but Ollama-clamped to N=1 sequential).
     /// 3. Pass the plain plan through (parallel not enabled).
-    async fn maybe_run_parallel_decompose(
-        &self,
-        decompose_plan: Option<String>,
-    ) -> Option<String> {
+    async fn maybe_run_parallel_decompose(&self, decompose_plan: Option<String>) -> Option<String> {
         let plan = decompose_plan.as_deref()?;
         if !crate::parallel_decompose::parallel_decompose_enabled() {
             return decompose_plan;
@@ -1554,9 +1547,8 @@ impl InteractiveController {
             return decompose_plan;
         };
 
-        let max_concurrency = crate::parallel_decompose::safe_max_concurrency(
-            self.state.config.current_model().api,
-        );
+        let max_concurrency =
+            crate::parallel_decompose::safe_max_concurrency(self.state.config.current_model().api);
         let has_round_with_multiple = parsed.rounds.iter().any(|r| r.len() > 1);
         if max_concurrency < 2 || !has_round_with_multiple {
             // PR 5 dry-run: annotate, don't execute. Either
@@ -2680,13 +2672,10 @@ fn build_agent(
         static PROMPT_BUDGET_WARNED: std::sync::Once = std::sync::Once::new();
         PROMPT_BUDGET_WARNED.call_once(|| warn!("{message}"));
     }
-    let profile = state
-        .config
-        .anie_config()
-        .resolve_profile(
-            &state.config.current_model().provider,
-            &state.config.current_model().id,
-        );
+    let profile = state.config.anie_config().resolve_profile(
+        &state.config.current_model().provider,
+        &state.config.current_model().id,
+    );
     let mut config = AgentLoopConfig::new(
         state.config.current_model().clone(),
         system_prompt,
@@ -2965,11 +2954,7 @@ pub(crate) fn render_skills_listing(
         return "No skills are currently registered.".to_string();
     }
     let mut out = String::from("Available skills:\n");
-    let max_name_len = registry
-        .iter()
-        .map(|s| s.name.len())
-        .max()
-        .unwrap_or(0);
+    let max_name_len = registry.iter().map(|s| s.name.len()).max().unwrap_or(0);
     for skill in registry.iter() {
         let mut tags: Vec<&str> = vec![skill.source.label()];
         if skill.disable_model_invocation {
@@ -2991,10 +2976,7 @@ pub(crate) fn render_skills_listing(
     if !active_set.is_empty() {
         let mut names: Vec<String> = active_set.into_iter().collect();
         names.sort();
-        out.push_str(&format!(
-            "\nActive in this run: {}",
-            names.join(", ")
-        ));
+        out.push_str(&format!("\nActive in this run: {}", names.join(", ")));
     }
     out
 }
@@ -3079,7 +3061,10 @@ fn small_tier_ledger_enabled(tier: PromptTier, ledger_env: Option<&str>) -> bool
 }
 
 fn use_small_tier_ledger(state: &ControllerState) -> bool {
-    small_tier_ledger_enabled(state.prompt_tier(), std::env::var("ANIE_LEDGER").ok().as_deref())
+    small_tier_ledger_enabled(
+        state.prompt_tier(),
+        std::env::var("ANIE_LEDGER").ok().as_deref(),
+    )
 }
 
 /// rlm-mode system-prompt augment. Establishes the policy
@@ -3413,13 +3398,10 @@ fn build_embedder(
         );
         return None;
     }
-    let embedder: Arc<dyn crate::embedder::Embedder> =
-        Arc::new(crate::embedder::OllamaEmbedder::new(
-            parent_model.base_url.clone(),
-            model_name.to_string(),
-        ));
-    let (tx, handle) =
-        crate::bg_embedder::spawn_embed_worker(Arc::clone(&embedder), store, cancel);
+    let embedder: Arc<dyn crate::embedder::Embedder> = Arc::new(
+        crate::embedder::OllamaEmbedder::new(parent_model.base_url.clone(), model_name.to_string()),
+    );
+    let (tx, handle) = crate::bg_embedder::spawn_embed_worker(Arc::clone(&embedder), store, cancel);
     Some((embedder, tx, handle))
 }
 

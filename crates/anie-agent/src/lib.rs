@@ -18,19 +18,19 @@ pub use agent_loop::{
     NoopBeforeModelPolicy, RunStopReason, ToolExecutionMode, send_event,
 };
 pub use evidence::{
-    collect_observed_evidence, render_evidence_brief, ObservedEvidence, ObservedFact, ObservedKind,
-    EVIDENCE_FINAL_ANSWER_STANCE,
-};
-pub use tool_call_parse::{
-    parse_embedded_tool_calls, parse_repair_prompt, resolve_assistant_tool_calls,
-    EmbeddedToolCallFormat, ResolvedToolCalls, ToolCallParse,
+    EVIDENCE_FINAL_ANSWER_STANCE, ObservedEvidence, ObservedFact, ObservedKind,
+    collect_observed_evidence, render_evidence_brief,
 };
 pub use failure_loop::{DEFAULT_FAILURE_LOOP_THRESHOLD, stable_args_hash};
-pub use recurse_depth::DEFAULT_RECURSE_DEPTH_WARN_AT;
 pub use recurse::{ContextProvider, RecurseScope, SubAgentBuildContext, SubAgentFactory};
+pub use recurse_depth::DEFAULT_RECURSE_DEPTH_WARN_AT;
 pub use tool::{
     MIN_TOOL_OUTPUT_BUDGET_BYTES, Tool, ToolError, ToolExecutionContext, ToolRegistry,
     ValidatorState, effective_tool_output_budget,
+};
+pub use tool_call_parse::{
+    EmbeddedToolCallFormat, ResolvedToolCalls, ToolCallParse, parse_embedded_tool_calls,
+    parse_repair_prompt, resolve_assistant_tool_calls,
 };
 
 #[cfg(test)]

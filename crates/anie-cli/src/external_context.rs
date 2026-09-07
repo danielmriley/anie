@@ -630,7 +630,14 @@ mod tests {
             content: serde_json::Value::Null,
             timestamp: now_millis(),
         }));
-        assert!(store.iter_stored().nth(tr).expect("present").tokens.is_empty());
+        assert!(
+            store
+                .iter_stored()
+                .nth(tr)
+                .expect("present")
+                .tokens
+                .is_empty()
+        );
     }
 
     /// `is_empty` matches `len == 0`.

@@ -145,7 +145,10 @@ impl VerifyRunner {
 
         if timed_out {
             return VerifyOutcome::Failed {
-                cause: format!("timeout after {}s; process group killed", self.timeout.as_secs()),
+                cause: format!(
+                    "timeout after {}s; process group killed",
+                    self.timeout.as_secs()
+                ),
                 output,
             };
         }
@@ -515,7 +518,10 @@ mod tests {
             BeforeModelResponse::Continue
         );
         // A NEWER successful write re-arms the trigger.
-        let context = vec![tool_result("edit", false, 100), tool_result("write", false, 200)];
+        let context = vec![
+            tool_result("edit", false, 100),
+            tool_result("write", false, 200),
+        ];
         assert!(matches!(
             policy.before_model(request(&context)).await,
             BeforeModelResponse::AppendMessages(_)
@@ -642,7 +648,9 @@ mod tests {
 
     fn assistant_done() -> AssistantMessage {
         AssistantMessage {
-            content: vec![ContentBlock::Text { text: "done".into() }],
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,

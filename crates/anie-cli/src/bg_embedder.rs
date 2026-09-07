@@ -207,8 +207,11 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(mappings));
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let id = store.write().await.push(user_msg("hello world"));
-        let (tx, _handle) =
-            spawn_embed_worker(Arc::clone(&embedder), Arc::clone(&store), CancellationToken::new());
+        let (tx, _handle) = spawn_embed_worker(
+            Arc::clone(&embedder),
+            Arc::clone(&store),
+            CancellationToken::new(),
+        );
 
         tx.send(EmbedRequest {
             id,
@@ -240,8 +243,11 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new(HashMap::new()));
         let store = Arc::new(RwLock::new(ExternalContext::new()));
         let id = store.write().await.push(user_msg("anything"));
-        let (tx, _handle) =
-            spawn_embed_worker(Arc::clone(&embedder), Arc::clone(&store), CancellationToken::new());
+        let (tx, _handle) = spawn_embed_worker(
+            Arc::clone(&embedder),
+            Arc::clone(&store),
+            CancellationToken::new(),
+        );
 
         tx.send(EmbedRequest {
             id,

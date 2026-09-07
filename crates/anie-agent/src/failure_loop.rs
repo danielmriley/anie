@@ -77,7 +77,10 @@ impl FailureLoopDetector {
     /// second strike onward — the first failure stays
     /// directive-only.
     pub(crate) fn record_file_match_failure(&mut self, path: &str) -> u32 {
-        let strikes = self.file_match_failures.entry(path.to_string()).or_insert(0);
+        let strikes = self
+            .file_match_failures
+            .entry(path.to_string())
+            .or_insert(0);
         *strikes += 1;
         *strikes
     }
@@ -94,12 +97,7 @@ impl FailureLoopDetector {
     /// `(tool_name, args_hash)` pair, `None` otherwise. A
     /// successful call resets the streak. Different
     /// `(tool_name, args_hash)` resets the streak.
-    pub(crate) fn observe(
-        &mut self,
-        tool_name: &str,
-        args: &Value,
-        is_error: bool,
-    ) -> Option<u32> {
+    pub(crate) fn observe(&mut self, tool_name: &str, args: &Value, is_error: bool) -> Option<u32> {
         if !is_error {
             self.last = None;
             return None;
@@ -242,10 +240,12 @@ impl SimilarCallDetector {
             self.streak_tool = Some(tool_name.to_string());
         }
         match self.streak {
-            SIMILAR_CALL_NOTE_STREAK => Some(SimilarCallSignal::Note { streak: self.streak }),
-            SIMILAR_CALL_PERTURB_STREAK => {
-                Some(SimilarCallSignal::Perturb { streak: self.streak })
-            }
+            SIMILAR_CALL_NOTE_STREAK => Some(SimilarCallSignal::Note {
+                streak: self.streak,
+            }),
+            SIMILAR_CALL_PERTURB_STREAK => Some(SimilarCallSignal::Perturb {
+                streak: self.streak,
+            }),
             _ => None,
         }
     }
@@ -485,11 +485,17 @@ mod tests {
             None
         );
         assert_eq!(
-            det.observe("web_search", &json!({"query": "what time is it right now today"})),
+            det.observe(
+                "web_search",
+                &json!({"query": "what time is it right now today"})
+            ),
             None
         );
         assert_eq!(
-            det.observe("web_search", &json!({"query": "current time right now what is it"})),
+            det.observe(
+                "web_search",
+                &json!({"query": "current time right now what is it"})
+            ),
             Some(SimilarCallSignal::Note { streak: 3 })
         );
     }
@@ -498,20 +504,32 @@ mod tests {
     fn dissimilar_call_resets_the_streak() {
         let mut det = SimilarCallDetector::new();
         det.observe("web_search", &json!({"query": "what time is it right now"}));
-        det.observe("web_search", &json!({"query": "what time is it right now today"}));
+        det.observe(
+            "web_search",
+            &json!({"query": "what time is it right now today"}),
+        );
         // A genuinely different query restarts the cluster…
         assert_eq!(
-            det.observe("web_search", &json!({"query": "rust borrow checker lifetimes"})),
+            det.observe(
+                "web_search",
+                &json!({"query": "rust borrow checker lifetimes"})
+            ),
             None
         );
         // …so two more near-duplicates of IT are still below
         // the note threshold at streak 2.
         assert_eq!(
-            det.observe("web_search", &json!({"query": "rust borrow checker lifetimes rules"})),
+            det.observe(
+                "web_search",
+                &json!({"query": "rust borrow checker lifetimes rules"})
+            ),
             None
         );
         assert_eq!(
-            det.observe("web_search", &json!({"query": "borrow checker lifetimes rust explained"})),
+            det.observe(
+                "web_search",
+                &json!({"query": "borrow checker lifetimes rust explained"})
+            ),
             Some(SimilarCallSignal::Note { streak: 3 })
         );
     }
@@ -520,12 +538,18 @@ mod tests {
     fn different_tool_call_resets_the_similarity_streak() {
         let mut det = SimilarCallDetector::new();
         det.observe("web_search", &json!({"query": "what time is it right now"}));
-        det.observe("web_search", &json!({"query": "what time is it right now today"}));
+        det.observe(
+            "web_search",
+            &json!({"query": "what time is it right now today"}),
+        );
         // Interleaved different tool breaks the streak even
         // though the per-tool history survives.
         det.observe("read", &json!({"path": "README.md"}));
         assert_eq!(
-            det.observe("web_search", &json!({"query": "what time is it right now please"})),
+            det.observe(
+                "web_search",
+                &json!({"query": "what time is it right now please"})
+            ),
             None,
             "streak must restart after a different tool"
         );

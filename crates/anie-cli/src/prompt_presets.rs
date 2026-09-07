@@ -4,8 +4,8 @@
 //! Hosted models with no template keep the historical default base.
 
 use anie_agent::{
-    collect_observed_evidence, render_evidence_brief, BeforeModelPolicy, BeforeModelRequest,
-    BeforeModelResponse, EVIDENCE_FINAL_ANSWER_STANCE,
+    BeforeModelPolicy, BeforeModelRequest, BeforeModelResponse, EVIDENCE_FINAL_ANSWER_STANCE,
+    collect_observed_evidence, render_evidence_brief,
 };
 use anie_config::{PromptTemplateId, ResolvedModelProfile, ToolCallFormat};
 use anie_protocol::{ContentBlock, Message, UserMessage};

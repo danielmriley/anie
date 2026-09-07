@@ -332,7 +332,10 @@ mod tests {
             "name = \"x\"\nfamily = \"f\"\nprompt = \"p\"\n[expect]\ncontains_any = [\"a\", \"b\"]\n",
         )
         .expect("parse");
-        assert_eq!(s.expect.contains_any, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            s.expect.contains_any,
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert!(s.expect.has_assertions());
         assert!(s.expect.has_content_assertion());
     }

@@ -61,9 +61,8 @@ pub fn render_evidence_brief(evidence: &ObservedEvidence) -> String {
         }
     }
 
-    let mut out = String::from(
-        "Observed results (cite only these; do not invent others):\n\nDone:\n",
-    );
+    let mut out =
+        String::from("Observed results (cite only these; do not invent others):\n\nDone:\n");
     if done.is_empty() {
         out.push_str("- (no tool-confirmed changes observed this run)\n");
     } else {
@@ -189,11 +188,7 @@ mod tests {
     #[test]
     fn evidence_brief_only_cites_observed_results() {
         let evidence = collect_observed_evidence(&[
-            tool_result(
-                "edit",
-                "updated crates/anie-tui/src/app.rs",
-                false,
-            ),
+            tool_result("edit", "updated crates/anie-tui/src/app.rs", false),
             tool_result(
                 "bash",
                 "$ cargo test -p anie-tui active_input\ntest result: ok. 2 passed",
@@ -231,11 +226,7 @@ mod tests {
 
     #[test]
     fn read_results_are_done_not_validation() {
-        let evidence = collect_observed_evidence(&[tool_result(
-            "read",
-            "fn main() {}",
-            false,
-        )]);
+        let evidence = collect_observed_evidence(&[tool_result("read", "fn main() {}", false)]);
         assert_eq!(evidence.facts[0].kind, ObservedKind::Done);
         let brief = render_evidence_brief(&evidence);
         assert!(brief.contains("read: ok"));

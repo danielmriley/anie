@@ -307,8 +307,14 @@ mod tests {
         let (coerced, notes) = coerce_arguments(&schema, args);
         assert_eq!(coerced, json!({ "command": "find . -name '*.rs'" }));
         assert_eq!(notes.len(), 2, "{notes:?}");
-        assert!(notes.iter().any(|note| note.starts_with("limit:")), "{notes:?}");
-        assert!(notes.iter().any(|note| note.starts_with("path:")), "{notes:?}");
+        assert!(
+            notes.iter().any(|note| note.starts_with("limit:")),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.starts_with("path:")),
+            "{notes:?}"
+        );
     }
 
     #[test]
@@ -325,8 +331,14 @@ mod tests {
         let (coerced, notes) = coerce_arguments(&schema, args);
         assert_eq!(coerced, json!({ "command": "date", "timeout": 5 }));
         assert_eq!(notes.len(), 2, "{notes:?}");
-        assert!(notes.iter().any(|note| note.contains("removed")), "{notes:?}");
-        assert!(notes.iter().any(|note| note.contains("coerced")), "{notes:?}");
+        assert!(
+            notes.iter().any(|note| note.contains("removed")),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("coerced")),
+            "{notes:?}"
+        );
     }
 
     /// Stripping only fires when the schema explicitly forbids

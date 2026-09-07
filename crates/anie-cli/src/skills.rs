@@ -89,7 +89,11 @@ impl SkillWarnDedup {
         let seen = store_path
             .as_deref()
             .and_then(|path| fs::read_to_string(path).ok())
-            .map(|raw| raw.lines().filter_map(|line| line.trim().parse().ok()).collect())
+            .map(|raw| {
+                raw.lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .collect()
+            })
             .unwrap_or_default();
         Self { seen, store_path }
     }
@@ -371,9 +375,7 @@ impl SkillRegistry {
         // Sort entries for deterministic load order within a
         // single layer (stable behavior across filesystem
         // traversal orderings).
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
         paths.sort();
         for path in paths {
             match parse_entry(&path, source) {
@@ -383,7 +385,11 @@ impl SkillRegistry {
                     // Unreadable content falls back to warning
                     // every time — losing dedup beats losing
                     // the warning.
-                    let manifest = if path.is_dir() { path.join("SKILL.md") } else { path.clone() };
+                    let manifest = if path.is_dir() {
+                        path.join("SKILL.md")
+                    } else {
+                        path.clone()
+                    };
                     if fs::read(&manifest)
                         .ok()
                         .is_none_or(|content| should_warn_for_content(&content))
@@ -462,9 +468,8 @@ fn bundled_skills() -> Vec<Skill> {
     BUNDLED_SKILL_MANIFESTS
         .iter()
         .map(|(name, raw)| {
-            parse_manifest_from_text(raw, name, SkillSource::Bundled).unwrap_or_else(|err| {
-                panic!("bundled skill `{name}` failed to parse: {err}")
-            })
+            parse_manifest_from_text(raw, name, SkillSource::Bundled)
+                .unwrap_or_else(|err| panic!("bundled skill `{name}` failed to parse: {err}"))
         })
         .collect()
 }
@@ -538,15 +543,10 @@ fn parse_manifest(
 /// cross-check) and ignores the resulting `root_dir` /
 /// `manifest_path` since neither is meaningful for embedded
 /// skills.
-fn parse_manifest_from_text(
-    raw: &str,
-    expected_name: &str,
-    source: SkillSource,
-) -> Result<Skill> {
-    let (frontmatter_text, body) =
-        split_frontmatter(raw).context("malformed frontmatter")?;
-    let fm: SkillFrontmatter = serde_yml::from_str(frontmatter_text)
-        .context("parsing YAML frontmatter")?;
+fn parse_manifest_from_text(raw: &str, expected_name: &str, source: SkillSource) -> Result<Skill> {
+    let (frontmatter_text, body) = split_frontmatter(raw).context("malformed frontmatter")?;
+    let fm: SkillFrontmatter =
+        serde_yml::from_str(frontmatter_text).context("parsing YAML frontmatter")?;
     validate_skill_name(&fm.name).context("invalid skill name")?;
     if !expected_name.is_empty() && fm.name != expected_name {
         return Err(anyhow!(
@@ -584,10 +584,7 @@ fn parse_manifest_from_text(
 /// trailing hyphen, no consecutive hyphens.
 fn validate_skill_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
-        return Err(anyhow!(
-            "name must be 1-64 chars (got {})",
-            name.len()
-        ));
+        return Err(anyhow!("name must be 1-64 chars (got {})", name.len()));
     }
     if name.starts_with('-') || name.ends_with('-') {
         return Err(anyhow!("name must not start or end with `-`"));
@@ -615,7 +612,9 @@ fn validate_skill_name(name: &str) -> Result<()> {
 fn split_frontmatter(raw: &str) -> Result<(&str, &str)> {
     let trimmed = raw.trim_start_matches('\u{feff}'); // strip BOM if present
     if !trimmed.starts_with("---") {
-        return Err(anyhow!("missing frontmatter — expected `---` on first line"));
+        return Err(anyhow!(
+            "missing frontmatter — expected `---` on first line"
+        ));
     }
     let after_open = trimmed
         .strip_prefix("---")
@@ -689,9 +688,7 @@ pub fn render_catalog(registry: &SkillRegistry, tier: crate::controller::PromptT
     if selected.is_empty() && omitted == 0 {
         return String::new();
     }
-    let mut out = String::from(
-        "Available skills (load with the `skill` tool when relevant):\n",
-    );
+    let mut out = String::from("Available skills (load with the `skill` tool when relevant):\n");
     for skill in selected {
         // Single-line description: replace any embedded
         // newlines with spaces so the catalog stays one
@@ -721,9 +718,7 @@ mod tests {
     }
 
     fn sample_skill(name: &str, description: &str) -> String {
-        format!(
-            "---\nname: {name}\ndescription: {description}\n---\n\n# Body\n\nGuidance text.\n"
-        )
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n\nGuidance text.\n")
     }
 
     #[test]
@@ -803,7 +798,10 @@ mod tests {
         fs::create_dir_all(&skill_dir).expect("mkdir");
         fs::write(skill_dir.join("README.md"), "not a skill").expect("write");
         let result = parse_entry(&skill_dir, SkillSource::Bundled).expect("ok");
-        assert!(result.is_none(), "directory without SKILL.md should be skipped");
+        assert!(
+            result.is_none(),
+            "directory without SKILL.md should be skipped"
+        );
     }
 
     #[test]
@@ -875,7 +873,11 @@ mod tests {
         let names: Vec<String> = registry.iter().map(|s| s.name.clone()).collect();
         assert_eq!(
             names,
-            vec!["a-skill".to_string(), "m-skill".to_string(), "z-skill".to_string()]
+            vec![
+                "a-skill".to_string(),
+                "m-skill".to_string(),
+                "z-skill".to_string()
+            ]
         );
     }
 
@@ -892,16 +894,8 @@ mod tests {
     fn render_catalog_lists_skills_one_per_line() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path().join("skills");
-        write_skill(
-            &root,
-            "alpha.md",
-            &sample_skill("alpha", "First skill"),
-        );
-        write_skill(
-            &root,
-            "beta.md",
-            &sample_skill("beta", "Second skill"),
-        );
+        write_skill(&root, "alpha.md", &sample_skill("alpha", "First skill"));
+        write_skill(&root, "beta.md", &sample_skill("beta", "Second skill"));
         let mut registry = SkillRegistry::empty();
         registry.absorb_root(&root, SkillSource::Bundled);
         let rendered = render_catalog(&registry, PromptTier::Full);
@@ -925,7 +919,10 @@ mod tests {
         let mut registry = SkillRegistry::empty();
         registry.absorb_root(dir.path(), SkillSource::Bundled);
         let rendered = render_catalog(&registry, PromptTier::Full);
-        assert!(rendered.contains("- multi: First line second line"), "got:\n{rendered}");
+        assert!(
+            rendered.contains("- multi: First line second line"),
+            "got:\n{rendered}"
+        );
     }
 
     /// Plan 04 §2b: a skill whose body exceeds the soft cap is
@@ -1001,10 +998,20 @@ mod tests {
             .collect();
         assert_eq!(
             listed,
-            vec!["nnn-bundle", "ooo-bundle", "ppp-bundle", "aac-project", "zzz-project", "aaa-user"],
+            vec![
+                "nnn-bundle",
+                "ooo-bundle",
+                "ppp-bundle",
+                "aac-project",
+                "zzz-project",
+                "aaa-user"
+            ],
             "{small}"
         );
-        assert!(small.contains("(1 more skill not listed; `/skills` shows all)"), "{small}");
+        assert!(
+            small.contains("(1 more skill not listed; `/skills` shows all)"),
+            "{small}"
+        );
     }
 
     /// Plan 04 §2b (tier-independent): repeated launches with the
@@ -1016,9 +1023,18 @@ mod tests {
         let store = dir.path().join("state").join("skill_warn_hashes");
 
         let mut dedup = SkillWarnDedup::load(Some(store.clone()));
-        assert!(dedup.should_warn(b"broken skill v1"), "first sighting warns");
-        assert!(!dedup.should_warn(b"broken skill v1"), "same content stays quiet");
-        assert!(dedup.should_warn(b"broken skill v2"), "changed content warns again");
+        assert!(
+            dedup.should_warn(b"broken skill v1"),
+            "first sighting warns"
+        );
+        assert!(
+            !dedup.should_warn(b"broken skill v1"),
+            "same content stays quiet"
+        );
+        assert!(
+            dedup.should_warn(b"broken skill v2"),
+            "changed content warns again"
+        );
 
         // Simulate the next launch: a fresh load from the same
         // store stays quiet for both already-warned contents.

@@ -91,7 +91,10 @@ fn current_map_text(cwd: &Path, max_tokens: u64, cache: &SharedRepoMap) -> Strin
     if needs_build {
         *guard = Some(anie_tools::repo_map::build_repo_map(cwd, max_tokens));
     }
-    guard.as_ref().map(|map| map.text.clone()).unwrap_or_default()
+    guard
+        .as_ref()
+        .map(|map| map.text.clone())
+        .unwrap_or_default()
 }
 
 fn is_repo_map_reminder(message: &Message) -> bool {
@@ -142,7 +145,9 @@ impl BeforeModelPolicy for RepoMapPolicy {
         }
         BeforeModelResponse::AppendMessages(vec![Message::User(UserMessage {
             content: vec![ContentBlock::Text {
-                text: format!("{REPO_MAP_REMINDER_OPEN}\n{text}\n\n{REPO_MAP_GUIDANCE}\n</system-reminder>"),
+                text: format!(
+                    "{REPO_MAP_REMINDER_OPEN}\n{text}\n\n{REPO_MAP_GUIDANCE}\n</system-reminder>"
+                ),
             }],
             timestamp: now_millis(),
         })])

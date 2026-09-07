@@ -205,7 +205,10 @@ fn xml_name_attr(attrs: &str) -> Option<String> {
     let prefix = "name=";
     let idx = trimmed.find(prefix)?;
     let value = trimmed[idx + prefix.len()..].trim();
-    let quote = value.chars().next().filter(|ch| *ch == '"' || *ch == '\'')?;
+    let quote = value
+        .chars()
+        .next()
+        .filter(|ch| *ch == '"' || *ch == '\'')?;
     let inner = value.get(1..)?;
     let end = inner.find(quote)?;
     Some(inner[..end].to_string())
@@ -302,8 +305,9 @@ fn decode_call_payload(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let arguments = match arguments {
-        serde_json::Value::String(raw) => serde_json::from_str(&raw)
-            .map_err(|_| "arguments string is not valid JSON")?,
+        serde_json::Value::String(raw) => {
+            serde_json::from_str(&raw).map_err(|_| "arguments string is not valid JSON")?
+        }
         other => other,
     };
     if !arguments.is_object() && !arguments.is_null() {
