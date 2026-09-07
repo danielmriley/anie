@@ -118,6 +118,12 @@ impl SystemPromptCache {
     /// Rebuild the prompt if the set of context files, any of
     /// their mtimes, or the prompt tier changed. Returns `true`
     /// if a rebuild happened.
+    ///
+    /// Tests-only wrapper over `refresh_if_stale_for_model` that
+    /// uses `[model]` from config. Production goes through the
+    /// live picker model (`ConfigState::current_model`), which
+    /// can diverge from that table.
+    #[cfg(test)]
     pub(crate) fn refresh_if_stale(
         &mut self,
         cwd: &Path,
@@ -137,6 +143,8 @@ impl SystemPromptCache {
         )
     }
 
+    // Mirrors `build_for_model`'s inputs plus `&mut self`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn refresh_if_stale_for_model(
         &mut self,
         cwd: &Path,
