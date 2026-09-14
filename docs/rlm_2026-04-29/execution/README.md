@@ -16,12 +16,16 @@ work lands.
 | Plan | Branch | Status | Commit |
 |---|---|---|---|
 | [01 — Stagnation detection + aggressive compaction](../01_stagnation_detection.md) | `main` | landed | `a2863e7` |
-| [02 — RLM `recurse` tool (shape 1)](../02_recurse_tool.md) | `dev_rlm` | landed (Phase A of 06) | `64dcbe2` |
+| [02 — RLM `recurse` tool (shape 1)](../02_recurse_tool.md) | `dev_rlm` | landed (escape hatch; not the page-in headline) | `64dcbe2` |
 | [03 — RLM recurse intent (shape 2)](../03_recurse_intent.md) | TBD | deferred | — |
 | [04 — Native RLM compat (shape 3)](../04_native_rlm_compat.md) | TBD | speculative | — |
 | [05 — Passive context management](../05_passive_context_management.md) | TBD | absorbed into 06 | — |
-| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phases A–F all landed** | — |
+| **[06 — Phased path to context virtualization](../06_phased_implementation.md)** | `dev_rlm` | **Phases A–F landed; admit rule is leftover-gated** | — |
+| [Leftover-gated paging](../leftover_gated_paging.md) | `dev_rlm` | **main product focus** | this PR |
 | [07 — Evaluation harness + mode flags](../07_evaluation_harness.md) | `dev_rlm` | partial (`--harness-mode` flag; scenarios deferred) | `8a162d3` |
+
+Phase B reliability work (profiles, prompt presets,
+parse-repair, evidence brief) is **out of scope**.
 
 ## Phase status (Plan 06)
 

@@ -34,29 +34,27 @@ Three things lined up:
    models into frontier-quality territory on long-context
    work. That's the entire reason anie exists.
 
-## Unified vision: context virtualization
+## Unified vision: leftover-gated context paging
 
-The plan series progressed through several reframings as we
-talked it through. The final picture:
+The plan series started as RLM `recurse` + context
+virtualization (Plan 06). Virtualization — a lean ceiling
+and an addressable overflow store — is the plumbing. The
+product is the admit rule:
 
-> **The harness owns the model's active context.** A fixed
-> ceiling well below the model's actual window keeps every
-> LLM call lean. Content beyond the ceiling lives in an
-> indexed external store. The model navigates that store via
-> the `recurse` tool. Compaction stays in as a fallback for
-> runs where the ceiling isn't tight enough; in normal
-> operation it rarely fires.
+> **A chunk enters the active window only if it
+> residual-reduces the current working sheet, or if it is
+> an orphan failure.** Keyword / embedding similarity
+> against the raw prompt is input-space catchment and is
+> not the default. `recurse` is an escape hatch, not the
+> page-in mechanism.
 
-This is **context virtualization** — analogous to OS virtual
-memory. The active context is the working set; the external
-store is the backing store; `recurse` is the page-in
-mechanism. The model performs at its quality ceiling on every
-call because it never sees a bloated context.
+See [leftover_gated_paging.md](leftover_gated_paging.md).
+Phase B reliability items (profiles, prompt presets,
+parse-repair, evidence brief) are out of scope.
 
-Plan 06 is the engineering roadmap that composes Plans 02 and
-05 into this unified target. Plan 07 is the measurement
-infrastructure (mode flags, scenarios, scoring) that lets us
-report the win.
+Plan 06 is the engineering roadmap that built the ceiling,
+store, ledger, and recall renderer. Plan 07 is the
+measurement infrastructure.
 
 ## Scope of the plan series
 
@@ -69,7 +67,7 @@ Eight plans, organized by purpose:
 | 03 | [RLM recurse intent (shape 2)](03_recurse_intent.md) | Promotes recursion to a first-class loop step | deferred (revisit after 06 + 07 data) |
 | 04 | [Native RLM compat (shape 3)](04_native_rlm_compat.md) | Profile for natively-recursive models | speculative |
 | 05 | [Passive context management](05_passive_context_management.md) | Background summarization + JIT filtering — components Plan 06 composes | absorbed into 06 |
-| **06** | [**Phased path to context virtualization**](06_phased_implementation.md) | **The unified roadmap: A through F, ~5–6 weeks** | `dev_rlm` |
+| **06** | [**Phased path to context virtualization**](06_phased_implementation.md) | Ceiling + store + ledger (plumbing). Admit rule: [leftover-gated paging](leftover_gated_paging.md) | `dev_rlm` |
 | 07 | [Evaluation harness + mode flags](07_evaluation_harness.md) | `--harness-mode {baseline,current,rlm}`; scenario corpus; scoring | `dev_rlm` (parallel to 06A) |
 | — | [Execution tracker](execution/README.md) | — | — |
 
@@ -77,16 +75,16 @@ Eight plans, organized by purpose:
 
 Read in this order:
 
-1. **This README** — the unified picture.
-2. **Plan 06** — the phased roadmap. Phases A–F describe
-   what we actually build, in order.
-3. **Plan 07** — how we measure whether each phase worked.
-4. **Plan 02** — Phase A's spec sheet (the recurse tool).
-5. **Plan 05** — components of Phases C–E (referenced from
+1. **This README** — the unified picture (leftover-gated paging).
+2. **[Leftover-gated paging](leftover_gated_paging.md)** — the admit rule.
+3. **Plan 06** — the phased roadmap that built the plumbing.
+4. **Plan 07** — how we measure whether each phase worked.
+5. **Plan 02** — Phase A's spec sheet (`recurse` as escape hatch).
+6. **Plan 05** — components of Phases C–E (referenced from
    06; not standalone work anymore).
-6. **Plan 01** — already shipped; the compaction work that
+7. **Plan 01** — already shipped; the compaction work that
    serves as the fallback under the new paradigm.
-7. **Plans 03, 04** — deferred / speculative; revisit after
+8. **Plans 03, 04** — deferred / speculative; revisit after
    Plan 06 phases land + Plan 07 produces eval data.
 
 ## A note on context scope
@@ -115,15 +113,14 @@ where anie's leverage is.
 
 ## Guiding principles
 
-1. **Compaction is a band-aid; RLM is the answer.** The
-   stagnation detector + aggressive compaction (Plan 01)
-   buys time within the old paradigm so users aren't blocked
-   while we build Plan 02. We're not investing further in
-   "fit more in context" beyond Plan 01.
-2. **Shape 1 first.** A `recurse` tool that the model calls
-   like any other tool is the smallest change that captures
-   the core RLM idea. It lets us measure the win before
-   committing to deeper architectural moves (shapes 2, 3).
+1. **Compaction is a band-aid; leftover-gated paging is the
+   answer.** The stagnation detector + aggressive compaction
+   (Plan 01) buys time within the old paradigm. We're not
+   investing further in "fit more in context" beyond Plan 01.
+2. **Harness-owned admit, model-owned recurse as hatch.**
+   Keyword/embedding JIT is not the page-in predicate. A
+   `recurse` tool remains so the model can fetch a body the
+   harness did not admit.
 3. **Eval-driven from Plan 02 onward.** The eval suite from
    `docs/small_model_capability_ideas_2026-04-29.md` (Tier 3
    #10) becomes load-bearing here. Without it we can't tell

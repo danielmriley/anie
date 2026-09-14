@@ -3258,13 +3258,13 @@ fn rlm_pin_tail_tokens() -> u64 {
     )
 }
 
-/// Read the relevance-budget override from
-/// `ANIE_RELEVANCE_BUDGET_TOKENS`. This is the Phase E
-/// budget for keyword-relevant content paged back in for
-/// the current turn (overlays on top of the active
-/// ceiling). Default is `active_ceiling / 4` so a tightly-
-/// budgeted run gets a proportional reranker headroom; set
-/// to 0 to disable paging entirely.
+/// Read the page-in budget override from
+/// `ANIE_RELEVANCE_BUDGET_TOKENS`. Token budget for
+/// leftover-gated overflow recalled into the current turn
+/// (overlays on top of the active ceiling). Default is
+/// `active_ceiling / 4`; set to 0 to disable paging. The
+/// admit predicate is leftover-gated unless
+/// `ANIE_PAGE_IN_ADMIT=keyword`.
 fn rlm_relevance_budget_tokens(active_ceiling_tokens: u64) -> u64 {
     if let Some(parsed) = std::env::var("ANIE_RELEVANCE_BUDGET_TOKENS")
         .ok()

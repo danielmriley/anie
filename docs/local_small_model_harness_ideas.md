@@ -388,6 +388,16 @@ Small models suffer more from noisy context than frontier models. anie
 should invest in a context builder that selects, compresses, and stages
 context deliberately.
 
+**Main harness bet:** leftover-gated context paging
+(`docs/rlm_2026-04-29/leftover_gated_paging.md`). The active
+window stays lean; overflow lives in an addressable store; a
+chunk pages in only if it residual-reduces the current working
+sheet or is an orphan failure. Keyword / embedding JIT
+similarity is not the admit rule. `recurse` is an escape hatch.
+
+The notes below (repo map, tiered context, budgeter) are
+supporting ideas. They are not a second product.
+
 ## Repository map
 
 Maintain a compact project map:
