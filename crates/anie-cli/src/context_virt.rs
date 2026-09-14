@@ -5,15 +5,15 @@
 //!
 //! [`ContextVirtualizationPolicy`] is a [`BeforeModelPolicy`]
 //! that enforces a configurable active-context token ceiling,
-//! pages relevant evicted content back in for the current
-//! turn, and injects a per-turn ledger telling the model
-//! what's externally available. When the run's active context
-//! exceeds the ceiling, the policy: (1) evicts oldest
+//! pages leftover-reducing evicted content back in for the
+//! current turn, and injects a per-turn ledger telling the
+//! model what's externally available. When the run's active
+//! context exceeds the ceiling, the policy: (1) evicts oldest
 //! messages pinning a token-budgeted tail; (2) archives every snapshot
 //! message to the shared [`ExternalContext`] so the recurse
-//! tool can still reach evicted content; (3) scores evicted
-//! content against the current user prompt via keyword
-//! overlap and recalls the highest scorers — within
+//! tool can still reach evicted content; (3) admits overflow
+//! candidates under a leftover gate (residual-reduce or
+//! orphan — not keyword overlap) and recalls them — within
 //! `relevance_budget_tokens` and the per-run budget — into
 //! one consolidated archive-recall message (rlm2/PR4);
 //! (4) builds a structured ledger; (5) returns
@@ -54,16 +54,20 @@
 //! rather than a user prompt. The previous turn's ledger is
 //! stripped before injecting a new one (no accumulation).
 //!
-//! Relevance reranker: keyword overlap. The current user
-//! prompt is tokenized (lowercase, alphanumeric split,
-//! 3-char minimum, common stopwords filtered); each evicted
-//! message is tokenized the same way; score is the size of
-//! the token-set intersection. Tie-break by recency. Cheap
-//! enough to run on every fire. Selection is summaries-first
-//! (rlm2/PR4): a scored candidate contributes its Phase-F
-//! summary when one exists; its full body only when no
-//! summary exists and the body is small. The recurse tool
-//! covers the fidelity gap.
+//! Page-in admit (default): leftover-gated. A candidate
+//! enters the recall window only if it residual-reduces the
+//! current [`crate::leftover::WorkingSheet`] (goal tokens
+//! plus in-window validation failures, minus tokens claimed
+//! by successful tool results) or if it is an orphan
+//! (`ToolResult.is_error` with nothing claimed explaining
+//! it). Keyword / embedding similarity against the raw
+//! prompt is input-space catchment and is **not** the
+//! default; `ANIE_PAGE_IN_ADMIT=keyword` restores that hatch
+//! for A/B. Tie-break by recency. Selection is
+//! summaries-first (rlm2/PR4): an admitted candidate
+//! contributes its Phase-F summary when one exists; its full
+//! body only when no summary exists and the body is small.
+//! The recurse tool covers the fidelity gap.
 //!
 //! Identity / dedup: messages are tracked by `timestamp`. The
 //! agent loop generates one message per `now_millis()`
@@ -79,7 +83,8 @@
 //! controller installs the policy in `--harness-mode=rlm`;
 //! default builds keep the noop policy. Setting
 //! `ANIE_ACTIVE_CEILING_TOKENS` to a finite value turns on
-//! the full eviction + ledger + relevance pipeline.
+//! the full eviction + ledger + leftover-gated page-in
+//! pipeline.
 //!
 //! Hysteresis (rlm2/PR3, `docs/rlm_context_v2/03_hysteresis.md`):
 //! eviction is batched — when the running total breaches the
@@ -133,6 +138,7 @@ use crate::external_context::{
     ExternalContext, MessageId, MessageKindLabel, StoredMessage, first_text, first_text_of,
     tokenize,
 };
+use crate::leftover::{PageInAdmit, decide_admit, is_validation_failure_message};
 
 /// Extract a Message's timestamp, regardless of variant.
 fn message_timestamp(m: &Message) -> u64 {
@@ -203,16 +209,14 @@ fn latest_user_prompt(working: &[Message]) -> Option<(String, u64)> {
     })
 }
 
-/// One candidate the relevance reranker is considering for
-/// paging back in. Carries the score (cosine similarity
-/// when embeddings are available, keyword-overlap intersection
-/// size cast to f32 otherwise), the archive entry's stable id
-/// (for the summary-fallback annotation), and BORROWED views
-/// of the message body and optional summary. rlm2/PR5 (perf):
-/// candidates borrow from the store for the whole
-/// score-and-select pass; the only owned data the reranker
-/// produces is the rendered section text of selected items —
-/// unselected bodies are never cloned.
+/// One candidate the page-in pass is considering. `score`
+/// is leftover rank (residual-hit count; orphans sort at 0
+/// after residual-reduce) or, on the keyword hatch, cosine
+/// similarity / keyword-intersection size. Higher is better
+/// for both. rlm2/PR5 (perf): candidates borrow from the
+/// store for the whole admit-and-select pass; the only owned
+/// data produced is the rendered section text of selected
+/// items — unselected bodies are never cloned.
 struct RelevanceCandidate<'a> {
     /// Cosine similarity in [-1, 1] when scored by
     /// embedding; intersection-size as f32 when scored by
@@ -345,6 +349,16 @@ fn env_page_in_bodies() -> bool {
     *BODIES
 }
 
+/// `ANIE_PAGE_IN_ADMIT`, parsed once per process. Default
+/// leftover-gated; `keyword` / `embed` restores input-space
+/// catchment for A/B.
+fn env_page_in_admit() -> PageInAdmit {
+    static MODE: LazyLock<PageInAdmit> = LazyLock::new(|| {
+        PageInAdmit::from_env(std::env::var("ANIE_PAGE_IN_ADMIT").ok().as_deref())
+    });
+    *MODE
+}
+
 /// rlm2/PR4: sticky page-in state, session-scoped (owned by
 /// the controller's `RlmSessionState`, shared with each
 /// per-run policy) but keyed by the latest user prompt's
@@ -410,13 +424,12 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// tokens/message.
     pin_tail_tokens: u64,
 
-    /// Token budget for relevance-based paging-in (Phase E).
-    /// Sits *on top* of `active_ceiling_tokens`: after
-    /// FIFO eviction lands `working` at ≤ ceiling, the
-    /// reranker may add up to this many tokens of
-    /// keyword-relevant evicted content. Set to 0 to disable
-    /// paging entirely (FIFO-only behavior, equivalent to
-    /// pure Phase C).
+    /// Token budget for leftover-gated paging-in. Sits *on
+    /// top of* `active_ceiling_tokens`: after FIFO eviction
+    /// lands `working` at ≤ ceiling, the admit pass may add
+    /// up to this many tokens of residual-reducing (or
+    /// orphan) overflow. Set to 0 to disable paging entirely
+    /// (FIFO-only behavior, equivalent to pure Phase C).
     relevance_budget_tokens: u64,
 
     /// rlm2/PR4: cap on total page-in spend per run. The
@@ -429,6 +442,11 @@ pub(crate) struct ContextVirtualizationPolicy {
     /// restores the pre-PR4 bodies-preferred selection.
     /// Default `false` (summaries-first).
     page_in_bodies: bool,
+
+    /// Default leftover-gated admit. `Keyword` is the
+    /// `ANIE_PAGE_IN_ADMIT=keyword` hatch (prompt overlap /
+    /// embedding cosine).
+    page_in_admit: PageInAdmit,
 
     /// rlm2/PR4: sticky page-in state. Session-scoped (shared
     /// with the controller's `RlmSessionState` via
@@ -602,6 +620,7 @@ impl ContextVirtualizationPolicy {
             relevance_budget_tokens,
             page_in_run_budget: env_page_in_run_budget(),
             page_in_bodies: env_page_in_bodies(),
+            page_in_admit: env_page_in_admit(),
             page_in_state: Arc::new(Mutex::new(PageInRunState::default())),
             external,
             pushed,
@@ -663,6 +682,14 @@ impl ContextVirtualizationPolicy {
     #[cfg(test)]
     fn with_page_in_bodies(mut self, enabled: bool) -> Self {
         self.page_in_bodies = enabled;
+        self
+    }
+
+    /// Pin the page-in admit predicate for deterministic
+    /// tests (the constructor reads the process-wide env).
+    #[cfg(test)]
+    fn with_page_in_admit(mut self, admit: PageInAdmit) -> Self {
+        self.page_in_admit = admit;
         self
     }
 
@@ -1292,14 +1319,15 @@ impl BeforeModelPolicy for ContextVirtualizationPolicy {
             }
         }
 
-        // Step 3.5 (rlm2/PR4): relevance-based recall. Score
-        // every evicted message against the current prompt;
-        // recall the highest scorers — summaries first — into
-        // the consolidated archive-recall render, within
-        // `min(relevance_budget_tokens, run budget remaining)`.
-        // The recall budget overlays on top of the active
-        // ceiling so total send is at most
-        // `active_ceiling + relevance_budget`. Recalled
+        // Step 3.5: leftover-gated recall. Admit evicted
+        // messages that residual-reduce the working sheet
+        // (or orphan failures); recall them — summaries
+        // first — into the consolidated archive-recall
+        // render, within `min(relevance_budget_tokens, run
+        // budget remaining)`. Keyword/embedding overlap is
+        // not the default admit. The recall budget overlays
+        // on top of the active ceiling so total send is at
+        // most `active_ceiling + relevance_budget`. Recalled
         // content never enters `working` itself: it renders
         // inside ONE `<system-reminder source="archive-recall">`
         // message appended right before the ledger below, so
@@ -1857,14 +1885,15 @@ impl ContextVirtualizationPolicy {
         });
     }
 
-    /// rlm2/PR4: score evicted messages against the current
-    /// prompt's keywords (or cached embedding) and recall the
-    /// highest scorers into the consolidated archive-recall
-    /// render — summaries first; a full body only when no
-    /// summary exists AND the body is under
-    /// [`PAGE_IN_BODY_MAX_TOKENS`] (`ANIE_PAGE_IN_BODIES=1`
-    /// restores the old bodies-preferred selection). The
-    /// per-fire budget is `min(relevance_budget_tokens,
+    /// Score evicted messages and recall admitted ones into
+    /// the consolidated archive-recall render — summaries
+    /// first; a full body only when no summary exists AND
+    /// the body is under [`PAGE_IN_BODY_MAX_TOKENS`]
+    /// (`ANIE_PAGE_IN_BODIES=1` restores the old
+    /// bodies-preferred selection). Default admit is
+    /// leftover-gated ([`PageInAdmit::Leftover`]); the
+    /// keyword/embedding hatch is [`PageInAdmit::Keyword`].
+    /// The per-fire budget is `min(relevance_budget_tokens,
     /// per-run budget remaining)`.
     ///
     /// Returns `(recall_text, newly_paged_count,
@@ -1913,32 +1942,41 @@ impl ContextVirtualizationPolicy {
                 self.relevance_budget_tokens.min(run_remaining),
             )
         };
-        let Some(prompt_tokens) = current_prompt_tokens(working) else {
-            return (self.render_sticky_recall(), 0, 0);
-        };
         if budget == 0 {
             return (self.render_sticky_recall(), 0, 0);
         }
 
-        // Plan-08: when an embedder is configured and the
-        // background task has already embedded the current
-        // prompt, score candidates by cosine similarity.
-        // On a cache miss this fire falls back to keyword
-        // overlap; the embed is kicked off below — after we
-        // know the archive actually holds something to
-        // rerank — so the turn path never waits on it.
-        let prompt_embed = prompt_text_ts
-            .as_ref()
-            .and_then(|(_, ts)| self.peek_prompt_embedding(*ts));
+        let leftover_sheet = match self.page_in_admit {
+            PageInAdmit::Leftover => match crate::leftover::build_working_sheet(working) {
+                Some(sheet) => Some(sheet),
+                None => return (self.render_sticky_recall(), 0, 0),
+            },
+            PageInAdmit::Keyword => None,
+        };
+        let prompt_tokens = match self.page_in_admit {
+            PageInAdmit::Keyword => match current_prompt_tokens(working) {
+                Some(toks) => toks,
+                None => return (self.render_sticky_recall(), 0, 0),
+            },
+            PageInAdmit::Leftover => HashSet::new(),
+        };
 
-        // Score and select while holding the read guard.
-        // rlm2/PR5 (perf): candidates BORROW from the store —
-        // scoring intersects the prompt's tokens with each
-        // entry's token set cached at archive time, and the
-        // budget loop renders owned section text only for
-        // the items it accepts. Unselected bodies are never
-        // cloned (enforced by `RelevanceCandidate<'_>`'s
-        // lifetime). No `.await` runs while the guard is
+        // Keyword hatch only: cosine when embeddings are
+        // ready, otherwise prompt-token intersection. The
+        // leftover path never consults embeddings — that
+        // is input-space catchment.
+        let prompt_embed = match self.page_in_admit {
+            PageInAdmit::Keyword => prompt_text_ts
+                .as_ref()
+                .and_then(|(_, ts)| self.peek_prompt_embedding(*ts)),
+            PageInAdmit::Leftover => None,
+        };
+
+        // Admit and select while holding the read guard.
+        // rlm2/PR5 (perf): candidates BORROW from the store;
+        // the budget loop renders owned section text only
+        // for the items it accepts. Unselected bodies are
+        // never cloned. No `.await` runs while the guard is
         // held, so the future stays Send.
         let working_ts: HashSet<u64> = working.iter().map(message_timestamp).collect();
         let mut candidate_pool = 0usize;
@@ -1952,17 +1990,34 @@ impl ContextVirtualizationPolicy {
                 })
                 .inspect(|_| candidate_pool += 1)
                 .filter_map(|s| {
-                    let score = score_candidate(prompt_embed.as_deref(), &prompt_tokens, s);
-                    if score <= 0.0 {
-                        None
-                    } else {
-                        Some(RelevanceCandidate {
-                            score,
-                            id: s.id,
-                            message: &s.message,
-                            summary: s.summary.as_deref(),
-                        })
-                    }
+                    let score = match self.page_in_admit {
+                        PageInAdmit::Leftover => {
+                            let sheet = leftover_sheet.as_ref()?;
+                            let decision = decide_admit(
+                                sheet,
+                                &s.tokens,
+                                is_validation_failure_message(&s.message),
+                            );
+                            if !decision.is_admit() {
+                                return None;
+                            }
+                            decision.rank() as f32
+                        }
+                        PageInAdmit::Keyword => {
+                            let score =
+                                score_candidate(prompt_embed.as_deref(), &prompt_tokens, s);
+                            if score <= 0.0 {
+                                return None;
+                            }
+                            score
+                        }
+                    };
+                    Some(RelevanceCandidate {
+                        score,
+                        id: s.id,
+                        message: &s.message,
+                        summary: s.summary.as_deref(),
+                    })
                 })
                 .collect();
 
@@ -2026,14 +2081,14 @@ impl ContextVirtualizationPolicy {
             accepted
         };
 
-        // Prompt-embed cache miss with a live candidate
-        // pool: compute the embedding off the turn path so
-        // the NEXT fire can rerank semantically. Skipped
-        // entirely when the archive holds nothing to rerank
-        // (RC2: the embed used to fire before the empty-
-        // candidates check, paying an HTTP call for turns
-        // with no archive at all).
-        if candidate_pool > 0 && prompt_embed.is_none() {
+        // Keyword hatch: on a prompt-embed cache miss with a
+        // live candidate pool, compute the embedding off the
+        // turn path so the NEXT fire can rerank semantically.
+        // Leftover admit never waits on or kicks off embeds.
+        if self.page_in_admit == PageInAdmit::Keyword
+            && candidate_pool > 0
+            && prompt_embed.is_none()
+        {
             if let Some((text, ts)) = prompt_text_ts {
                 self.spawn_prompt_embed_if_missing(text, ts);
             }
@@ -2425,6 +2480,24 @@ mod tests {
             is_error: false,
             timestamp: ts,
         })
+    }
+
+    fn tool_result_err(call_id: &str, tool_name: &str, body: &str, ts: u64) -> Message {
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            content: vec![ContentBlock::Text { text: body.into() }],
+            details: serde_json::Value::Null,
+            is_error: true,
+            timestamp: ts,
+        })
+    }
+
+    fn recall_text(survivors: &[Message]) -> Option<&str> {
+        survivors
+            .iter()
+            .find(|m| is_archive_recall(m))
+            .and_then(user_text)
     }
 
     fn sample_model() -> Model {
@@ -3034,11 +3107,12 @@ mod tests {
         assert_eq!(survivors.len(), 2);
     }
 
-    /// Phase E: with a relevance budget, evicted messages
-    /// matching the prompt's keywords get paged back in.
-    /// Sets up a 10-message context with a topical
-    /// keyword-match buried in the front; tight ceiling
-    /// evicts it; relevance budget pages it back in.
+    /// Phase E (updated): with a page-in budget, evicted
+    /// messages that residual-reduce the unclaimed goal
+    /// tokens get paged back in. Unclaimed leftover looks
+    /// like keyword overlap here because nothing in the
+    /// window has claimed the prompt tokens yet — that is
+    /// residual-reduce, not the keyword hatch.
     #[tokio::test]
     async fn paged_in_messages_match_prompt_keywords() {
         let store = Arc::new(RwLock::new(ExternalContext::new()));
@@ -3557,11 +3631,190 @@ mod tests {
         );
     }
 
-    /// Plan 08: when the policy has an embedder + the
-    /// candidate has a cached embedding, the reranker
-    /// scores by cosine similarity. Verify a high-cosine
-    /// candidate gets paged in even when its keyword
-    /// overlap with the prompt is zero.
+    /// Default admit is leftover-gated, not keyword overlap.
+    /// A store candidate that only shares already-claimed
+    /// prompt tokens stays out; a residual-reducing sibling
+    /// pages in. This is the matched page-in vs keyword
+    /// baseline.
+    #[tokio::test]
+    async fn leftover_gated_page_in_admits_residual_not_claimed_keyword_match() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            user("alphamodule notes: alphawidget implementation details", 1),
+            user("betalock flaky test failed on retry", 2),
+        ])));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64, 2u64])),
+        );
+        assert_eq!(policy.page_in_admit, PageInAdmit::Leftover);
+        let context = vec![
+            tool_result(
+                "c1",
+                "bash",
+                "alphamodule compiles; alphawidget tests passed",
+                10,
+            ),
+            user(
+                "keep going on alphamodule and also fix the flaky betalock test",
+                100,
+            ),
+        ];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall = recall_text(&survivors).expect("expected leftover page-in");
+        assert!(
+            recall.contains("betalock flaky test failed on retry"),
+            "residual-reduce must page in: {recall}"
+        );
+        assert!(
+            !recall.contains("alphawidget implementation details"),
+            "claimed keyword match must not page in: {recall}"
+        );
+    }
+
+    /// Keyword hatch still pages the claimed prompt-overlap
+    /// candidate — same fixture, opposite admit.
+    #[tokio::test]
+    async fn keyword_hatch_pages_claimed_prompt_overlap() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            user("alphamodule notes: alphawidget implementation details", 1),
+            user("betalock flaky test failed on retry", 2),
+        ])));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64, 2u64])),
+        )
+        .with_page_in_admit(PageInAdmit::Keyword);
+        let context = vec![
+            tool_result(
+                "c1",
+                "bash",
+                "alphamodule compiles; alphawidget tests passed",
+                10,
+            ),
+            user(
+                "keep going on alphamodule and also fix the flaky betalock test",
+                100,
+            ),
+        ];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall = recall_text(&survivors).expect("expected keyword hatch page-in");
+        assert!(
+            recall.contains("alphawidget implementation details"),
+            "keyword hatch must page claimed prompt overlap: {recall}"
+        );
+    }
+
+    /// Orphan: an `is_error` tool result with zero prompt
+    /// overlap and nothing claimed explaining it still pages
+    /// in under leftover-gated admit.
+    #[tokio::test]
+    async fn leftover_gated_page_in_admits_orphan_failure() {
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![
+            tool_result_err("e1", "bash", "ld: undefined symbol zetaentry in omegalib", 1),
+        ])));
+        let policy = ContextVirtualizationPolicy::new(
+            10_000,
+            8,
+            10_000,
+            Arc::clone(&store),
+            shared_pushed(HashSet::from([1u64])),
+        );
+        let context = vec![user("continue the refactor of alphamodule", 100)];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let recall = recall_text(&survivors).expect("expected orphan page-in");
+        assert!(
+            recall.contains("zetaentry"),
+            "orphan failure must page in: {recall}"
+        );
+    }
+
+    /// Pin rules still hold when leftover paging is on:
+    /// latest user survives a ceiling too tight for the
+    /// rest of the transcript.
+    #[tokio::test]
+    async fn leftover_paging_preserves_latest_user_pin() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let mut context: Vec<Message> = (0..8)
+            .map(|i| user(&format!("filler chatter {i}"), i as u64))
+            .collect();
+        context.push(user("keep going on alphamodule", 100));
+        let policy = ContextVirtualizationPolicy::new(
+            2,
+            1,
+            50,
+            store,
+            shared_pushed(HashSet::new()),
+        );
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let has_directive = survivors.iter().any(|m| {
+            user_text(m)
+                .map(|t| t.contains("keep going on alphamodule"))
+                .unwrap_or(false)
+        });
+        assert!(
+            has_directive,
+            "latest user pin must survive leftover paging: {survivors:?}"
+        );
+    }
+
+    /// Over-ceiling eviction still drops oldest unpinned
+    /// messages when leftover paging is enabled.
+    #[tokio::test]
+    async fn leftover_paging_still_evicts_over_ceiling() {
+        let store = Arc::new(RwLock::new(ExternalContext::new()));
+        let mut context: Vec<Message> = (0..8)
+            .map(|i| user(&format!("old chatter number {i}"), i as u64))
+            .collect();
+        context.push(user("keep going on alphamodule", 100));
+        let policy = ContextVirtualizationPolicy::new(
+            5,
+            1,
+            0, // paging off — this is the eviction check
+            Arc::clone(&store),
+            shared_pushed(HashSet::new()),
+        );
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        let has_oldest = survivors.iter().any(|m| {
+            user_text(m)
+                .map(|t| t.contains("old chatter number 0"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !has_oldest,
+            "oldest unpinned message must evict: {survivors:?}"
+        );
+        assert!(
+            !survivors.iter().any(is_archive_recall),
+            "budget 0 must not page in"
+        );
+    }
+
+    /// Plan 08 hatch: when the policy has an embedder + the
+    /// candidate has a cached embedding, keyword-mode scores
+    /// by cosine similarity. Verify a high-cosine candidate
+    /// gets paged in even when its keyword overlap with the
+    /// prompt is zero. Leftover-gated default must not.
     #[tokio::test]
     async fn reranker_prefers_high_cosine_similarity() {
         use crate::bg_embedder::EmbedRequest;
@@ -3592,17 +3845,17 @@ mod tests {
         let pushed = HashSet::from([1u64]);
         let policy =
             ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), shared_pushed(pushed))
+                .with_page_in_admit(PageInAdmit::Keyword)
                 .with_embedder(embedder, tx);
 
-        // Active context's prompt has no keyword overlap
-        // with the candidate. With keyword scoring this
-        // would page in nothing; with embedding cosine=1
-        // it should page in. RC2: the prompt embedding is
-        // computed by a background task — the first fire
-        // falls back to keyword overlap (finding nothing)
-        // and kicks the embed off; a later fire picks the
-        // cached vector up and pages the candidate in by
-        // cosine.
+        // Hatch path: prompt has no keyword overlap with the
+        // candidate. Leftover-gated default would reject;
+        // keyword+embedding cosine=1 pages it in. RC2: the
+        // prompt embedding is computed by a background task
+        // — the first fire falls back to keyword overlap
+        // (finding nothing) and kicks the embed off; a later
+        // fire picks the cached vector up and pages the
+        // candidate in by cosine.
         let context = vec![user("totally different abc query", 100)];
         let mut paged_in = false;
         for _ in 0..100 {
@@ -3626,6 +3879,44 @@ mod tests {
         assert!(
             paged_in,
             "embedding cosine=1 candidate should be paged in once the background prompt embed lands"
+        );
+    }
+
+    /// Default leftover admit ignores embedding cosine: a
+    /// high-similarity candidate with no residual hit stays
+    /// out. Keyword/embedding is not the default predicate.
+    #[tokio::test]
+    async fn leftover_gated_rejects_embedding_only_match() {
+        use crate::bg_embedder::EmbedRequest;
+
+        let store = Arc::new(RwLock::new(ExternalContext::from_messages(vec![user(
+            "zero keyword overlap content xyz",
+            1,
+        )])));
+        store.write().await.set_embedding(0, vec![1.0, 0.0, 0.0]);
+
+        struct StubEmbedder;
+        #[async_trait::async_trait]
+        impl crate::embedder::Embedder for StubEmbedder {
+            async fn embed(&self, _text: &str) -> Result<Vec<f32>, String> {
+                Ok(vec![1.0, 0.0, 0.0])
+            }
+        }
+        let (tx, _rx) = mpsc::channel::<EmbedRequest>(8);
+        let pushed = HashSet::from([1u64]);
+        let policy =
+            ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), shared_pushed(pushed))
+                .with_embedder(Arc::new(StubEmbedder), tx);
+        assert_eq!(policy.page_in_admit, PageInAdmit::Leftover);
+
+        let context = vec![user("totally different abc query", 100)];
+        let survivors = match policy.before_model(sample_request(&context)).await {
+            BeforeModelResponse::ReplaceMessages(s) => s,
+            other => panic!("expected ReplaceMessages, got {other:?}"),
+        };
+        assert!(
+            !survivors.iter().any(is_archive_recall),
+            "leftover admit must not page embedding-only catchment: {survivors:?}"
         );
     }
 
@@ -3718,6 +4009,7 @@ mod tests {
         let pushed = HashSet::from([1u64, 2u64]);
         let policy =
             ContextVirtualizationPolicy::new(10_000, 2, 10_000, Arc::clone(&store), shared_pushed(pushed))
+                .with_page_in_admit(PageInAdmit::Keyword)
                 .with_embedder(embedder, tx);
 
         let context = vec![user("looking for quux", 100)];

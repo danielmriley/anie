@@ -19,6 +19,7 @@ mod external_context;
 mod goal_command;
 mod harness_mode;
 mod interactive_mode;
+mod leftover;
 mod login_command;
 mod loop_command;
 mod model_catalog;
@@ -80,17 +81,19 @@ pub struct Cli {
     /// Harness profile: `baseline` exposes no tools or
     /// compaction gate (model-only floor for measurement);
     /// `current` (default) is anie's existing behavior;
-    /// `rlm` turns on context virtualization end-to-end —
-    /// installs the `recurse` tool plus the active-context
-    /// ceiling, FIFO eviction, ledger injection, and
-    /// relevance-based paging-in. Defaults: ceiling derived
-    /// from the effective Ollama num_ctx minus prompt/output
-    /// reserves (16k static for non-Ollama models), a
-    /// 3072-token pinned tail, ceiling/4 relevance budget.
-    /// Override via `ANIE_ACTIVE_CEILING_TOKENS`,
+    /// `rlm` turns on leftover-gated context paging: a lean
+    /// active-context ceiling, FIFO eviction into an
+    /// addressable store, leftover-gated page-in (not
+    /// keyword overlap), ledger injection, and `recurse` as
+    /// an escape hatch. Defaults: ceiling derived from the
+    /// effective Ollama num_ctx minus prompt/output reserves
+    /// (16k static for non-Ollama models), a 3072-token
+    /// pinned tail, ceiling/4 page-in budget. Override via
+    /// `ANIE_ACTIVE_CEILING_TOKENS`,
     /// `ANIE_OUTPUT_RESERVE_TOKENS`, `ANIE_PIN_TAIL_TOKENS`
     /// (deprecated positional alias: `ANIE_KEEP_LAST_N`),
-    /// `ANIE_RELEVANCE_BUDGET_TOKENS`.
+    /// `ANIE_RELEVANCE_BUDGET_TOKENS`,
+    /// `ANIE_PAGE_IN_ADMIT=keyword` (A/B hatch).
     /// Plan `docs/rlm_2026-04-29/07_evaluation_harness.md`.
     #[arg(long, value_enum, default_value_t = harness_mode::HarnessMode::default())]
     pub harness_mode: harness_mode::HarnessMode,

@@ -11,11 +11,10 @@
 //! - `current` (default) — anie's existing behavior: full
 //!   tool set, controller-side compaction gate, no RLM
 //!   features. This is what users run today.
-//! - `rlm` — context virtualization (Plan 06 of
-//!   `docs/rlm_2026-04-29/`). Currently identical to
-//!   `current` on this branch; later commits add the
-//!   `recurse` tool, the active-context policy, and the
-//!   indexed external store as the RLM phases land.
+//! - `rlm` — leftover-gated context paging: lean ceiling,
+//!   addressable overflow store, leftover admit, `recurse`
+//!   as an escape hatch. Plan 06 of
+//!   `docs/rlm_2026-04-29/`.
 //!
 //! The mode is set at run start and is immutable for the
 //! life of the run. The CLI flag (`--harness-mode`) is the
@@ -36,9 +35,8 @@ pub enum HarnessMode {
     /// gate). Backward-compatible with all prior versions.
     #[default]
     Current,
-    /// Context virtualization (Plan 06). Identical to
-    /// `Current` until the recurse tool + active-context
-    /// policy land in subsequent commits on this branch.
+    /// Leftover-gated context paging: lean ceiling, overflow
+    /// store, leftover admit, `recurse` as an escape hatch.
     Rlm,
 }
 
