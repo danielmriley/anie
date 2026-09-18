@@ -193,16 +193,9 @@ enum RpcEvent {
         delay_ms: u64,
         error: String,
     },
-    /// Assistant failure carried on `AgentEvent::MessageEnd` when the
-    /// message's `stop_reason` is `Error`. Print mode already surfaces
-    /// the same text on stderr (`print_mode.rs`, `MessageEnd` arm); the
-    /// RPC projection used to blank that event, so a provider give-up
-    /// (auth, exhausted retries) was indistinguishable from a
-    /// zero-token success on the wire.
-    ///
-    /// anie-specific (not verified against pi): pi's rpc-mode source
-    /// was not available when this landed. The tag is additive on
-    /// `hello.version` 1. `error` stays reserved for unparsable stdin.
+    // anie-specific (not verified against pi): pi's rpc-mode source was not
+    // available when this landed. The tag is additive on `hello.version` 1.
+    // `error` stays reserved for unparsable stdin.
     #[serde(rename = "assistant_error")]
     AssistantError { message: String },
     #[serde(rename = "error")]
