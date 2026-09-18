@@ -51,3 +51,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV
         run: cargo check --workspace --all-targets
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Build and unit tests
+        run: npm test
+      - name: End-to-end against the fake anie (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run verify
+        env:
+          CI: true
+      - name: End-to-end against the fake anie (macOS)
+        if: runner.os == 'macOS'
+        run: npm run verify
+        env:
+          CI: true
