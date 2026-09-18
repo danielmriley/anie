@@ -5,9 +5,10 @@ use tokio::{
     sync::mpsc,
 };
 
-use anie_protocol::{AgentEvent, CompactionPhase, Message, StreamDelta};
+use anie_protocol::{AgentEvent, CompactionPhase, Message, StopReason, StreamDelta};
 use anie_tui::UiAction;
 
+use crate::print_mode::assistant_error_text;
 use crate::{Cli, bootstrap::prepare_controller_state, controller::InteractiveController};
 
 /// Start minimal JSONL RPC mode.
@@ -192,6 +193,18 @@ enum RpcEvent {
         delay_ms: u64,
         error: String,
     },
+    /// Assistant failure carried on `AgentEvent::MessageEnd` when the
+    /// message's `stop_reason` is `Error`. Print mode already surfaces
+    /// the same text on stderr (`print_mode.rs`, `MessageEnd` arm); the
+    /// RPC projection used to blank that event, so a provider give-up
+    /// (auth, exhausted retries) was indistinguishable from a
+    /// zero-token success on the wire.
+    ///
+    /// anie-specific (not verified against pi): pi's rpc-mode source
+    /// was not available when this landed. The tag is additive on
+    /// `hello.version` 1. `error` stays reserved for unparsable stdin.
+    #[serde(rename = "assistant_error")]
+    AssistantError { message: String },
     #[serde(rename = "error")]
     Error { message: String },
 }
@@ -265,6 +278,11 @@ impl From<AgentEvent> for RpcEvent {
                 delay_ms,
                 error,
             },
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(assistant),
+            } if matches!(assistant.stop_reason, StopReason::Error) => Self::AssistantError {
+                message: assistant_error_text(&assistant).to_string(),
+            },
             AgentEvent::TurnStart
             | AgentEvent::TurnEnd { .. }
             | AgentEvent::MessageStart { .. }
@@ -274,5 +292,90 @@ impl From<AgentEvent> for RpcEvent {
                 text: String::new(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anie_protocol::{AgentEvent, AssistantMessage, Message, StopReason, Usage, UserMessage};
+
+    use super::*;
+
+    fn assistant_message(stop_reason: StopReason, error_message: Option<&str>) -> AssistantMessage {
+        AssistantMessage {
+            content: Vec::new(),
+            usage: Usage::default(),
+            stop_reason,
+            error_message: error_message.map(str::to_string),
+            provider: "test".into(),
+            model: "test-model".into(),
+            timestamp: 1,
+            reasoning_details: None,
+        }
+    }
+
+    /// Regression; measured at 18270d9, `anie --rpc` with no API key
+    /// answered a prompt with `agent_start`, six `{"type":"system","text":""}`
+    /// lines and `agent_end`; the Authentication failed text reached only
+    /// the log and the session JSONL.
+    #[test]
+    fn message_end_with_auth_error_emits_assistant_error_not_empty_system() {
+        let event = AgentEvent::MessageEnd {
+            message: Message::Assistant(assistant_message(
+                StopReason::Error,
+                Some("Authentication failed: no key"),
+            )),
+        };
+        assert_eq!(
+            serde_json::to_string(&RpcEvent::from(event)).unwrap(),
+            r#"{"type":"assistant_error","message":"Authentication failed: no key"}"#
+        );
+    }
+
+    #[test]
+    fn message_end_with_blank_error_message_uses_fallback_sentence() {
+        let event = AgentEvent::MessageEnd {
+            message: Message::Assistant(assistant_message(StopReason::Error, Some("   "))),
+        };
+        assert_eq!(
+            serde_json::to_string(&RpcEvent::from(event)).unwrap(),
+            r#"{"type":"assistant_error","message":"assistant response ended with an error"}"#
+        );
+    }
+
+    #[test]
+    fn message_end_user_role_still_emits_empty_system() {
+        let event = AgentEvent::MessageEnd {
+            message: Message::User(UserMessage {
+                content: Vec::new(),
+                timestamp: 1,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_string(&RpcEvent::from(event)).unwrap(),
+            r#"{"type":"system","text":""}"#
+        );
+    }
+
+    #[test]
+    fn message_end_with_stop_reason_stop_still_emits_empty_system() {
+        let event = AgentEvent::MessageEnd {
+            message: Message::Assistant(assistant_message(StopReason::Stop, None)),
+        };
+        assert_eq!(
+            serde_json::to_string(&RpcEvent::from(event)).unwrap(),
+            r#"{"type":"system","text":""}"#
+        );
+    }
+
+    #[test]
+    fn message_end_aborted_does_not_emit_assistant_error() {
+        let event = AgentEvent::MessageEnd {
+            message: Message::Assistant(assistant_message(StopReason::Aborted, None)),
+        };
+        assert_eq!(
+            serde_json::to_string(&RpcEvent::from(event)).unwrap(),
+            r#"{"type":"system","text":""}"#
+        );
     }
 }

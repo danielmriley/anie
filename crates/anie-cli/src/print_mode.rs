@@ -235,7 +235,7 @@ fn assistant_text(content: &[ContentBlock]) -> String {
     out
 }
 
-fn assistant_error_text(assistant: &anie_protocol::AssistantMessage) -> &str {
+pub(crate) fn assistant_error_text(assistant: &anie_protocol::AssistantMessage) -> &str {
     assistant
         .error_message
         .as_deref()
