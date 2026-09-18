@@ -68,7 +68,8 @@ select[data-testid="thinking-select"] {
 }
 
 .context,
-.session-id {
+.session-id,
+.provider {
 	font-size: 12px;
 	color: #9aa3b2;
 }

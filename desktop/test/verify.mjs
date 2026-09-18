@@ -406,6 +406,19 @@ async function main() {
 		);
 		await shot('thinking');
 
+		await evaluate('document.querySelector(\'[data-testid="new-session"]\').click()');
+		await waitFor(
+			`(() => {
+				const kinds = [...document.querySelectorAll('[data-item-kind]')].map((n) => n.dataset.itemKind);
+				return { phase: document.body.dataset.processPhase, kinds };
+			})()`,
+			(value) => value !== null && typeof value === 'object' && value.phase === 'ready' && Array.isArray(value.kinds) && value.kinds.length === 1 && value.kinds[0] === 'notice',
+			'new session restarts the child and resets the transcript to the session notice',
+		);
+		const firstChildExit = JSON.parse(await readFile(exitFile, 'utf8'));
+		check(firstChildExit.reason === 'stdin-eof', 'new session ended the first child with stdin EOF');
+		await shot('new-session');
+
 		await evaluate('window.close()');
 		cdp.close();
 		cdp = null;
@@ -451,14 +464,16 @@ async function main() {
 		const port = await reservePort();
 		// X11 looks up .Xauthority under HOME, so the override that isolates
 		// anie's ~/.anie must keep pointing Electron at the real cookie file.
-		const launched = spawnElectron(port, {
+		const env = {
 			...process.env,
 			ANIE_DESKTOP_BIN: binary,
 			ANIE_DESKTOP_CWD: cwd,
 			HOME: tempHome,
 			XAUTHORITY: process.env.XAUTHORITY ?? path.join(os.homedir(), '.Xauthority'),
 			ELECTRON_DISABLE_SECURITY_WARNINGS: 'true',
-		});
+		};
+		for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY']) delete env[key];
+		const launched = spawnElectron(port, env);
 		electron = launched.electron;
 		lastDiagnostics = launched.diagnostics;
 		cdp = await connect(port);

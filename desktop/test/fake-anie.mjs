@@ -147,6 +147,8 @@ async function handlePrompt(text) {
 			delay_ms: 200,
 			error: 'Transport error: dns',
 		});
+		emit({ type: 'transcript_replace', messages: [] });
+		emit(statusLine());
 		await delay(200);
 		running = true;
 		await emitBetween([

@@ -17,12 +17,9 @@ let win: BrowserWindow | null = null;
 let cwd = '';
 let quitting = false;
 
-const anie = new AnieProcess(
-	(push) => {
-		if (win && !win.isDestroyed()) win.webContents.send('push', push);
-	},
-	{ binary: process.env.ANIE_DESKTOP_BIN },
-);
+const anie = new AnieProcess((push) => {
+	if (win && !win.isDestroyed()) win.webContents.send('push', push);
+});
 
 function settingsPath(): string {
 	return path.join(app.getPath('userData'), 'settings.json');

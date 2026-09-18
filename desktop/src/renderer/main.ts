@@ -56,6 +56,10 @@ cwdBtn.type = 'button';
 cwdBtn.dataset.testid = 'cwd';
 cwdBtn.className = 'cwd-btn';
 
+const providerEl = document.createElement('span');
+providerEl.dataset.testid = 'provider';
+providerEl.className = 'provider';
+
 const modelInput = document.createElement('input');
 modelInput.type = 'text';
 modelInput.dataset.testid = 'model-input';
@@ -89,7 +93,7 @@ newSessionBtn.textContent = 'New session';
 
 const headerEl = document.createElement('header');
 headerEl.className = 'header';
-headerEl.append(cwdBtn, modelInput, thinkingSelect, contextEl, sessionIdEl, processStateEl, newSessionBtn);
+headerEl.append(cwdBtn, providerEl, modelInput, thinkingSelect, contextEl, sessionIdEl, processStateEl, newSessionBtn);
 
 const mainEl = document.createElement('main');
 mainEl.className = 'main';
@@ -377,10 +381,12 @@ function paint(): void {
 		if ((THINKING_LEVELS as readonly string[]).includes(thinking)) {
 			thinkingSelect.value = thinking;
 		}
+		providerEl.textContent = status.provider;
 		sessionIdEl.textContent = status.sessionId;
 		contextEl.textContent =
 			status.contextWindow > 0 ? `${status.estimatedContextTokens} / ${status.contextWindow}` : '';
 	} else {
+		providerEl.textContent = '';
 		sessionIdEl.textContent = '';
 		contextEl.textContent = '';
 	}

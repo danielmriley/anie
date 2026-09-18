@@ -362,6 +362,9 @@ export function decodeLine(line: string): Decoded {
 			return message === null ? malformed : event({ kind: 'assistant_error', message });
 		}
 		case 'transcript_replace':
+			// anie-specific (differs from anie's TUI, which repaints from this
+			// event): it fires only after a retry or a compaction, so a
+			// transcript rebuilt from it would show tool bodies inconsistently.
 			return { kind: 'noise' };
 		case 'compaction_start': {
 			const phase = compactionPhase(raw);
