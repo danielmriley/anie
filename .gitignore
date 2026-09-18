@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# Desktop app
+desktop/node_modules/
+
 # Local runtime data and secrets
 /.anie/
 .env

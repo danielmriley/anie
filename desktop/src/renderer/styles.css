@@ -1,0 +1,286 @@
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	height: 100%;
+	background: #121417;
+	color: #e6e6e6;
+	font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+	font-size: 14px;
+	line-height: 1.45;
+}
+
+body {
+	display: flex;
+	flex-direction: column;
+	min-height: 100vh;
+}
+
+.header {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem 0.75rem;
+	padding: 0.6rem 0.75rem;
+	border-bottom: 1px solid #2a2f38;
+	flex-shrink: 0;
+}
+
+.cwd-btn {
+	max-width: 14rem;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font: inherit;
+	cursor: pointer;
+	background: #1c2128;
+	color: #e6e6e6;
+	border: 1px solid #3d4450;
+	border-radius: 4px;
+	padding: 0.25rem 0.5rem;
+}
+
+.cwd-btn:hover {
+	border-color: #7aa2f7;
+}
+
+.model-input {
+	min-width: 8rem;
+	font: inherit;
+	background: #1c2128;
+	color: #e6e6e6;
+	border: 1px solid #3d4450;
+	border-radius: 4px;
+	padding: 0.25rem 0.5rem;
+}
+
+.thinking-select,
+select[data-testid="thinking-select"] {
+	font: inherit;
+	background: #1c2128;
+	color: #e6e6e6;
+	border: 1px solid #3d4450;
+	border-radius: 4px;
+	padding: 0.25rem 0.35rem;
+}
+
+.context,
+.session-id,
+.provider {
+	font-size: 12px;
+	color: #9aa3b2;
+}
+
+.process-pill {
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	padding: 0.15rem 0.45rem;
+	border-radius: 999px;
+	background: #2a3140;
+	color: #7aa2f7;
+}
+
+.main {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	overflow: hidden;
+}
+
+.transcript {
+	flex: 1;
+	overflow-y: auto;
+	padding: 0.75rem;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.item {
+	margin-bottom: 0.75rem;
+}
+
+.user-bubble {
+	display: inline-block;
+	max-width: 85%;
+	margin-left: auto;
+	text-align: left;
+	background: #1e3a5f;
+	border-radius: 8px;
+	padding: 0.5rem 0.65rem;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.item-user {
+	display: flex;
+	justify-content: flex-end;
+}
+
+.item-assistant {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.cursor {
+	animation: blink 1s step-end infinite;
+	color: #7aa2f7;
+}
+
+@keyframes blink {
+	50% {
+		opacity: 0;
+	}
+}
+
+.assistant-error {
+	margin-top: 0.35rem;
+	padding: 0.45rem 0.55rem;
+	border: 1px solid #c44;
+	border-radius: 4px;
+	color: #f5a8a8;
+	white-space: pre-wrap;
+}
+
+.aborted-tag {
+	display: inline-block;
+	margin-left: 0.35rem;
+	font-size: 11px;
+	color: #9aa3b2;
+	text-transform: uppercase;
+}
+
+.item-tool {
+	background: #1c2128;
+	border: 1px solid #2a2f38;
+	border-radius: 6px;
+	padding: 0.45rem 0.55rem;
+	font-size: 13px;
+}
+
+.tool-title {
+	font-weight: 600;
+	color: #7aa2f7;
+}
+
+.tool-args {
+	margin: 0.35rem 0 0;
+	font-size: 12px;
+	color: #c8cdd6;
+}
+
+.tool-state-tag {
+	font-size: 11px;
+	text-transform: uppercase;
+	color: #9aa3b2;
+}
+
+.item-notice {
+	font-size: 12px;
+	color: #9aa3b2;
+}
+
+.notice-warn {
+	color: #e0b060;
+}
+
+.item-retry {
+	font-size: 12px;
+	color: #e0b060;
+}
+
+.item-compaction {
+	font-size: 12px;
+	color: #9aa3b2;
+}
+
+.composer {
+	display: flex;
+	gap: 0.5rem;
+	padding: 0.6rem 0.75rem;
+	border-top: 1px solid #2a2f38;
+	flex-shrink: 0;
+	align-items: flex-end;
+}
+
+.composer textarea {
+	flex: 1;
+	font: inherit;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	background: #1c2128;
+	color: #e6e6e6;
+	border: 1px solid #3d4450;
+	border-radius: 6px;
+	padding: 0.45rem 0.55rem;
+	resize: vertical;
+	min-height: 3rem;
+}
+
+.composer button {
+	font: inherit;
+	cursor: pointer;
+	background: #2a3140;
+	color: #e6e6e6;
+	border: 1px solid #3d4450;
+	border-radius: 6px;
+	padding: 0.4rem 0.75rem;
+}
+
+.composer button[type="submit"] {
+	background: #3d5a99;
+	border-color: #7aa2f7;
+}
+
+.composer button:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+
+.busy-hint {
+	padding: 0.35rem 0.75rem;
+	font-size: 12px;
+	color: #e0b060;
+	background: #1c2128;
+}
+
+.start-failure {
+	margin: 1rem;
+	padding: 1rem;
+	border: 1px solid #c44;
+	border-radius: 8px;
+	background: #1a1518;
+}
+
+.start-failure pre {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	font-size: 12px;
+	max-height: 12rem;
+	overflow-y: auto;
+}
+
+.start-failure button {
+	margin-top: 0.5rem;
+	font: inherit;
+	cursor: pointer;
+	padding: 0.35rem 0.75rem;
+	background: #3d5a99;
+	color: #e6e6e6;
+	border: none;
+	border-radius: 4px;
+}
+
+button[data-testid="new-session"] {
+	font: inherit;
+	cursor: pointer;
+	background: #2a3140;
+	color: #e6e6e6;
+	border: 1px solid #3d4450;
+	border-radius: 4px;
+	padding: 0.25rem 0.5rem;
+}

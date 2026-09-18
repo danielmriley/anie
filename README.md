@@ -280,6 +280,7 @@ Print mode runs a single prompt and writes the response to stdout. It is selecte
 ### RPC mode
 
 RPC mode communicates over JSONL on stdin/stdout for non-TUI integrations.
+Assistant failures such as an authentication error are emitted as {"type":"assistant_error","message":"..."} so clients can show them; the error tag stays reserved for unparsable stdin commands.
 
 ## Built-in tools
 
